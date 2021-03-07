@@ -4,8 +4,17 @@ GYMIR is a GPL implementation of the Ymir compiler that use the GCC as a back en
 
 # Compilation for local usage and tests
 
+```bash
+# installing dependencies
 
-```bash 
+sudo apt install gcc-9
+curl https://www.gitlab.emile-cadorel.fr/9.3.0/gyc-9_9.3.0_amd64.deb
+curl https://www.gitlab.emile-cadorel.fr/9.3.0/libgmidgard_9.3.0_amd64.deb
+sudo dpkg -i gyc-9_9.3.0_amd64.deb
+sudo dpkg -i libgmidgard_9.3.0_amd64.deb
+
+# Create source directories
+
 mkdir {install_dir}/gcc
 cd {install_dir}/gcc
 mkdir gcc-src
@@ -18,9 +27,9 @@ cd {install_dir}/gcc/gcc-src
 git fetch --tags --depth=1
 git checkout releases/gcc-{version}
 
-# cloning ymir - master revision
+# cloning ymir bootstrap - master revision
 cd {install_dir}/gcc/gcc-src/gcc
-git clone --depth=1 https://github.com/GNU-Ymir/gymir.git ymir
+git clone --depth=1 https://github.com/GNU-Ymir/bootstrap.git ymir
 
 # install deps
 cd {install_dir}/gcc/gcc-src/gcc
@@ -49,10 +58,9 @@ make install
 ```
 Will update the gyc command.
 
-**Warning** some modification of ymir (such as ListError.{cc,hh}) may
-  require to recompile every ymir files, the dependencies of
-  compilation in `c++` are not totally managed.
-To remove all precompiled file, and make sure everything is correct, you will have to run :
+**Warning** some modification of ymir may require to recompile every
+  ymir files. To remove all precompiled file, and make sure everything
+  is correct, you will have to run :
 
 ```bash
 cd {install_dir}/gcc/gcc-build
