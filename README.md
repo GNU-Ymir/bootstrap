@@ -8,10 +8,10 @@ GYMIR is a GPL implementation of the Ymir compiler that use the GCC as a back en
 # installing dependencies
 
 sudo apt install gcc-9
-curl https://www.gitlab.emile-cadorel.fr/9.3.0/gyc-9_9.3.0_amd64.deb
-curl https://www.gitlab.emile-cadorel.fr/9.3.0/libgmidgard_9.3.0_amd64.deb
-sudo dpkg -i gyc-9_9.3.0_amd64.deb
-sudo dpkg -i libgmidgard_9.3.0_amd64.deb
+curl https://www.gitlab.emile-cadorel.fr/9.3.0/${arch}/gyc-9_9.3.0_${arch}.deb
+curl https://www.gitlab.emile-cadorel.fr/9.3.0/${arch}/libgmidgard_9.3.0_${arch}.deb
+sudo dpkg -i gyc-9_9.3.0_${arch}.deb
+sudo dpkg -i libgmidgard_9.3.0_${arch}.deb
 
 # Create source directories
 
