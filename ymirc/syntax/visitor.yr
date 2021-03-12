@@ -1,0 +1,966 @@
+mod syntax::visitor;
+
+import std::fs::file;
+import errors::_, std::conv;
+import syntax::lexer, syntax::word;
+import syntax::tokens, syntax::keys;
+import utils::stream;
+import options::state;
+
+
+import syntax::declaration::module;
+import syntax::declaration::_;
+import syntax::expression::_;
+
+import std::collection::set;
+import std::collection::vec;
+import std::io;
+import syntax::error_messages;
+
+
+/**
+ * The syntax visitor class is the class used to transform a text content into an analyzable syntax tree
+ * The syntax visitor will validated the content of the source code, but only at a syntaxic level
+ */
+pub class @final SyntaxVisitor {
+    
+    let dmut _lex : &Lexer;
+
+    let dmut _forbiddenKeys = HashSet!([c8])::new ();
+
+    /**
+     * Create a new visitor on a file
+     * @params: 
+     *    - filename: the path of the file to open
+     */
+    pub self open (filename : [c8]) 
+        with _lex = Lexer::new (filename, content-> {
+            with dmut file = File::open (filename.to![c32]()) {            
+                file:.readAll ()
+            }
+        }, tokens-> Tokens::members, comments-> [const ("/*"s8, "*/"s8), ("//"s8, "\n"s8)])    
+        throws &FileError
+    {
+        for i in Tokens::members {
+            self._forbiddenKeys:.insert (i);
+        }
+
+        for i in Keys::members {
+            self._forbiddenKeys:.insert (i);
+        }
+    }
+    
+    /**
+     * Once the visitor is initialized, (with open for instance) 
+     * the content can be read an transformed into a syntax tree
+     * @example: 
+     * =================
+     * let dmut visitor = Visitor::open ("foo.yr"s8);
+     * { 
+     *    // verify the grammar of the content of the file
+     *    // And return it into a syntax tre
+     *    let module = visitor:.read (); 
+     *    println (format ("%"s8, module)); // pretty print the module that has been read
+     * } catch {
+     *    err : &ErrorMsg => {
+     *          println (format ("%"s8, err)); // print the error that occured inside the file
+     *    }
+     * }
+     * =================
+     */
+    pub def read (mut self) -> &Module
+        throws &ErrorMsg
+    {
+        let (loc, path, comm) = self:.readGlobalPath ();        
+        Module::new (loc, path, comm, self:.readDeclBlock (loc, comm), isGlobal-> true)
+    }
+
+    /**
+     * Read the first declaration line of the module (if any), and return the declared path
+     * @returns: 
+     *    - the path, or Unit if nothing was found was found
+     *    - the comments above the path
+     */
+    prv def readGlobalPath (mut self) -> (&Word, &Expression, [c8])
+        throws &ErrorMsg
+    {
+        let beginPos = self._lex.getCounter ();
+        
+        let (next, comm) = self:.readIf ([Keys::MOD]);
+        if (next.isEof ()) return (next, cast!(&Expression) (const Unit::new ()), ""s8);
+
+        let path = self:.readPath ();
+        if (!(self:.readIf ([Tokens::SEMI_COLON])._0).isEof ()) {
+            (next, path, comm)
+        } else {
+            self._lex:.rewind (nb-> self._lex.getCounter () - beginPos);
+            (next, cast!(&Expression) (const Unit::new ()), ""s8)
+        }
+    }
+    
+    /**
+     * Read a set of declaration in a global module (or in a global sub symbol, such as local module, protection block, etc.)
+     * @verbatim: 
+     * ===================
+     * decl_block := declaration | protection_block | version_block
+     * ===================
+     * @params: 
+     *     - close: if false, then the reading stops when the token eof () is found
+     *              , otherwise it stops when the token Tokens::RACC is found
+     */
+    prv def readDeclBlock (mut self, loc : &Word, comm : [c8], closing : bool = false, protection : Protection = Protection::PRIVATE) -> &DeclBlock
+        throws &ErrorMsg    
+    {        
+        let dmut decls = Vec!(&Declaration)::new ();
+        loop {
+            let beginCur = self._lex.getCounter ();
+            let (tok, _) = self._lex:.next ();
+            if (closing && tok.str () == Tokens::RACC) break {}
+            if (!tok.isEof ()) self._lex:.rewind (nb-> self._lex.getCounter () - beginCur);
+            
+            match tok.str () {
+                Keys::PUBLIC => 
+                    decls:.push (self:.readProtectionBlock ());
+                Keys::PRIVATE =>
+                    decls:.push (self:.readProtectionBlock ());
+                Keys::VERSION =>
+                    decls:.push (self:.readVersionBlock (protection-> protection));
+                _ => {
+                    if !tok.isEof () {
+                        decls:.push (self:.readDeclaration ());
+                    } else break {}
+                }
+            }            
+        }
+        
+        DeclBlock::new (loc, comm, decls [], protection-> protection)
+    }
+
+    /**
+     * Read a protection block
+     * @verbatim: 
+     * ===============
+     * protection_block :=   (Keys::PRIVATE | Keys::PUBLIC) Tokens::LACC decl_block Tokens::RACC
+     *                     | (Keys::PRIVATE | Keys::PUBLIC) declaration
+     * ===============
+     */
+    prv def readProtectionBlock (mut self) -> &DeclBlock
+        throws &ErrorMsg
+    {
+        let (loc, comm) = self._lex:.next ();
+        {
+            let protection = if (loc.str () == Keys::PRIVATE) { Protection::PRIVATE } else { Protection::PUBLIC };
+            let (tok, _) = self:.readIf ([Tokens::LACC]);
+            if (tok.isEof ()) {
+                DeclBlock::new (loc, comm, [self:.readDeclaration ()], protection-> protection)
+            } else {
+                self:.readDeclBlock (loc, comm, closing-> true, protection-> protection)
+            }
+        } catch {
+            err : &ErrorMsg => {
+                throw err.appendNotes ([ErrorMsg::note (loc, SyntaxMessage::IN_DECL_BLOCK)]);
+            }
+        }
+    }
+
+    /**
+     * Visit a version block
+     * @verbatim: 
+     * ================
+     * version_block := Keys::VERSION Tokens::LACC decl_block Tokens::RACC (else Tokens::LACC decl_block Tokens::RACC)?
+     * ================
+     */
+    prv def readVersionBlock (mut self, protection : Protection = Protection::PRIVATE)-> &DeclBlock
+        throws &ErrorMsg
+    {
+        let (loc, comm) = self._lex:.next ();
+        {
+            let (v, _) = self:.readIdentifier ();
+            return if global::state ().isVersionActive (v.str ()) {
+                self:.readTokens ([Tokens::LACC]);
+                let block = self:.readDeclBlock (loc, comm, closing-> true, protection-> protection);
+                if (!(self:.readIf ([Keys::ELSE])._0).isEof ())
+                    self:.ignoreBlock ();
+                block
+            } else {
+                self:.ignoreBlock ();
+                if (!(self:.readIf ([Keys::ELSE])._0).isEof ()) {
+                    self:.readTokens ([Tokens::LACC]);
+                    self:.readDeclBlock (loc, comm, closing-> true, protection-> protection)
+                } else {
+                    DeclBlock::new (loc, comm, [])
+                }
+            } ;       
+        } catch {
+            err : &ErrorMsg => {
+                throw err.appendNotes ([ErrorMsg::note (loc, SyntaxMessage::IN_DECL_BLOCK)]);
+            }
+        }
+    }
+
+    /**
+     * Ignore a block of element (no matters what is inside)
+     * Basically, it can be used to consider the next block of code as a comment 
+     * A block is enclosed by Tokens::LACC and Tokens::RACC
+     */
+    prv def ignoreBlock (mut self)
+        throws &ErrorMsg
+    {
+        let _ = self:.readTokens ([Tokens::LACC]);
+        let mut nb = 1u64;
+        loop {
+            let (next, _) = self._lex:.next ();
+            if (next == Tokens::RACC) {
+                nb -= 1u64;
+                if (nb == 0u64) 
+                    break {}                
+            } else if (next == Tokens::LACC) nb += 1u64;
+            else if (next.isEof ())
+                throw ErrorMsg::fatal (next, SyntaxMessage::UNTERMINATED_BLOCK);
+        }
+    }
+
+    /**
+     * Read a declaration
+     * @verbatim:
+     * ==================
+     * decl :=   aka_decl
+     *         | class_decl
+     *         | enum_decl
+     *         | func_decl
+     *         | static_decl
+     *         | import_decl
+     *         | extern_decl
+     *         | macro_decl
+     *         | mod_decl
+     *         | struct_decl
+     *         | trait_decl
+     * ==================
+     */
+    prv def readDeclaration (mut self)-> &Declaration
+        throws &ErrorMsg
+    {
+        let (tok, comm) = self._lex:.next ();
+        match tok.str () {
+            Keys::AKA    => { return self:.readAka (tok, comm); }
+            Keys::CLASS  => { return self:.readClass (tok, comm); }
+            Keys::ENUM   => { return self:.readEnum (tok, comm); }
+            Keys::DEF    => { return self:.readFunction (tok, comm); }
+            Keys::STATIC => { return self:.readGlobal (tok, comm); }
+            Keys::IMPORT => { return self:.readImport (tok, comm); }
+            Keys::EXTERN => { return self:.readExtern (tok, comm); }
+            Keys::MACRO  => { return self:.readMacro (tok, comm); }
+            Keys::MOD    => { return self:.readLocalModule (tok, comm); }
+            Keys::STRUCT => { return self:.readStruct (tok, comm); }
+            Keys::TRAIT  => { return self:.readTrait (tok, comm); }
+            _ => {
+                throw ErrorMsg::fatal (tok, format (SyntaxMessage::UNEXPECTED_BUT_LST, tok.str (),
+                                                    [Keys::AKA, Keys::CLASS, Keys::ENUM, Keys::STATIC,
+                                                     Keys::IMPORT, Keys::EXTERN, Keys::MACRO, Keys::MOD,
+                                                     Keys::STRUCT, Keys::TRAIT])
+                                      );
+            }
+        }
+    }
+
+    /**
+     * Read an aka declaration
+     * @verbatim: 
+     * ===============
+     * aka_decl :=   Keys::AKA Keys::IF expression:(0) Identifier template_param_list Tokens::EQUAL expression:(0)
+     *             | Keys::AKA Identifier (template_param_list)? Tokens::EQUAL expression:(0)
+     * ===============
+     */
+    prv def readAka (mut self, _ : &Word, comm : [c8])-> &Declaration
+        throws &ErrorMsg
+    {
+        let (hasTest, test) = self:.readTemplateTest ();        
+        let (ident, _) = self:.readIdentifier ();
+        let templates = self:.readTemplateParameters (ifLoc-> hasTest)
+        
+        self:.readTokens ([Tokens::EQUAL]);
+        let value = self:.readExpression ();
+        self:.readIf ([Tokens::SEMI_COLON]);
+
+        if (templates.len == 0u64) {
+            Aka::new (ident, comm, value)            
+        } else {
+            Template::new (ident, comm, templates, Aka::new (ident, comm, value), test-> test)            
+        }
+    }
+
+    /**
+     * Read a class declaration
+     * @verbatim: 
+     * ===============
+     * class_decl :=   Keys::CLASS Keys::IF expression:(0) (attribute_list)? Identifier template_param_list (Keys::OVER expression:(0))? class_block_decl
+     *               | Keys::CLASS (attributes_list)? Identifier (template_param_list)? (Keys::OVER expression:(0))? class_block_decl
+     * ===============
+     */
+    prv def readClass (mut self,  _ : &Word, comm : [c8])-> &Declaration
+        throws &ErrorMsg
+    {
+        let (hasTest, test) = self:.readTemplateTest ();
+        let attribs = self:.readAttributes ();
+        let (ident, _) = self:.readIdentifier ();
+        let templates = self:.readTemplateParameters (ifLoc-> hasTest)
+
+        let ancestor =
+            if (self:.readIf ([Keys::OVER])._0).isEof () {
+                Unit::new ()
+            } else {
+                self:.readExpression ()
+            };
+
+        let (open, _) = self:.readTokens ([Tokens::LACC]);
+        let decls = {
+            self:.readClassDeclBlock (closing-> true)
+        } catch {
+            err : &ErrorMsg => {
+                throw err.appendNotes ([ErrorMsg::note (open, SyntaxMessage::IN_DECL_BLOCK)]);
+            }
+        }
+        
+        let cls = Class::new (ident, comm, decls, attrs-> attribs, ancestor-> ancestor);
+
+        if (templates.len == 0u64) {
+            cls
+        } else {
+            Template::new (ident, comm, templates, cls, test-> test)
+        }
+    }
+
+    /**
+     * Read the inner part of a class declaration
+     * @verbatim: 
+     * ================
+     * class_block_decl :=   (Keys::PUBLIC | Keys::PRIVATE | Keys::PROTECTED) class_block_decl
+     *                     | Keys::VERSION Identifier class_block_decl (Keys::ELSE class_block_decl)?
+     *                     | Keys::IMMUTABLE Keys::IF expression:(0) class_block_decl (Keys::ELSE class_block_decl)?
+     *                     | class_inner_declaration*
+     * ================
+     * @params: 
+     *     - close: if false, then the reading stops after the first declaration, otherwise it stops when the token Tokens::RACC is found
+     */
+    prv def readClassDeclBlock (mut self, closing : bool = false, inProtection : bool = false)-> [&Declaration]
+        throws &ErrorMsg
+    {
+        let dmut vec = Vec!(&Declaration)::new ();
+        loop {
+            let (next, comm) = self._lex:.next ();
+            match next.str () {
+                Keys::PRIVATE | Keys::PUBLIC | Keys::PROTECTED  => {
+                    let inner = {
+                        if ((self:.readIf ([Tokens::LACC])._0).isEof ()) {
+                            let (d, c) = self._lex:.next ();
+                            [self:.readClassInnerDecl (d, c, inProtection-> true)]
+                        } else {
+                            self:.readClassDeclBlock (closing-> true, inProtection-> true)
+                        }
+                    }  catch {
+                        err : &ErrorMsg => {
+                            throw err.appendNotes ([ErrorMsg::note (next, SyntaxMessage::IN_DECL_BLOCK)]);
+                        }
+                    }                    
+                    vec:.push (DeclBlock::new (next, comm, inner, protection-> self.toProtection (next.str ())));
+                }                
+                
+                Tokens::RACC => {
+                    if (closing) break {}
+                    else throw ErrorMsg::fatal (next, format (SyntaxMessage::UNEXPECTED_BUT_LST, next.str (), [Keys::PUBLIC, Keys::PROTECTED, Keys::PRIVATE]));
+                }
+                _ => {
+                    vec:.push (self:.readClassInnerDecl (next, comm, inProtection-> inProtection));
+                }
+            }
+        }
+        
+        vec:.fit ();
+        vec []
+    }
+
+    /**
+     * Read a declaration inside a class definition
+     * @verbatim: 
+     * ===============
+     * class_inner_decl :=   constructor 
+     *                     | function
+     *                     | field
+     *                     | impl (if !inProtection)
+     *                     | import (if !inProtection)
+     * ===============
+     * @params: 
+     *    - inProtection: impl and import cannot be under protected declarators, and must be declared at root level of the class
+     */
+    prv def readClassInnerDecl (mut self, loc : &Word, comm : [c8], inProtection : bool = false)-> &Declaration
+        throws &ErrorMsg
+    {
+        match loc {
+            Keys::SELF => { return self:.readClassConstructor (loc, comm); }
+            Keys::DEF  => { return self:.readFunction (loc, comm, isMethod-> true); }
+            Keys::OVER => { return self:.readFunction (loc, comm, isMethod-> true, isOver-> true); }
+            Keys::LET  => { return self:.readGlobal (loc, comm, isField-> true); }
+            Keys::IMPL => {
+                if (inProtection) {
+                    throw ErrorMsg::warn (loc, SyntaxMessage::IMPL_IN_PROTECTION);
+                }
+                return self:.readImplement (loc, comm);
+            }
+            Keys::IMPORT => {
+                if (inProtection) {
+                    throw ErrorMsg::warn (loc, SyntaxMessage::IMPORT_IN_PROTECTION);
+                }
+                return self:.readImport (loc, comm);
+            }
+            _ => {
+                if inProtection {
+                    throw ErrorMsg::fatal (loc, format (SyntaxMessage::UNEXPECTED_BUT_LST, loc.str (), [
+                        Keys::SELF, Keys::DEF, Keys::OVER, Keys::LET
+                    ]));
+                } else {                    
+                    throw ErrorMsg::fatal (loc, format (SyntaxMessage::UNEXPECTED_BUT_LST, loc.str (), [
+                        Keys::SELF, Keys::DEF, Keys::OVER, Keys::LET, Keys::IMPL, Keys::IMPORT
+                    ]));
+                }
+            }
+        }
+    }
+    
+    /**
+     * Read a class constructor
+     * @verbatim: 
+     * ================
+     * constructor :=   Keys::SELF Keys::IF expression:(0) (attribs)? (Identifier)? template_param_list param_list (with_decl)? (throws_decl)? expression:(0)
+     *                | Keys::SELF (attribs)? (Identifier)? (template_param_list)? param_list (with_decl)? (throws_decl)? expression:(0)
+     * ================
+     */
+    prv def readClassConstructor (mut self, loc : &Word, comm : [c8]) -> &Declaration
+        throws &ErrorMsg
+    {
+        let (hasTest, test) = self:.readTemplateTest ();
+        let attribs = self:.readAttributes ();
+        let (name, _) = self:.readIfIdentifier ();
+        let templates = self:.readTemplateParameters (ifLoc-> hasTest);
+        println (format ("%"s8, templates));
+                 
+        let proto = self:.readFunctionPrototype ();
+        
+        let dmut construction = Vec!{(&Word, &Expression)}::new ();
+        let mut supers : [&Expression] = [];
+        let mut auxCstrLoc = Word::eof ();
+        if (!(self:.readIf ([Keys::WITH])._0).isEof ()) {
+            loop {
+                let (next, _) = self._lex:.next ();
+                match next.str () {
+                    Keys::SUPER | Keys::SELF => {
+                        if (!auxCstrLoc.isEof ()) 
+                            throw ErrorMsg::fatal (next, SyntaxMessage::MULTIPLE_AUX_CSTRS, notes-> [ErrorMsg::note (auxCstrLoc, ""s8)]);
+                                                
+                        auxCstrLoc = next;
+                        self:.readTokens ([Tokens::LPAR]);
+                        supers = self:.readArgumentList ();
+                        self:.readTokens ([Tokens::RPAR]);
+                    }
+                    _ => {
+                        if (!self.isIdentifier (next.str ())) 
+                            throw ErrorMsg::fatal (next, format (SyntaxMessage::USED_AS_IDENTIFIER, next.str ()));
+                        
+                        self:.readTokens ([Tokens::EQUAL]);
+                        construction:.push ((next, self:.readExpression ()));
+                    }
+                }
+                
+                if ((self:.readIf ([Tokens::COMA])._0).isEof ()) {
+                    break {}
+                }
+            }
+        }
+
+        let throwers = self:.readThrowers ();
+        let body = self:.readExpression ();
+
+        let cstr = Constructor::new (loc, comm, rename-> name, proto, superParams-> supers, fields-> construction[], body-> body, explicitCstrsCall-> auxCstrLoc, attributes-> attribs, throwers-> throwers);
+        
+        if (templates.len != 0u64) {
+            Template::new (loc, comm, templates, cstr, test-> test)
+        } else {
+            cstr
+        }
+    }
+    
+    prv def readImplement (mut self, loc : &Word, comm : [c8]) -> &Declaration
+        throws &ErrorMsg
+    {
+        throw ErrorMsg::fatal (loc, comm);
+    }
+    
+    prv def readEnum (mut self,  _ : &Word, _ : [c8])-> &Enum
+        throws &ErrorMsg
+    {
+        throw ErrorMsg::fatal (Word::eof (), ""s8);
+    }
+
+    prv def readFunction (mut self,  _ : &Word, _ : [c8], isMethod : bool = false, isOver : bool = false)-> &Function
+        throws &ErrorMsg
+    {
+        isOver;
+        isMethod;
+        throw ErrorMsg::fatal (Word::eof (filename-> "main.yr"s8), "s"s8);
+    }
+
+    prv def readFunctionPrototype (mut self)-> &FunctionProto
+        throws &ErrorMsg
+    {
+        throw ErrorMsg::fatal (Word::eof (filename-> "main.yr"s8), "s"s8);
+    }
+
+    prv def readThrowers (mut self)-> [&Expression] {
+        []
+    }
+    
+    prv def readGlobal (mut self,  _ : &Word, _ : [c8], isField : bool = false)-> &Global
+        throws &ErrorMsg
+    {
+        isField;
+        throw ErrorMsg::fatal (Word::eof (), ""s8);
+    }
+
+    prv def readImport (mut self,  _ : &Word, _ : [c8])-> &Import
+        throws &ErrorMsg
+    {
+        throw ErrorMsg::fatal (Word::eof (), ""s8);
+    }
+
+    prv def readExtern (mut self,  _ : &Word, _ : [c8])-> &ExternBlock
+        throws &ErrorMsg
+    {
+        throw ErrorMsg::fatal (Word::eof (), ""s8);
+    }
+
+    prv def readMacro (mut self,  _ : &Word, _ : [c8])-> &Macro
+        throws &ErrorMsg
+    {
+        throw ErrorMsg::fatal (Word::eof (), ""s8);
+    }
+
+    prv def readLocalModule (mut self,  _ : &Word, _ : [c8])-> &Module
+        throws &ErrorMsg
+    {
+        throw ErrorMsg::fatal (Word::eof (), ""s8);
+    }
+    
+    prv def readStruct (mut self,  _ : &Word, _ : [c8])-> &Struct
+        throws &ErrorMsg
+    {
+        throw ErrorMsg::fatal (Word::eof (), ""s8);
+    }    
+
+    prv def readTrait (mut self,  _ : &Word, _ : [c8])-> &Trait
+        throws &ErrorMsg
+    {
+        throw ErrorMsg::fatal (Word::eof (), ""s8);
+    }        
+
+    /**
+     * Read a list of template parameters 
+     * @params: 
+     *    - ifLoc: the location of the if test, if not eof, has to read the list, can't return an empty list
+     * @throws:
+     *    - ErrorMsg: if !ifLoc.isEof (), but there is no list to read
+     */
+    prv def readTemplateParameters (mut self, ifLoc : &Word = Word::eof ())-> [&Expression]
+        throws &ErrorMsg
+    {
+        let (next, _) = if (!ifLoc.isEof ()) {
+            let (x, c) = self._lex:.next ();
+            if (x != Tokens::NOT) {
+                throw ErrorMsg::fatal (x, format (SyntaxMessage::UNEXPECTED_BUT_LST, x.str (), [Tokens::NOT]),
+                                       notes-> [ErrorMsg::note (ifLoc, SyntaxMessage::IF_NON_TEMPLATE)]);
+            }
+            (x, c)
+        } else {
+            self:.readIf ([Tokens::NOT])
+        }
+
+        if (!next.isEof ()) { // there are templates to read
+            let dmut vec = Vec!{&Expression}::new ();
+            let (begin, _) = self:.readTokens ([Tokens::LACC, Tokens::INF]);
+            loop {
+                let beginCur = self._lex.getCounter ();
+                let (curr, _) = self._lex:.next ();
+                match curr.str () {
+                    Keys::STRUCT | Keys::CLASS | Keys::ALIAS | TemplateVarType::TUPLE => {
+                        vec:.push (TemplateVar::new (curr, self.toTemplateVarType (curr.str ())));
+                    }
+                    _ => {
+                        self._lex:.rewind (nb-> self._lex.getCounter () - beginCur);
+                        vec:.push (
+                            if self.isIdentifier (curr.str ()) {
+                                self:.readTemplateVarParam ()
+                            } else {
+                                self:.readExpression ()
+                            }
+                        );
+                    }
+                }
+                
+                let (token, _) = if (begin == Tokens::LACC) {
+                    self:.readTokens ([Tokens::RACC, Tokens::COMA])
+                } else {
+                    self:.readTokens ([Tokens::SUP, Tokens::COMA])
+                }
+                
+                if (token.str () == Tokens::RACC || token.str () == Tokens::SUP)
+                    break {}            
+            }  catch {
+                err : &ErrorMsg => {
+                    throw err.appendNotes ([ErrorMsg::note (begin, SyntaxMessage::IN_TEMPLATE_PARAMS)]);
+                }
+            }
+            
+            vec:.fit ();
+            return vec [];
+        } 
+        
+        []
+    }
+
+    /**
+     * Read an expression that might be a variable inside a list of template parameters
+     * @verbatim: 
+     * ===============
+     * template_var_decl :=    Identifier (Tokens::COLON expression:0)? (Tokens::EQUAL expression:0)?
+     *                      |  Identifier (Keys::OF | Keys::OVER | Keys::IMPL) expression:0
+     *                      |  Identifier (Tokens::COLON)?  Tokens::TDOT
+     *                      |  expression:0
+     * ===============
+     */
+    prv def readTemplateVarParam (mut self) -> &Expression
+        throws &ErrorMsg
+    {
+        let beginCur = self._lex.getCounter ();
+        let (name, _) = self:.readIdentifier ();
+        let (next, _) = self:.readIf ([cast![c8] (Tokens::COLON), Tokens::TDOT,
+                                       Tokens::EQUAL, Keys::OVER, Keys::OF,
+                                       Keys::IMPL]);
+        
+        match next.str () {
+            Tokens::COLON => {
+                let (tok, _) = self:.readIf ([Tokens::TDOT]);
+                if (tok.isEof ()) { // V : type ('=' value)?
+                    let type = self:.readExpression ();
+                    if (!(self:.readIf ([Tokens::EQUAL])._0).isEof ()) { // '=' value
+                        return VarDecl::new (name, name, value-> self:.readExpression (), type-> type);
+                    } else return VarDecl::new (name, name, value-> Unit::new (), type-> type);
+                } else return TemplateVariadicVar::new (name, isValue-> true); // V:...
+            }
+            Tokens::EQUAL => {
+                return VarDecl::new (name, name, value-> self:.readExpression (), type-> Unit::new ());
+            }
+            Tokens::TDOT  => {
+                return TemplateVariadicVar::new (name, isValue-> false);
+            }
+            Keys::OVER | Keys::OF | Keys::IMPL => {
+                let k = self.toTemplateOfVarType (next.str ());
+                return TemplateOfVar::new (name, self:.readExpression (), kind-> k);
+            }
+        }
+
+        self._lex:.rewind (nb-> self._lex.getCounter () - beginCur);
+        return self:.readExpression ();
+    }
+
+    /**
+     * Read a template test (if anyl
+     * @returns: 
+     *   - the location of the if token, (or eof)
+     *   - the test expression, or Unit
+     */
+    prv def readTemplateTest (mut self)-> (&Word, &Expression)
+        throws &ErrorMsg
+    {    
+        let (hasTest, _) = self:.readIf ([Keys::IF]);
+        if hasTest.isEof () {
+            (hasTest, const cast!(&Expression) (Unit::new ()))
+        } else {
+            (hasTest, self:.readExpression ())
+        }
+    }
+
+    /**
+     * Read a list of custom attributes, if the token Tokens::AT is not read, then an empty list is returned
+     * @verbatim:
+     * =================
+     * attributes_lst :=   Tokens::AT Keys::LACC Attribute (Tokens::COMA Attribute)* Keys::RACC
+     *                   | Tokens::AT Attribute
+     * =================
+     */
+    prv def readAttributes (mut self)-> [Attributes]
+        throws &ErrorMsg
+    {
+        let (next, _) = self:.readIf ([Tokens::AT]);
+        if (next.isEof ()) return [];
+
+        let (open, _) = self:.readIf ([Tokens::LACC]);
+        let dmut vec = Vec!(Attributes)::new ();
+        loop {
+            let (identifier, _) = self:.readIdentifier ();
+            match identifier {
+                Attributes::ABSTRACT => vec:.push (Attributes::ABSTRACT);
+                Attributes::FINAL    => vec:.push (Attributes::FINAL);
+                Attributes::PACKED   => vec:.push (Attributes::PACKED);
+                Attributes::UNION    => vec:.push (Attributes::UNION);
+                _ => {
+                    throw ErrorMsg::fatal (identifier, format (SyntaxMessage::UNDEFINED_ATTRIBUTE, identifier.str ()));
+                }
+            }
+            
+            if (open.isEof ()) break {}
+            else {
+                let (close, _) = self:.readTokens ([Tokens::COMA, Tokens::RACC]);
+                if (close.str () == Tokens::RACC) break {}
+            }
+        }  catch {
+            err : &ErrorMsg => {
+                throw err.appendNotes ([ErrorMsg::note (open, SyntaxMessage::IN_DECL_BLOCK)]);
+            }
+        }
+        
+        vec:.fit ()
+        vec[]
+    }
+    
+    /**
+     * Read a list of arguments
+     * @params: 
+     *    - withNamed: if true, named expression are allowed in the argument list
+     *    - closing: the token that closes the list
+     * @verbatim: 
+     * ===================
+     * 
+     * ===================
+     */
+    prv def readArgumentList (mut self, withNamed : bool = false, closing : [c8] = Tokens::RPAR)-> [&Expression]
+        throws &ErrorMsg
+    {
+        let dmut vec = Vec!{&Expression}::new ();
+        loop {
+            let (x, _) = self:.readIf ([closing]);
+            if (!x.isEof ()) break {}
+            
+            let beg = self._lex.getCounter ();
+            let mut read = false;
+            if (withNamed) {
+                let (name, _) = self._lex:.next ();
+                if (self.isIdentifier (name.str ())) {
+                    let (arr, _) = self:.readIf ([Tokens::ARROW]);
+                    if (!arr.isEof ()) {
+                        vec:.push (NamedExpression::new (name, self:.readExpression ()));
+                        read = true;
+                    }
+                }
+            }
+            
+            if (!read) {
+                self._lex:.rewind (nb-> self._lex.getCounter () - beg);
+                vec:.push (self:.readExpression ());
+            }
+            
+            if (self:.readTokens ([closing, Tokens::COMA])._0).str () != Tokens::COMA {
+                break {}
+            }
+        }
+        
+        vec:.fit ()
+        vec []
+    }
+    
+    /**
+     * Read an expression with the highest priority (any expression)
+     */
+    prv def readExpression (mut self)-> &Expression
+        throws &ErrorMsg
+    {
+        self:.readTokens ([Tokens::LACC]);
+        self:.readTokens ([Tokens::RACC]);
+        Unit::new ()
+    }
+    
+    /**
+     * Read a namepath expression 
+     * @verbatim: 
+     * =============
+     * namepath_expr := Identifier ('::' Identifier)* 
+     * =============
+     */
+    prv def readPath (mut self) -> &Expression
+        throws &ErrorMsg
+    {
+        let fst = self:.readIdentifier ();
+        let mut res : &Expression = Var::new (fst._0);
+        loop {
+            let (next, _) = self:.readIf ([Tokens::DCOLON]);
+            if (!next.isEof ())  {
+                let af = {                    
+                    let (x, _) = self:.readIf ([Keys::UNDER]);
+                    if !x.isEof () { x }
+                    else { self:.readIdentifier ()._0 }                        
+                }
+                res = PathExpr::new (next, res, Var::new (af));
+            } else break {}
+        }
+        
+        res
+    }
+
+    /**
+     * Read an identifier from the lexer
+     * @throws:
+     *    - ErrorMsg: if the next token is not a valid identifier
+     */
+    prv def readIdentifier (mut self)-> (&Word, [c8])
+        throws &ErrorMsg
+    {
+        let (ident, comm) = self._lex:.next ();
+        if (!self.isIdentifier (ident.str ())) {
+            throw ErrorMsg::fatal (ident, format (SyntaxMessage::USED_AS_IDENTIFIER, ident.str ()));
+        }
+
+        (ident, comm)
+    }
+
+    /**
+     * @returns: true if str is a valid identifier, false otherwise
+     */
+    prv def isIdentifier (self, str : [c8])-> bool {
+        if (str in self._forbiddenKeys) {
+            return false;
+        }
+
+        let mut i = 0u64;
+        let found = for j in str { // must start by a letter, but can be preceded by as many _ as wanted
+            if (j >= 'a'c8 && j <= 'z'c8) || (j >= 'A'c8 && j <= 'Z'c8) {
+                break true;
+            } else if (j != '_'c8) {
+                return false;
+            }
+            i += 1u64;
+            false
+        }
+        
+        i += 1u64;
+        if (i < str.len) { // the rest of the identifier must be composed of letters, numbers, or _
+            {
+                for j in str [i .. $] {
+                    if (j < 'a'c8 || j > 'z'c8) && (j < 'A'c8 || j > 'Z'c8) && (j != '_'c8) && (j < '0'c8 || j > '9'c8) {
+                        return false;
+                    }
+                }
+            } catch {
+                _ => { return false; } // impossible
+            }
+            
+        } else {
+            if !found { // only a list of _ is not an identifier
+                return false;
+            }
+        }
+        
+        true
+    }
+    
+    
+    /**
+     * @returns: the next token inside the lexer, if it is equals to one of the token inside lst
+     * @info: if none of lst token is found, the lexer is not incremented
+     * @params: 
+     *    - lst: a list of tokens 
+     */
+    prv def readIf (mut self, lst : [[c8]])-> (&Word, [c8]) {
+        let (x, y) = self._lex:.next ();
+        if (x.isEof ()) return (Word::eof (), ""s8);
+        
+        for i in lst {
+            if i == x.str () {
+                return (x, y);
+            }
+        }
+        
+        self._lex:.rewind ();
+        (Word::eof (), ""s8)
+    }    
+
+    /**
+     * Read an identifier if there is an identifier to read
+     * @returns: the identifier (and associated comment), or (Word::eof (), ""s8) if no identifier can be read
+     */
+    prv def readIfIdentifier (mut self)-> (&Word, [c8]) {
+        let begin = self._lex.getCounter ();
+        let x = self:.readIdentifier ()?
+        match x {
+            Ok (name:_) => { name }
+            _ => {
+                self._lex:.rewind (nb-> self._lex.getCounter () - begin);
+                (Word::eof (), ""s8)
+            }
+        }
+    }
+    
+    /**
+     * @returns: the next token inside the lexer, if it is equals to one of the token inside lst
+     * @throws: 
+     *   - ErrorMsg: if none of the token in lst is equal to the token that have been read, or the next token is eof
+     * @params: 
+     *    - lst: a list of tokens 
+     */
+    prv def readTokens (mut self, lst : [[c8]])-> (&Word, [c8])
+        throws &ErrorMsg
+    {
+        let (x, y) = self._lex:.next ();
+        for i in lst {
+            if i == x.str () {
+                return (x, y);
+            }
+        }
+
+        throw ErrorMsg::fatal (x, format (SyntaxMessage::UNEXPECTED_BUT_LST, x.str (), lst));
+    }
+
+    /**
+     * Transform a word into a protection
+     * @info: if the word does not contain a protection, by default Protection::PRIVATE is returned
+     */
+    prv def toProtection (self, msg : [c8])-> Protection {
+        match msg {
+            Keys::PROTECTED => { Protection::PROTECTED }
+            Keys::PUBLIC =>  { Protection::PUBLIC }
+            _ => { Protection::PRIVATE }
+        }
+    }
+
+    /**
+     * Transform a word into a template var type
+     * @info: if the word does not contain a template var type, by default TemplateVarType::TUPLE is returned
+     */
+    prv def toTemplateVarType (self, msg : [c8])-> TemplateVarType {
+        match msg {
+            Keys::ALIAS => { TemplateVarType::ALIAS }
+            Keys::CLASS => { TemplateVarType::CLASS }
+            Keys::STRUCT => { TemplateVarType::STRUCT }
+            _ => { TemplateVarType::TUPLE }                
+        }
+    }
+
+    /**
+     * Transform a word into a template of var type
+     * @info: if the word does not contain a template var type, by default TemplateOfVarType::IMPL is returned
+     */
+    prv def toTemplateOfVarType (self, msg : [c8])-> TemplateOfVarType {
+        match msg {
+            Keys::OF => { TemplateOfVarType::OF }
+            Keys::OVER => { TemplateOfVarType::OVER }
+            _ => { TemplateOfVarType::IMPL }                
+        }
+    }
+
+}

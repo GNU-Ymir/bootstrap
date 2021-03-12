@@ -36,7 +36,6 @@ extern "C" void __bootstrap__activate_version_ (YrtArray version);
 extern "C" void __bootstrap__add_include_dir_ (YrtArray dir);
 extern "C" void __bootstrap__set_prefix_ (YrtArray dir);
 
-
 /* Language-dependent contents of a type.  */
  
 struct GTY (()) lang_type
