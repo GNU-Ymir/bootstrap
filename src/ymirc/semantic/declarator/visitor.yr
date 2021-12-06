@@ -2,7 +2,7 @@ mod ymirc::semantic::declarator::visitor;
 
 import std::collection::map;
 import std::collection::set;
-import std::fs::path;
+import std::fs::path, std::fs;
 import std::io;
 
 import ymirc::errors::_;
@@ -11,11 +11,14 @@ import ymirc::semantic::declarator::errors;
 import ymirc::semantic::symbol::_;
 import ymirc::syntax::declaration::_;
 import ymirc::syntax::expression::_;
+import ymirc::syntax::keys;
 import ymirc::lexing::word;
 import ymirc::global::common;
 
+import ymirc::syntax::visitor;
 import ymirc::utils::format;
 
+import std::concurrency::future;
 
 
 /**
@@ -23,7 +26,7 @@ import ymirc::utils::format;
  * The nodes of the tree are not validated, and have to be passed to a validator
  */
 pub class Declarator {
-
+    
     /// The list of imported modules
     let dmut _imported  = HashMap!{&Path, dmut &Symbol}::new ();
 
@@ -45,7 +48,7 @@ pub class Declarator {
     pub def declare (mut self, root : &Declaration)-> dmut &Symbol
         throws &ErrorMsg
     {
-        alias self:.declare (root, parent-> alias self._root, protection-> Protection::PUBLIC)
+        alias self:.declare (root, parent-> alias self._root, protection-> Protection::PUBLIC)            
     }
 
     /**
@@ -59,7 +62,7 @@ pub class Declarator {
     {
         match root {
             m : &ModuleDecl => {
-                return alias self:.declareModule (m, alias alias parent, protection-> protection);
+                return self:.declareModule (m, alias parent, protection-> protection);
             }
             block : &BlockDecl => {
                 for i in block.getDeclarations () {
@@ -67,9 +70,41 @@ pub class Declarator {
                 }
                 return EmptySymbol::new ();
             }
+            im : &ImportDecl => {
+                return self:.declareImport (im, alias parent, protection-> protection);
+            }
+            cl : &ClassDecl => {
+                return self:.declareClass (cl, alias parent, protection-> protection);
+            }
+            t : &TemplateDecl => {
+                return self.declareTemplate (t, alias parent, protection-> protection);
+            }
+            ex : &ExternBlockDecl => {
+                return self.declareExternBlock (ex, alias parent, protection-> protection);
+            }
+            f : &FunctionDecl => {
+                return self.declareFunction (f, alias parent, protection-> protection);
+            }
+            m : &MacroDecl => {
+                return self.declareMacro (m, alias parent, protection-> protection);
+            }
+            s : &StructDecl => {
+                return self.declareStruct (s, alias parent, protection-> protection);
+            }
+            en : &EnumDecl => {
+                return self.declareEnum (en, alias parent, protection-> protection);
+            }
+            ak : &AkaDecl => {
+                return self.declareAka (ak, alias parent, protection-> protection);
+            }
+            tr : &TraitDecl => {
+                return self:.declareTrait (tr, alias parent, protection-> protection);
+            }
+            gl : &GlobalDecl => {
+                return self.declareGlobal (gl, alias parent, protection-> protection);
+            }
             _ => {
-                println (root::typeinfo.name);
-                __pragma!panic ();
+                throw ErrorMsg::fatal (root.getLoc (), DeclareErrorMessage::UNEXPECTED_IN_MODULE);  
             }
         }
     }
@@ -93,25 +128,28 @@ pub class Declarator {
         throws &ErrorMsg
     {
         let p = match module.getPath () {
-            UnitExpr () => { Path::new (module.getLoc ().filename ()).stripExtension () }
+            UnitExpr ()        => { Path::new (module.getLoc ().filename ()).stripExtension () }
+            EmptyExpression () => { Path::new (module.getLoc ().filename ()).stripExtension () }
             _ => {
                 self.toPath (module.getPath ())
             }
         }
 
         let prt = if (module.isGlobal ()) Protection::PUBLIC else { protection };
-        let dmut ret = ModuleSymbol::new (Word::new (p.file (), module.getLoc ()), module.getComments (), isExtern-> false, isGlobal-> module.isGlobal (), protection-> prt);
+        let loc = if (module.isGlobal ()) Word::new (p.file (), module.getLoc ()) else { module.getLoc () }
+        let dmut ret = ModuleSymbol::new (loc, module.getComments (), isExtern-> false, isGlobal-> module.isGlobal (), protection-> prt);
                               
         if (module.isGlobal ()) {
             self._imported:.insert (p, alias ret);
+                        
             let fileLoc = Path::new (module.getLoc ().filename ()).stripExtension ();
             if (!self.isRelativeFrom (p, fileLoc)) {
                 throw ErrorMsg::fatal (module.getLoc (), format (DeclareErrorMessage::WRONG_MODULE_NAME, module.getPath (), p.addExtension (CommonVars::YMIR_EXTENSION).toStr ()));
             }
 
-            self:.insertByPath (p, alias ret, alias self._root);
+            self:.insertByPath (p, alias ret, alias self._root);            
         } else {
-            parent:.insert (alias ret, replace-> false);    
+            parent:.insert (alias ret, replace-> false);            
         }
 
         for i in module.getDeclarations () {
@@ -121,7 +159,890 @@ pub class Declarator {
         return alias ret;
     }
 
+    /**
+     * ================================================================================
+     * ================================================================================
+     * =========================            IMPORT            =========================
+     * ================================================================================
+     * ================================================================================
+     */
 
+    /**
+     * Declare an importation statement
+     * @params: 
+     *   - im: the importation to declare
+     *   - parent: the parent of the importation (module that is making the import)
+     *   - protection: the protection of the importation
+     */
+    def declareImport (mut self, im : &ImportDecl, dmut parent : &Symbol, protection : Protection)-> dmut &Symbol
+        throws &ErrorMsg
+    {
+        let mut p = self.toPath (im.getModulePath ());
+
+        {
+            let dmut modO = self._imported:.find (p);
+            let dmut modSym : &Symbol = match ref modO {
+                Ok (dmut m : &Symbol) => { alias m }
+                _ => {
+                    let (modDecl, path) = self.readModuleFromImport (im.getLoc (), p);                    
+                    p = path;
+                    
+                    alias self:.declare (modDecl)                    
+                }
+            }
+
+            if (!im.getAs ().isEof ()) {
+                parent:.insertAs (im.getAs ().str (), alias modSym);
+            } else {
+                parent:.use (p, alias modSym, protection-> protection);
+            }
+        } catch {
+            err : &ErrorMsg => {
+                throw ErrorMsg::note (im.getLoc (), format (DeclareErrorMessage::IN_IMPORT, im.getModulePath ()), notes-> [err]);
+            }
+        }
+        
+        return EmptySymbol::new ();
+    }
+
+    /**
+     * Read a module from a file path (search in Include directories, until the file is found)
+     * @params: 
+     *  - loc: the location of the importation
+     *   - path: the relative path of the module
+     * @returns: 
+     *    - .0: the module syntaxically read
+     *    - .1: the path of the file that has been read
+     * @throws: 
+     *   - &ErrorMsg: Or there is no file, or there is a syntax error inside the file
+     */
+    def readModuleFromImport (self, loc : &Word, path : &Path)-> (&Declaration, &Path)
+        throws &ErrorMsg
+    {
+        let file_path = path.addExtension (CommonVars::YMIR_EXTENSION);
+        {
+            if (fs::isFile (file_path)) {
+                return (SyntaxVisitor::open (file_path):.read (), file_path);
+            } else {
+                for dir in global::state::instance ().getIncludeDirs () {
+                    let d_file_path = dir.push (file_path);
+                    if (fs::isFile (d_file_path)) {
+                        return (SyntaxVisitor::open (d_file_path):.read (), d_file_path);
+                    }
+                }
+            }
+        } catch {
+            err : &ErrorMsg => {
+                throw err;
+            }
+            _ => {
+                throw ErrorMsg::note (loc, DeclareErrorMessage::IN_IMPORT, notes-> [
+                    ErrorMsg::fatal (loc, format (DeclareErrorMessage::NO_SUCH_FILE, file_path.toStr ()))]);
+            }
+        }
+        
+        throw ErrorMsg::fatal (loc, format (DeclareErrorMessage::NO_SUCH_FILE, file_path.toStr ()));
+    }
+
+    /**
+     * ================================================================================
+     * ================================================================================
+     * =========================            CLASS             =========================
+     * ================================================================================
+     * ================================================================================
+     */
+
+    /**
+     * Declare the symbol of a class
+     * @params: 
+     *   - cl: the class to declare
+     *   - parent: the module that is declaring the class
+     *   - protection: the protection of the class
+     */
+    def declareClass (mut self, cl : &ClassDecl, dmut parent : &Symbol, protection : Protection)-> dmut &Symbol
+        throws &ErrorMsg
+    {
+        let syms = parent.getLocalSymbols (cl.getLoc ().str ());
+        for s in syms {
+            match s {
+                ModuleSymbol () => {}
+                TemplateSymbol () => {}
+                _ => {
+                    throw ErrorMsg::fatal (cl.getLoc (),
+                                       format (DeclareErrorMessage::SHADOWING_DECL, cl.getLoc ().str ()),
+                                       notes-> [ErrorMsg::note (s.getLoc (), ""s8)]);
+                }
+            }
+        }
+        
+        let (isAbstract, isFinal) = self.validateAbstractFinal (cl.getAttributes ());        
+        let dmut clSym = ClassSymbol::new (cl.getLoc (), cl.getComments (), ancestor-> cl.getAncestor (), isAbstract-> isAbstract, isFinal-> isFinal, protection-> protection);
+        parent:.insert (alias clSym, replace-> false);
+
+        for d in cl.getDeclarations () {
+            self:.declareInnerClass (d, alias clSym, protection-> Protection::PROTECTED);
+        }
+        
+        alias clSym
+    }
+
+
+    /**
+     * Validate the custom attributes of a class definition
+     * @params: 
+     *   - attributes: the list of custom attributes of the class
+     * @returns: 
+     *   - .0: isAbstract
+     *   - .1: isFinal
+     * @throws: 
+     *   - ErrorMsg: if (isAbstract && isFinal), or if an attributes is not defined for class
+     */
+    def validateAbstractFinal (self, attributes : [AttributeWord])-> (bool, bool)
+        throws &ErrorMsg
+    {
+        let mut isAbstract = false, mut isFinal = false;
+        let mut abstractLoc = EOF_WORD, mut finalLoc = EOF_WORD;
+        for a in attributes {
+            match a.attr {
+                Attributes::ABSTRACT => {
+                    isAbstract = true;
+                    abstractLoc = a.loc;
+                    if (isFinal) throw ErrorMsg::fatal (a.loc, DeclareErrorMessage::ABSTRACT_AND_FINAL, notes-> [ErrorMsg::note (finalLoc, ""s8)]);
+                }
+                Attributes::FINAL => {
+                    isFinal = true;
+                    finalLoc = a.loc;
+                    if (isAbstract) throw ErrorMsg::fatal (a.loc, DeclareErrorMessage::ABSTRACT_AND_FINAL, notes-> [ErrorMsg::note (abstractLoc, ""s8)]);
+                }
+                _ => {
+                    throw ErrorMsg::fatal (a.loc, format (DeclareErrorMessage::UNDEFINED_ATTRIBUTE_FOR_CLASS, a.attr));
+                }
+            }
+        }
+        
+        (isAbstract, isFinal)
+    }
+
+
+    /**
+     * Declare the content of a class
+     * @params: 
+     *   - d: the declaration to transform into symbol
+     *   - cl: the class symbol that is filled
+     *   - protection: the current protection of the symbol to declare
+     */
+    def declareInnerClass (mut self, current : &Declaration, dmut cl : &ClassSymbol, protection : Protection)
+        throws &ErrorMsg
+    {
+        match current {
+            dl : &BlockDecl => {
+                for i in dl.getDeclarations () {
+                    self:.declareInnerClass (i, alias cl, protection-> dl.getProtection ());
+                }
+            }
+            cstr : &ConstructorDecl => {
+                self.declareConstructor (cstr, alias cl, protection-> protection);
+            }
+            im : &ImplDecl => {
+                self:.declareImpl (im, alias cl, protection-> protection);
+            }
+            gl : &GlobalDecl => {
+                self.declareFieldClass (gl, alias cl, protection-> protection);
+            }
+            f : &FunctionDecl => {
+                self.declareFunction (f, alias cl, protection-> protection);
+            }
+            t : &TemplateDecl => {
+                self.declareTemplate (t, alias cl, protection-> protection);
+            }
+            CondBlockDecl () => {
+                throw ErrorMsg::fatal (current.getLoc (), DeclareErrorMessage::CONDITION_NON_TEMPLATE_CLASS);
+            }
+            wrap : &ExpressionWrapperDecl => {
+                self.declareAssertClass (wrap, alias cl);
+            }
+            im : &ImportDecl => {
+                self:.declareImport (im, alias cl, protection-> protection);
+            }
+            dtor : &DestructorDecl => {
+                self.declareDestructor (dtor, alias cl);
+            }
+            _ => {
+                throw ErrorMsg::fatal (current.getLoc (), DeclareErrorMessage::UNEXPECTED_IN_CLASS);   
+            }
+        }
+    }
+
+    /**
+     * Declare a class constructor
+     * @params: 
+     *   - cstr: the constructor to declare
+     *   - cl: the parent class 
+     *   - protection: the protection of the constructor
+     */
+    def declareConstructor (self, cstr : &ConstructorDecl, dmut cl : &ClassSymbol, protection : Protection) {
+        let dmut cstrSym = ConstructorSymbol::new (cstr.getLoc (), cstr.getComments (), cstr, alias cl, protection-> protection);
+        cl:.insert (alias cstrSym, replace-> false);
+    }
+
+    /**
+     * Declare the destructor of the class
+     * @params: 
+     *   - dtor: the destructor
+     *   - cl: the parent class
+     * @throws: 
+     *    - &ErrorMsg: if there are multiple destructor
+     */
+    def declareDestructor (self, dtor : &DestructorDecl, dmut cl : &ClassSymbol)
+        throws &ErrorMsg
+    {
+        match cl.getDestructor () {
+            EmptySymbol () => {}
+            _ => {
+                throw ErrorMsg::fatal (dtor.getLoc (), DeclareErrorMessage::MULTIPLE_DESTRUCTOR,
+                                       notes-> [ErrorMsg::note (cl.getDestructor ().getLoc (), ""s8)]);
+            }
+        }
+
+        let dmut dtorSym = DestructorSymbol::new (dtor.getLoc (), dtor.getComments (), dtor, alias cl);
+        cl:.setDestructor (alias dtorSym);        
+    }
+
+
+    /**
+     * Declare an implementation 
+     * @params: 
+     *   - impl: the implementation to declare
+     *   - cl: the parent class
+     */
+    def declareImpl (mut self, im : &ImplDecl, dmut cl : &ClassSymbol, protection : Protection)
+        throws &ErrorMsg
+    {
+        let dmut implSym = ImplSymbol::new (im.getLoc (), im.getComments (), im, protection-> protection);
+        for i in im.getDeclarations () {
+            self:.declareInnerImpl (i, alias implSym, alias cl, protection-> Protection::PROTECTED);
+        }
+
+        cl:.insert (alias implSym, replace-> false);
+    }
+
+    /**
+     * Declare the content of an implementation
+     * @params: 
+     *   - current: the declaration to transform
+     *   - im: the implementation that is being declared
+     *   - protection: the protection of the implementation
+     */
+    def declareInnerImpl (mut self, current : &Declaration, dmut im : &ImplSymbol, dmut cl : &ClassSymbol, protection : Protection)
+        throws &ErrorMsg
+    {
+        match current {
+            dl : &BlockDecl => {
+                for i in dl.getDeclarations () {
+                    self:.declareInnerImpl (i, alias im, alias cl, protection-> dl.getProtection ());
+                }
+            }
+            f : &FunctionDecl => {
+                self.declareFunction (f, alias im, protection-> protection);
+            }
+            wrap : &ExpressionWrapperDecl => {
+                self.declareAssertClass (wrap, alias cl);
+            }
+            imp : &ImportDecl => {
+                self:.declareImport (imp, alias cl, protection-> protection);
+            }
+            _ => {
+                throw ErrorMsg::fatal (current.getLoc (), DeclareErrorMessage::UNEXPECTED_IN_IMPL);
+            }
+        }
+    }
+
+    /**
+     * Declare a field in a class
+     * @params: 
+     *   - field: the field to declare
+     *   - cl: the class symbol 
+     *   - protection: the protection of the field
+     */
+    def declareFieldClass (self, field : &GlobalDecl, dmut cl : &ClassSymbol, protection : Protection)
+    {
+        cl:.addField (field.getContent (), field.getComments (), protection-> protection)
+    }
+
+    /**
+     * Declare an assertion in a class
+     */
+    def declareAssertClass (self, wrap : &ExpressionWrapperDecl, dmut cl : &ClassSymbol) {
+        cl:.addAssertion (wrap.getContent (), wrap.getComments ());
+    }
+    
+    /**
+     * ================================================================================
+     * ================================================================================
+     * =========================          FUNCTIONS           =========================
+     * ================================================================================
+     * ================================================================================
+     */
+
+    /**
+     * Declare a function declaration
+     * @params: 
+     *   - func: the function to declare
+     *   - parent: the parent of the declaration
+     *   - protection: the protection of the declaration
+     */
+    def declareFunction (self, func : &FunctionDecl, dmut parent : &Symbol, protection : Protection, isExtern : bool = false)-> dmut &Symbol
+        throws &ErrorMsg
+    {
+        self.validateShadowingFunction (func.getLoc (), parent);
+        let isFinal = self.validateFinalFunction (func.getAttributes ());
+        let isCVariadic = func.getFunctionProto ().isVariadic ();
+        if (isCVariadic && !isExtern) {
+            throw ErrorMsg::fatal (func.getLoc (), DeclareErrorMessage::DECL_VARIADIC_FUNC);
+        }
+        
+        let dmut funcSym = FunctionSymbol::new (func.getLoc (), func.getComments (), func, isOver-> func.isOver (), isFinal-> isFinal, isCVariadic-> isCVariadic, isTest-> false, protection-> protection);
+        
+        parent:.insert (alias funcSym, replace-> false);
+        
+        alias funcSym
+    }
+
+    /**
+     * Validate that the function is not shadowing another declaration of a different type
+     * @params: 
+     *   - loc: the location of the function decl
+     *   - parent: the parent symbol in which the function will be declared
+     */
+    def validateShadowingFunction (self, loc : &Word, parent : &Symbol)
+        throws &ErrorMsg
+    {
+        let syms = parent.getLocalSymbols (loc.str ());
+        for s in syms {
+            match s {
+                FunctionSymbol () => {}
+                ModuleSymbol () => {}
+                TemplateSymbol () => {}
+                _ => {
+                    
+                    throw ErrorMsg::fatal (loc,
+                                           format (DeclareErrorMessage::SHADOWING_DECL, loc.str ()),
+                                           notes-> [ErrorMsg::note (s.getLoc (), ""s8)]);
+                }
+            }
+        }
+    }
+
+    /**
+     * Validate the custom attributes of a function definition
+     * @params: 
+     *   - attributes: the list of custom attributes of the function
+     * @returns: isFinal
+     * @throws: 
+     *   - ErrorMsg:  if an attributes is not defined for function
+     */
+    def validateFinalFunction (self, attributes : [AttributeWord])-> bool
+        throws &ErrorMsg
+    {
+        let mut isFinal = false;
+        for a in attributes {
+            match a.attr {
+                Attributes::FINAL => {
+                    isFinal = true;
+                }
+                _ => {
+                    throw ErrorMsg::fatal (a.loc, format (DeclareErrorMessage::UNDEFINED_ATTRIBUTE_FOR_FUNCTION, a.attr));
+                }
+            }
+        }
+        
+        isFinal
+    }
+
+    /**
+     * ================================================================================
+     * ================================================================================
+     * =========================           TEMPLATE           =========================
+     * ================================================================================
+     * ================================================================================
+     */
+    
+
+    /**
+     * Declare a template declaration
+     * @params: 
+     *   - tm: the template to declare
+     *   - parent: the parent symbol of the declaration
+     *   - protection: the protection of the declaration
+     */
+    def declareTemplate (self, tm : &TemplateDecl, dmut parent : &Symbol, protection : Protection)-> dmut &Symbol
+        throws &ErrorMsg
+    {
+        self.validateShadowingTemplates (tm.getParameters ());
+        let dmut templSym = TemplateSymbol::new (tm.getLoc (), tm.getComments (), tm, protection-> protection);
+
+        parent:.insert (alias templSym, replace-> false);
+
+        alias templSym
+    }
+
+    /**
+     * Verify that there is no shadowing in the name of the template parameters
+     * @params: 
+     *   - params: the template parameters
+     */
+    def validateShadowingTemplates (self, params : [&Expression])
+        throws &ErrorMsg
+    {
+        if (params.len == 0us) return {}
+        for i in 0us .. params.len - 1us {
+            for j in i + 1us .. params.len {
+                let fst = match params [i] {
+                    v : &TemplateVariadicVarExpr => { v.getLoc ().str () }
+                    v : &TemplateOfVarExpr => { v.getLoc ().str () }
+                    v : &TemplateVarExpr => { v.getLoc ().str () }
+                    v : &VarDeclExpr => { v.getLoc ().str () }
+                    _ => ""s8
+                }
+                let shadow = match params [j] {
+                    v : &TemplateVariadicVarExpr => { v.getLoc ().str () == fst }
+                    v : &TemplateOfVarExpr => { v.getLoc ().str () == fst }
+                    v : &TemplateVarExpr => { v.getLoc ().str () == fst }
+                    v : &VarDeclExpr => { v.getLoc ().str ()  == fst}
+                    _ => { false }
+                }
+                
+                if (shadow) {
+                    throw ErrorMsg::fatal (params [j].getLoc (),
+                                           format (DeclareErrorMessage::SHADOWING_DECL, params [i].getLoc ().str ()),
+                                           notes-> [ErrorMsg::note (params [i].getLoc (), ""s8)]);
+                }                
+            }
+        }
+    }
+
+    /**
+     * ================================================================================
+     * ================================================================================
+     * =========================          EXTERNAL            =========================
+     * ================================================================================
+     * ================================================================================
+     */
+
+    /**
+     * Declare an external language block
+     * @params: 
+     *   - decl: the block to declare
+     *   - parent: the parent module of the declaration
+     *   - protection: the protection of the declaration
+     */
+    def declareExternBlock (self, decl : &ExternBlockDecl, dmut parent : &Symbol, protection : Protection)-> dmut &Symbol
+        throws &ErrorMsg
+    {
+        let path = self.validateSpaceLanguage (decl.getLanguage (), decl.getNamespace ());
+        self.declareInnerExternal (decl.getDeclaration (), alias parent, protection-> protection, lang-> decl.getLanguage ().str (), path-> path);        
+
+        return EmptySymbol::new ();
+    }
+
+    /**
+     * Declare the content of an external block
+     * @params: 
+     *    - decl: the inner declaration to declare
+     *    - parent: the parent of the external block
+     *    - protection: the protection of the declaration
+     *    - lang: the language of the extern block
+     *    - path: the path of the extern block
+     */
+    def declareInnerExternal (self, decl : &Declaration, dmut parent : &Symbol, protection : Protection, lang : [c8], path : &Path)
+        throws &ErrorMsg
+    {
+        match decl {
+            f : &FunctionDecl => {
+                let dmut sym = self.declareFunction (f, alias parent, protection-> protection, isExtern-> true);
+                sym:.setExternalLanguage (lang, path);
+            }
+            bl : &BlockDecl => {
+                for i in bl.getDeclarations () {
+                    self.declareInnerExternal (i, alias parent, protection-> bl.getProtection (), lang, path);
+                }
+            }
+            _ => {
+                throw ErrorMsg::fatal (decl.getLoc (), DeclareErrorMessage::UNEXPECTED_IN_EXTERN);
+            }
+        }
+    }
+    
+    /**
+     * Verify that the path is empty or applicable for the given language
+     * @params: 
+     *   - lang: the language of the extern
+     *   - space: the namespace of the extern
+     */
+    def validateSpaceLanguage (self, lang : &Word, space : &Expression)-> &Path
+        throws &ErrorMsg
+    {
+        let (empty, path) = match space {
+            UnitExpr () => { (true, Path::new (""s8)) }
+            EmptyExpression () => { (true, Path::new (""s8)) }
+            _ => {
+                (false, self.toPath (space))
+            }
+        }
+        
+        if (lang != Keys::CPPLANG && lang != Keys::DLANG && !empty) {
+            throw ErrorMsg::fatal (lang, format (DeclareErrorMessage::NAMESPACE_EXTERNAL, lang.str ()),
+                                   notes-> [ErrorMsg::note (space.getLoc (), ""s8)]);
+        }
+
+        path
+    }
+
+    /**
+     * ================================================================================
+     * ================================================================================
+     * =========================            MACRO             =========================
+     * ================================================================================
+     * ================================================================================
+     */
+
+    /**
+     * Declare a macro
+     * @params: 
+     *    - m: the macro to declare
+     *    - parent: the parent module of the declaration
+     *    - protection: the protection of the declaration
+     */
+    def declareMacro (self, m : &MacroDecl, dmut parent : &Symbol, protection : Protection)-> dmut &Symbol
+        throws &ErrorMsg
+    {
+
+        let syms = parent.getLocalSymbols (m.getLoc ().str ());
+        for s in syms {
+            match s {
+                ModuleSymbol () => {}
+                TemplateSymbol () => {}
+                _ => {
+                    throw ErrorMsg::fatal (m.getLoc (),
+                                           format (DeclareErrorMessage::SHADOWING_DECL, m.getLoc ().str ()),
+                                           notes-> [ErrorMsg::note (s.getLoc (), ""s8)]);
+                }
+            }
+        }
+        
+        let dmut macroSym = MacroSymbol::new (m.getLoc (), m.getComments (), protection-> protection);
+        for d in m.getDeclarations () {
+            self.declareInnerMacro (d, alias macroSym, protection-> Protection::PROTECTED);
+        }
+
+        parent:.insert (alias macroSym, replace-> false);
+        
+        alias macroSym
+    }
+
+    /**
+     * Declare the content of a macro definition
+     * @params: 
+     *   - decl: the declaration to declare
+     *   - m: the parent macro symbol
+     *   - protection: the protection of the declaration
+     */
+    def declareInnerMacro (self, decl : &Declaration, dmut m : &MacroSymbol, protection : Protection)
+        throws &ErrorMsg
+    {
+        match decl {
+            bl : &BlockDecl => {
+                for d in bl.getDeclarations () {
+                    self.declareInnerMacro (d, alias m, protection-> bl.getProtection ());
+                }
+            }
+            ctor : &MacroRuleDecl => {
+                if (ctor.isConstructor ()) {
+                    let dmut sym = MacroConstructorSymbol::new (ctor.getLoc (), ctor.getComments (), ctor, protection);
+                    m:.insert (alias sym, replace-> false);
+                } else {
+                    let dmut sym = MacroRuleSymbol::new (ctor.getLoc (), ctor.getComments (), ctor, protection);
+                    m:.insert (alias sym, replace-> false);
+                }                
+            }
+            _ => {
+                throw ErrorMsg::fatal (decl.getLoc (), DeclareErrorMessage::UNEXPECTED_IN_MACRO);
+            }
+        }
+    }
+
+    /**
+     * ================================================================================
+     * ================================================================================
+     * =========================            STRUCT            =========================
+     * ================================================================================
+     * ================================================================================
+     */
+
+
+    /**
+     * Declare the symbol of a struct
+     * @params: 
+     *   - st: the struct to declare
+     *   - parent: the module that is declaring the struct
+     *   - protection: the protection of the struct
+     */
+    def declareStruct (self, st : &StructDecl, dmut parent : &Symbol, protection : Protection)-> dmut &Symbol
+        throws &ErrorMsg
+    {
+        let syms = parent.getLocalSymbols (st.getLoc ().str ());
+        for s in syms {
+            match s {
+                ModuleSymbol () => {}
+                TemplateSymbol () => {}
+                _ => {
+                    throw ErrorMsg::fatal (st.getLoc (),
+                                           format (DeclareErrorMessage::SHADOWING_DECL, st.getLoc ().str ()),
+                                           notes-> [ErrorMsg::note (s.getLoc (), ""s8)]);
+                }
+            }
+        }
+        
+        let (isUnion, isPacked) = self.validateUnionPacked (st.getAttributes ());        
+        let dmut strSym = StructSymbol::new (st.getLoc (), st.getComments (), st, protection, isUnion-> isUnion, isPacked-> isPacked);
+        
+        parent:.insert (alias strSym, replace-> false);
+        
+        alias strSym
+    }
+
+    /**
+     * Validate the custom attributes of a struct definition
+     * @params: 
+     *   - attributes: the list of custom attributes of the struct
+     * @returns: 
+     *   - .0: isUnion
+     *   - .1: isPacker
+     * @throws: 
+     *   - ErrorMsg: if (isUnion && isPacked), or if an attributes is not defined for struct
+     */
+    def validateUnionPacked (self, attributes : [AttributeWord])-> (bool, bool)
+        throws &ErrorMsg
+    {
+        let mut isUnion = false, mut isPacked = false;
+        let mut unionLoc = EOF_WORD, mut packLoc = EOF_WORD;
+        for a in attributes {
+            match a.attr {
+                Attributes::UNION => {
+                    isUnion = true;
+                    unionLoc = a.loc;
+                    if (isPacked) throw ErrorMsg::fatal (a.loc, DeclareErrorMessage::UNION_AND_PACKED, notes-> [ErrorMsg::note (packLoc, ""s8)]);
+                }
+                Attributes::PACKED => {
+                    isPacked = true;
+                    packLoc = a.loc;
+                    if (isUnion) throw ErrorMsg::fatal (a.loc, DeclareErrorMessage::UNION_AND_PACKED, notes-> [ErrorMsg::note (unionLoc, ""s8)]);
+                }
+                _ => {
+                    throw ErrorMsg::fatal (a.loc, format (DeclareErrorMessage::UNDEFINED_ATTRIBUTE_FOR_STRUCT, a.attr));
+                }
+            }
+        }
+        
+        (isUnion, isPacked)
+    }
+
+    /**
+     * ================================================================================
+     * ================================================================================
+     * =========================             ENUM             =========================
+     * ================================================================================
+     * ================================================================================
+     */
+
+
+    /**
+     * Declare the symbol of a enumeration
+     * @params: 
+     *   - st: the enum to declare
+     *   - parent: the module that is declaring the enum
+     *   - protection: the protection of the enum
+     */
+    def declareEnum (self, en : &EnumDecl, dmut parent : &Symbol, protection : Protection)-> dmut &Symbol
+        throws &ErrorMsg
+    {
+        let syms = parent.getLocalSymbols (en.getLoc ().str ());
+        for s in syms {
+            match s {
+                ModuleSymbol () => {}
+                TemplateSymbol () => {}
+                _ => {
+                    throw ErrorMsg::fatal (en.getLoc (),
+                                           format (DeclareErrorMessage::SHADOWING_DECL, en.getLoc ().str ()),
+                                           notes-> [ErrorMsg::note (s.getLoc (), ""s8)]);
+                }
+            }
+        }
+               
+        let dmut enSym = EnumSymbol::new (en.getLoc (), en.getComments (), en, protection);        
+        parent:.insert (alias enSym, replace-> false);
+        
+        alias enSym
+    }
+    
+
+    /**
+     * ================================================================================
+     * ================================================================================
+     * =========================             AKA              =========================
+     * ================================================================================
+     * ================================================================================
+     */
+
+
+    /**
+     * Declare the symbol of an aka
+     * @params: 
+     *   - st: the aka to declare
+     *   - parent: the module that is declaring the aka
+     *   - protection: the protection of the aka
+     */
+    def declareAka (self, en : &AkaDecl, dmut parent : &Symbol, protection : Protection)-> dmut &Symbol
+        throws &ErrorMsg
+    {
+        let syms = parent.getLocalSymbols (en.getLoc ().str ());
+        for s in syms {
+            match s {
+                ModuleSymbol () => {}
+                TemplateSymbol () => {}
+                _ => {
+                    throw ErrorMsg::fatal (en.getLoc (),
+                                           format (DeclareErrorMessage::SHADOWING_DECL, en.getLoc ().str ()),
+                                           notes-> [ErrorMsg::note (s.getLoc (), ""s8)]);
+                }
+            }
+        }
+               
+        let dmut enSym = AkaSymbol::new (en.getLoc (), en.getComments (), en, protection);        
+        parent:.insert (alias enSym, replace-> false);
+        
+        alias enSym
+    }
+
+
+    /**
+     * ================================================================================
+     * ================================================================================
+     * =========================            TRAIT             =========================
+     * ================================================================================
+     * ================================================================================
+     */
+
+
+
+    /**
+     * Declare an implementation 
+     * @params: 
+     *   - impl: the implementation to declare
+     *   - cl: the parent class
+     */
+    def declareTrait (mut self, tr : &TraitDecl, dmut parent : &Symbol, protection : Protection)-> dmut &Symbol
+        throws &ErrorMsg
+    {
+        let syms = parent.getLocalSymbols (tr.getLoc ().str ());
+        for s in syms {
+            match s {
+                ModuleSymbol () => {}
+                TemplateSymbol () => {}
+                _ => {
+                    throw ErrorMsg::fatal (tr.getLoc (),
+                                           format (DeclareErrorMessage::SHADOWING_DECL, tr.getLoc ().str ()),
+                                           notes-> [ErrorMsg::note (s.getLoc (), ""s8)]);
+                }
+            }
+        }
+        
+        let dmut traitSym = TraitSymbol::new (tr.getLoc (), tr.getComments (), tr, protection-> protection);      
+        for i in tr.getDeclarations () {
+            self:.declareInnerTrait (i, alias traitSym, protection-> Protection::PROTECTED);
+        }
+
+        parent:.insert (alias traitSym, replace-> false);
+
+        alias traitSym
+    }
+
+    /**
+     * Declare the content of a trait
+     * @params: 
+     *   - current: the declaration to transform
+     *   - tr: the trait that is being declared
+     *   - protection: the protection of the declaration inside the trait
+     */
+    def declareInnerTrait (mut self, current : &Declaration, dmut tr : &TraitSymbol, protection : Protection)
+        throws &ErrorMsg
+    {
+        match current {
+            dl : &BlockDecl => {
+                for i in dl.getDeclarations () {
+                    self:.declareInnerTrait (i, alias tr, protection-> dl.getProtection ());
+                }
+            }
+            f : &FunctionDecl => {
+                self.declareFunction (f, alias tr, protection-> protection);
+            }
+            wrap : &ExpressionWrapperDecl => {
+                self.declareAssertTrait (wrap, alias tr);
+            }
+            imp : &ImportDecl => {
+                self:.declareImport (imp, alias tr, protection-> protection);
+            }
+            _ => {
+                throw ErrorMsg::fatal (current.getLoc (), DeclareErrorMessage::UNEXPECTED_IN_TRAIT);
+            }
+        }
+    }
+
+        /**
+     * Declare an assertion in a class
+     */
+    def declareAssertTrait (self, wrap : &ExpressionWrapperDecl, dmut tr : &TraitSymbol) {
+        tr:.addAssertion (wrap.getContent (), wrap.getComments ());
+    }
+
+
+    /**
+     * ================================================================================
+     * ================================================================================
+     * =========================            GLOBAL            =========================
+     * ================================================================================
+     * ================================================================================
+     */
+
+    /**
+     * Declare a global variable
+     * @params: 
+     *   - gl: the var to declare
+     *   - parent: the parent module declaring the variable
+     *   - protection: the protection of the declaration
+     */
+    def declareGlobal (self, gl : &GlobalDecl, dmut parent : &Symbol, protection : Protection)-> dmut &Symbol
+        throws &ErrorMsg
+    {
+        let syms = parent.getLocalSymbols (gl.getContent ().getLoc ().str ());
+        for s in syms {
+            match s {
+                ModuleSymbol () => {}
+                TemplateSymbol () => {}
+                _ => {
+                    throw ErrorMsg::fatal (gl.getContent ().getLoc (),
+                                           format (DeclareErrorMessage::SHADOWING_DECL, gl.getContent ().getLoc ().str ()),
+                                           notes-> [ErrorMsg::note (s.getLoc (), ""s8)]);
+                }
+            }
+        }
+
+        let dmut glSym = GlobalSymbol::new (gl.getContent ().getLoc (), gl.getComments (), gl, protection-> protection);
+        parent:.insert (alias glSym, replace-> false);
+
+        alias glSym
+    }
+    
     /**
      * ================================================================================
      * ================================================================================
@@ -202,7 +1123,22 @@ pub class Declarator {
 
         return true;
     }
-    
+
+
+    /**
+     * ================================================================================
+     * ================================================================================
+     * =========================        MISCELLANEOUS         =========================
+     * ================================================================================
+     * ================================================================================
+     */
+
+    impl Formattable {
+
+        pub over format (self, dmut stream : &Formatter) {
+            self._root.format (alias stream);
+        }
+    }
     
     
 }
