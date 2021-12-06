@@ -4,10 +4,15 @@ import ymirc::semantic::validator::visitor;
 import ymirc::semantic::validator::errors;
 import ymirc::syntax::declaration::protection;
 import ymirc::syntax::expression::_;
+import ymirc::syntax::declaration::_;
+import ymirc::semantic::symbol::_;
+import ymirc::semantic::declarator::visitor;
+
 
 import ymirc::semantic::generator::_;
 import ymirc::errors::_;
 import ymirc::utils::format;
+import ymirc::lexing::word;
 
 import std::collection::vec;
 import std::io;
@@ -34,12 +39,763 @@ pub class ValueValidator {
     pub def validate (self, dmut context : &Validator, value : &Expression)-> &Value
         throws &ErrorMsg
     {
-        context;
-        //throw ErrorMsg::fatal (value.getLoc (), ""s8);
-        __pragma!fake_throw (&ErrorMsg);
-        UnitValue::new (loc-> value.getLoc ())
+        match value {
+            b : &BlockExpr => return self.validateBlock (alias context, b);
+            l : &LiteralExpr => return self.validateLiteral (alias context, l);
+            o : &OperatorExpr => return self.validateOperator (alias context, o);
+            v : &VarDeclExpr => return self.validateVarDecl (alias context, v);
+            s : &SetExpr => return self.validateSet (alias context, s);
+            d : &DecoratedExpr => return self.validateDecoExpr (alias context, d);
+            c : &ConditionalExpr => return self.validateConditional (alias context, c);
+            f : &ForLoopExpr => return self.validateForLoop (alias context, f);
+            w : &WhileLoopExpr => return self.validateWhileLoop (alias context, w);
+            b : &BreakExpr => return self.validateBreak (alias context, b);
+            r : &ReturnExpr => return self.validateReturn (alias context, r);
+            t : &ThrowExpr => return self.validateThrow (alias context, t);
+            m : &MatcherExpr => return self.validateMatcher (alias context, m);
+            m : &MacroCallExpr => return self.validateMacroCall (alias context, m);
+            p : &PragmaExpr => return self.validatePragma (alias context, p);
+            a : &AssertExpr => return self.validateAssert (alias context, a);
+            t : &TryExpr => return self.validateTry (alias context, t);
+            w : &DisposeScopeExpr => return self.validateWith (alias context, w);
+            a : &AtomicExpr => return self.validateAtomic (alias context, a);
+            c : &CastExpr => return self.validateCast (alias context, c);
+            l : &ListExpr => return self.validateList (alias context, l);
+            i : &IntrinsicExpr => return self.validateIntrinsics (alias context, i);
+            u : &UnitExpr => return self.validateUnit (alias context, u);
+            n : &NamedExpr => return self.validateNamedExpr (alias context, n);
+            t : &TemplateCallExpr => return self.validateTemplateCall (alias context, t);
+            t : &TemplateCheckerExpr => return self.validateTemplateChecker (alias context, t);
+            l : &LambdaValueExpr => return self.validateLambda (alias context, l);
+            x : _ => {
+                println (x::typeinfo.name);
+                __pragma!panic ();
+            }            
+        }
     }
+
+
+    /**
+     * ================================================================================
+     * ================================================================================
+     * =========================            BLOCK             =========================
+     * ================================================================================
+     * ================================================================================
+     */
+
+    /**
+     * Validate a block expression
+     * @params: 
+     *   - context: the context of the validation
+     *   - b: the block to validate
+     * @returns: the validated value
+     */
+    def validateBlock (self, dmut context : &Validator, b : &BlockExpr)-> &Value
+        throws &ErrorMsg
+    {
+        let dmut errors = Vec!{&ErrorMsg}::new ();
+
+        let (values, type, brLoc, rtLoc, _) = {
+            context:.enterBlock ();
+            let dmut module = self.validateInnerModule (alias context, b.getModule (), alias errors);
+            let value = match module {                
+                EmptySymbol () => {
+                    self.validateInnerBlock (alias context, b.getExpressions (), alias errors)
+                }
+                _ => {
+                    context:.pushReferent (alias module);
+                    self.validateInnerBlock (alias context, b.getExpressions (), alias errors)
+                } exit {
+                    context:.popReferent ();
+                }                
+            }
+            
+            value
+        } exit {
+            {
+                context:.quitBlock (warnUnused-> errors.len () == 0us);
+            } catch { err : &ErrorMsg => errors:.push (err); }
+        }
         
+        let retBlock = BlockValue::new (b.getLoc (), type, values, breakLoc-> brLoc, returnLoc-> rtLoc);        
+        let (_, _, _) = if (errors.len () != 0us) {
+            self.validateCatcher (alias context, b.getCatcher (), type, retBlock.getThrowers (), alias errors)
+        } else {
+            let a : &Value = UnitValue::new ();
+            (a, a, a)
+        }
+
+        // let (onExit, onSuccess, onFailure) = self.validateScopes ();
+        
+        if (errors.len () != 0us) {
+            throw ErrorMsg::list (errors[]);
+        }
+        
+        
+        retBlock
+    }
+
+
+    /**
+     * Validate the local module declared inside a block
+     * @params: 
+     *    - context: the context of the validation
+     *    - m: the module declared in the block
+     * @returns:
+     *    - errors: the errors that occured when validating    
+     *    - the symbol that was validated (or EmptySymbol, if the validation failed)
+     */
+    def validateInnerModule (self, dmut context : &Validator, m : &Declaration, dmut errors : &Vec!{&ErrorMsg})-> dmut &Symbol
+    {
+        {
+            let dmut modSym = Declarator::new ():.declare (m);
+            context:.getReferent ():.insert (alias modSym);
+            {
+                context:.enterForeign ();
+                context:.validate (alias modSym);            
+            } exit {
+                context:.exitForeign ();
+            }
+
+            return alias modSym;
+        } catch {
+            err : &ErrorMsg => {
+                errors:.push (err);
+                return EmptySymbol::new ();
+            }
+        } 
+    }
+
+    /**
+     * Validate the content of a block
+     * @params: 
+     *   - context: the context of the validation
+     *   - m: the block to validate
+     * @returns:
+     *   - errors: the list of errors, if an errors occurs
+     *   - .0: the list of values inside the block
+     *   - .1: the type of the last value
+     *   - .2: the location of a break statement if any (EOF otherwise)
+     *   - .3: the location of a return statement if any (EOF otherwise)
+     *   - .4: the location of the last value
+     */
+    def validateInnerBlock (self, dmut context : &Validator, exprs : [&Expression], dmut errors : &Vec!{&ErrorMsg})-> ([&Value], &Type, &Word, &Word, &Word) {
+        let mut returner = false, mut breaker = false;
+        let mut rtLoc = EOF_WORD, mut brLoc = EOF_WORD, mut valueLoc = EOF_WORD;
+        let mut type : &Type = VoidType::new (EOF_WORD);
+        let dmut values = Vec!{&Value}::new ();
+        for i in 0us .. exprs.len {
+            {
+                if ((breaker || returner) && exprs [i].isOf!{&UnitExpr}()) throw ErrorMsg::fatal (exprs [i].getLoc (), ValidateErrorMessage::UNREACHBLE_STATEMENT);
+                let val = context:.validateValue (exprs [i]);
+                let isMutable = val.getType ().isMutable ();
+                if (val.isReturner ()) { returner = true; rtLoc = val.getReturnerLoc (); }
+                if (val.isBreaker ())  { breaker = true; rtLoc = val.getBreakerLoc (); }
+
+                type = val.getType ().clone (isMutable-> isMutable);
+                valueLoc = val.getLoc ();
+                values:.push (val);
+            } catch {
+                err : &ErrorMsg => { errors:.push (err); }
+            }
+        }
+
+        match type {
+            VoidType () => {}
+            _ => {
+                context:.verifyMemoryOwner (valueLoc, type, values[][$ - 1us]);
+            } catch {
+                err : &ErrorMsg => { errors:.push (err); }
+            }
+        }
+
+        (values[], type, rtLoc, brLoc, valueLoc)
+    }
+
+
+    /**
+     * Validate the catcher part of a block
+     * @params: 
+     *   - context: the context of the validation
+     *   - catcher: the catcher to validate
+     *   - type: the type of the block that is catched
+     *   - throwers: the list of exception thrown by the block
+     * @returns: 
+     *   - errors: if errors occured
+     *   - .0: the variable that is catched
+     *   - .1: the type info of the catch var
+     *   - .2: the content of the catcher
+     */
+    def validateCatcher (self, dmut context : &Validator, catcher : &Expression, type : &Type, throwers : [&Type], dmut errors : &Vec!{&ErrorMsg})-> (&Value, &Value, &Value) {
+        match catcher {
+            EmptyExpression () => {
+                let a : &Value = UnitValue::new ();
+                return (a, a, a);
+            }
+            _ => {
+                if (throwers.len == 0us) errors:.push (ErrorMsg::fatal (catcher.getLoc (), ValidateErrorMessage::NOTHING_TO_CATCH));
+            }
+        }
+        
+        context;
+        catcher;
+        errors;
+        type;
+        // Need pattern matching
+        __pragma!panic ();
+    }
     
+    /**
+     * ================================================================================
+     * ================================================================================
+     * =========================           LITERAL            =========================
+     * ================================================================================
+     * ================================================================================
+     */
+    
+    
+    /**
+     * Validate a literal expression
+     * @params: 
+     *   - context: the context of the validation
+     *   - l: the literal to validate
+     * @returns: the validated value
+     */
+    def validateLiteral (self, dmut context : &Validator, l : &LiteralExpr)-> &Value
+        throws &ErrorMsg
+    {
+        context;
+        l;
+        __pragma!fake_throw (&ErrorMsg);
+        __pragma!panic ();
+    }
+
+    /**
+     * Validate a list expression
+     * @params: 
+     *   - context: the context of the validation
+     *   - l: the list expression to validate
+     * @returns: the validated value
+     */
+    def validateList (self, dmut context : &Validator, l : &ListExpr)-> &Value
+        throws &ErrorMsg
+    {
+        context;
+        l;
+        __pragma!fake_throw (&ErrorMsg);
+        __pragma!panic ();
+    }
+
+    /**
+     * Validate a unit expression
+     * @params: 
+     *   - context: the context of the validation
+     *   - u: the unit expression to validate
+     * @returns: the validated value
+     */
+    def validateUnit (self, dmut context : &Validator, u : &UnitExpr)-> &Value
+        throws &ErrorMsg
+    {
+        context;
+        u;
+        __pragma!fake_throw (&ErrorMsg);
+        __pragma!panic ();
+    }
+
+    /**
+     * Validate a lambda value expression
+     * @params: 
+     *   - context: the context of the validation
+     *   - l: the lambda value
+     * @returns: the validated value
+     */
+    def validateLambda (self, dmut context : &Validator, l : &LambdaValueExpr)-> &Value
+        throws &ErrorMsg
+    {
+        context;
+        l;
+        __pragma!fake_throw (&ErrorMsg);
+        __pragma!panic ();
+    }
+    
+    /**
+     * ================================================================================
+     * ================================================================================
+     * =========================          OPERATORS           =========================
+     * ================================================================================
+     * ================================================================================
+     */
+
+    /**
+     * Validate an operator expression
+     * @params: 
+     *   - context: the context of the validation
+     *   - o: the operator to validate
+     * @returns: the validated value
+     */
+    def validateOperator (self, dmut context : &Validator, o : &OperatorExpr)-> &Value
+        throws &ErrorMsg
+    {
+        context;
+        o;
+        __pragma!fake_throw (&ErrorMsg);
+        __pragma!panic ();
+    }
+
+
+    /**
+     * ================================================================================
+     * ================================================================================
+     * =========================           VAR_DECL           =========================
+     * ================================================================================
+     * ================================================================================
+     */
+    
+    /**
+     * Validate a var declaration expression
+     * @params: 
+     *   - context: the context of the validation
+    *    - v: the var declaration to validate
+     * @returns: the validated value
+     */
+    def validateVarDecl (self, dmut context : &Validator, v : &VarDeclExpr)-> &Value
+        throws &ErrorMsg
+    {
+        context;
+        v;
+        __pragma!fake_throw (&ErrorMsg);
+        __pragma!panic ();
+    }
+
+    /**
+     * Validate a set expression (generally a succession of var decl)
+     * @params: 
+     *   - context: the context of the validation
+     *   - s: the set to validate
+     * @returns: the validated value
+     */
+    def validateSet (self, dmut context : &Validator, s : &SetExpr)-> &Value
+        throws &ErrorMsg
+    {
+        context;
+        s;
+        __pragma!fake_throw (&ErrorMsg);
+        __pragma!panic ();
+    }    
+
+    /**
+     * ================================================================================
+     * ================================================================================
+     * =========================          DECORATED           =========================
+     * ================================================================================
+     * ================================================================================
+     */
+
+
+    /**
+     * Validate a decorated expression
+     * @params: 
+     *   - context: the context of the validation
+     *   - d: the decorated expression to validate
+     * @returns: the validated value
+     */
+    def validateDecoExpr (self, dmut context : &Validator, d : &DecoratedExpr)-> &Value
+        throws &ErrorMsg
+    {
+        context;
+        d;
+        __pragma!fake_throw (&ErrorMsg);
+        __pragma!panic ();
+    }
+
+    /**
+     * Validate an intrinsic expr
+     * @params: 
+     *   - context: the context of the validation
+     *   - i: the intrinsic expression to validate
+     * @returns: the validated value
+     */
+    def validateIntrinsics (self, dmut context : &Validator, i : &IntrinsicExpr)-> &Value
+        throws &ErrorMsg
+    {
+        context;
+        i;
+        __pragma!fake_throw (&ErrorMsg);
+        __pragma!panic ();
+    }
+
+    /**
+     * Validate a named expression
+     * @params: 
+     *   - context: the context of the validation
+     *   - n: the named expression to validate
+     * @returns: the validated value
+     */
+    def validateNamedExpr (self, dmut context : &Validator, n : &NamedExpr)-> &Value
+        throws &ErrorMsg
+    {
+        context;
+        n;
+        __pragma!fake_throw (&ErrorMsg);
+        __pragma!panic ();
+    }
+
+    
+    /**
+     * ================================================================================
+     * ================================================================================
+     * =========================     CONDITION AND LOOPS      =========================
+     * ================================================================================
+     * ================================================================================
+     */
+    
+    /**
+     * Validate a conditional expression
+     * @params: 
+     *   - context: the context of the validation
+     *   - c: the conditional expression to validate
+     * @returns: the validated value
+     */
+    def validateConditional (self, dmut context : &Validator, c : &ConditionalExpr)-> &Value
+        throws &ErrorMsg
+    {
+        context;
+        c;
+        __pragma!fake_throw (&ErrorMsg);
+        __pragma!panic ();
+    }
+
+        
+    /**
+     * Validate a for loop
+     * @params: 
+     *   - context: the context of the validation
+     *   - f: the for loop to validate
+     * @returns: the validated value
+     */
+    def validateForLoop (self, dmut context : &Validator, f : &ForLoopExpr)-> &Value
+        throws &ErrorMsg
+    {
+        context;
+        f;
+        __pragma!fake_throw (&ErrorMsg);
+        __pragma!panic ();
+    }
+
+    /**
+     * Validate a while loop
+     * @params: 
+     *   - context: the context of the validation
+     *   - w: the while loop to validate
+     * @returns: the validated value
+     */
+    def validateWhileLoop (self, dmut context : &Validator, w : &WhileLoopExpr)-> &Value
+        throws &ErrorMsg
+    {
+        context;
+        w;
+        __pragma!fake_throw (&ErrorMsg);
+        __pragma!panic ();
+    }
+
+    /**
+     * ================================================================================
+     * ================================================================================
+     * =========================    BREAK/RETURN/ and MISC    =========================
+     * ================================================================================
+     * ================================================================================
+     */
+
+
+    /**
+     * Validate a break expression
+     * @params: 
+     *   - context: the context of the validation
+     *   - b: the break to validate
+     * @returns: the validated value
+     */
+    def validateBreak (self, dmut context : &Validator, b : &BreakExpr)-> &Value
+        throws &ErrorMsg
+    {
+        context;
+        b;
+        __pragma!fake_throw (&ErrorMsg);
+        __pragma!panic ();
+    }
+
+    /**
+     * Validate a return expression
+     * @params: 
+     *   - context: the context of the validation
+     *   - r: the return to validate
+     * @returns: the validated value
+     */
+    def validateReturn (self, dmut context : &Validator, r : &ReturnExpr)-> &Value
+        throws &ErrorMsg
+    {
+        context;
+        r;
+        __pragma!fake_throw (&ErrorMsg);
+        __pragma!panic ();
+    }
+
+    /**
+     * Validate a throw expression
+     * @params: 
+     *   - context: the context of the validation
+     *   - t: the throw to validate
+     * @returns: the validated value
+     */
+    def validateThrow (self, dmut context : &Validator, t : &ThrowExpr)-> &Value
+        throws &ErrorMsg
+    {
+        context;
+        t;
+        __pragma!fake_throw (&ErrorMsg);
+        __pragma!panic ();
+    }
+
+    /**
+     * ================================================================================
+     * ================================================================================
+     * =========================        PATTERN MATCH         =========================
+     * ================================================================================
+     * ================================================================================
+     */
+    
+    /**
+     * Validate a pattern matcher
+     * @params: 
+     *   - context: the context of the validation
+     *   - m: the pattern matcher to validate
+     * @returns: the validated value
+     */
+    def validateMatcher (self, dmut context : &Validator, m : &MatcherExpr)-> &Value
+        throws &ErrorMsg
+    {
+        context;
+        m;
+        __pragma!fake_throw (&ErrorMsg);
+        __pragma!panic ();
+    }
+
+    /**
+     * ================================================================================
+     * ================================================================================
+     * =========================            MACRO             =========================
+     * ================================================================================
+     * ================================================================================
+     */
+
+
+    /**
+     * Validate a macro call expression
+     * @params: 
+     *   - context: the context of the validation
+     *   - m: the macro call expression to validate
+     * @returns: the validated value
+     */
+    def validateMacroCall (self, dmut context : &Validator, m : &MacroCallExpr)-> &Value
+        throws &ErrorMsg
+    {
+        context;
+        m;
+        __pragma!fake_throw (&ErrorMsg);
+        __pragma!panic ();
+    }
+
+
+    /**
+     * ================================================================================
+     * ================================================================================
+     * =========================            PRAGMA            =========================
+     * ================================================================================
+     * ================================================================================
+     */
+
+    /**
+     * Validate a pragma expression
+     * @params: 
+     *   - context: the context of the validation
+     *   - p: the pragma expression to validate
+     * @returns: the validated value
+     */
+    def validatePragma (self, dmut context : &Validator, p : &PragmaExpr)-> &Value
+        throws &ErrorMsg
+    {
+        context;
+        p;
+        __pragma!fake_throw (&ErrorMsg);
+        __pragma!panic ();
+    }
+
+
+    /**
+     * ================================================================================
+     * ================================================================================
+     * =========================            ASSERT            =========================
+     * ================================================================================
+     * ================================================================================
+     */
+
+
+    /**
+     * Validate an assert expression
+     * @params: 
+     *   - context: the context of the validation
+     *   - p: the assert expression to validate
+     * @returns: the validated value
+     */
+    def validateAssert (self, dmut context : &Validator, a : &AssertExpr)-> &Value
+        throws &ErrorMsg
+    {
+        context;
+        a;
+        __pragma!fake_throw (&ErrorMsg);
+        __pragma!panic ();
+    }
+
+
+    /**
+     * ================================================================================
+     * ================================================================================
+     * =========================             TRY              =========================
+     * ================================================================================
+     * ================================================================================
+     */
+
+    /**
+     * Validate a try expression
+     * @params: 
+     *   - context: the context of the validation
+     *   - t: the try expression to validate
+     * @returns: the validated value
+     */
+    def validateTry (self, dmut context : &Validator, t : &TryExpr)-> &Value
+        throws &ErrorMsg
+    {
+        context;
+        t;
+        __pragma!fake_throw (&ErrorMsg);
+        __pragma!panic ();
+    }
+
+
+    /**
+     * ================================================================================
+     * ================================================================================
+     * =========================             WITH             =========================
+     * ================================================================================
+     * ================================================================================
+     */
+
+
+    /**
+     * Validate a with expression
+     * @params: 
+     *   - context: the context of the validation
+     *   - w: the with expression to validate
+     * @returns: the validated value
+     */
+    def validateWith (self, dmut context : &Validator, w : &DisposeScopeExpr)-> &Value
+        throws &ErrorMsg
+    {
+        context;
+        w;
+        __pragma!fake_throw (&ErrorMsg);
+        __pragma!panic ();
+    }
+
+
+    /**
+     * ================================================================================
+     * ================================================================================
+     * =========================            ATOMIC            =========================
+     * ================================================================================
+     * ================================================================================
+     */
+
+    /**
+     * Validate an atomic expression
+     * @params: 
+     *   - context: the context of the validation
+     *   - a: the atomic expression to validate
+     * @returns: the validated value
+     */
+    def validateAtomic (self, dmut context : &Validator, a : &AtomicExpr)-> &Value
+        throws &ErrorMsg
+    {
+        context;
+        a;
+        __pragma!fake_throw (&ErrorMsg);
+        __pragma!panic ();
+    }
+
+
+    /**
+     * ================================================================================
+     * ================================================================================
+     * =========================             CAST             =========================
+     * ================================================================================
+     * ================================================================================
+     */
+
+
+    /**
+     * Validate a cast expression
+     * @params: 
+     *   - context: the context of the validation
+     *   - c: the cast expression to validate
+     * @returns: the validated value
+     */
+    def validateCast (self, dmut context : &Validator, c : &CastExpr)-> &Value
+        throws &ErrorMsg
+    {
+        context;
+        c;
+        __pragma!fake_throw (&ErrorMsg);
+        __pragma!panic ();
+    }
+
+
+    /**
+     * ================================================================================
+     * ================================================================================
+     * =========================          TEMPLATES           =========================
+     * ================================================================================
+     * ================================================================================
+     */
+    
+    /**
+     * Validate a template call expression
+     * @params: 
+     *   - context: the context of the validation
+     *   - t: the template call to validate
+     * @returns: the validated value
+     */
+    def validateTemplateCall (self, dmut context : &Validator, t : &TemplateCallExpr)-> &Value
+        throws &ErrorMsg
+    {
+        context;
+        t;
+        __pragma!fake_throw (&ErrorMsg);
+        __pragma!panic ();
+    }
+
+    /**
+     * Validate a template checker expression
+     * @params: 
+     *   - context: the context of the validation
+     *   - t: the template checker to validate
+     * @returns: the validated value
+     */
+    def validateTemplateChecker (self, dmut context : &Validator, t : &TemplateCheckerExpr)-> &Value
+        throws &ErrorMsg
+    {
+        context;
+        t;
+        __pragma!fake_throw (&ErrorMsg);
+        __pragma!panic ();
+    }
     
 }
