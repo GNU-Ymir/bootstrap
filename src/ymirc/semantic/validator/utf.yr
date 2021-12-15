@@ -1,0 +1,202 @@
+mod ymirc::semantic::validator::utf;
+
+
+import ymirc::semantic::validator::errors;
+import ymirc::semantic::validator::visitor;
+import ymirc::lexing::word;
+import ymirc::errors::_;
+import ymirc::utils::format;
+
+import std::collection::vec;
+import std::collection::map;
+import std::io;
+
+/**
+ * The utf visitor class is used to validate literal strings and chars
+ */
+pub class UtfVisitor {
+
+    /// The list of escape chars
+    let _escape = hmap#{'a'c8 => 7u8,
+                        'b'c8 => 8u8,
+                        'f'c8 => 12u8,
+                        'n'c8 => 10u8,
+                        'r'c8 => 13u8,
+                        't'c8 => 9u8,
+                        'v'c8 => 11u8,
+                        '\\'c8 => 92u8,
+                        '\''c8 => 39u8,
+                        '\"'c8 => 34u8,
+                        '?'c8 => 63u8
+    };
+   
+    /**
+     * Create an empty visitor
+     */
+    pub self () {}
+
+    /**
+     * Convert a sequence from literal string into a utf encoded string
+     * @params: 
+     *   - loc: the location of the sequence
+     *   - content: the literal to convert
+     * @returns:
+     *   - .0: the utf8 encoded string
+     *   - .1: the len of the string (differ from .0.len)
+     * @throws: &ErrorMsg: if the literal is malformed
+     */
+    pub def convertUtf8 (self, loc : &Word, content : [c8])-> ([c8], usize)
+        throws &ErrorMsg
+    {
+        let str = self.escapeChars (loc, content, add-> "\u{0}"s8);
+        (str, str.len)
+    }
+
+    /**
+     * Convert a sequence from literal string into a utf encoded string
+     * @params: 
+     *   - loc: the location of the sequence
+     *   - content: the literal to convert
+     * @returns:
+     *   - .0: the utf32 encoded string
+     *   - .1: the len of the string (differ from .0.len)
+     * @throws: &ErrorMsg: if the literal is malformed
+     */
+    pub def convertUtf32 (self, loc : &Word, content : [c8])-> ([c32], usize)
+        throws &ErrorMsg
+    {
+        import std::conv;
+        let str = self.escapeChars (loc, content, add-> "\u{0}"s8).to![c32] ();
+        (str, str.len)
+    }
+
+    /**
+     * Traverse the string and transform the escape char into the correct int values
+     * @params:
+     *   - loc: the location of the string
+     *   - content: the content of the string
+     * @throws: &ErrorMsg: if the literal has malformed escaped chars
+     * @returns: a string literal without any escape chars
+     */
+    def escapeChars (self, loc : &Word, content : [c8], add : [c8])-> [c8]
+        throws &ErrorMsg
+    {
+        let mut col = 0us, mut line = 0us;
+        let mut it = 0us;
+        let dmut stream = StringStream::new ();
+        
+        while it < content.len {
+            if (content [it] == '\n'c8) {
+                line += 1us;
+                col = 0us;
+            } else col += 1us;
+
+            if (content [it] == '\\'c8) {
+                if (it + 1us < content.len) {
+                    if (content [it + 1us] == 'u'c8) {
+                        it += 1us;
+                        let (it_, code) = self.escapeUnicode (loc, content [it + 1us .. $], line, col);
+                        it += it_;
+                        stream:.write (code);
+                    } else {
+                        let pos = self._escape.find (content [it + 1us]);
+                        match pos {
+                            Ok (x : _) => {
+                                it += 1us;
+                                stream:.write (cast!c8 (x));
+                            }
+                            _ => {
+                                let realLoc = Word::new (loc.str (), loc, addLine-> cast!u64 (line), addCol-> cast!u64 (col));
+                                throw ErrorMsg::fatal (realLoc, ValidateErrorMessage::UNDEFINED_ESCAPE);
+                            }
+                        }
+                    }
+                } else {
+                    let realLoc = Word::new (loc.str (), loc, addLine-> cast!u64 (line), addCol-> cast!u64 (col));
+                    throw ErrorMsg::fatal (realLoc, ValidateErrorMessage::UNTERMINATED_ESCAPE);
+                }
+            } else {
+                stream:.write (content [it]);
+            }
+            
+            it += 1us;
+        }
+
+        stream:.write (add);
+        stream []
+    }
+
+    /**
+     * Convert a escape unicode into the correct string
+     * @params: 
+     *    - loc: the location of the string literal
+     *    - content: the content of the string
+     *    - line: the current line
+     *    - col: the current column
+     */
+    def escapeUnicode (self, loc : &Word, content : [c8], line : usize, col : usize)-> (usize, [c8])
+        throws &ErrorMsg
+    {
+        import std::conv;
+        let realLoc = Word::new (loc.str (), loc, addLine-> cast!u64 (line), addCol-> cast!u64 (col));
+        let mut n_pos = 0us;
+        if (content.len == 0us) throw ErrorMsg::fatal (realLoc, ValidateErrorMessage::UNTERMINATED_ESCAPE);
+        else if (content [0us] != '{'c8) throw ErrorMsg::fatal (realLoc, ValidateErrorMessage::UNDEFINED_ESCAPE);
+        
+        for i in 1us .. content.len {
+            if (content [i] == '}'c8) {
+                n_pos = i;
+                break {}
+            }
+        }
+        
+        if (n_pos == 0us) {
+            throw ErrorMsg::fatal (realLoc, ValidateErrorMessage::UNTERMINATED_ESCAPE);
+        }
+
+        let inner = {
+            content [1us .. n_pos].to!{u32, [c8], 16us} ()
+        } catch {
+            _ => throw ErrorMsg::fatal (realLoc, ValidateErrorMessage::UNDEFINED_ESCAPE);
+        }
+
+        (n_pos + 1us, self.getUnicodeChar (inner))
+    }
+
+    /**
+     * Transform a unicode code into a list of chars encoded in utf8
+     * @returns: the utf8 encoded unicode
+     */
+    def getUnicodeChar (self, code : u32)-> [c8] {
+        if (code < 0x7Fu32) {
+            [cast!c8 (cast!u8 (code) & 0x7Fu8)]
+        } else if (code <= 0x7FFu32) {
+            let dmut ret = ['\u{0}'c8 ; new 2];
+            ret [1] = cast!c8 (0x80u8 | (cast!u8 (code) & 0x3Fu8));
+            let c2 = code >> 6u32;
+            ret [0] = cast!c8 (0xC0u8 | (cast!u8 (c2) & 0x1Fu8));
+            ret
+        } else if (code <= 0xFFFFu32) {
+            let dmut ret = ['\u{0}'c8 ; new 3];
+            ret [2] = cast!c8 (0x80u8 | (cast!u8 (code) & 0x3Fu8));
+            let c2 = code >> 6u32;
+            ret [1] = cast!c8 (0x80u8 | (cast!u8 (c2) & 0x3Fu8));
+            let c3 = c2 >> 6u32;
+            ret [0] = cast!c8 (0xE0u8 | (cast!u8 (c3) & 0xFu8));
+            ret
+        } else if (code <= 0x10FFFFu32) {
+            let dmut ret = ['\u{0}'c8 ; new 4];
+            ret [3] = cast!c8 (0x80u8 | (cast!u8 (code) & 0x3Fu8));
+            let c2 = code >> 6u32;
+            ret [2] = cast!c8 (0x80u8 | (cast!u8 (c2) & 0x3Fu8));
+            let c3 = c2 >> 6u32;
+            ret [1] = cast!c8 (0x80u8 | (cast!u8 (c3) & 0x3Fu8));
+            let c4 = c3 >> 6u32;
+            ret [0] = cast!c8 (0xF0u8 | (cast!u8 (c4) & 0x7u8));
+            ret
+        } else {
+            [cast!c8 (0xBDu8), cast!c8 (0xBFu8), cast!c8 (0xEFu8)]
+        }
+    }
+    
+}
