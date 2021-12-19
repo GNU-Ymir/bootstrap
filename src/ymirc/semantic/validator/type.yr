@@ -5,12 +5,16 @@ import ymirc::semantic::validator::errors;
 
 import ymirc::syntax::declaration::protection;
 import ymirc::syntax::expression::_;
+import ymirc::syntax::keys;
+import ymirc::lexing::word;
 
 import ymirc::semantic::generator::_;
 import ymirc::errors::_;
 import ymirc::utils::format;
 
 import std::collection::vec;
+import std::collection::map;
+import std::collection::set;
 import std::io;
 
 /**
@@ -38,25 +42,25 @@ pub class TypeValidator {
     pub def validate (self, dmut context : &Validator, type : &Expression, parentMutable : bool = true, isMutable : bool = false, isDeeplyMutable : bool = false, isRoot : bool = true)-> &Type
         throws &ErrorMsg
     {
-        isRoot;
         let ret = match type {
             UnitExpr () => { cast!{&Type} (NoneType::new (loc-> type.getLoc ())) }
             EmptyExpression () => { cast!{&Type} (NoneType::new (loc-> type.getLoc ())) }
             arr : &SliceAllocatorExpr => { self.validateSliceAllocator (alias context, arr, parentMutable, isMutable, isDeeplyMutable) }
             v : &VarExpr => { self.validateVar (alias context, v, parentMutable, isMutable, isDeeplyMutable) }
-            // dec : &DecoratedExpr => { self.validateDeco (alias context, dec, parentMutable, isDeeplyMutable, isRoot) }
+            dec : &DecoratedExpr => { self.validateDeco (alias context, dec, parentMutable, isDeeplyMutable, isRoot) }
             // un : &UnaryExpr => { self.validateUnary (alias context, un, parentMutable, isDeeplyMutable) }
             // tr : &TryExpr => { self.validateTry (alias context, tr, parentMutable, isDeeplyMutable) }
-            // lst : &ListExpr => {
-            //     if (lst.isArray ()) {
-            //         self.validateArrayList (alias context, lst, parentMutable, isDeeplyMutable)
-            //     } else {
-            //         self.validateTuple (alias context, lst, parentMutable, isDeeplyMutable)
-            //     }
-            // } 
+            lst : &ListExpr => {
+                if (lst.isArray ()) {
+                    self.validateSliceList (alias context, lst, parentMutable, isMutable, isDeeplyMutable)
+                } else {
+                    self.validateTupleList (alias context, lst, parentMutable, isMutable, isDeeplyMutable)
+                }
+            } 
             // call : &TemplateCall => { self.validateTemplateCall (alias context, cl, parentMutable, isDeeplyMutable) }            
             _ => {
-                throw ErrorMsg::fatal (type.getLoc (), ""s8);
+                println ("TODO : ", type);
+                __pragma!panic ();
             }
         };
 
@@ -65,7 +69,90 @@ pub class TypeValidator {
     }
 
     /**
-     * Validate an array alloc as a type
+     * Validate a decorated type 
+     * @params: 
+     *   - context: the context of the validation
+     *   - type: the type to validate
+     *   - parentMutable: true if a decorator `mut` was found in the description of the parent
+     *   - isMutable: true if a decorator `mut` was found in the description of this type (assuming isMutable => parentMutable)
+     *   - isDeeplyMutable: true if a decorator `dmut` was found in the description
+     *   - isRoot: true iif this is the root of the type and not an inner type
+     */
+    def validateDeco (self, dmut context : &Validator, type : &DecoratedExpr, parentMutable : bool, isDeeplyMutable : bool, isRoot : bool)-> &Type
+        throws &ErrorMsg
+    {        
+        let dmut found = HashMap!{Decorators, &Word}::new ();
+        let dmut antiAffs = hmap #[
+            Decorators::MUT  => hset #{Decorators::CONST, Decorators::DMUT, Decorators::PURE},
+            Decorators::DMUT  => hset #{Decorators::CONST, Decorators::MUT, Decorators::PURE},
+            Decorators::CONST  => hset #{Decorators::PURE, Decorators::MUT, Decorators::DMUT}
+        ];
+
+        for i in type.getDecorators () {
+            match i.deco {
+                Decorators::STATIC => {
+                    throw ErrorMsg::fatal (i.loc, format (ValidateErrorMessage::UNDEF_DECORATOR_TYPE, Decorators::STATIC));
+                }
+                Decorators::CTE => {
+                    throw ErrorMsg::fatal (i.loc, format (ValidateErrorMessage::UNDEF_DECORATOR_TYPE, Decorators::CTE));
+                }
+                Decorators::REF => {
+                    throw ErrorMsg::fatal (i.loc, format (ValidateErrorMessage::UNDEF_DECORATOR_TYPE, Decorators::REF));
+                }
+                Decorators::PURE => {
+                    throw ErrorMsg::fatal (i.loc, format (ValidateErrorMessage::UNDEF_DECORATOR_TYPE, Decorators::PURE));
+                }
+                _ => {
+                    match found.find (i.deco) {
+                        Ok (l : _) => throw ErrorMsg::warn (i.loc, format (ValidateErrorMessage::MULTIPLE_DECORATORS, i.deco), notes-> [ErrorMsg::note (l, ""s8)]);
+                    }
+
+                    match antiAffs.find (i.deco) {
+                        Ok (an : _) => {
+                            for j in an {
+                                match found.find (j) {
+                                    Ok (l : _) => throw ErrorMsg::fatal (i.loc, format (ValidateErrorMessage::CONFLIT_DECORATORS, j, i.deco), notes-> [ErrorMsg::note (l, ""s8)]);
+                                }
+                            }
+                        }
+                    }
+                    
+                    found:.insert (i.deco, i.loc);
+                }
+            }
+        }
+
+        let (isMutable_, isDeeplyMutable_, _, _) = (Decorators::MUT in found, Decorators::DMUT in found, Decorators::REF in found, Decorators::PURE in found);
+
+        if (isRoot) {
+            self.validate (alias context, type.getContent (), isMutable-> (isMutable_ || isDeeplyMutable_), isDeeplyMutable-> isDeeplyMutable_, parentMutable-> (isMutable_ || isDeeplyMutable_), isRoot-> false)
+        } else {
+            if (isMutable_ && (!parentMutable || isDeeplyMutable))
+                match found.find (Decorators::MUT) {
+                    Ok (l : _) => {
+                        if (!parentMutable) {
+                            throw ErrorMsg::fatal (l, ValidateErrorMessage::IMMUTABLE_PARENT)
+                        } else {
+                            throw ErrorMsg::fatal (l, ValidateErrorMessage::DEEPLY_INNER_TYPE)
+                        }
+                    }
+                }
+
+            // if (isDeeplyMutable_) {
+            //     match found.find (Decorators::MUT) {
+            //         Ok (l : _) => {
+            //             throw ErrorMsg::fatal (l, ValidateErrorMessage::DEEPLY_INNER_TYPE)
+            //         }
+            //     }
+            // }
+            
+            self.validate (alias context, type.getContent (), isMutable-> (isMutable_ || isDeeplyMutable), isDeeplyMutable-> isDeeplyMutable, parentMutable-> (isMutable_ || isDeeplyMutable), isRoot-> false)
+        }
+    }
+
+    
+    /**
+     * Validate an array alloc as a type (e.g. [i32 ; 12u32])
      * @params: 
      *   - context: the context of the validation
      *   - type: the type to validate
@@ -80,7 +167,7 @@ pub class TypeValidator {
     {
         if (type.isDynamic()) throw ErrorMsg::fatal (type.getLoc (), ValidateErrorMessage::USE_AS_TYPE);
         
-        let innerType = self.validate (alias context, type.getValue (), isMutable-> false, parentMutable-> isMutable, isDeeplyMutable-> isDeeplyMutable, isRoot-> false);
+        let innerType = self.validate (alias context, type.getValue (), isMutable-> isDeeplyMutable, parentMutable-> (isMutable || isDeeplyMutable), isDeeplyMutable-> isDeeplyMutable, isRoot-> false);
         let size = context:.getCompileTimeInterpreter ().compute (context:.validateValue (type.getSize ()));
         
         match size {
@@ -90,6 +177,51 @@ pub class TypeValidator {
             _ => throw ErrorMsg::fatal (size.getLoc (), format (ValidateErrorMessage::ARRAY_SIZE_TYPE, size.getType ()));
         }        
     }
+
+    /**
+     * Validate a slice list type (e.g. [i32])
+     * @params: 
+     *   - context: the context of the validation
+     *   - type: the type to validate
+     *   - parentMutable: true if a decorator `mut` was found in the description of the parent
+     *   - isMutable: true if a decorator `mut` was found in the description of this type (assuming isMutable => parentMutable)
+     *   - isDeeplyMutable: true if a decorator `dmut` was found in the description
+     * @returns: a type
+     * @throws: &ErrorMsg: if the type is not valid
+     */
+    def validateSliceList (self, dmut context : &Validator, type : &ListExpr, parentMutable : bool, isMutable : bool, isDeeplyMutable : bool)-> &Type
+        throws &ErrorMsg
+    {
+        if (type.getParameters ().len != 1us) throw ErrorMsg::fatal (type.getLoc (), ValidateErrorMessage::USE_AS_TYPE);
+
+        let innerType = self.validate (alias context, type.getParameters ()[0], isMutable-> isDeeplyMutable, parentMutable-> (isMutable || isDeeplyMutable), isDeeplyMutable-> isDeeplyMutable, isRoot-> false);
+        
+        SliceType::new (type.getLoc (), innerType, isMutable-> (parentMutable && isMutable))
+    }
+
+
+    /**
+     * Validate a tuple type (e.g. (i32, u64))
+     * @params: 
+     *   - context: the context of the validation
+     *   - type: the type to validate
+     *   - parentMutable: true if a decorator `mut` was found in the description of the parent
+     *   - isMutable: true if a decorator `mut` was found in the description of this type (assuming isMutable => parentMutable)
+     *   - isDeeplyMutable: true if a decorator `dmut` was found in the description
+     * @returns: a type
+     * @throws: &ErrorMsg: if the type is not valid
+     */
+    def validateTupleList (self, dmut context : &Validator, type : &ListExpr, parentMutable : bool, isMutable : bool, isDeeplyMutable : bool)-> &Type
+        throws &ErrorMsg
+    {
+        let dmut innerTypes = Vec!{&Type}::new ();
+        for i in type.getParameters () {
+            innerTypes:.push (self.validate (alias context, i, isMutable-> isDeeplyMutable, parentMutable-> (isMutable || isDeeplyMutable), isDeeplyMutable-> isDeeplyMutable, isRoot-> false));
+        }
+
+        TupleType::new (type.getLoc (), innerTypes[], isMutable-> (parentMutable && isMutable))
+    }
+       
 
     /**
      * Validate a var expression as a type
@@ -116,17 +248,18 @@ pub class TypeValidator {
             NativeTypes::U32 => return IntType::new (type.getLoc (), size-> 32u16, signed-> false, isMutable-> (parentMutable && isMutable));
             NativeTypes::U64 => return IntType::new (type.getLoc (), size-> 64u16, signed-> false, isMutable-> (parentMutable && isMutable));
             NativeTypes::USIZE => return IntType::new (type.getLoc (), size-> 0u16, signed-> false, isMutable-> (parentMutable && isMutable));
-            NativeTypes::U8 => return IntType::new (type.getLoc (), size-> 8u16, signed-> true, isMutable-> (parentMutable && isMutable));
-            NativeTypes::U16 => return IntType::new (type.getLoc (), size-> 16u16, signed-> true, isMutable-> (parentMutable && isMutable));
-            NativeTypes::U32 => return IntType::new (type.getLoc (), size-> 32u16, signed-> true, isMutable-> (parentMutable && isMutable));
-            NativeTypes::U64 => return IntType::new (type.getLoc (), size-> 64u16, signed-> true, isMutable-> (parentMutable && isMutable));
-            NativeTypes::USIZE => return IntType::new (type.getLoc (), size-> 0u16, signed-> true, isMutable-> (parentMutable && isMutable));
+            NativeTypes::I8 => return IntType::new (type.getLoc (), size-> 8u16, signed-> true, isMutable-> (parentMutable && isMutable));
+            NativeTypes::I16 => return IntType::new (type.getLoc (), size-> 16u16, signed-> true, isMutable-> (parentMutable && isMutable));
+            NativeTypes::I32 => return IntType::new (type.getLoc (), size-> 32u16, signed-> true, isMutable-> (parentMutable && isMutable));
+            NativeTypes::I64 => return IntType::new (type.getLoc (), size-> 64u16, signed-> true, isMutable-> (parentMutable && isMutable));
+            NativeTypes::ISIZE => return IntType::new (type.getLoc (), size-> 0u16, signed-> true, isMutable-> (parentMutable && isMutable));
             NativeTypes::BOOL => return BoolType::new (type.getLoc (), isMutable-> (parentMutable && isMutable));
             NativeTypes::F32 => return FloatType::new (type.getLoc (), size-> 32u16, isMutable-> (parentMutable && isMutable));
             NativeTypes::F64 => return FloatType::new (type.getLoc (), size-> 64u16, isMutable-> (parentMutable && isMutable));
         }
 
         /// TODO global types
+        println (format ("%", type));
         __pragma!fake_throw (&ErrorMsg);
         __pragma!panic ();
     }
