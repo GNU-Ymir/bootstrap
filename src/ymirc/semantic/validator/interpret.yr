@@ -4,6 +4,12 @@ import ymirc::semantic::generator::_;
 import ymirc::errors::message;
 import std::io;
 
+import ymirc::lexing::word;
+import ymirc::utils::format;
+import ymirc::semantic::validator::errors;
+
+import std::collection::vec;
+
 /**
  * The compile time interpreter, is the class that can compute the values at compilation time
  * It is used to compute some stuff, that must be known at compilation time, or for optimization purpose
@@ -28,11 +34,512 @@ pub class CompileTimeInterpreter {
     {
         match value {
             LiteralValue () => { value }
+            rng : &RangeValue => { self.computeRangeValue (rng) }
+            slc : &SliceConcatValue => { self.computeSliceConcat (slc) }
+            slc : &SliceCompareValue => { self.computeSliceCompare (slc) }
+            slc : &SliceAccessValue => { self.computeSliceAccess (slc) }
+            bin : &BinaryOperatorValue => { self.computeBinary (bin) }
+            un : &UnaryOperatorValue => { self.computeUnary (un) }
+            cd : &ConditionalValue => { self.computeConditional (cd) }
+            bl : &BlockValue => { self.computeBlock (bl) }
+            vref : &VarRefValue => { self.computeVarRef (vref) }
+            addr : &AddressValue => { self.computeAddress (addr) }
             _ => {
-                println ("TODO ", value::typeinfo.name);
-                __pragma!fake_throw (&ErrorMsg);
-                __pragma!panic ();
+                throw ErrorMsg::fatal (value.getLoc (), format (ValidateErrorMessage::UNKNOWN_AT_COMPILE_TIME, value.getType ()));
             }                
+        }
+    }
+
+    /**
+     * ================================================================================
+     * ================================================================================
+     * =========================            RANGE             =========================
+     * ================================================================================
+     * ================================================================================
+     */
+
+    /**
+     * Compute the content of a range value at compilation time
+     * @params: 
+     *   - value: the range value to compute
+     * @returns: a range value
+     * @throws: &ErrorMsg if the value cannot be known at compilation time
+     */
+    def computeRangeValue (self, value : &RangeValue)-> &Value
+        throws &ErrorMsg
+    {
+        let left = self.compute (value.getLeft ());
+        let right = self.compute (value.getRight ());
+        let full = self.compute (value.getIsFull ());
+        let step = match value.getStep () {
+            n : &NoneValue => { cast!{&Value} (n) }
+            s : &Value => { self.compute (s) }
+        }
+        
+        RangeValue::new (value.getLoc (), value.getType (), left, right, full-> full, step-> step)
+    }
+
+    /**
+     * ================================================================================
+     * ================================================================================
+     * =========================        CONCATENATION         =========================
+     * ================================================================================
+     * ================================================================================
+     */
+    
+    /**
+     * Compute a slice concatenation operation
+     * @params: 
+     *  - value: the value to compute
+     * @returns: the value
+     * @throws: 
+     *   - &ErrorMsg: if the value cannot be known at compilation time
+     */
+    def computeSliceConcat (self, value : &SliceConcatValue)-> &Value
+        throws &ErrorMsg
+    {
+        let left = match self.compute (value.getLeft ()) {
+            al : &AliaserValue => { al.getInnerValue () }
+            l : _ => { l }
+        };
+
+        let right = match self.compute (value.getRight ()) {
+            al : &AliaserValue => { al.getInnerValue () }
+            r : _ => { r }
+        };
+
+        let res = match (left, right) {
+            (l : &StringValue, r : &StringValue) => {
+                self.concatStrings (value.getLoc (), value.getType (), l, r)
+            }
+            // (l : &LiteralValue, r : &LiteralValue) => {
+            //     self.concatArrays (value.getLoc (), value.getType (), l, r)
+            // }
+            _ => {
+                throw ErrorMsg::fatal (value.getLoc (), format (ValidateErrorMessage::UNKNOWN_AT_COMPILE_TIME, value.getType ()));
+            }            
+        }
+
+        res
+    }
+
+    /**
+     * Concatenation of two string values
+     * @params: 
+     *  - loc: the location of the operation
+     *  - type: the type of the operation
+     *  - left: the left operand of the concat
+     *  - right: the right operand of the concat
+     * @returns: a aliaservalue containing a new string value
+     */
+    def concatStrings (self, loc : &Word, type : &Type, left : &StringValue, right : &StringValue)-> &Value {
+        match type {
+            s : &SliceType => {
+                match s.getInners ()[0] {
+                    c : &CharType => {
+                        if (c.getSize () == 8u16) {
+                            return self.concatUtf8 (loc, left, right);
+                        } else {
+                            return self.concatUtf32 (loc, left, right);
+                        }
+                    }
+                }
+            }
+        }
+
+        __pragma!panic ();
+    }
+
+    /**
+     * Concatenate two strings in utf-8 format
+     * @params: 
+     *   - loc: the location of the operation
+     *   - left: the left operand
+     *   - right: the right operand
+     * @returns: a aliaservalue containing a new string value
+     */
+    def concatUtf8 (self, loc : &Word, left : &StringValue, right : &StringValue)-> &Value {
+        let dmut res = Vec!{c8}::new ();
+        let l_u8 = left.getUtf8 ();
+        let r_u8 = right.getUtf8 ();
+        for i in 0us .. left.getLen () {
+            res:.push (l_u8 [i]);
+        }
+        
+        for i in 0us .. right.getLen () {
+            res:.push (r_u8 [i]);
+        }
+
+        let len = left.getLen () + right.getLen ();
+        res:.push ('\u{0}'c8);
+        
+        let inner = CharType::new (loc, size-> 8u16);
+        let arrType = ArrayType::new (loc, inner, size-> int::usize (loc, len), isMutable-> true);
+        let slcType = SliceType::new (loc, inner, isMutable-> true);
+
+        AliaserValue::new (
+            loc,
+            slcType,
+            StringValue::new (loc, arrType, c8Val-> res[], c32Val-> [], len)) 
+    }
+
+    /**
+     * Concatenate two strings in utf-32 format
+     * @params: 
+     *   - loc: the location of the operation
+     *   - left: the left operand
+     *   - right: the right operand
+     * @returns: a aliaservalue containing a new string value
+     */
+    def concatUtf32 (self, loc : &Word, left : &StringValue, right : &StringValue)-> &Value {
+        let dmut res = Vec!{c32}::new ();
+        let l_u32 = left.getUtf32 ();
+        let r_u32 = right.getUtf32 ();
+        for i in 0us .. left.getLen () {
+            res:.push (l_u32 [i]);
+        }
+        
+        for i in 0us .. right.getLen () {
+            res:.push (r_u32 [i]);
+        }
+
+        let len = left.getLen () + right.getLen ();
+        res:.push ('\u{0}');
+        
+        let inner = CharType::new (loc, size-> 32u16);
+        let arrType = ArrayType::new (loc, inner, size-> int::usize (loc, len), isMutable-> true);
+        let slcType = SliceType::new (loc, inner, isMutable-> true);
+
+        AliaserValue::new (
+            loc,
+            slcType,
+            StringValue::new (loc, arrType, c8Val-> [], c32Val-> res[], len)) 
+
+    }
+
+    /**
+     * Concatenate two arrays
+     * @params: 
+     *   - loc: the location of the operation
+     *   - type: the type of the result
+     *   - left: the left operand
+     *   - right: the right operand
+     * @returns: the result 
+     */
+    def concatArrays (self, loc : &Word, type : &Type, left : &LiteralValue, right : &LiteralValue)-> &Value {
+        loc;
+        type;
+        left;
+        right;
+        __pragma!panic ();
+    }
+
+    /**
+     * ================================================================================
+     * ================================================================================
+     * =========================          COMPARISON          =========================
+     * ================================================================================
+     * ================================================================================
+     */
+
+    /**
+     * Compute the value of a slice comparison
+     * @params: 
+     *   - value: the value to execute a cte
+     * @returns: the result value
+     * @throws: 
+     *  - &ErrorMsg: if the value cannot be known at compilation time
+     */
+    def computeSliceCompare (self, value : &SliceCompareValue)-> &Value
+        throws &ErrorMsg
+    {
+        let left = match self.compute (value.getLeft ()) {
+            al : &AliaserValue => { al.getInnerValue () }
+            l : _ => { l }
+        };
+
+        let right = match self.compute (value.getRight ()) {
+            al : &AliaserValue => { al.getInnerValue () }
+            r : _ => { r }
+        };
+
+        let res = match (left, right) {
+            (l : &StringValue, r : &StringValue) => {
+                self.compareStrings (value.getLoc (), value.getType (), l, r)
+            }
+            // (l : &LiteralValue, r : &LiteralValue) => {
+            //     self.concatArrays (value.getLoc (), value.getType (), l, r)
+            // }
+            _ => {
+                throw ErrorMsg::fatal (value.getLoc (), format (ValidateErrorMessage::UNKNOWN_AT_COMPILE_TIME, value.getType ()));
+            }            
+        }
+
+        res
+    }
+
+    /**
+     * Comparison of two string values
+     * @params: 
+     *  - loc: the location of the operation
+     *  - type: the type of the operation
+     *  - left: the left operand of the concat
+     *  - right: the right operand of the concat
+     * @returns: a bool value
+     */
+    def compareStrings (self, loc : &Word, type : &Type, left : &StringValue, right : &StringValue)-> &Value {
+        match type {
+            s : &SliceType => {
+                match s.getInners ()[0] {
+                    c : &CharType => {
+                        if (c.getSize () == 8u16) {
+                            return self.compareUtf8 (loc, left, right);
+                        } else {
+                            return self.compareUtf32 (loc, left, right);
+                        }
+                    }
+                }
+            }
+        }
+
+        __pragma!panic ();
+    }
+
+    /**
+     * Compare two strings in utf-8 format
+     * @params: 
+     *   - loc: the location of the operation
+     *   - left: the left operand
+     *   - right: the right operand
+     * @returns: a bool value
+     */
+    def compareUtf8 (self, loc : &Word, left : &StringValue, right : &StringValue)-> &Value {
+        let l_u8 = left.getUtf32 ();
+        let r_u8 = right.getUtf32 ();
+
+        let mut res = true;
+        if (left.getLen () != right.getLen ()) res = false;
+        else {
+            for i in 0us .. left.getLen () {
+                if (r_u8[i] != l_u8 [i]) {
+                    res = false;
+                    break {}
+                }
+            }
+        }
+
+        BoolValue::new (loc, res)
+    }
+
+    /**
+     * Compare two strings in utf-32 format
+     * @params: 
+     *   - loc: the location of the operation
+     *   - left: the left operand
+     *   - right: the right operand
+     * @returns: a bool value
+     */
+    def compareUtf32 (self, loc : &Word, left : &StringValue, right : &StringValue)-> &Value {
+        let l_u32 = left.getUtf32 ();
+        let r_u32 = right.getUtf32 ();
+
+        let mut res = true;
+        if (left.getLen () != right.getLen ()) res = false;
+        else {
+            for i in 0us .. left.getLen () {
+                if (r_u32[i] != l_u32 [i]) {
+                    res = false;
+                    break {}
+                }
+            }
+        }
+
+        BoolValue::new (loc, res)
+    }
+
+    /**
+     * Compare two arrays
+     * @params: 
+     *   - loc: the location of the operation
+     *   - type: the type of the result
+     *   - left: the left operand
+     *   - right: the right operand
+     * @returns: the result 
+     */
+    def compareArrays (self, loc : &Word, type : &Type, left : &LiteralValue, right : &LiteralValue)-> &Value {
+        loc;
+        type;
+        left;
+        right;
+        __pragma!panic ();
+    }
+    
+    /**
+     * ================================================================================
+     * ================================================================================
+     * =========================            BINARY            =========================
+     * ================================================================================
+     * ================================================================================
+     */
+
+    /**
+     * Compute the value of a binary operation
+     * @params: 
+     *   - bin: the value to compute
+     * @returns: the result
+     * @throws:
+     *   - &ErrorMsg: if the value cannot be known at compile time
+     */
+    def computeBinary (self, bin : &BinaryOperatorValue)-> &Value
+        throws &ErrorMsg
+    {
+        bin;
+        __pragma!fake_throw (&ErrorMsg);
+        __pragma!panic ();
+    }
+
+    
+    /**
+     * ================================================================================
+     * ================================================================================
+     * =========================            UNARY             =========================
+     * ================================================================================
+     * ================================================================================
+     */
+
+    /**
+     * Compute the value of a unary operation
+     * @params: 
+     *   - un: the value to compute
+     * @returns: the result
+     * @throws:
+     *   - &ErrorMsg: if the value cannot be known at compile time
+     */
+    def computeUnary (self, un : &UnaryOperatorValue)-> &Value
+        throws &ErrorMsg
+    {
+        un;
+        __pragma!fake_throw (&ErrorMsg);
+        __pragma!panic ();
+    }
+    
+    /**
+     * ================================================================================
+     * ================================================================================
+     * =========================         SLICE ACCESS         =========================
+     * ================================================================================
+     * ================================================================================
+     */
+
+    /**
+     * Compute a slice access value
+     * @params: 
+     *   - slc: the value to compute
+     * @returns: the result
+     * @throws:
+     *    - &ErrorMsg: if the value cannot be known at compile time
+     */
+    def computeSliceAccess (self, slc : &SliceAccessValue)-> &Value
+        throws &ErrorMsg
+    {
+        slc;
+        __pragma!fake_throw (&ErrorMsg);
+        __pragma!panic ();
+    }
+
+    /**
+     * ================================================================================
+     * ================================================================================
+     * =========================      CONDITION / LOOPS       =========================
+     * ================================================================================
+     * ================================================================================
+     */
+
+    /**
+     * Compute a conditional value
+     * @params:
+     *   - cd: the value to compute
+     * @returns: the result
+     * @throws:
+     *    - &ErrorMsg: if the value cannot be known at compile time
+     */
+    def computeConditional (self, cd : &ConditionalValue)-> &Value
+        throws &ErrorMsg
+    {
+        cd;
+        __pragma!fake_throw (&ErrorMsg);
+        __pragma!panic ();
+    }
+    
+    /**
+     * Compute a block value
+     * @params:
+     *   - bl: the block value to compute
+     * @returns: the result
+     * @throws:
+     *    - &ErrorMsg: if the value cannot be known at compile time
+     */
+    def computeBlock (self, bl : &BlockValue)-> &Value 
+        throws &ErrorMsg
+    {
+        bl;
+        __pragma!fake_throw (&ErrorMsg);
+        __pragma!panic ();
+    }
+
+    /**
+     * ================================================================================
+     * ================================================================================
+     * =========================             VARS             =========================
+     * ================================================================================
+     * ================================================================================
+     */
+
+    /**
+     * Compute a var ref value
+     * @params:
+     *   - bl: the value to compute
+     * @returns: the result
+     * @throws:
+     *    - &ErrorMsg: if the value cannot be known at compile time
+     */
+    def computeVarRef (self, vref : &VarRefValue)-> &Value 
+        throws &ErrorMsg
+    {
+        match vref.getValue () {
+            NoneValue () => {
+                throw ErrorMsg::fatal (vref.getLoc (), format (ValidateErrorMessage::UNKNOWN_AT_COMPILE_TIME, vref.getType ()));
+            }
+            c : _ => { self.compute (c) }
+        }
+    }
+
+    /**
+     * ================================================================================
+     * ================================================================================
+     * =========================         MISC VALUES          =========================
+     * ================================================================================
+     * ================================================================================
+     */
+
+    /**
+     * Compute an address operator value
+     * @params:
+     *   - addr: the value to compute
+     * @returns: the result
+     * @throws:
+     *    - &ErrorMsg: if the value cannot be known at compile time
+     */
+    def computeAddress (self, addr : &AddressValue)-> &Value
+        throws &ErrorMsg
+    {
+        match (addr.getType (), addr.getInner ()) {
+            (FuncPtrType (), PrototypeValue ()) => { // Ok if this is an address to a function 
+                addr
+            }
+            _ => {
+                throw ErrorMsg::fatal (addr.getLoc (), format (ValidateErrorMessage::UNKNOWN_AT_COMPILE_TIME, addr.getType ()));
+            }
         }
     }
     
