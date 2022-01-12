@@ -1,0 +1,246 @@
+mod ymirc::semantic::validator::symbol::lambda;
+
+import ymirc::semantic::validator::visitor;
+import ymirc::semantic::validator::errors;
+import ymirc::syntax::declaration::protection;
+import ymirc::syntax::expression::_;
+import ymirc::syntax::declaration::_;
+
+import ymirc::syntax::keys;
+import ymirc::semantic::generator::_;
+import ymirc::errors::_;
+import ymirc::utils::format;
+import ymirc::lexing::word;
+
+import std::collection::vec;
+import std::collection::map;
+import std::io, std::fs::path;
+
+
+/**
+ * The lambda validator is the class responsible for lambda symbol validation
+ */
+pub class LambdaValidator {
+
+    /// The already validated lambdas
+    let dmut _validated = HashMap!{[c8], &Value}::new ();
+
+    /// The index of the lambdas
+    let mut _index = 0u32;
+    
+    /**
+     * Create a new empty validator
+     */
+    pub self () {}
+
+    /**
+     * Validate an lambda symbol
+     * @params: 
+     *    - context: the context of the validation
+     *    - sym: the symbol to validate
+     * @returns: the value of the lambda
+     * @throws: &ErrorMsg, if the lambda is malformed
+     */
+    pub def validate (mut self, dmut context : &Validator, sym : &LambdaValueExpr)-> &Value
+        throws &ErrorMsg
+    {
+        let name = format ("_%_%", sym.getLoc ().line (), sym.getLoc ().col ());
+        let frameName = context:.getReferent ().getPath ().push (name);
+        match self._validated.find (frameName.toStr (sep-> "::"s8)) {
+            Ok (x : &Value) => return x;
+        };
+        
+        // We start by validating the prototype of the lambda
+        // Unlike function prototype it can be uncomplete (missing some var decl type)
+        let (paramVars, paramTypes, retType, complete) = self.validateLambdaPrototype (alias context, sym.getFunctionProtoDecl ());
+
+        // Each lambda has a uniq index, to be identified for closure in addition to there name
+        self._index += 1u32;
+        let proto = LambdaValue::new (sym.getLoc (), LambdaType::new (sym.getLoc ()),
+                                           frameName.toStr (sep-> "::"s8),
+                                           paramVars,
+                                           retType,
+                                           sym.getValue (),
+                                           sym.isClosure (),
+                                           self._index);
+        
+        if (!complete) { // Missing some types
+            proto
+        } else { // Have all the type we can validate it as a function
+            self.validateLambdaBody (alias context, proto, paramTypes)
+        }
+    }
+
+    /**
+     * Validate the prototype of a lambda expression
+     * @params: 
+     *   - context: the context of the validation
+     *   - proto: the prototype of the lambda expression
+     * @returns:
+     *    - .0: the list of parameters of the lambda (ParamVar)
+     *    - .1: the list of the types of the parameters (might be full of NoneType, if the lambda is not complete)
+     *    - .2: the return type of the lambda (NoneType is possible even if the lambda is complete)
+     *    - .3: true iif the lambda is complete and that the body can be validated
+     * @throws: &ErrorMsg: if the lambda is malformed
+     */
+    def validateLambdaPrototype (self, dmut context : &Validator, proto : &FunctionProtoDecl)-> ([&Value], [&Type], &Type, bool)
+        throws &ErrorMsg
+    {
+        let dmut errors = Vec!{&ErrorMsg}::new ();
+        let mut uncomplete = false;
+        let dmut parameters = Vec!{&Value}::new ();
+        let dmut types = Vec!{&Type}::new ();        
+        
+        context:.enterForeign (); // Enter a foreign because we don't want to pollute the current function scope
+        context:.enterBlock (); 
+        for param in proto.getParameters () {   
+            {
+                match param {
+                    v : &VarDeclExpr => { 
+                        let type = if (v.getType ().isOf!{&EmptyExpression} ()) { // If no type has been given in the definition of the lambda, then it is validated by calling it
+                            uncomplete = true;
+                            cast!{&Type} (NoneType::new (v.getLoc ()))
+                        } else {
+                            self.validateTypeParam (alias context, v) // Otherwise we can already make some validation
+                        }
+
+                        let paramGen = ProtoVarValue::new (v.getLoc (), type, NoneValue::new (), type.isMutable (), isSelf-> false);
+                        parameters:.push (paramGen);
+                        types:.push (type);
+                        
+                        if (param.getLoc ().str () != Keys::UNDER) {
+                            context:.verifyShadow (paramGen.getLoc ());
+                            context:.insertLocal (paramGen.getLoc ().str (), paramGen);
+                        }                        
+                    }
+                    _ => __pragma!panic (); // There is only VarDeclExpr in lambda prototypes
+                }
+            } catch {
+                err : &ErrorMsg => errors:.push (err);
+            }
+        }
+
+        if (errors.len () != 0us) throw ErrorMsg::list (errors[]);
+
+        let r : &Type = match proto.getRetType () {
+            e : &EmptyExpression => { 
+                cast!{&Type} (NoneType::new (e.getLoc ())) // If no type is given as return type, it will take the type of the body (unlike normal function definition)
+            }
+            x : _ => { context:.validateType (x) }
+        };
+
+        return (parameters [], types[], r, uncomplete);
+    } exit {
+        context:.quitBlock (warnUnused-> false);
+        context:.exitForeign (); // Of course we exit the foreign a get back to the parent function definition
+    }
+
+
+    /**
+     * Validate the type composant of a VarDeclExpr assuming it is not an EmptyExpression
+     * @params: 
+     *   - context: the context of the validation
+     *   - v: the var decl whose type we have to validate
+     * @returns: the type of the vardecl with correct mutable level
+     * @throws: 
+     *  - &ErrorMsg: if the type is not valid
+     */
+    def validateTypeParam (self, dmut context : &Validator, vdecl : &VarDeclExpr)-> &Type
+        throws &ErrorMsg
+    {
+        let type : &Type = {
+            context:.validateType (vdecl.getType (), decos-> vdecl.getDecos ())
+        } catch {
+            err : &ErrorMsg => throw ErrorMsg::note (vdecl.getLoc (), ValidateErrorMessage::VALIDATING, notes-> [err]);
+        }                
+        
+        if (type.isMutable () && !type.needExplicitAlias ()) { // Verification that the value is mutable iif it is aliasable
+            throw ErrorMsg::fatal (vdecl.getLoc (), ValidateErrorMessage::MUTABLE_CONST_PARAM);
+        }
+
+        match type { // Verification that the type of the var decl is usable
+            VoidType () => throw ErrorMsg::fatal (vdecl.getLoc (), format (ValidateErrorMessage::DECLARE_VOID_VAR, type));
+            NoneType () => throw ErrorMsg::fatal (vdecl.getLoc (), format (ValidateErrorMessage::DECLARE_VOID_VAR, type));
+            TemporaryType () => throw ErrorMsg::fatal (vdecl.getLoc (), format (ValidateErrorMessage::INCOMPLETE_TYPE, type));
+        }
+        
+        type
+    }
+    
+
+    /**
+     * Validate the body of a lambda expression, assuming that the lambda is complete
+     * @params: 
+     *    - context: the context of the validation
+     *    - proto: the prototype of the lambda to validate
+     *    - paramTypes: the type of the parameters of the lambda
+     * @throws: &ErrorMsg: if the lambda is malformed
+     */
+    pub def validateLambdaBody (self, dmut context : &Validator, lmbd : &LambdaValue, paramTypes : [&Type])-> &Value
+        throws &ErrorMsg        
+    {
+        context:.enterForeign (); // Enter a foreign because we don't want to pollute the current function scope
+        context:.enterBlock ();
+
+        // Validate the parameters with the correct types
+        // insert them in context, and set the return type of the lambda
+        let _ = self.validateFinalParameters (alias context, lmbd, paramTypes);
+        //let body = self.validateBody (alias context, lmbd, params, retType);
+        __pragma!panic ();
+        
+    } exit {
+        context:.quitBlock ();
+        context:.exitForeign (); // Of course we exit the foreign a get back to the parent function definition
+    }
+
+
+    /**
+     * Validate the uncomplete parameters of the lambda, with the given paramTypes
+     * @warning: complete var decl must have the same types as the corresponding paramTypes
+     * @info: update the context by inserting param var decl in the current scope and setting current return type of function
+     * @assume: a new foreign is entered, and there is at least on scope to fill
+     * @params: 
+     *   - context: the context of the validation
+     *   - proto: the proto lambda to validate
+     *   - paramTypes: the types of the var decls 
+     * @returns: the list of parameters
+     * @throws: 
+     *   - &ErrorMsg: if there is a incompatibility between paramTypes and proto
+     */
+    def validateFinalParameters (self, dmut context : &Validator, proto : &LambdaValue, paramTypes : [&Type])-> [&Value]
+        throws &ErrorMsg
+    {
+
+        let dmut parameters = Vec!{&Value}::new ();
+        let dmut errors = Vec!{&ErrorMsg}::new ();
+        
+        for i, param in proto.getParameters () {
+            {
+                match param {
+                    v : &ProtoVarValue => {
+                        if (!v.getType ().isOf!{&NoneType} ()) {
+                            context:.verifyCompatibleType (v.getLoc (), paramTypes[i].getLoc (), v.getType (), paramTypes[i]);
+                        }
+
+                        let vVal = ProtoVarValue::new (v.getLoc (), paramTypes [i], NoneValue::new (v.getLoc ()), paramTypes [i].isMutable (), isSelf-> false);
+                        parameters:.push (vVal);
+                        if (v.getLoc ().str () != Keys::UNDER) {
+                            // Useless ? Is there a way for the var to avoid the shadowing verif made by the lambda validation ?
+                            context:.verifyShadow (v.getLoc ()); 
+                            context:.insertLocal (v.getLoc ().str (), vVal);
+                        }                    
+                    }
+                }
+            } catch {
+                err : &ErrorMsg => errors:.push (err);
+            }
+        }
+
+        if (errors.len () != 0us) throw ErrorMsg::list (errors[]);
+        context:.setFunctionReturn (proto.getRetType ());
+
+
+        parameters[]
+    }
+    
+}
