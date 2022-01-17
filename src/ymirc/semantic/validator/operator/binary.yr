@@ -12,18 +12,20 @@ import ymirc::lexing::word;
 import ymirc::syntax::keys;
 
 import std::algorithm::comparison;
+import std::collection::vec;
 import std::io;
 
 pub enum 
-| MATH = 2u32
+| MATH = 1u32
+| BINARY = 2u32
 | LOGICAL = 3u32
-| RANGE = 7u32
-| POINTER = 4u32
-| SET = 3u32
-| TYPE = 5u32
+| RANGE = 4u32
+| POINTER = 5u32
+| SET = 6u32
+| TYPE = 7u32
 | FIELD = 8u32
 | MODULE = 9u32
-| NONE = 1u32
+| NONE = 10u32
  -> OperatorType;
 
 /**
@@ -53,6 +55,9 @@ pub class BinaryOpValidator {
         match (type, isAff) {
             (OperatorType::MATH, false) => { 
                 return self.validateMathOperation (alias context, op, bin);
+            }
+            (OperatorType::BINARY, false) => { // |, &, ^, <<, >>, applicable only on ints
+                return self.validateBinaryLevelOperation (alias context, op, bin);
             }
             (OperatorType::LOGICAL, false) => { // all boolean operators, cannot be an affectation
                 return self.validateLogicalOperation (alias context, op, bin);
@@ -107,13 +112,33 @@ pub class BinaryOpValidator {
     {
         let left = context:.validateValue (bin.getLeft ());
         let right = context:.validateValue (bin.getRight ());
-        match left.getType () {
-            IntType () => return self.validateIntMathOp (alias context, bin.getLoc (), op, left, right);
-            CharType () => return self.validateCharMathOp (alias context, bin.getLoc (), op, left, right);
-            FloatType () => return self.validateFloatMathOp (alias context, bin.getLoc (), op, left, right);
-        };
+        
+        let dmut errors = Vec!{&ErrorMsg}::new ();        
+        {
+            match left.getType () { // First we try the operation as a left side operation (asking for left operand to be the master of the operation, i.e. left.opBinary!{op} (right)
+                IntType () => return self.validateIntMathOp (alias context, bin.getLoc (), op, left, right);
+                CharType () => return self.validateCharMathOp (alias context, bin.getLoc (), op, left, right);
+                FloatType () => return self.validateFloatMathOp (alias context, bin.getLoc (), op, left, right);
+                PointerType () => return self.validatePointerMathOp (alias context, bin.getLoc (), op, left, right);
+                StructType () => return self.validateStructOpLeft (alias context, bin.getLoc (), op, left, right);
+                ClassPtrType () => return self.validateClassOpLeft (alias context, bin.getLoc (), op, left, right);
+            };
+            
+            errors:.push (ErrorMsg::fatal (bin.getLoc (), format (ValidateErrorMessage::UNDEFINED_BIN_OP, op, left.getType (), right.getType ())));
+        } catch {
+            err : &ErrorMsg => { errors:.push (err); }
+        } 
 
-        __pragma!panic ();
+        { // if we are here the validation as a left operand validation failed, so we need to try it as a right operation (right.opBinaryRight!{op} (left))
+            match right.getType () { // it is working only for two kind of type structs and classes
+                StructType () => return self.validateStructOpRight (alias context, bin.getLoc (), op, left, right);
+                ClassPtrType () => return self.validateClassOpRight (alias context, bin.getLoc (), op, left, right);
+            } // We can quit without testing the other types, there is already an error in the errors vec
+        } catch {
+            err : &ErrorMsg => { errors:.push (err); } // No we still fail
+        }
+
+        throw ErrorMsg::list (errors[]); // there is no valid math operation for left and right
     }
 
 
@@ -138,7 +163,7 @@ pub class BinaryOpValidator {
                         if (li.isSigned () == ri.isSigned ()) {
                             let maxSize = comparison::max (li.getSize (), ri.getSize ());
                             let type = IntType::new (loc, signed-> li.isSigned (), size-> maxSize);
-                            return BinaryOperatorValue::new (loc, type, op, left, right);
+                            return BinaryIntOperatorValue::new (loc, type, op, left, right);
                         } else {
                             throw ErrorMsg::fatal (loc, format (ValidateErrorMessage::UNDEFINED_BIN_OP, op, left.getType (), right.getType ()));
                         }
@@ -176,7 +201,7 @@ pub class BinaryOpValidator {
                     rc : &CharType => {
                         if (lc.getSize () == rc.getSize ()) {
                             let type = CharType::new (loc, size-> lc.getSize ());
-                            return BinaryOperatorValue::new (loc, type, op, left, right);
+                            return BinaryCharOperatorValue::new (loc, type, op, left, right);
                         } else {
                             throw ErrorMsg::fatal (loc, format (ValidateErrorMessage::UNDEFINED_BIN_OP, op, left.getType (), right.getType ()));
                         }
@@ -204,14 +229,14 @@ pub class BinaryOpValidator {
      */
     def validateFloatMathOp (self, dmut _ : &Validator, loc : &Word, op : BinaryOperators, left : &Value, right : &Value)-> &Value
         throws &ErrorMsg
-    {
+    {        
         match left.getType () {
             lf : &FloatType => {
                 match right.getType () {
                     rf : &FloatType => {
                         let maxSize = comparison::max (lf.getSize (), rf.getSize ());
                         let type = FloatType::new (loc, size-> maxSize);
-                        return BinaryOperatorValue::new (loc, type, op, left, right);
+                        return BinaryFloatOperatorValue::new (loc, type, op, left, right);
                     }
                     _ => {
                         throw ErrorMsg::fatal (loc, format (ValidateErrorMessage::UNDEFINED_BIN_OP, op, left.getType (), right.getType ()));
@@ -221,6 +246,76 @@ pub class BinaryOpValidator {
             _ => __pragma!panic ();   
         }
     }
+
+        /**
+     * Validate a math operation where the left operand is a pointer type operand
+     * @params: 
+     *   - _: the context of the validation
+     *   - op: the operator
+     *   - left: the left operand (assumed of type pointer)
+     *   - right: the right operand
+     * @returns: The result value
+     * @throws: 
+     *   - &ErrorMsg: if the operation is not valid
+     */
+    def validatePointerMathOp (self, dmut _ : &Validator, loc : &Word, op : BinaryOperators, left : &Value, right : &Value)-> &Value
+        throws &ErrorMsg
+    {
+        if (op != BinaryOperators::PLUS && op != BinaryOperators::MINUS) {
+            throw ErrorMsg::fatal (loc, format (ValidateErrorMessage::UNDEFINED_BIN_OP, op, left.getType (), right.getType ()));
+        }
+        
+        match left.getType () {
+            lp : &PointerType => {
+                match right.getType () {
+                    ri : &IntType => {
+                        if (!ri.isSigned ()) {                            
+                            return BinaryPointerOperatorValue::new (loc, lp, op, left, right);
+                        }
+                    }
+                    rp : &PointerType => {
+                        if (rp.getInners ()[0] == lp.getInners ()[0] || rp.getInners ()[0].isOf!{&VoidType} ()) {
+                            return BinaryPointerOperatorValue::new (loc, lp, op, left, right);
+                        }
+                    }
+                }
+            }
+            _ => __pragma!panic ();
+        }
+        
+        throw ErrorMsg::fatal (loc, format (ValidateErrorMessage::UNDEFINED_BIN_OP, op, left.getType (), right.getType ()));
+    }
+
+
+    /**
+     * ================================================================================
+     * ================================================================================
+     * =========================            BINARY            =========================
+     * ================================================================================
+     * ================================================================================
+     */
+
+
+    /**
+     * Validate a binary operation involving binary level operators (|, &, <<, etc.)
+     * @params: 
+     *   - context: the context of the validation
+     *   - op: the operator (assuming it's a logical operator)
+     *   - bin: the binary expression to validate
+     * @returns: the validated value
+     * @throws:
+     *   - &ErrorMsg: if the operation is not valid
+     */
+    def validateBinaryLevelOperation (self, dmut context : &Validator, op : BinaryOperators, bin : &BinaryExpr)-> &Value
+        throws &ErrorMsg
+    {
+        context;
+        op;
+        bin;
+        __pragma!fake_throw (&ErrorMsg);
+        __pragma!panic ();
+    }
+
     
     /**
      * ================================================================================
@@ -457,6 +552,113 @@ pub class BinaryOpValidator {
         __pragma!panic ();
     }
 
+
+    /**
+     * ================================================================================
+     * ================================================================================
+     * =========================       STRUCT / CLASS         =========================
+     * ================================================================================
+     * ================================================================================
+     */
+
+    /**
+     * Validate a binary operator (math, set, range or binary) assuming that the left operand is a struct
+     * @params: 
+     *   - context: the context of the validation
+     *   - loc: the location of the operation
+     *   - op: the operator
+     *   - left: the left operand (assumed to be a struct type operand)
+     *   - right: the right operand
+     * @returns: the result value (generally a call value)
+     * @throws: 
+     *   - &ErrorMsg: if the operation is invalid
+     */
+    def validateStructOpLeft (self, dmut context : &Validator, loc : &Word, op : BinaryOperators, left : &Value, right : &Value)-> &Value
+        throws &ErrorMsg
+    {
+        context;
+        loc;
+        op;
+        left;
+        right;
+        __pragma!fake_throw (&ErrorMsg);
+        __pragma!panic ();
+    }
+
+    /**
+     * Validate a binary operator (math, set, range or binary) assuming that the right operand is a struct
+     * @params: 
+     *   - context: the context of the validation
+     *   - loc: the location of the operation
+     *   - op: the operator
+     *   - left: the left operand 
+     *   - right: the right operand (assumed to be a struct type operand)
+     * @returns: the result value (generally a call value)
+     * @throws: 
+     *   - &ErrorMsg: if the operation is invalid
+     */    
+    def validateStructOpRight (self, dmut context : &Validator, loc : &Word, op : BinaryOperators, left : &Value, right : &Value)-> &Value
+        throws &ErrorMsg
+    {
+        context;
+        loc;
+        op;
+        left;
+        right;
+        __pragma!fake_throw (&ErrorMsg);
+        __pragma!panic ();
+    }
+
+        /**
+     * Validate a binary operator (math, set, range or binary) assuming that the left operand is a class ptr
+     * @params: 
+     *   - context: the context of the validation
+     *   - loc: the location of the operation
+     *   - op: the operator
+     *   - left: the left operand (assumed to be a class ptr type operand)
+     *   - right: the right operand
+     * @returns: the result value (generally a call value)
+     * @throws: 
+     *   - &ErrorMsg: if the operation is invalid
+     */
+    def validateClassOpLeft (self, dmut context : &Validator, loc : &Word, op : BinaryOperators, left : &Value, right : &Value)-> &Value
+        throws &ErrorMsg
+    {
+        context;
+        loc;
+        op;
+        left;
+        right;
+        __pragma!fake_throw (&ErrorMsg);
+        __pragma!panic ();
+    }
+
+    /**
+     * Validate a binary operator (math, set, range or binary) assuming that the right operand is a class ptr
+     * @params: 
+     *   - context: the context of the validation
+     *   - loc: the location of the operation
+     *   - op: the operator
+     *   - left: the left operand 
+     *   - right: the right operand (assumed to be a class ptr type operand)
+     * @returns: the result value (generally a call value)
+     * @throws: 
+     *   - &ErrorMsg: if the operation is invalid
+     */    
+    def validateClassOpRight (self, dmut context : &Validator, loc : &Word, op : BinaryOperators, left : &Value, right : &Value)-> &Value
+        throws &ErrorMsg
+    {
+        context;
+        loc;
+        op;
+        left;
+        right;
+        __pragma!fake_throw (&ErrorMsg);
+        __pragma!panic ();
+    }
+
+
+
     
     /**
      * ================================================================================
@@ -487,8 +689,8 @@ pub class BinaryOpValidator {
             BinaryOperators::STAR_AFF => { (BinaryOperators::STAR, true, OperatorType::MATH) }
             BinaryOperators::TILDE_AFF => { (BinaryOperators::TILDE, true, OperatorType::SET) }
             BinaryOperators::PERCENT_AFF => { (BinaryOperators::PERCENT, true, OperatorType::MATH) }
-            BinaryOperators::LEFTD_AFF => { (BinaryOperators::LEFTD, true, OperatorType::MATH) }
-            BinaryOperators::RIGHTD_AFF => { (BinaryOperators::RIGHTD, true, OperatorType::MATH) }
+            BinaryOperators::LEFTD_AFF => { (BinaryOperators::LEFTD, true, OperatorType::BINARY) }
+            BinaryOperators::RIGHTD_AFF => { (BinaryOperators::RIGHTD, true, OperatorType::BINARY) }
             
             BinaryOperators::DPIPE => { (BinaryOperators::DPIPE, false, OperatorType::LOGICAL) }
             BinaryOperators::DAND => { (BinaryOperators::DAND, false, OperatorType::LOGICAL) }
@@ -509,11 +711,11 @@ pub class BinaryOpValidator {
             BinaryOperators::TDOT => { (BinaryOperators::TDOT, false, OperatorType::RANGE) }
             BinaryOperators::DDOT => { (BinaryOperators::DDOT, false, OperatorType::RANGE) }
             
-            BinaryOperators::LEFTD => { (BinaryOperators::LEFTD, false, OperatorType::MATH) }
-            BinaryOperators::RIGHTD => { (BinaryOperators::RIGHTD, false, OperatorType::MATH) }
-            BinaryOperators::PIPE => { (BinaryOperators::PIPE, false, OperatorType::MATH) }  
-            BinaryOperators::XOR => { (BinaryOperators::XOR, false, OperatorType::MATH) } 
-            BinaryOperators::AND => { (BinaryOperators::AND, false, OperatorType::MATH) }
+            BinaryOperators::LEFTD => { (BinaryOperators::LEFTD, false, OperatorType::BINARY) }
+            BinaryOperators::RIGHTD => { (BinaryOperators::RIGHTD, false, OperatorType::BINARY) }
+            BinaryOperators::PIPE => { (BinaryOperators::PIPE, false, OperatorType::BINARY) }  
+            BinaryOperators::XOR => { (BinaryOperators::XOR, false, OperatorType::BINARY) } 
+            BinaryOperators::AND => { (BinaryOperators::AND, false, OperatorType::BINARY) }
             
             BinaryOperators::PLUS => { (BinaryOperators::PLUS, false, OperatorType::MATH) }
             BinaryOperators::TILDE => { (BinaryOperators::TILDE, false, OperatorType::SET) }
