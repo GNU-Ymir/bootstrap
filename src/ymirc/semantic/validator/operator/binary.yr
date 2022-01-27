@@ -86,7 +86,7 @@ pub class BinaryOpValidator {
                 return self.validateFieldOperation (alias context, op, bin);
             }
             (OperatorType::MODULE, false) => { // ::, cannot be an affectation                
-                __pragma!panic ();
+                return self.validateModuleOperation (alias context, op, bin);
             }
             (_, true) => { // =, +=, -=, ~=, etc., affectation operators
                 return self.validateAffectOperation (alias context, op, bin);
@@ -221,8 +221,14 @@ pub class BinaryOpValidator {
                                               syntVar,
                                               [leftSynt, rightSynt], canBeDotCall-> false);
 
-        // Validate the final rewritten value
-        context:.validateValue (syntCall)
+        {
+            // Validate the final rewritten value
+            return context:.validateValue (syntCall);
+        } catch {
+            err : &ErrorMsg => {
+                throw ErrorMsg::note (loc, ValidateErrorMessage::VALIDATING, notes-> [err]);
+            }
+        }
     }
     
     /**
@@ -646,21 +652,27 @@ pub class BinaryOpValidator {
         let syntCall = MultOperatorExpr::new (Word::new (Tokens::LPAR, loc), Word::new (Tokens::RPAR, loc),
                                               syntVar,
                                               [leftSynt, rightSynt], canBeDotCall-> false);
+        {            
+            // Validate the value to get the return type
+            let valueCall = context:.validateValue (syntCall);
 
-        // Validate the value to get the return type
-        let valueCall = context:.validateValue (syntCall);
+            // Cast the value 0 to the type of the return type of the core function (it can change from one implementation to another and does not really have an impact)
+            // The only thing that is necessary is that it returns a signed int value no matter the size
+            let syntCast = CastExpr::new (loc,
+                                          TypeWrapperExpr::new (loc, valueCall.getType ()),
+                                          ValueWrapperExpr::new (loc, usize (loc, 0us)));
 
-        // Cast the value 0 to the type of the return type of the core function (it can change from one implementation to another and does not really have an impact)
-        // The only thing that is necessary is that it returns a signed int value no matter the size
-        let syntCast = CastExpr::new (loc,
-                                      TypeWrapperExpr::new (loc, valueCall.getType ()),
-                                      ValueWrapperExpr::new (loc, usize (loc, 0us)));
+            // Compare the value of the call to 0 using the operator provided by the source code ('op')
+            let syntTest = BinaryExpr::new (Word::new (op, loc), ValueWrapperExpr::new (loc, valueCall), syntCast);
 
-        // Compare the value of the call to 0 using the operator provided by the source code ('op')
-        let syntTest = BinaryExpr::new (Word::new (op, loc), ValueWrapperExpr::new (loc, valueCall), syntCast);
-
-        // Validate the final rewritten value
-        context:.validateValue (syntTest)
+            
+            // Validate the final rewritten value
+            context:.validateValue (syntTest)
+        } catch {
+            err : &ErrorMsg => {
+                throw ErrorMsg::note (loc, ValidateErrorMessage::VALIDATING, notes-> [err]);
+            }
+        }
     }
 
     /**
@@ -695,13 +707,19 @@ pub class BinaryOpValidator {
                                               syntVar,
                                               [leftSynt, rightSynt], canBeDotCall-> false);
 
-        // Validate the value to get the return type
-        let valueCall = context:.validateValue (syntCall);
-        if (op == BinaryOperators::NOT_EQUAL) { // We need to inverse the equality, the operator returns '=='
-            let syntTest = UnaryExpr::new (Word::new (UnaryOperators::NOT, loc), ValueWrapperExpr::new (loc, valueCall));
-            context:.validateValue (syntTest)
-        } else {
-            valueCall
+        {
+            // Validate the value to get the return type
+            let valueCall = context:.validateValue (syntCall);        
+            if (op == BinaryOperators::NOT_EQUAL) { // We need to inverse the equality, the operator returns '=='
+                let syntTest = UnaryExpr::new (Word::new (UnaryOperators::NOT, loc), ValueWrapperExpr::new (loc, valueCall));
+                context:.validateValue (syntTest)
+            } else {
+                valueCall
+            }
+        } catch {
+            err : &ErrorMsg => {
+                throw ErrorMsg::note (loc, ValidateErrorMessage::VALIDATING, notes-> [err]);
+            }
         }
     }
     
@@ -1012,13 +1030,166 @@ pub class BinaryOpValidator {
     def validateSetOperation (self, dmut context : &Validator, op : BinaryOperators, bin : &BinaryExpr)-> &Value
         throws &ErrorMsg
     {
-        context;
-        op;
-        bin;
-        __pragma!fake_throw (&ErrorMsg);
-        __pragma!panic ();
+        if (op == BinaryOperators::NOT_IN || op == BinaryOperators::IN) {
+            return self.validateContainOperation (alias context, op, bin);
+        } else {
+            return self.validateConcatOperation (alias context, op, bin);
+        }
     }
 
+    /**
+     * Validate a contain operation (in or !in)
+     * @params: 
+     *   - context: the context of the validation
+     *   - op: the operator (assuming it's a set operator)
+     *   - bin: the binary expression to validate
+     * @returns: the validated value
+     * @throws:
+     *   - &ErrorMsg: if the operation is not valid
+     */
+    def validateContainOperation (self, dmut context : &Validator, op : BinaryOperators, bin : &BinaryExpr)-> &Value
+        throws &ErrorMsg
+    {
+        let right = context:.validateValue (bin.getRight ());
+        match right.getType () {
+            ClassPtrType () => { /// The contain operator is only applicable to class (maybe structures ? and slices ?)
+                let dotOp = BinaryExpr::new (Word::new (Tokens::DOT, bin.getLoc ()),
+                                             ValueWrapperExpr::new (right.getLoc (), right),
+                                             VarExpr::new (Word::new (CoreNames::CONTAIN_OP_OVERRIDE, bin.getLoc ())));
+
+                // The call is right.opContains (left)-> any, maybe check if it is really a bool ?
+                let mut callOp : &Expression = MultOperatorExpr::new (Word::new (Tokens::LPAR, bin.getLoc ()),
+                                                                      Word::new (Tokens::RPAR, bin.getLoc ()),
+                                                                      dotOp,
+                                                                      [bin.getLeft ()], canBeDotCall-> false);
+                
+                if (op == BinaryOperators::NOT_IN) { // !in is rewritten into '!(right.opContains (left))'
+                    callOp = UnaryExpr::new (Word::new (UnaryOperators::NOT, bin.getLoc ()), callOp);
+                }
+
+                {
+                    return context:.validateValue (callOp);                    
+                } catch {
+                    err : &ErrorMsg => { // We add a note, because it can be a bit obscur why opContains is called
+                        throw ErrorMsg::note (bin.getLoc (), ValidateErrorMessage::VALIDATING, notes-> [err]);
+                    }
+                }                
+            }
+        }
+
+        let left = context:.validateValue (bin.getLeft ());
+        throw ErrorMsg::fatal (bin.getLoc (), format (ValidateErrorMessage::UNDEFINED_BIN_OP, op, left.getType (), right.getType ()));
+    }
+
+    /**
+     * Validate a concatenation operation (~)
+     * @params: 
+     *   - context: the context of the validation
+     *   - op: the operator (assuming it's a set operator)
+     *   - bin: the binary expression to validate
+     * @returns: the validated value
+     * @throws:
+     *   - &ErrorMsg: if the operation is not valid
+     */
+    def validateConcatOperation (self, dmut context : &Validator, op : BinaryOperators, bin : &BinaryExpr)-> &Value
+        throws &ErrorMsg
+    {
+        let mut left = context:.validateValue (bin.getLeft ());
+        let mut right = context:.validateValue (bin.getRight ());
+
+        // There are only three types that can make concatenation operations, 1) class, 2) slice and 3) arrays
+        if (left.getType ().isOf!{&ClassPtrType} () || right.getType ().isOf!{&ClassPtrType} ()) { // Class operation is completely different than slices and array
+            return self.validateClassConcatOperation (alias context, bin.getLoc (), op, left, right);
+        }
+
+        // But slice and array are exactly the same, but we first need to transform the arrays into slices
+        // The left element has to be a slice or an array
+        let leftSynt = match left.getType () {
+            SliceType () => { ValueWrapperExpr::new (left.getLoc (), left) }
+            ArrayType () => { IntrinsicExpr::new (left.getLoc (), IntrinsicKeys::ALIAS, ValueWrapperExpr::new (left.getLoc (), left)) }
+            _ => {
+                throw ErrorMsg::fatal (bin.getLoc (), format (ValidateErrorMessage::UNDEFINED_BIN_OP, op, left.getType (), right.getType ()));
+            }
+        };
+        
+        // The concatenation can be made only with an element of the same type, that is to say a slice or an array
+        let rightSynt = match right.getType () {
+            SliceType () => { ValueWrapperExpr::new (right.getLoc (), right) }
+            ArrayType () => { IntrinsicExpr::new (right.getLoc (), IntrinsicKeys::ALIAS, ValueWrapperExpr::new (right.getLoc (), right)) }
+            _ => {
+                throw ErrorMsg::fatal (bin.getLoc (), format (ValidateErrorMessage::UNDEFINED_BIN_OP, op, left.getType (), right.getType ()));
+            }
+        };
+
+        
+        left = context:.validateValue (leftSynt); // We revalidate the value to get an alias in case of array 
+        right = context:.validateValue (rightSynt); // Idem here
+
+        {
+            context:.verifyCompatibleType (left.getLoc (), right.getLoc (), left.getType (), right.getType ()); // Evidently the concat is made only with slices of the same kind            
+        } catch {
+            err : &ErrorMsg => {
+                throw ErrorMsg::note (bin.getLoc (), ValidateErrorMessage::VALIDATING, notes-> [err]);
+            }
+        }
+        
+        let llevel = left.getType ().mutabilityLevel (), rlevel = right.getType ().mutabilityLevel (); 
+
+        let retType = if (llevel < rlevel) { // the mutability of the result is the same mutability as the type with the lowest mutability level 
+            left.getType ()
+        } else {
+            right.getType ()
+        };
+        
+        SliceConcatValue::new (bin.getLoc (), retType, left, right)
+    }
+
+    /**
+     * Validate the concatenation assuming that left or right is class typed value
+     * @params: 
+     *   - context: the context of the validation
+     *   - op: the operator (assuming it's a set operator)
+     *   - bin: the binary expression to validate
+     * @returns: the validated value
+     * @throws:
+     *   - &ErrorMsg: if the operation is not valid
+     */
+    def validateClassConcatOperation (self, dmut context : &Validator, loc : &Word, op : BinaryOperators, left : &Value, right : &Value)-> &Value
+        throws &ErrorMsg
+    {
+        let dmut errors = Vec!{&ErrorMsg}::new ();
+        {
+            match left.getType () { // We first try to validate the operation as a left operation
+                ClassPtrType () => { 
+                    return self.validateClassOpLeft (alias context, loc, op, left, right);
+                }                
+            };
+
+            // Left operand is not a class, but we need at least one error to display if the right operand is not a class as well
+            errors:.push (ErrorMsg::fatal (loc, format (ValidateErrorMessage::UNDEFINED_BIN_OP, op, left.getType (), right.getType ())));
+        } catch {
+            err : &ErrorMsg => {
+                errors:.push (err);
+            }
+        }
+
+        {
+            match right.getType () { // Now we try to validate the operation as a right operation
+                ClassPtrType () => { 
+                    return self.validateClassOpRight (alias context, loc, op, left, right);
+                }
+            };
+            
+            // If the right operand is not a class we don't add any error because there is already an error for the 'as left' operation
+        } catch {
+            err : &ErrorMsg => {
+                errors:.push (err);
+            }
+        }
+
+        throw ErrorMsg::list (errors[]); // 'as Left' and 'as right' failed, no other choice than throwing the errors
+    }
+    
     
     /**
      * ================================================================================
@@ -1087,6 +1258,25 @@ pub class BinaryOpValidator {
      * ================================================================================
      */
 
+    /**
+     * Validate a binary operation involving a module operator
+     * @params: 
+     *   - context: the context of the validation
+     *   - bin: the binary expression to validate
+     * @returns: the validated value
+     * @throws:
+     *   - &ErrorMsg: if the operation is not valid
+     */
+    pub def validateModuleOperation (self, dmut context : &Validator, op : BinaryOperators, bin : &BinaryExpr)-> &Value 
+        throws &ErrorMsg
+    {
+        context;
+        op;
+        bin;
+        __pragma!fake_throw (&ErrorMsg);
+        __pragma!panic ();
+    }
+    
     /**
      * Validate a binary operation involving a module operator
      * @params: 
