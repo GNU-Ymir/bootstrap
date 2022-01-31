@@ -98,22 +98,25 @@ pub class ValueValidator {
 
         let (values, type, brLoc, rtLoc, _) = {
             context:.enterBlock ();
+            // A block can have local symbol definitions (such as import, struct, etc.), we need to validate them
             let dmut module = self.validateInnerModule (alias context, b.getModule (), alias errors);
+            
             let value = match module {                
-                EmptySymbol () => {
+                EmptySymbol () => { // No local symbol to access
                     self.validateInnerBlock (alias context, b.getExpressions (), alias errors)
                 }
-                _ => {
+                _ => { // There are some local symbols, we need to have access to them in the current block
                     context:.pushReferent (alias module);
                     self.validateInnerBlock (alias context, b.getExpressions (), alias errors)
                 } exit {
-                    context:.popReferent ();
+                    context:.popReferent (); // We go back to the previous symbol table, all local symbol are no longer accessible
                 }                
             }
             
             value
         } exit {
             {
+                // No need to warn unused if there were errors in the validation of the block (it will complicate the error handling)
                 context:.quitBlock (warnUnused-> errors.len () == 0us);
             } catch { err : &ErrorMsg => errors:.push (err); }
         }
@@ -148,16 +151,17 @@ pub class ValueValidator {
      */
     def validateInnerModule (self, dmut context : &Validator, m : &Declaration, dmut errors : &Vec!{&ErrorMsg})-> dmut &Symbol
     {
-        {
+        {   // We get the declarator of the context, maybe there are imports here, and maybe they are already imported, so we just have to make a reference
             let dmut modSym = context:.getDeclarator ():.declare (m);
-            context:.getReferent ():.insert (alias modSym);
+            context:.getReferent ():.insert (alias modSym); // We insert the module in the current symbol
             {
-                context:.enterForeign ();
-                context:.validate (alias modSym);            
+                context:.enterForeign (isFnBody-> false); // Enter a foreign, but this is not a function, we just want to avoid polluting the current context
+                context:.validate (alias modSym);  // Validation of the declared symbols 
             } exit {
                 context:.exitForeign ();
             }
-
+            
+            // Here we return a leaf that can be accessed only from the current block            
             return alias modSym;
         } catch {
             err : &ErrorMsg => {
@@ -181,36 +185,40 @@ pub class ValueValidator {
      *   - .4: the location of the last value
      */
     def validateInnerBlock (self, dmut context : &Validator, exprs : [&Expression], dmut errors : &Vec!{&ErrorMsg})-> ([&Value], &Type, &Word, &Word, &Word) {
-        let mut returner = false, mut breaker = false;
-        let mut rtLoc = EOF_WORD, mut brLoc = EOF_WORD, mut valueLoc = EOF_WORD;
-        let mut type : &Type = VoidType::new (EOF_WORD);
-        let dmut values = Vec!{&Value}::new ();
+        let mut returner = false, mut breaker = false; // Blocks can break loops or return functions
+        // A returned block is a block in which every path leads to a return statement, and a break statement is breaker
+        
+        let mut rtLoc = EOF_WORD, mut brLoc = EOF_WORD, mut valueLoc = EOF_WORD; // The location of the return, break, and value for error handling
+        let mut type : &Type = VoidType::new (EOF_WORD); // By default a block has no value, thus its type is void
+        let dmut values = Vec!{&Value}::new (); // List of values in the block
         for i in 0us .. exprs.len {
             {
+                // There is another expression to validate, but there is no way that the program arrives at that point (cf. breaker or returner)
                 if ((breaker || returner) && !exprs [i].isOf!{&UnitExpr}()) throw ErrorMsg::fatal (exprs [i].getLoc (), ValidateErrorMessage::UNREACHBLE_STATEMENT);
+                
                 let val = context:.validateValue (exprs [i]);
-                let isMutable = val.getType ().isMutable ();
+                let isMutable = val.getType ().isMutable (); 
                 if (val.isReturner ()) { returner = true; rtLoc = val.getReturnerLoc (); }
                 if (val.isBreaker ())  { breaker = true; rtLoc = val.getBreakerLoc (); }
                 
-                type = val.getType ().clone (isMutable-> isMutable);
-                valueLoc = val.getLoc ();
-                values:.push (val);
+                type = val.getType ().clone (isMutable-> isMutable); // We clone the type (why?)
+                valueLoc = val.getLoc (); // store the location of the value of the block (if it is the last value, it will be definitely stored)
+                values:.push (val);  // push the value in the list of value of the block
             } catch {
                 err : &ErrorMsg => { errors:.push (err); }
             }            
         }
 
-        match type {
-            VoidType () => {}
-            _ => {
+        match type { 
+            VoidType () => {} 
+            _ => { // Verify implicit aliases and stuff
                 context:.verifyMemoryOwner (valueLoc, type, values[][$ - 1us]);
             } catch {
                 err : &ErrorMsg => { errors:.push (err); }
             }
         }
-
-        (values[], type, rtLoc, brLoc, valueLoc)
+        
+        (values[], type, rtLoc, brLoc, valueLoc) 
     }
 
 
@@ -750,7 +758,7 @@ pub class ValueValidator {
         // Change the loop type for future break branches (and loop type)
         context:.setCurrentLoopType (finLoopType);
 
-        // Breaks do not really have are values (you cannot write 'a = break 12;'), they are always typed 'void'
+        // Breaks are not really values (you cannot write 'a = break 12;'), they are always typed 'void'
         BreakValue::new (b.getLoc (), val)
     }
 
@@ -764,10 +772,41 @@ pub class ValueValidator {
     def validateReturn (self, dmut context : &Validator, r : &ReturnExpr)-> &Value
         throws &ErrorMsg
     {
-        context;
-        r;
-        __pragma!fake_throw (&ErrorMsg);
-        __pragma!panic ();
+        if (!context.isInFunctionBody ()) throw ErrorMsg::fatal (r.getLoc (), ValidateErrorMessage::RETURN_NO_FUNCTION);
+
+        // The function type is set once at the beginning of a function validation, or by return statement in case of lambda validation
+        let fnType = context.getFunctionReturn ();
+        
+        // Return can be used in void function to quit the function immediately, so without a value
+        let val = match r.getValue () {
+            EmptyExpression () => { cast!{&Value} (UnitValue::new (loc-> r.getLoc ())) }
+            v : &Expression => {
+                let res = context:.validateValue (v);
+                
+                match res.getType () {
+                    LambdaType () => {
+                        // We have the possibility here - thanks to the return type of the function - to know the types of the prototype of a lambda function
+                        if (fnType.isOf!{&FuncPtrType} () || fnType.isOf!{&DelegateType} ()) { // inferLambdaValue manage that test, but we don't want error throwing for anything else than lambda validation error
+                            context:.inferLambdaValue (fnType, res)
+                        } else { res }
+                    }
+                    _ => { res }
+                }
+            }
+        };
+
+        
+        if (context.isInLambdaBody ()) { // The type can be changed by the return statement
+            let finFnType = context:.inferTypeBranchingWithValue (val.getLoc (), fnType, val);
+            context:.setFunctionReturn (finFnType);
+        } else {
+            // Verify that the mutability of the returned values is respected
+            context:.verifyMemoryOwner (fnType.getLoc (), fnType, val, construct-> true, checkTypes-> true);
+        }
+        
+
+        // Returns are not really values (you cannot write 'a = return 12;'), they are always typed 'void'
+        ReturnValue::new (r.getLoc (), val)
     }
 
     /**

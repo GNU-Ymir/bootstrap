@@ -132,9 +132,12 @@ pub class Validator {
     /// The current return type of the current function
     let dmut _functionReturns = Vec!{&Type}::new ();
 
-    /// True iif we are currently validating a closure
-    let mut _isInClosure = false;
+    /// True iif we are currently validating a lambda body
+    let dmut _inLambda = Vec!{bool}::new ();
 
+    /// True iif we are currently validating a function body (can be a lambda)
+    let dmut _inFunctionBody = Vec!{bool}::new ();
+    
     /// The current type of the breaks for the current loop
     let dmut _loopBreakTypes = Vec!{dmut &Vec!{&Type}}::new ();
 
@@ -514,12 +517,17 @@ pub class Validator {
 
     /**
      * Enter a new foreign scope space
+     * @params: 
+     *   - isLambda: true iif the foreign that will be validated is lambda function (closure or not)
+     *   - isFnBody: true iif the foreign we just entered is for validating a function body
      */
-    pub def enterForeign (mut self) {
+    pub def enterForeign (mut self, isLambda : bool = false, isFnBody : bool) {
         self._symbols:.push (Vec!{dmut &HashMap!{[c8], &Value}}::new ());
         self._usedSyms:.push (Vec!{dmut &HashSet!{[c8]}}::new ());
         self._functionReturns:.push (NoneType::new (loc-> EOF_WORD));
-        self._loopBreakTypes:.push (Vec!{&Type}::new ());
+        self._inLambda:.push (isLambda);
+        self._inFunctionBody:.push (isFnBody);
+        self._loopBreakTypes:.push (Vec!{&Type}::new ());        
     }
 
     /**
@@ -530,8 +538,55 @@ pub class Validator {
         self._usedSyms:.pop (1u64);
         self._functionReturns:.pop (1u64);
         self._loopBreakTypes:.pop (1u64);
+        self._inLambda:.pop (1u64);
+        self._inFunctionBody:.pop (1u64);
     }
 
+    /**
+     * After entering a foreign with isFnBody-> false, we can change the context with this function 
+     * This allows to avoid exiting foreign, and reentering it just after
+     * @info: this does not have to be exited
+     * @example: 
+     * ==================
+     * enterForeign (isFnBody-> false); // <-    
+     * // Validate prototype                | 
+     * enterFunctionBody (); //             |
+     * // Validate function body            |
+     * exitForeign (); // ------------------+
+     * ==================
+     */
+    pub def enterFunctionBody (mut self) {
+        __pragma!trusted ({
+            (alias self._inFunctionBody) [self._inFunctionBody.len () - 1us] = true;
+        });
+    }
+
+    /**
+     * @returns: true iif the context is currently in validation of a function body (or lambda)
+     */
+    pub def isInFunctionBody (self)-> bool {
+        __pragma!trusted ({
+            if (self._inFunctionBody.len () != 0us) {
+                self._inFunctionBody [self._inFunctionBody.len () - 1us]
+            } else {
+                false
+            }
+        })
+    }
+
+    /**
+     * @returns: true iif the context is currently in validation of a lambda body
+     */
+    pub def isInLambdaBody (self)-> bool {
+        __pragma!trusted ({
+            if (self._inLambda.len () != 0us) {
+                self._inLambda [self._inLambda.len () - 1us]
+            } else {
+                false
+            }
+        })
+    }
+    
     /**
      * @returns: the index of the foreign that would be enclosed if a lambda closure was created in current context
      */
@@ -550,7 +605,6 @@ pub class Validator {
         (alias (alias self._usedSyms)[self._usedSyms.len () - 1us])[0us]:.insert ("#{CLOSURE-VARREF}"s8);
         
         self._closureType:.push (ClosureType::new (EOF_WORD, [], [], refId, (alias self._symbols)[closureIndex], alias (alias self._usedSyms)[closureIndex]));
-        self._isInClosure = true;
     } catch {
         _ => __pragma!panic ();
     }
@@ -563,8 +617,6 @@ pub class Validator {
         let type = self._closureType[self._closureType.len () - 1us];
         
         self._closureType:.pop ();
-
-        self._isInClosure = (self._closureType.len () != 0us);
         
         type
     } catch {
@@ -823,7 +875,41 @@ pub class Validator {
         __pragma!fake_throw (&ErrorMsg);
         __pragma!panic ();
     }
+
+
+    /**
+     * Infer a lambda value from a function or delegate type
+     * @params: 
+     *   - type: the type that will help for the inference
+     *   - val: the value in which the search is performed
+     * @returns: a lambda value
+     * @throws: 
+     *   - &ErrorMsg: if is was not found, or the inference is impossible 
+     */
+    pub def inferLambdaValue (mut self, type : &Type, val : &Value)-> &Value
+        throws &ErrorMsg
+    {
+        let innerVal = match val {
+            v : &VarRefValue => { v.getValue () } // The lambda value can be hidden in a variable
+            _ => { val }
+        };
         
+        match innerVal {            
+            lmbd : &LambdaValue => {
+                let paramTypes = match type {
+                    f : &FuncPtrType => { f.getParameters () }
+                    d : &DelegateType => { d.getParameters () }
+                    _ => { throw ErrorMsg::fatal (val.getLoc (), format (ValidateErrorMessage::INCOMPATIBLE_TYPE, type, val.getType ())); } // The lambda value was found, but the result cannot be infered
+                }
+                
+                return self._lambdaValidator.validateLambdaBody (alias self, lmbd, paramTypes); // Validate the lambda from the parameters of  'type'
+            }
+            _ => { // The lambda value was not found
+                throw ErrorMsg::fatal (val.getLoc (), format (ValidateErrorMessage::INCOMPATIBLE_TYPE, type, val.getType ()));
+            }
+        };
+        
+    }
     
     /**
      * ================================================================================
@@ -1254,7 +1340,7 @@ pub class Validator {
      * @returns: a local variable that is enclosed
      */
     def getInClosure (mut self, name : [c8])-> &Value {
-        if (!self._isInClosure) return NoneValue::new ();
+        if (self._closureType.len () == 0us) return NoneValue::new ();
 
         let dmut closureType = (alias self._closureType) [self._closureType.len () - 1us];
         let field = closureType.getField (name);
