@@ -377,29 +377,7 @@ pub class LiteralValidator {
     {
         let dmut syms = context:.getGlobal (v.getLoc ().str ());
         if (syms.len == 0us) {
-            let prvSyms = context:.getGlobalPrivate (v.getLoc ().str ());
-            let dmut notes = Vec!{&ErrorMsg}::new ();
-            for s in prvSyms {
-                notes:.push (ErrorMsg::note (s.getLoc (), oneLine-> true, format (ValidateErrorMessage::PRIVATE_IN_THIS_CONTEXT, s.getPath ().toStr (sep-> Tokens::DCOLON))));
-            }
-            
-            if (prvSyms.len == 0us) {
-                let closeSyms = context:.getCloseGlobal (v.getLoc ().str (), distance-> 2us);
-                let dmut used = HashSet!{&Path}::new ();
-                for s in closeSyms {
-                    if (s.getPath () !in used) {
-                        let p = s.getPath ().parent ().toStr (sep-> Tokens::DCOLON);
-                        if (p.len != 0us) {
-                            notes:.push (ErrorMsg::note (s.getLoc (), oneLine-> true, format (ValidateErrorMessage::MAYBE_WAS_MEANT_FROM_MOD, s.getPath ().file (), p)));
-                        } else
-                            notes:.push (ErrorMsg::note (s.getLoc (), oneLine-> true, format (ValidateErrorMessage::MAYBE_WAS_MEANT, s.getPath ().file ())));
-                        
-                        used:.insert (s.getPath ());
-                    }
-                }   
-            }
-            
-            throw ErrorMsg::fatal (v.getLoc (), format (ValidateErrorMessage::UNDEF_VAR, v.getLoc ().str ()), notes-> notes[]);        
+            throw context:.createGlobalVarError (v.getLoc (), v.getLoc ().str ());
         } else {
             { 
                 return self.validateMultSymbols (v.getLoc (), alias context, alias syms);
@@ -410,10 +388,22 @@ pub class LiteralValidator {
     }
 
     /**
+     * ================================================================================
+     * ================================================================================
+     * =========================          MULT SYMS           =========================
+     * ================================================================================
+     * ================================================================================
+     */
+    
+    /**
      * Transform symbol references into a single value
      * @params:
+     *   - loc: the location of the symbol ref
      *   - context: the context of the validation
      *   - syms: the list of symbols
+     * @returns: a value containing multiple symbols (&MultSymValue), or a single one (&Value)
+     * @throws: 
+     *   - &ErrorMsg: if the transformation fails
      */
     pub def validateMultSymbols (self, loc : &Word, dmut context : &Validator, dmut syms : [&Symbol])-> &Value
         throws &ErrorMsg
@@ -425,12 +415,8 @@ pub class LiteralValidator {
             {
                 context:.pushReferent (alias syms [i]);
                 match ref syms [i] {
-                    dmut a : &AkaSymbol => {
-                        res:.push (context:.getAkaValidator ().validate (alias context, alias a));
-                        // maybe catch when the aka refers to a type
-                    }
                     dmut f : &FunctionSymbol => {
-                        if (!f.isMethod ())
+                        if (!f.isMethod ()) 
                             res:.push (context:.getFunctionValidator ().validatePrototype (alias context, alias f));
                     }
                     dmut c : &ConstructorSymbol => {
@@ -439,21 +425,24 @@ pub class LiteralValidator {
                     m : &ModuleSymbol => {
                         res:.push (ModuleRefValue::new (loc, m));
                     }
-                    dmut t : &TemplateSymbol => {
-                        res:.push (context:.getTemplateValidator ().validate (alias context, alias t));
-                        // Maybe catch when the template refers to a type
+                    dmut a : &AkaSymbol => { // Aka are sometimes types, there is a special function to handle that
+                        self.validateAkaSymbolMultSym (loc, alias context, alias a, alias res, alias typeErrors);
                     }
-                    dmut c : &ClassSymbol => {
-                        let type = context:.getClassValidator ().validateOutModule (alias context, alias c);
+                    dmut t : &TemplateSymbol => { // Templates are sometimes types, there is a special function to handle that
+                        self.validateTemplateSymbolMultSym (loc, alias context, alias t, alias res, alias typeErrors);
+                    }
+                    dmut c : &ClassSymbol => { // class are types
+                        let type = context:.getClassValidator ().validate (alias context, alias c, inModule-> false);
                         typeErrors:.push (ErrorMsg::fatal (loc, format (ValidateErrorMessage::USE_AS_VALUE, type)));
-                    } // class are types
-                    dmut s : &StructSymbol => {
+                    } 
+                    dmut s : &StructSymbol => { // struct are also types
                         let type = context:.getStructValidator ().validate (alias context, alias s);
                         typeErrors:.push (ErrorMsg::fatal (loc, format (ValidateErrorMessage::USE_AS_VALUE, type)));
-                    } // struct are also types
-                    dmut tr : &TraitSymbol => {
-                        res:.push (context:.getTraitValidator ().validate (alias context, alias tr));
-                    } // Maybe trait too ?
+                    } 
+                    dmut tr : &TraitSymbol => { // Traits are also types
+                        let type = context:.getTraitValidator ().validate (alias context, alias tr);
+                        typeErrors:.push (ErrorMsg::fatal (loc, format (ValidateErrorMessage::USE_AS_VALUE, type)));
+                    } 
                     _ => {
                         println ("TODO : ", (syms [i])::typeinfo.name);
                         __pragma!panic ();
@@ -468,16 +457,78 @@ pub class LiteralValidator {
             }
         }
 
+        // There are errors in value validation
         if (errors.len () != 0us) throw ErrorMsg::list (errors[]);
 
-        if (res.len () == 1us) {
+        if (res.len () == 1us) { 
             res[][0us]
         } else {
-            if (res.len () == 0us) {
-                if (typeErrors.len () != 0us) throw ErrorMsg::list (typeErrors[]);
-                else __pragma!panic ();
-            }            
+            if (res.len () == 0us) { // There are no values
+                if (typeErrors.len () != 0us) throw ErrorMsg::list (typeErrors[]); // It has to be because of type error
+                else __pragma!panic (); // The list passed to the function was empty ?
+            }
+            
             cast!{&Value} (MultSymValue::new (loc, res[], prettyStr-> loc.str ()))
+        }
+    }
+
+    /**
+     * Aka symbol may refer to types, or to values
+     * In order to show the correct error, we should try both validation
+     * @params: 
+     *   - loc: the location of the symbol reference
+     *   - context: the context of the validation
+     *   - sym: the symbol to validate
+     * @throws: 
+     *   - &ErrorMsg: if the aka is malformed (but not a type)
+     * @returns: 
+     *   - res: add the value to the vec
+     *   - typeErrors: add an error, if the aka is a type (but not malformed)
+     */
+    def validateAkaSymbolMultSym (self, loc : &Word, dmut context : &Validator, dmut sym : &AkaSymbol, dmut res : &Vec!{&Value}, dmut typeErrors : &Vec!{&ErrorMsg})
+        throws &ErrorMsg
+    {
+        {
+            res:.push (context:.getAkaValidator ().validateValue (alias context, alias sym));
+        } catch {
+            err : &ErrorMsg => { // There are two possibilities 
+                {
+                    let type = context:.getAkaValidator ().validateType (alias context, alias sym); // 1) its a type
+                    typeErrors:.push (ErrorMsg::fatal (loc, format (ValidateErrorMessage::USE_AS_VALUE, type))); // Then we add no value, but add an error in typeErrors
+                } catch { // 2) it is just malformed
+                    _ => throw err;
+                }
+            }
+        }
+    }
+
+    /**
+     * Template symbol may refer to types, or to values
+     * In order to show the correct error, we should try both validation
+     * @params: 
+     *   - loc: the location of the symbol reference
+     *   - context: the context of the validation
+     *   - sym: the symbol to validate
+     * @throws: 
+     *   - &ErrorMsg: if the template is malformed (but not a type)
+     * @returns: 
+     *   - res: add the value to the vec
+     *   - typeErrors: add an error, if the template is a type (but not malformed)
+     */
+    def validateTemplateSymbolMultSym (self, loc : &Word, dmut context : &Validator, dmut sym : &TemplateSymbol, dmut res : &Vec!{&Value}, dmut typeErrors : &Vec!{&ErrorMsg})
+        throws &ErrorMsg
+    {
+        {
+            res:.push (context:.getTemplateValidator ().validateValue (alias context, alias sym));
+        } catch {
+            err : &ErrorMsg => { // There are two possibilities 
+                {
+                    let type = context:.getTemplateValidator ().validateType (alias context, alias sym); // 1) its a type
+                    typeErrors:.push (ErrorMsg::fatal (loc, format (ValidateErrorMessage::USE_AS_VALUE, type))); // Then we add no value, but add an error in typeErrors
+                } catch { // 2) it is just malformed
+                    _ => throw err;
+                }
+            }
         }
     }
 }
