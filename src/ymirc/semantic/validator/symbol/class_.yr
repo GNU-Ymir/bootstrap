@@ -24,10 +24,7 @@ pub class ClassValidator {
 
     /// The list of class symbols currently in validation to avoid infinite recursion, and validating multiple times the same symbol
     let dmut _validation = HashSet!{&Symbol}::new ();
-    
-    /// The list of class symbol that were found during the validation, but that needs to be fully validated once everything is done
-    let dmut _postValidation = HashSet!{&Symbol}::new ();
-    
+        
     /**
      * Create a new empty validator
      */
@@ -47,20 +44,17 @@ pub class ClassValidator {
         throws &ErrorMsg
     {
         if (inModule || !self.checkValidation (sym)) {
-            self:.validateClassContent (alias context, alias sym, inModule-> inModule);
+            self:.validateClassContent (alias context, alias sym, inModule-> inModule); // This cannot throw (cf. the function def)
         }
 
         match sym.getTypeInfo () {
             r : &ClassRefType => {
-                // The validation of the class succedeed, but maybe it created some other class validation that are incomplete
-                if (self._validation.len () == 0us && self._postValidation.len () != 0us) { // self._validation.len () is always 0, no ?
-                    self.postValidateAll (alias context); // so we need to validate them
-                }
-
                 return r;
             }
-            err : &ErrorGenerator => { // The class was validated in a previous call, but failed so the generator is an error
-                throw err.getErrorMessage ();
+            err : &ErrorGenerator => { // The class was validated by self.validateClassContent, but it failed so the generator is an error
+                // we simply throw it, unfortunately it will leads to printing the same error multiple times, but I don't see any way to avoid that efficiently (while making sure the error is at least printed one time)
+                // Maybe add a uniq identifier to errors, and perform the verification directly in the error printing part
+                throw err.getErrorMessage ();  
             }
             _ => {
                 __pragma!panic ();
@@ -78,18 +72,14 @@ pub class ClassValidator {
 
     /**
      * Validate the content of a class (fields, methods, etc.)
+     * @warning: does not throw an error, but write it in the generator of the class if there was any.
      * @params: 
      *   - context: the context of the validation
      *   - sym: the symbol to validate
      *   - inModule: if true, then the methods of the class are validated and inserted in the generators of the context
-     * @throws:
-     *   - &ErrorMsg: if the class is malformed
      */
-    def validateClassContent (mut self, dmut context : &Validator, dmut sym : &ClassSymbol, inModule : bool)
-        throws &ErrorMsg
-    {        
-        let dmut _ = Vec!{&ErrorMsg}::new ();
-
+    def validateClassContent (mut self, dmut context : &Validator, dmut sym : &ClassSymbol, inModule : bool) {
+        
         // The validation of the class is not finished
         // a recursive reference to itself in ancestor will lead to infinite loop, we want to avoid that
         sym:.setTypeInfo (ErrorGenerator::new (sym.getLoc (), ErrorMsg::fatal (sym.getLoc (), ValidateErrorMessage::FORWARD_REFERENCE_TYPE)));
@@ -98,15 +88,43 @@ pub class ClassValidator {
         self._validation:.insert (sym);
         
         // First we need to validate the ancestor of the class, to generate the vtable, the child class vtable being an override of the one of the ancestor
-        let _ = self.validateAncestor (alias context, alias sym);
+        let ancestor = self.validateAncestor (alias context, alias sym);
+        
+        // Now that we have the ancestor, the class is a bit more usable for further validation
+        sym:.setTypeInfo (ClassRefType::new (sym.getLoc (), sym, ancestor));        
+
+        // Validate the static assertions of the class definition (@warning: this is only performed if the validation is a root validation-> self._validation.len () == 1us, to avoid too deep and unreadable errors)
+        self.validateCtes (alias context, alias sym);
+        
+        // Validate the vtable (without validating the method bodies, just the prototypes)
+        //self.validateVtable (alias context, alias sym, ancestor);
+
+        // Validate the fields of the class
+        self.validateFields (alias context, alias sym, ancestor);
 
         inModule;
-        __pragma!fake_throw (&ErrorMsg);
-        __pragma!panic ();    
+        // if (inModule) { // The class is defined in the module that is currently validated, we need to declare the inner symbols of the class (i.e. the methods)
+        //     context:.insertClassValidation (alias sym);
+        // }
+        
     } exit {
         self._validation:.remove (sym);
+    } catch {
+        err : &ErrorMsg => {
+            // If there is an error in the validation, then write it in the type validation
+            // Then each time a validation is tried, the same error is sent without needing a new validation
+            sym:.setTypeInfo (ErrorGenerator::new (sym.getLoc (), ErrorMsg::fatal (sym.getLoc (), ValidateErrorMessage::VALIDATING, notes-> [err])));
+        }
     }
 
+    /**
+     * ================================================================================
+     * ================================================================================
+     * =========================           ANCESTOR           =========================
+     * ================================================================================
+     * ================================================================================
+     */
+    
     /**
      * Validate the ancestor of the class
      * @params: 
@@ -136,7 +154,7 @@ pub class ClassValidator {
                             throw ErrorMsg::fatal (ancestor.getLoc (), format (ValidateErrorMessage::INHERIT_FINAL_CLASS, cr));
                         }
                         
-                        cr
+                        cr // if it is a class ref, and not final then no problem, it can be an ancestor
                     }
                     x : _ => { // This is not a class, cannot inherit non class types
                         throw ErrorMsg::fatal (ancestor.getLoc (), format (ValidateErrorMessage::INHERIT_NO_CLASS, x));
@@ -144,23 +162,201 @@ pub class ClassValidator {
                 }
             }
         }
-    }   
+    }
     
     /**
-     * Validate the content of all the pre validated classes 
+     * ================================================================================
+     * ================================================================================
+     * =========================             CTES             =========================
+     * ================================================================================
+     * ================================================================================
+     */
+
+    /**
+     * Validate the static assertion of a class symbol
+     * @warning: 
+     * ----------------
+     * the validation is only performed on root validation (meaning iif self._validation.len () == 1us)   
+     * In order to avoid too deep errors, and complex error handling
+     * ----------------
+     * @params: 
+     *    - context: the context of the validation
+     *    - sym: the symbol to validate
+     * @throws:
+     *   - &ErrorMsg: if some assertion where invalid, or not true
+     */
+    def validateCtes (self, dmut context : &Validator, dmut sym : &ClassSymbol)
+        throws &ErrorMsg
+    {
+        if (self._validation.len () != 1us) return {}
+
+        let dmut errors = Vec!{&ErrorMsg}::new ();
+        if (sym.getAssertions ().len != 0us) {
+            context:.pushReferent (alias sym); // The assertion are located in the class context
+            context:.enterForeign (isFnBody-> false); // There are not inside function
+
+            for it in sym.getAssertions () { 
+                context:.validateCteValue (it); // validate the assertion
+            } catch { 
+                err : &ErrorMsg => errors:.push (err);
+            }          
+            
+        } exit {
+            context:.popReferent ();
+            context:.exitForeign ();
+        }
+
+        // Some assertion failed
+        if (errors.len () != 0us) throw ErrorMsg::list (errors[]);
+    }
+           
+    /**
+     * ================================================================================
+     * ================================================================================
+     * =========================            FIELDS            =========================
+     * ================================================================================
+     * ================================================================================
+     */
+
+    /**
+     * Validate the fields of a class symbol, and populate the class definition
      * @params: 
      *   - context: the context of the validation
+     *   - sym: the symbol to validate
+     *   - ancestor: the ancestor type of the class
+     *   - inModule: true if the validation of the class is "in module"
      * @throws:
-     *   - &ErrorMsg: if one or more of the class are malformed
+     *   - &ErrorMsg: if there is an error in the validation of the fields
      */
-    def postValidateAll (self, dmut context : &Validator)
+    def validateFields (self, dmut context : &Validator, dmut sym : &ClassSymbol, ancestor : &Type)
+        throws &ErrorMsg
+    {                
+        let localFields = self.validateLocalFields (alias context, alias sym); // Validate the fields declared in the class def
+        let allFields = match ancestor {
+            cl : &ClassRefType => {
+                let ancestorFields = cl.getFields (); // Get the fields declared in the ancestor class
+                self.verifyFieldCollisions (alias context, ancestorFields, localFields); // Verify that there is no collistion between ancestor fields and local fields
+                    
+                ancestorFields ~ localFields            
+            }
+            _ => { localFields }
+        };
+
+        // Update the class type info definition in the symbol, so it has access to the fields
+        match sym.getTypeInfo () {
+            oldRef : &ClassRefType => {
+                let dmut clRef = ClassRefType::withField (oldRef, allFields, localFields);
+                sym:.setTypeInfo (alias clRef);
+            }
+            _ => __pragma!panic (); // The function was called where exactly ?!!
+        }
+    }
+
+    /**
+     * Validate the fields that are declared in the class definition
+     * @params : 
+     *    - context: the context of the validation
+     *    - sym: the symbol whose field we will validate
+     * @returns: The list of validated fields
+     * @throws:
+     *    - &ErrorMsg: if there was an error in one or more field validation
+     */
+    def validateLocalFields (self, dmut context : &Validator, dmut sym : &ClassSymbol)-> [&Value]
+        throws &ErrorMsg
+    {
+        context:.pushReferent (alias sym); // Fields are declared inside the class
+        context:.enterForeign (isFnBody-> false); // A new foreign, we don't wan't to pollute current context
+        context:.enterBlock (); // A block, we will add variable definitions
+
+        let dmut fields = Vec!{&Value}::new ();
+        for it in sym.getFields () {
+            match it {
+                f : &VarDeclExpr => {
+                    // Fields are just like variable decls 
+                    let field = context:.getValueValidator ().validateVarDecl (alias context, f, needInitValue-> false);
+                    
+                    // There are two reasons for clearing local space
+                    // 1) we don't want warnings about unused fields
+                    // 2) fields cannot refer to other fields in the value definition (e.g. "let a = 12, b = a;" is invalid)
+                    context:.clearLocalScope ();
+
+                    // We add the validated field
+                    fields:.push (field);
+                }
+                _ => { // Something strange was declared as a field in the class definition
+                    __pragma!panic ();
+                }
+            };
+        }
+        
+        fields [] // returning the list of fields
+    } exit {
+        context:.quitBlock (); // We entered a block at the beginning of the function
+        
+        context:.exitForeign (); // We entered a foreign
+        context:.popReferent (); // And we pushed a referent
+    }
+    
+    /**
+     * Verify that there is no collision between fields declared in ancestor class, and fields declared in local class
+     * @params:
+     *   - context: the context of the validation 
+     *   - ancestorFields: the list of fields declared in ancestor classes
+     *   - localFields: the list of fields declared in local class
+     * @throws:
+     *   - &ErrorMsg: if there is a collision     
+     */
+    def verifyFieldCollisions (self, dmut _ : &Validator, ancestorFields : [&Value], localFields : [&Value])
+        throws &ErrorMsg
+    {
+        let dmut errors = Vec!{&ErrorMsg}::new ();
+
+        // These loops are pretty self explanatory, we just traverse the fields and verify that there is no common names in local and ancestor fields
+        for lt in localFields {
+            for at in ancestorFields {
+                match (lt, at) {
+                    (lvar : &VarDeclValue, avar : &VarDeclValue) => {
+                        if (lvar.getLoc ().str () == avar.getLoc ().str ()) {
+                            errors:.push (ErrorMsg::fatal (lvar.getLoc (), // Shadowing error
+                                                           format (ValidateErrorMessage::SHADOWING_DECL,
+                                                                   lvar.getLoc ().str ()),
+                                                           notes-> [ErrorMsg::note (avar.getLoc (), ""s8)]));
+                        }
+                    }
+                }
+            }
+        }
+
+        if (errors.len () != 0us) throw ErrorMsg::list (errors[]); // There are collisions
+    }
+    
+    /**
+     * ================================================================================
+     * ================================================================================
+     * =========================            VTABLE            =========================
+     * ================================================================================
+     * ================================================================================
+     */
+
+    /**
+     * Validate the vtable of a class and populates the class symbol definition
+     * @params:
+     *    - context: the context of the validation
+     *    - sym: the symbol to validate
+     *    - ancestor: the type of the ancestor of the class
+     * @throws:
+     *    - &ErrorMsg: if there is an error in the vtable validation
+     */
+    def validateVtable (self, dmut context : &Validator, dmut sym : &ClassSymbol, ancestor : &Type)
         throws &ErrorMsg
     {
         context;
+        sym;
+        ancestor;
         __pragma!fake_throw (&ErrorMsg);
         __pragma!panic ();
     }
-    
+            
     /**
      * ================================================================================
      * ================================================================================
