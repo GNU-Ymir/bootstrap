@@ -350,7 +350,11 @@ pub class ClassValidator {
     def validateVtable (self, dmut context : &Validator, dmut sym : &ClassSymbol, ancestor : &Type)
         throws &ErrorMsg
     {
+        // Validate the vtable, and get the list of method prototypes, and their protections
         let (vtable, protection) = self.validateClassDeclarations (alias context, alias sym, ancestor);
+
+        // Validate the destructor of the class (if any)
+        // In order to be virtual (overridable and callable from child class), dtor must be defined in the vtable 
         let dtor = self.validateVtableDtor (alias context, alias sym, ancestor);
 
         // Update the class type info definition in the symbol, so it has access to the vtable
@@ -358,6 +362,7 @@ pub class ClassValidator {
             oldRef : &ClassRefType => {
                 let dmut clRef = ClassRefType::withVtable (oldRef, vtable, protection, dtor);
                 sym:.setClassRef (alias clRef);
+                // TODO compute the TypeInfo value, and also put it in the class definition
             }
             _ => __pragma!panic (); // Mh, well no supposed to be here, verify that there is previous classref in the symbol
         }
@@ -379,13 +384,268 @@ pub class ClassValidator {
     def validateClassDeclarations (self, dmut context : &Validator, dmut sym : &ClassSymbol, ancestor : &Type)-> ([&Value], [MethodProtection])
         throws &ErrorMsg
     {
+        let dmut vtable = Vec!{&Value}::new ();
+        let dmut prots = Vec!{MethodProtection}::new ();
+        let dmut addMethods = Vec!{dmut &Symbol}::new ();
+
+        // Ok, this part is complex, so hang in there.
+
+        // Retreive the vtable of the ancestor, the vtable of the current class is an update of it, and same symbols must be located at the same place
+        let ancVtable = self.retreiveAncestorVtable (ancestor, alias vtable, alias prots, alias addMethods);
+
+        // Create the vector containing all the methods defined in implemented traits
+        let implemented = self.retreiveImplsVtable (alias context, alias sym, ancestor, alias vtable, alias prots, ancVtable, alias addMethods);
+       
+        // At this point, vtable contains :
+        //  1) All the methods declared in ancestor class
+        //  2) All the methods declared in implemented traits
+        // There is no method declared in the class (either new, over, of impl over) in the vtable
+        // So we start by validating the methods that are declared outside implementations
+        self.validateDirectVtable (alias context, alias sym, ancestor, alias vtable, alias prots, ancVtable, alias addMethods);
+
+        // An now the methods that are declared inside implementations
+        self.validateImplsVtable (alias context, alias sym, ancestor, implemented, alias vtable, alias prots, alias addMethods);
+
+
+        // Finally, verify that all method prototypes are uniqely identifiable
+        self.verifyCollisionVtable (vtable[]);
+
+        // Insert the symbol of the methods that has to be fully validated if the class is "in module"
+        // This symbols are the methods that are declared inside the class (new, over or impl over)
+        for i in 0us .. addMethods.len () { 
+            __pragma!trusted ({
+                let dmut meth = alias (alias addMethods)[i];
+                match meth {
+                    EmptySymbol () => {} // if it is an empty symbol, then the method was declared in ancestor or trait, and put in the class as it was (not over)
+                    _ => {
+                        sym:.insertAddMethod (alias meth); // The method is new or overriden
+                    }
+                }
+            });
+        }
+        
+        (vtable[], prots[])
+    }
+
+    /**
+     * ================================================================================
+     * ================================================================================
+     * =========================       VTABLE ANCESTOR        =========================
+     * ================================================================================
+     * ================================================================================
+     */
+   
+    /**
+     * Retreive the vtable of the ancestor if the ancestor exists
+     * @params:
+     *    - ancestor: the ancestor type
+     * @returns:
+     *   - .0: the vtable of the ancestor (list of prototype of methods)
+     *   - vtable: same as .0, but updatable
+     *   - prots: almost same as .1, but updatable (and PRV is now PRV_PARENT)
+     */
+    def retreiveAncestorVtable (self, ancestor : &Type, dmut vtable : &Vec!{&Value}, dmut prots : &Vec!{MethodProtection}, dmut addMethods : &Vec!{dmut &Symbol}) -> [&Value]
+    {
+        match ancestor {
+            clRef : &ClassRefType => { // there is an ancestor
+                let ancVtable = clRef.getVtable ();
+                let ancProts = clRef.getVtableProtections ();
+                for i in ancVtable { // insert the method prototype in the vtable of the current class
+                    vtable:.push (i);
+                    addMethods:.push (alias EMPTY_SYMBOL);
+                }
+
+                for j in ancProts { // Insert the protection in the vtable of the current class 
+                    if (j == MethodProtection::PRV) prots:.push (MethodProtection::PRV_PARENT); // private methods are not accessible in child class
+                    else prots:.push (j);
+                }
+                
+                return ancVtable; // return the vtable of the ancestor class
+            }
+        }
+
+        [] // There is no ancestor to the current class
+    }
+
+    /**
+     * ================================================================================
+     * ================================================================================
+     * =========================         VTABLE IMPL          =========================
+     * ================================================================================
+     * ================================================================================
+     */
+    
+    /**
+     * Retreive the list of methods that are declared inside traits, and that are implemented by the class
+     * @params: 
+     *   - context: the context of the validation
+     *   - sym: the class symbol to validate
+     *   - ancestor: the ancestor type of the class
+     *   - ancVtable: the vtable of the ancestor class
+     * @returns:
+     *    - vtable: populate the vtable, or update it
+     *    - vtableProt: populate the protections
+     *    - addMethods: the list of methods that are either overriden or newly defined 
+     *    - .0: the list of implemented traits, [(.0: the trait symbol, .1: the trait type)]
+     * @throws:
+     *   - &ErrorMsg: if there is an error in the validation    
+     */
+    def retreiveImplsVtable (self, dmut context : &Validator, dmut sym : &ClassSymbol, ancestor : &Type, dmut vtable : &Vec!{&Value}, dmut vtableProt : &Vec!{MethodProtection}, ancVtable : [&Value], dmut addMethods : &Vec!{dmut &Symbol})-> [(&Symbol, &Type)]
+        throws &ErrorMsg
+    {
+        let dmut implemented = Vec!{(&Symbol, &Type)}::new ();
+        let dmut errors = Vec!{&ErrorMsg}::new ();
+        
+        for it in sym.getAllLocalSymbols (protection-> Protection::PRIVATE) {
+            {
+                match it {
+                    im : &ImplSymbol => { // If there is an implementation, then we need to validated its vtable
+                        let ret = self.retreiveImplVtable (alias context, im, alias sym, ancestor, alias vtable, alias vtableProt, ancVtable, alias addMethods);
+                        implemented:.push ((im, ret));
+                    }
+                }
+            } catch {
+                err : &ErrorMsg => {
+                    errors:.push (ErrorMsg::note (it.getLoc (), ValidateErrorMessage::VALIDATING, notes-> [err]));
+                }
+            }
+        }
+
+        if (errors.len () != 0us) throw ErrorMsg::list (errors[]);
+        
+        implemented []
+    }
+
+
+    /**
+     * Retreive the vtable of a trait implementation
+     * @params: 
+     *   - context: the context of the validation
+     *   - im: the implementation to validated
+     *   - sym: the class symbol to validate
+     *   - ancestor: the ancestor type of the class
+     *   - ancVtable: the vtable of the ancestor class
+     * @returns:
+     *    - vtable: populate the vtable, or update it
+     *    - vtableProt: populate the protections
+     *    - addMethods: the list of methods that are either overriden or newly defined 
+     *    - .0: the trait ref type
+     * @throws:
+     *   - &ErrorMsg: if there is an error in the validation (for example, 'im' does not implement a trait) 
+     */
+    def retreiveImplVtable (self, dmut context : &Validator, im : &ImplSymbol, dmut sym : &ClassSymbol, ancestor : &Type, dmut vtable : &Vec!{&Value}, dmut vtableProt : &Vec!{MethodProtection}, ancVtable : [&Value], dmut addMethods : &Vec!{dmut &Symbol})-> &Type
+        throws &ErrorMsg
+    {
         context;
+        im;
         sym;
         ancestor;
+        vtable;
+        vtableProt;
+        ancVtable;
+        addMethods;
         __pragma!fake_throw (&ErrorMsg);
         __pragma!panic ();
     }
 
+    /**
+     * ================================================================================
+     * ================================================================================
+     * =========================      VTABLE VALIDATION       =========================
+     * ================================================================================
+     * ================================================================================
+     */
+
+    /**
+     * Validate the methods prototypes that are declared inside implementations
+     * @params: 
+     *    - context: the context of the validation
+     *    - sym: the class symbol to validate
+     *    - ancestor: the ancestor type of the class
+     *    - vtableProt: the protections of the methods of the vtable
+     * @returns:
+     *    - vtable: update the vtable (cannot grow, otherwise a method was declared in the impl but is not an "over"??)
+     *    - addMethods: the list of methods that are either overriden or newly defined 
+     *    - .0: the trait ref type
+     * @throws:
+     *   - &ErrorMsg: if there is an error in the validation (for example, 'im' does not implement a trait) 
+     */
+    def validateImplsVtable (self, dmut context : &Validator, dmut sym : &ClassSymbol, ancestor : &Type, implemented : [(&Symbol, &Type)], dmut vtable : &Vec!{&Value}, dmut vtableProt : &Vec!{MethodProtection}, dmut addMethods : &Vec!{dmut &Symbol})-> [&Value]
+        throws &ErrorMsg
+    {
+        context;
+        sym;
+        ancestor;
+        implemented;
+        vtable;
+        vtableProt;
+        addMethods;
+        __pragma!fake_throw (&ErrorMsg);
+        __pragma!panic ();
+    }
+    
+    /**
+     * Validate the methods prototypes that are declared outside implementations
+     * @params: 
+     *    - context: the context of the validation
+     *    - sym: the class symbol to validate
+     *    - ancestor: the ancestor type of the class
+     *    - ancVtable: the vtable of the ancestor class
+     *    - vtableProt: the protections of the methods of the vtable
+     * @returns:
+     *    - vtable: update the vtable, can grow
+     *    - vtableProt: grow when new methods are defined in the class (but cannot be updated, or the protection of a method change when it is overriden ??)
+     *    - addMethods: the list of methods that are either overriden or newly defined 
+     *    - .0: the trait ref type
+     * @throws:
+     *   - &ErrorMsg: if there is an error in the validation (for example, 'im' does not implement a trait) 
+     */
+    def validateDirectVtable (self, dmut context : &Validator, dmut sym : &ClassSymbol, ancestor : &Type, dmut vtable : &Vec!{&Value}, dmut vtableProt : &Vec!{MethodProtection}, ancVtable : [&Value], dmut addMethods : &Vec!{dmut &Symbol})-> [&Value]
+        throws &ErrorMsg
+    {
+        context;
+        sym;
+        ancestor;
+        vtable;
+        vtableProt;
+        ancVtable;
+        addMethods;
+        __pragma!fake_throw (&ErrorMsg);
+        __pragma!panic ();
+    }
+
+
+    /**
+     * ================================================================================
+     * ================================================================================
+     * =========================     VTABLE VERIFICATION      =========================
+     * ================================================================================
+     * ================================================================================
+     */
+    
+    /**
+     * Traverse the vtable, and verify that every method prototype is uniqely identifiable
+     * @params: 
+     *   - vtable: the list of methods in the vtable
+     * @throws:
+     *   - &ErrorMsg: if there is a collision
+     */
+    def verifyCollisionVtable  (self, vtable : [&Value])
+        throws &ErrorMsg
+    {
+        vtable;
+        __pragma!fake_throw (&ErrorMsg);
+        __pragma!panic ();
+    }    
+
+    /**
+     * ================================================================================
+     * ================================================================================
+     * =========================      VTABLE DESTRUCTOR       =========================
+     * ================================================================================
+     * ================================================================================
+     */
+    
     /**
      * Validate the prototype of the destructor for the vtable
      * @params:
