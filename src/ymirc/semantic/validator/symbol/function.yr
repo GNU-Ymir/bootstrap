@@ -79,7 +79,7 @@ pub class FunctionValidator {
         context:.enterForeign (isFnBody-> false);
 
         // Only one kind of constructor
-        self:.validateConstructor (alias context, alias sym, clRef);                
+        self:.validateConstructor (alias context, alias sym, clRef, validateBody-> true);                
     } exit {
         context:.exitForeign ();
         context:.popReferent ();
@@ -170,7 +170,7 @@ pub class FunctionValidator {
      * @returns: a callable prototype of function
      * @throws: &ErrorMsg, if the constructor is malformed
      */
-    pub def validateCtorPrototype (mut self, dmut context : &Validator, dmut sym : &ConstructorSymbol, clRef : &ClassRefType)-> &MethodPrototypeValue
+    pub def validateCtorPrototype (mut self, dmut context : &Validator, dmut sym : &ConstructorSymbol, clRef : &ClassRefType)-> &CtorPrototypeValue
         throws &ErrorMsg
     {
         match sym.getFrameProto () {
@@ -191,7 +191,7 @@ pub class FunctionValidator {
 
                 ret
             }
-            v : &MethodPrototypeValue => {
+            v : &CtorPrototypeValue => {
                 v
             }
             g : _ => {
@@ -294,6 +294,7 @@ pub class FunctionValidator {
 
     /**
      * Validate a normal function
+     * @todo: this function is way too long, and way too close to validateMethod and validateConstructor. A refactorization would be great
      * @params: 
      *    - context: the context of the validation
      *    - sym: the symbol to validate
@@ -426,6 +427,7 @@ pub class FunctionValidator {
 
     /**
      * Validate a method
+     * @todo: this function is way too long, and way too close to validateFunction and validateConstructor. A refactorization would be great
      * @params: 
      *    - context: the context of the validation
      *    - sym: the symbol to validate
@@ -514,6 +516,7 @@ pub class FunctionValidator {
 
     /**
      * Validate a constructor
+     * @todo: this function is way too long, and way too close to validateFunction and validateMethod. A refactorization would be great
      * @params: 
      *    - context: the context of the validation
      *    - sym: the symbol to validate
@@ -523,14 +526,14 @@ pub class FunctionValidator {
      * @throws:
      *    - &ErrorMsg: if the validation failed
      */
-    def validateConstructor (mut self, dmut context : &Validator, dmut sym : &ConstructorSymbol, clRef : &ClassRefType, validateBody : bool = false)-> &MethodPrototypeValue
+    def validateConstructor (mut self, dmut context : &Validator, dmut sym : &ConstructorSymbol, clRef : &ClassRefType, validateBody : bool = false)-> &CtorPrototypeValue
         throws &ErrorMsg
     {
         let func = sym.getContent ();
         let dmut errors = Vec!{&ErrorMsg}::new ();
         let throwers = self.validateThrowers (alias context, func.getThrowers (), alias errors);
 
-        let (retType, _, parameters, _) = {
+        let (_, parameters, body) = {
             context:.enterBlock ();
             let clPtr = match clRef.clone (isMutable-> true) { // create the class ptr type (first parameter and return type of the constructor)
                 nRef : &ClassRefType => {                    
@@ -550,15 +553,26 @@ pub class FunctionValidator {
             };
 
             let body = if (validateBody) {
-                // 1) Validate super, redirection and field constructions
-                // 2) Validate the body of the ctor
-                cast!{&Value} (NoneValue::new ()) // TODO
-            } else {
+                // insert self in the scope, alongside with parameters (its an hidden param)
+                context:.insertLocal (selfParam.getLoc ().str (), selfParam);
+                
+                // Validate the pre construction of the constructor (construction of fields, and ancestor)
+                let preConstruct = self.validatePreConstructor (alias context, func, clRef, selfParam);
+
+                // From this point, return is allowed
+                context:.enterFunctionBody ();
+
+                // Validate the body of the constructor (return void type)
+                let (body, _) = self.validateBody (alias context, func.getLoc (), sym.getPath (), func.getBody (), VoidType::new (sym.getLoc ()), throwers, alias errors);
+
+                // the body contains the pre construction, and the proper body
+                BlockValue::new (body.getLoc (), VoidType::new (sym.getLoc ()), [preConstruct, body])
+            } else { // we validate only the prototype
                 cast!{&Value} (NoneValue::new ())
             }
             
                                    
-            (clPtr, selfParam, parameters, body) // don't add the self parameter in the prototype, we don't have it when calling the prototype
+            (selfParam, parameters, body) // don't add the self parameter in the prototype, we don't have it when calling the prototype
         } exit {
             {
                 if (!validateBody) context:.clearLocalScope (); //ignore the inserted parameters, or there will be errors when quitting block
@@ -573,14 +587,20 @@ pub class FunctionValidator {
         }
 
         if (errors.len () != 0us) throw ErrorMsg::list (errors[]);
-        if (validateBody) {
-            __pragma!panic (); // insert the generator for 'generation'
+        if (validateBody) {            
+            match func.getBody () {
+                EmptyExpression () => {}
+                _ => {
+                    let frame = FrameGenerator::new (func.getLoc (), sym.getPath (), parameters, VoidType::new (sym.getLoc ()), body, needFinalReturn-> false, isWeak-> sym.isWeak ());
+                    context:.insertNewGenerator (frame);
+                }
+            }
         }
 
         match sym.getFrameProto () {
-            p : &MethodPrototypeValue => { p }
+            p : &CtorPrototypeValue => { p }
             _ => {
-                let gen = MethodPrototypeValue::new (sym.getLoc (), sym, parameters, retType, throwers, clRef, isMutable-> true, isFinal-> true, isCtor-> true, rename-> func.getRename ().str ());
+                let gen = CtorPrototypeValue::new (sym.getLoc (), sym, parameters, throwers, clRef, rename-> func.getRename ().str ());
                 if (validateBody) { // If not validate body the prototype might be uncomplete
                     sym:.setFrameProto (gen);
                 }
@@ -589,7 +609,153 @@ pub class FunctionValidator {
             }
         }
         
-    }      
+    }
+
+    /**
+     * Validate the pre construction of a constructor
+     * @params: 
+     *    - context: the context of the validation
+     *    - func: the declaration to validate
+     *    - clRef: the type of self
+     *    - selfParam: the self parameter
+     * @returns: the value containing the constructions statements
+     * @throws: 
+     *    - &ErrorMsg: if there was an error in the validation
+     */
+    def validatePreConstructor (self, dmut context : &Validator, func : &ConstructorDecl, clRef : &ClassRefType, selfParam : &Value)-> &Value
+        throws &ErrorMsg
+    {
+        if (func.getExplicitCstrsCall () == Keys::SELF) { // There is a redirection of construction
+            return self.validateRedirectCtor (alias context, func, clRef, selfParam);
+        }
+
+        let dmut block = Vec!{&Value}::new (); // list of instructions        
+        let ancCall = self.validateAncestorCtorCall (alias context, func, clRef, selfParam);
+        match ancCall {
+            NoneValue () => {} // Don't add an empty value
+            _ =>  {
+                block:.push (ancCall); // There is an ancestor, and its ctor is called
+            }
+        }        
+
+        let fieldCtor = self.validateFieldCtors (alias context, func, clRef, selfParam);
+        match fieldCtor {
+            NoneValue () => {} // Don't add an empty value
+            _ => {
+                block:.push (fieldCtor); // there are field constructions
+            }
+        }
+
+        // We create the block of instruction, containing super call, and field ctors
+        BlockValue::new (func.getLoc (), VoidType::new (func.getLoc ()), block[])
+    }
+
+    /**
+     * Validate the call of a redirect constructor
+     * @params: 
+     *    - context: the context of the validation
+     *    - func: the declaration of the constructor
+     *    - clRef: the type of the class that is being validated
+     * @returns: the instruction calling the redirect constructor
+     * @throws: 
+     *    - &ErrorMsg: if there is an error in the validation
+     */
+    def validateRedirectCtor (self, dmut context : &Validator, func : &ConstructorDecl, clRef : &ClassRefType, selfParam : &Value)-> &Value
+        throws &ErrorMsg
+    {
+        context;
+        func;
+        clRef;
+        selfParam;
+        __pragma!fake_throw (&ErrorMsg);
+        __pragma!panic ();
+    }
+    
+    /**
+     * Validate the call of the ancestor constructor (if there is an ancestor)
+     * @params: 
+     *    - context: the context of the validation
+     *    - func: the declaration of the constructor
+     *    - clRef: the type of the class that is being validated
+     *    - selfParam: the self parameters
+     * @returns: the instruction calling the ancestor constructor (or Unit, if there is not call)
+     * @throws: 
+     *    - &ErrorMsg: if there is an error in the validation
+     */
+    def validateAncestorCtorCall (self, dmut context : &Validator, func : &ConstructorDecl, clRef : &ClassRefType, selfParam : &Value)-> &Value
+        throws &ErrorMsg
+    {
+        match clRef.getAncestor () {
+            ancestor : &ClassRefType => {
+                // If the super call is implicit, we need a valid location
+                let superLoc = if (func.getExplicitCstrsCall ().isEof ()) { func.getLoc () } else { func.getExplicitCstrsCall () };
+                
+                let dmut rights = Vec!{&Value}::new ();
+                for v in func.getSuperParams () { // Validate the parameters that are passed to the parent constructor
+                    rights:.push (context:.validateValue (v));
+                }
+
+                let dmut errors = Vec!{&ErrorMsg}::new ();                      
+                let prots = ancestor.getCtorProtections ();
+                for i, ctor in ancestor.getCtors () {
+                    match ctor {
+                        ctorProto : &CtorPrototypeValue => {
+                            let cl = context:.getMultOpValidator ().validateCtorCall (alias context, ctorProto, rights[], selfParam-> selfParam); // Try to call the ctor with the given parameters
+
+                            // The call succeeded, and the constructor is not private in this context
+                            if (prots [i] != MethodProtection::PRV_PARENT) return cl; 
+                            else { // The call succeeded but the constructor is private
+                                errors:.push (ErrorMsg::fatal (ctorProto.getLoc (), end-> superLoc, format (ValidateErrorMessage::PRIVATE_IN_THIS_CONTEXT, ctorProto)));
+                            }
+                        }
+                    }
+                } catch {
+                    err : &ErrorMsg => {
+                        if (prots[i] != MethodProtection::PRV_PARENT) {
+                            errors:.push (err); // Don't add the error if the call failed, and the constructor is private, it is not supposed to work
+                        }
+                    }
+                }
+
+                // If we are here, then there are two possibilities :
+                // 1) there is constructors, and called failed
+                if (errors.len () != 0us) throw ErrorMsg::list (errors[]);
+                
+                // 2) there is no constructors                
+                throw ErrorMsg::fatal (superLoc, format (ValidateErrorMessage::UNDEFINED_SUPER_CALL_CTOR, rights[]));
+            }
+            _ => {
+                // Class does not have any ancestor, so it can't be called
+                if (func.getExplicitCstrsCall () == Keys::SUPER) {
+                    throw ErrorMsg::fatal (func.getExplicitCstrsCall (), format (ValidateErrorMessage::NO_SUPER_CLASS, clRef));
+                }
+                
+                return NoneValue::new ();
+            }            
+        }        
+    }
+
+    /**
+     * Validate the field constructors
+     * @params: 
+     *    - context: the context of the validation
+     *    - func: the declaration of the constructor
+     *    - clRef: the type of the class that is being validated
+     *    - selfParam: the parameter self              
+     * @returns: the instructions affecting values to the fields
+     * @throws: 
+     *     - &ErrorMsg: if there is an error in the validation
+     */
+    def validateFieldCtors (self, dmut context : &Validator, func : &ConstructorDecl, clRef : &ClassRefType, selfParam : &Value)-> &Value
+        throws &ErrorMsg
+    {
+        context;
+        func;
+        clRef;
+        selfParam;
+        __pragma!fake_throw (&ErrorMsg);
+        __pragma!panic ();
+    }
     
     /**
      * ================================================================================
