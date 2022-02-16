@@ -533,7 +533,7 @@ pub class FunctionValidator {
         let dmut errors = Vec!{&ErrorMsg}::new ();
         let throwers = self.validateThrowers (alias context, func.getThrowers (), alias errors);
 
-        let (_, parameters, body) = {
+        let (selfParam, parameters, body) = {
             context:.enterBlock ();
             let clPtr = match clRef.clone (isMutable-> true) { // create the class ptr type (first parameter and return type of the constructor)
                 nRef : &ClassRefType => {                    
@@ -552,12 +552,15 @@ pub class FunctionValidator {
                 }
             };
 
-            let body = if (validateBody) {
+            let body = if (validateBody) {                
                 // insert self in the scope, alongside with parameters (its an hidden param)
                 context:.insertLocal (selfParam.getLoc ().str (), selfParam);
+
+                // Reference to the self hidden param
+                let selfValue = VarRefValue::new (selfParam.getLoc (), selfParam.getLoc (), selfParam.getType (), true, selfParam.getUniqId (), isSelf-> true);
                 
                 // Validate the pre construction of the constructor (construction of fields, and ancestor)
-                let preConstruct = self.validatePreConstructor (alias context, func, clRef, selfParam);
+                let preConstruct = self.validatePreConstructor (alias context, func, clRef, selfValue);
 
                 // From this point, return is allowed
                 context:.enterFunctionBody ();
@@ -591,7 +594,7 @@ pub class FunctionValidator {
             match func.getBody () {
                 EmptyExpression () => {}
                 _ => {
-                    let frame = FrameGenerator::new (func.getLoc (), sym.getPath (), parameters, VoidType::new (sym.getLoc ()), body, needFinalReturn-> false, isWeak-> sym.isWeak ());
+                    let frame = FrameGenerator::new (func.getLoc (), sym.getPath (), [selfParam] ~ parameters, VoidType::new (sym.getLoc ()), body, needFinalReturn-> false, isWeak-> sym.isWeak ());
                     context:.insertNewGenerator (frame);
                 }
             }
@@ -646,8 +649,12 @@ pub class FunctionValidator {
             }
         }
 
-        // We create the block of instruction, containing super call, and field ctors
-        BlockValue::new (func.getLoc (), VoidType::new (func.getLoc ()), block[])
+        if (block.len () != 0us) {
+            // We create the block of instruction, containing super call, and field ctors
+            BlockValue::new (func.getLoc (), VoidType::new (func.getLoc ()), block[])
+        } else {
+            UnitValue::new (loc-> func.getLoc ())
+        }
     }
 
     /**
@@ -694,35 +701,15 @@ pub class FunctionValidator {
                 for v in func.getSuperParams () { // Validate the parameters that are passed to the parent constructor
                     rights:.push (context:.validateValue (v));
                 }
-
-                let dmut errors = Vec!{&ErrorMsg}::new ();                      
-                let prots = ancestor.getCtorProtections ();
-                for i, ctor in ancestor.getCtors () {
-                    match ctor {
-                        ctorProto : &CtorPrototypeValue => {
-                            let cl = context:.getMultOpValidator ().validateCtorCall (alias context, ctorProto, rights[], selfParam-> selfParam); // Try to call the ctor with the given parameters
-
-                            // The call succeeded, and the constructor is not private in this context
-                            if (prots [i] != MethodProtection::PRV_PARENT) return cl; 
-                            else { // The call succeeded but the constructor is private
-                                errors:.push (ErrorMsg::fatal (ctorProto.getLoc (), end-> superLoc, format (ValidateErrorMessage::PRIVATE_IN_THIS_CONTEXT, ctorProto)));
-                            }
-                        }
-                    }
-                } catch {
-                    err : &ErrorMsg => {
-                        if (prots[i] != MethodProtection::PRV_PARENT) {
-                            errors:.push (err); // Don't add the error if the call failed, and the constructor is private, it is not supposed to work
-                        }
+                
+                {
+                    let ctors = self.createCtorDelegate (superLoc, ancestor, selfParam, withPrivate-> false);
+                    return context:.getMultOpValidator ().validate (alias context, superLoc, ctors, rights[]); // Call the ctors with the parameters and return the one that succeeded
+                } catch { 
+                    err : &ErrorMsg => { // None succeeded (TODO print private candidates)
+                        throw ErrorMsg::fatal (superLoc, format (ValidateErrorMessage::UNDEFINED_SUPER_CALL_CTOR, rights[]), notes-> [err]);
                     }
                 }
-
-                // If we are here, then there are two possibilities :
-                // 1) there is constructors, and called failed
-                if (errors.len () != 0us) throw ErrorMsg::list (errors[]);
-                
-                // 2) there is no constructors                
-                throw ErrorMsg::fatal (superLoc, format (ValidateErrorMessage::UNDEFINED_SUPER_CALL_CTOR, rights[]));
             }
             _ => {
                 // Class does not have any ancestor, so it can't be called
@@ -735,6 +722,39 @@ pub class FunctionValidator {
         }        
     }
 
+    /**
+     * Create a mult sym containing all the constructor of the class with the given instance
+     * @params: 
+     *    - loc: the location of the call
+     *    - clRef: the class whose constructors are used
+     *    - selfParam: the instance for self
+     *    - withPrivate: include PRV_PARENT constructors ?
+     * @returns: a MultSymValue with all the available ctors (can be of len == 0us)
+     */
+    def createCtorDelegate (self, loc : &Word, clRef : &ClassRefType, selfParam : &Value, withPrivate : bool = false, prettyStr : [c8] = "super"s8)-> &Value {    
+        let prots = clRef.getCtorProtections ();
+        let ptrType = match clRef.clone (isMutable-> true) {
+            nRef : &ClassRefType => {
+                ClassPtrType::new (loc, nRef, isMutable-> true)
+            }
+            _ => { __pragma!panic (); }
+        };
+
+        let dmut results = Vec!{&Value}::new ();
+        for i, ctor in clRef.getCtors () { // traverse all defined ctor (TODO include template ctors)
+            if (prots [i] != MethodProtection::PRV || withPrivate) { // Include only if the protection is ok
+                match ctor {
+                    proto : &CtorPrototypeValue => { // Necessarily that, previous compiler version has a bug, we have to deal with that
+                        results:.push (CtorDelegateValue::new (loc, ptrType, instance-> selfParam, proto)); // Don't forget to include the instance, otherwise a new instance is created
+                    }
+                    _ => __pragma!panic ();
+                }
+            }
+        }
+
+        MultSymValue::new (loc, results[], prettyStr-> prettyStr) 
+    }
+    
     /**
      * Validate the field constructors
      * @params: 
@@ -754,7 +774,8 @@ pub class FunctionValidator {
         clRef;
         selfParam;
         __pragma!fake_throw (&ErrorMsg);
-        __pragma!panic ();
+        //        __pragma!panic ();
+        NoneValue::new ()
     }
     
     /**
