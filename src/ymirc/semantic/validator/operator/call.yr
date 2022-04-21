@@ -253,48 +253,85 @@ pub class CallOpValidator {
     def validateMultSym (self, dmut context : &Validator, loc : &Word, left : &MultSymValue, rights : [&Value])-> (&Value, u32)
         throws &ErrorMsg
     {
-        let dmut results = Vec!{&Value}::new ();
-        let dmut call = Vec!{&Value}::new ();
+        let prettyName = self.prettyName (left);
+        let (nonTemplates, templates) = self.divideByPriority (left.getValues ()); // non template values have higher priorities than template ones, so if there can be called then no need to validate template ones
+        let (call, res, score) = {
+            self.validateValueList (alias context, loc, prettyName, nonTemplates, rights)
+        } catch { // there is no need to worry of empty list, it is managed in validateValueList
+            err : &ErrorMsg => { // there is no value in non template values that works with rigths
+                {
+                    self.validateValueList (alias context, loc, prettyName, templates, rights) // so we try the template values
+                } catch { // there is no need to worry of empty list here either, it is managed in validateValueList
+                    templateError : &ErrorMsg => { // Does not work with both template and non templates
+                        throw ErrorMsg::fatal (loc, format (ValidateErrorMessage::UNDEFINED_CALL_OP, prettyName, rights), notes-> [err, templateError])
+                    }
+                }
+            }
+        };
+
+        if (res.len != 1us) { // there are more than one success in the call validation, so we need to throw the error of 'works with both'
+            let dmut errors = Vec!{&ErrorMsg}::new ();
+            for i in 0us .. call.len {
+                errors:.push (ErrorMsg::note (call[i].getLoc (), format (ValidateErrorMessage::CANDIDATE_ARE, call[i])));
+            }        
+            
+            throw ErrorMsg::fatal (loc, format (ValidateErrorMessage::WORKS_WITH_BOTH, prettyName, rights), notes-> errors[]);
+        }
+
+        // Only one success ! we return it
+        (res[0us], score)
+    }
+
+    /**
+     * Validate a call on a list of values, where only the values with the highest score are called
+     * @params: 
+     *    - context: the context of the validation
+     *    - loc: the loc of the call
+     *    - prettyName: the pretty name to use in error throwing
+     *    - lefts: the list of values to call
+     *    - rights: the list of values used as right operands
+     * @returns:
+     *    - .0: the list of values that are called with highest score (left[i])
+     *    - .1: the list of call values (validation of: left[i] (rights))
+     *    - .2: the score of the call (the highest one)
+     * @throws:
+     *    - &ErrorMsg: if no value can be called
+     */
+    def validateValueList (self, dmut context : &Validator, loc : &Word, prettyName : [c8], lefts : [&Value], rights : [&Value])-> ([&Value], [&Value], u32)
+        throws &ErrorMsg
+    {
+        let dmut results = Vec!{&Value}::new (); // stores the list of call validation (left[i] (rigths)
+        let dmut call = Vec!{&Value}::new (); // stores the list of used values (left[i])
         let mut highestScore = 0u32;
         let dmut errors = Vec!{&ErrorMsg}::new ();
 
-        // TODO, when templating will be done, prioritize non template functions
-        for it in left.getValues () { // traverse all the candidates
+        for it in lefts { // traverse all the candidates
             { 
                 let (gen, score) = self.validateCall (alias context, loc, it, rights, candidate-> true); // try to use it
                 if (score > highestScore) { // It works and has a better score than previous candidates
                     highestScore = score;
-                    results:.clear ();
+                    results:.clear (); // all the last success are removed, they have a lesser score
+                    call:.clear ();
                     results:.push (gen);
                     call:.push (it);
                 } else if (score == highestScore) { // It works and has the same score
                     results:.push (gen);
                     call:.push (it);
-                } // Does work, but with a lesser score
+                } // Does work, but with a lesser score, just skip it
             } catch {
                 err : &ErrorMsg => { // Does not work
-                    errors:.push (err);
+                    errors:.push (err); // we store the error, if no candidate works we need to use the error
                 }
             }
         }
-
-        if (results.len () == 0us) { // No candidates work
-            throw ErrorMsg::fatal (loc, format (ValidateErrorMessage::UNDEFINED_CALL_OP, self.prettyName (left), rights), notes-> errors[])
-        } else if (results.len () > 1us) { // There are more than one candidate with the same score
-            __pragma!trusted ({
-                errors:.clear ();
-                for i in 0us .. results.len () {
-                    errors:.push (ErrorMsg::note (call[i].getLoc (), format (ValidateErrorMessage::CANDIDATE_ARE, call[i])));
-                }
-            })
-
-            throw ErrorMsg::fatal (loc, format (ValidateErrorMessage::WORKS_WITH_BOTH, self.prettyName (left), rights), notes-> errors[])
+        
+        if (results.len () == 0us) { // No candidates work, we throw all the stored errors
+            throw ErrorMsg::fatal (loc, format (ValidateErrorMessage::UNDEFINED_CALL_OP, prettyName, rights), notes-> errors[])
         }
 
-        __pragma!trusted ({
-            (results[0us], highestScore) // Ok, there is only one candidate, no possibility of failing
-        })
-    } 
+        // Some values succeeded in the call, so we return them, along with the score they generate
+        (call[], results[], highestScore)                    
+    }
     
     /**
      * ================================================================================
@@ -338,16 +375,38 @@ pub class CallOpValidator {
                             throw ErrorMsg::fatal (loc, format (ValidateErrorMessage::UNDEFINED_CALL_OP, self.prettyName (left), rights))
                         }
                     }
+                    t : &TemplateRefValue => {
+                        self.validateTemplateCall (alias context, loc, t, rights, candidate-> candidate) 
+                    }
                     _ => {
                         throw ErrorMsg::fatal (loc, format (ValidateErrorMessage::UNDEFINED_CALL_OP, self.prettyName (left), rights))
                     }
-                    // c : &ConstructorValue => {}
                     // l : &LambdaValue => {}
                     // t : &TemplateRefValue => {}
                 }
             }
         }
     }
+
+    /**
+     * Divide the list of values into two lists where the first list values have higher priorities than those in the right one
+     * @info: this function places template values in the right list
+     * @params:
+     *    - list: the list of values to divide
+     * @returns: 
+     *    - .0: the list of values with high priority
+     *    - .1: the list of values with low priority     
+     */
+    def divideByPriority (self, list : [&Value])-> ([&Value], [&Value]) {
+        let dmut left = Vec!{&Value}::new ();
+        let dmut right = Vec!{&Value}::new ();
+        for i in list match i {
+            TemplateRefValue () => { right:.push (i); }
+            _ => { left:.push (i); }
+        }
+
+        (left[], right[])
+    }        
 
     /**
      * ================================================================================
@@ -643,6 +702,40 @@ pub class CallOpValidator {
             }
             _ => { __pragma!panic (); }
         }
+    }
+
+    /**
+     * ================================================================================
+     * ================================================================================
+     * =========================          TEMPLATES           =========================
+     * ================================================================================
+     * ================================================================================
+     */
+
+    /**
+     * Validate a call where left value is a template, and thus needs a specialization
+     * @params: 
+     *    - context: the context of the validation
+     *    - loc: the location of the call
+     *    - left: the template value
+     *    - rights: the list of values used to call the template value
+     *    - candidate: if true add the candidate_are error in case of failure (for multsym error handling)
+     * @returns:
+     *    - .0: the call
+     *    - .1: the score of the call
+     * @throws: 
+     *    - &ErrorMsg: if the call if not possible
+     */
+    def validateTemplateCall (self, dmut context : &Validator, loc : &Word, left : &TemplateRefValue, rights : [&Value], candidate : bool = false)-> (&Value, u32)
+        throws &ErrorMsg
+    {
+        context;
+        loc;
+        left;
+        rights;
+        candidate;
+        __pragma!fake_throw (&ErrorMsg);
+        __pragma!panic ();
     }
     
     /**
