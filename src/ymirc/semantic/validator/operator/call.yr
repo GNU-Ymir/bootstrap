@@ -6,13 +6,17 @@ import ymirc::semantic::validator::scores;
 import ymirc::semantic::validator::template::_;
 import ymirc::errors::_;
 import ymirc::utils::format;
-import ymirc::syntax::expression::_;
+
+import ymirc::semantic::symbol::_;
 import ymirc::semantic::generator::value::_;
 import ymirc::semantic::generator::type::_;
 import ymirc::semantic::generator::value::expandvalue;
 import ymirc::lexing::word;
 import ymirc::lexing::tokens;
+
 import ymirc::syntax::keys;
+import ymirc::syntax::declaration::_;
+import ymirc::syntax::expression::_;
 
 
 import std::collection::vec;
@@ -261,7 +265,8 @@ pub class CallOpValidator {
         } catch { // there is no need to worry of empty list, it is managed in validateValueList
             err : &ErrorMsg => { // there is no value in non template values that works with rigths
                 {
-                    self.validateValueTemplateList (alias context, loc, prettyName, templates, rights) // so we try the template values
+                    let (call, res, _, score) = self.validateValueTemplateList (alias context, loc, prettyName, templates, rights); // so we try the template values
+                    (call, res, score)
                 } catch { // there is no need to worry of empty list here either, it is managed in validateValueList
                     templateError : &ErrorMsg => { // Does not work with both template and non templates
                         throw ErrorMsg::fatal (loc, format (ValidateErrorMessage::UNDEFINED_CALL_OP, prettyName, rights), notes-> [err, templateError])
@@ -345,33 +350,36 @@ pub class CallOpValidator {
      * @returns:
      *    - .0: the list of values that are called with highest score (left[i])
      *    - .1: the list of call values (validation of: left[i] (rights))
-     *    - .2: the score of the call (the highest one)
+     *    - .2: the rewritters to use to create the final symbols needed for the calls
+     *    - .3: the score of the call (the highest one)
      * @throws:
      *    - &ErrorMsg: if no value can be called
      */
-    def validateValueTemplateList (self, dmut context : &Validator, loc : &Word, prettyName : [c8], lefts : [&TemplateRefValue], rights : [&Value])-> ([&Value], [&Value], u32)
+    def validateValueTemplateList (self, dmut context : &Validator, loc : &Word, prettyName : [c8], lefts : [&TemplateRefValue], rights : [&Value])-> ([&Value], [&Value], [&TemplateRewriter], u32)
         throws &ErrorMsg
     {
-                // We store the results inside a vector, where to each valid values is associated the correct rewritter
-        let mut results : mut [mut (u32, [(&TemplateRewriter, &Value)])] = []; 
+        // We store the results inside a vector, where to each valid values is associated the correct rewritter
+        let dmut results = Vec!{&Value}::new (); // stores the list of call validation (left[i] (rigths)
+        let dmut call = Vec!{&Value}::new (); // stores the list of used values (left[i])
+        let dmut syms = Vec!{&TemplateRewriter}::new (); // stores the list of generated symbols
+        let mut highestScore = 0u32;
         let dmut errors = Vec!{&ErrorMsg}::new ();
         for it in lefts {
             {
-                let rewriter = context:.getTemplateSolver ().validateImplicitValue (alias context, loc, it, rights);                    
-                let mut found = false;
-                for i in 0us .. results.len {                    
-                    if (results[i]._0 == rewriter.getScore ()) {
-                        (alias results)[i] = (results[i]._0, results[i]._1 ~ [(rewriter, cast!{&Value} (it))]);
-                        found = true;
-                        break {}
-                    } else if (results[i]._0 < rewriter.getScore ()) {
-                        results = alias ((alias results[0us .. i] ~ [(rewriter.getScore (), [(rewriter, cast!{&Value} (it))])]) ~ results[i .. $]);
-                        found = true;
-                        break {}
-                    }
+                let (value, sym, score) = self.validateTemplateCall (alias context, loc, it, rights, candidate-> true);
+                if (score > highestScore) { // It works and has a better score than previous candidates
+                    highestScore = score;
+                    results:.clear (); // all the last success are removed, they have a lesser score
+                    call:.clear ();
+                    syms:.clear ();
+                    results:.push (value);
+                    call:.push (it);
+                    syms:.push (sym);
+                } else if (score == highestScore) { // It works and has the same score
+                    results:.push (value);
+                    call:.push (it);
+                    syms:.push (sym);
                 }
-
-                if (!found) results = alias (results ~ [(rewriter.getScore (), [(rewriter, cast!{&Value} (it))])]);
             } catch {
                 err : &ErrorMsg => { // does not work
                     errors:.push (err);
@@ -379,19 +387,13 @@ pub class CallOpValidator {
             }
         }
 
-        if (results.len == 0us && errors.len () != 0us) { // No value succeded, and there was some errors        
-            throw ErrorMsg::fatal (loc, format (ValidateErrorMessage::UNDEFINED_CALL_OP, prettyName, rights), notes-> errors[]);
+        if (results.len () == 0us) { // No candidates work, we throw all the stored errors
+            throw ErrorMsg::fatal (loc, format (ValidateErrorMessage::UNDEFINED_CALL_OP, prettyName, rights), notes-> errors[])
         }
-
-        // We only rewrite the values with the highest score ? maybe their score is high but does not work
-        let multSym = context:.getValueValidator ().finalizeTemplateCallMultSym (alias context, loc, results[0us]._1);
-        match multSym {
-            m : &MultSymValue => {
-                return self.validateValueList (alias context, loc, prettyName, m.getValues (), rights);
-            }
-            _ => __pragma!panic ();
-        }
-    }        
+        
+        // Some values succeeded in the call, so we return them, along with the score they generate
+        (call[], results[], syms[], highestScore)                    
+    }
     
     /**
      * ================================================================================
@@ -776,17 +778,89 @@ pub class CallOpValidator {
      *    - left: the template value
      *    - rights: the list of values used to call the template value
      *    - candidate: if true add the candidate_are error in case of failure (for multsym error handling)
-     * @returns:
-     *    - .0: the call
-     *    - .1: the score of the call
+     * @returns: 
+     *    - .0: the call value
+     *    - .1: the symbol that was created by the template validation
+     *    - .2: the score of the call
      * @throws: 
      *    - &ErrorMsg: if the call if not possible
      */
-    def validateTemplateCall (self, dmut context : &Validator, loc : &Word, left : &TemplateRefValue, rights : [&Value], _ : bool = false)-> &TemplateRewriter
+    def validateTemplateCall (self, dmut context : &Validator, loc : &Word, left : &TemplateRefValue, rights : [&Value], candidate : bool = false)-> (&Value, &TemplateRewriter, u32)
         throws &ErrorMsg
     {
-        context:.getTemplateSolver ().validateImplicitValue (alias context, loc, left, rights)
+        match left.getSymbol ().getContent ().getContent () {
+            f : &FunctionDecl => {
+                return self.validateTemplateCallFunction (alias context, loc, left, f, rights, candidate-> candidate);
+            }
+            x : _ => {
+                println (format ("TODO : %", x));
+                __pragma!panic ();
+            }
+        }
     }
+
+    /**
+     * Validate a call on a template value that contains a function declaration
+     * @params: 
+     *    - context: the context of the declaration
+     *    - loc: the location of the call
+     *    - left: the template ref that is called
+     *    - func: the function contained in the template ref (left.getSymbol ().getContent ().getContent ())
+     *    - rigths: the list of parameters passed to the call
+     * @returns: 
+     *    - .0: the call value
+     *    - .1: the symbol that was created by the template validation
+     *    - .2: the score of the call
+     * @throws: 
+     *    - &ErrorMsg: if the call failed (from template solving, declaration, or simply cannot be called with the parameters)
+     */
+    def validateTemplateCallFunction (self, dmut context : &Validator, loc : &Word, left : &TemplateRefValue, func : &FunctionDecl, rights : [&Value], candidate : bool = false)-> (&Value, &TemplateRewriter, u32)
+        throws &ErrorMsg
+    {
+        let argList = self.createTemplatePrototypeValues (alias context, left, func.getFunctionProto ().getParameters ());
+        println (format ("%", argList));
+        
+        //let (params, rest) = self.validateTemplateParameterList (argList, rights);
+        context;
+        loc;
+        left;
+        rights;
+        candidate;
+        __pragma!fake_throw (&ErrorMsg);
+        __pragma!panic ();        
+    }
+
+
+    /**
+     * Create a list of prototype value from an unvalidated function
+     * @params: 
+     *    - context: the context of the validation
+     *    - arguments: the list of expression of the prototype
+     * @returns: the list of protovalues
+     */
+    def createTemplatePrototypeValues (self, dmut context : &Validator, left : &TemplateRefValue, arguments : [&Expression])-> [&ProtoVarValue]
+    {
+        let dmut result = Vec!{&ProtoVarValue}::new ();        
+        context:.pushReferent (alias context:.getSymbolFromRef (left.getSymbol ()));
+        context:.enterForeign (isFnBody-> false);
+        
+        for arg in arguments {
+            context:.enterBlock ();
+            let (isMut, type, value) = context:.getFunctionValidator ().validateTemplateParamDecl (alias context, arg);
+            let paramGen = ProtoVarValue::new (arg.getLoc (), type, value, isMut, isSelf-> false);
+            result:.push (paramGen);            
+            {
+                context:.quitBlock (warnUnused-> false);
+            } catch { _ => __pragma!panic (); }
+        }
+    
+        context:.exitForeign ();
+        context:.popReferent ();
+
+
+        result[]
+    }
+
     
     /**
      * ================================================================================
