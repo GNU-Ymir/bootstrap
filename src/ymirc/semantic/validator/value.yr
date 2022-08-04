@@ -69,6 +69,7 @@ pub class ValueValidator {
             t : &TemplateCallExpr => return self.validateTemplateCall (alias context, t);
             t : &TemplateCheckerExpr => return self.validateTemplateChecker (alias context, t);
             l : &LambdaValueExpr => return self.validateLambda (alias context, l);
+            d : &DestructVarDeclExpr => return self.validateDestructVarDecl (alias context, d);
             e : &EmptyExpression => return UnitValue::new (loc-> e.getLoc ());
             w : &ValueWrapperExpr => return w.getContent ();
             t : &TypeWrapperExpr => {
@@ -452,6 +453,125 @@ pub class ValueValidator {
     {
         context:.getLambdaValidator ():.validate (alias context, l)
     }
+
+    /**
+     * ================================================================================
+     * ================================================================================
+     * =========================         DESTUCT DECL         =========================
+     * ================================================================================
+     * ================================================================================
+     */
+
+    /**
+     * Validate a destructor decl of variables
+     * @params: 
+     *    - context: the context of the validation
+     *    - d: the destructor decl
+     * @returns: the set of decl values
+     * @throws: 
+     *    - &ErrorMsg: if there is an error during the validation
+     */
+    def validateDestructVarDecl (self, dmut context : &Validator, d : &DestructVarDeclExpr)-> &Value
+        throws &ErrorMsg
+    {
+        let value = context:.validateValue (d.getValue ());
+        match value {
+            ev : &ExpandValue => {
+                return self.validateDestructDeclExpand (alias context, d, ev);
+            }
+            _ => { // if expand is not implicit then we explicit here to make it implicit 
+                let intrValue = context:.validateValue (IntrinsicExpr::new (d.getLoc (), IntrinsicKeys::EXPAND, ValueWrapperExpr::new (value.getLoc (), value)));
+                match intrValue { 
+                    ev : &ExpandValue => { // it was probably a tuple, or something expandable
+                        return self.validateDestructDeclExpand (alias context, d, ev);
+                    }
+                    _ => // it was not expandable, so it is just a single declaration
+                        return self.validateDestructDeclSingle (alias context, d, value);
+                }
+            }
+        }
+    }
+    
+    /**
+     * Validate a destruct decl for an expand value
+     * @params: 
+     *    - context: the context of the validation
+     *    - d: the destructor declaration
+     *    - value: the expand value to deconstruct
+     *    - et: the type of the expand value to deconstruct
+     */
+    def validateDestructDeclExpand (self, dmut context : &Validator, d : &DestructVarDeclExpr, value : &ExpandValue)-> &Value
+        throws &ErrorMsg
+    {
+        // if the arity mismatch then throw an error
+        if ((d.isVariadic () && d.getParameters ().len > value.getValues ().len) ||
+            (!d.isVariadic () && d.getParameters ().len != value.getValues ().len)) {
+            throw ErrorMsg::fatal (d.getLoc (), format (ValidateErrorMessage::TUPLE_ARITY_OVERFLOW, d.getParameters ().len, value.getValues ().len));            
+        }
+
+        let dmut values = Vec!{&Value}::new ();
+
+        // For each variable declaration of the destruct decl
+        for i in 0us .. d.getParameters ().len {
+            let assocValue : &Value = if (i != d.getParameters ().len - 1us || value.getValues ().len == d.getParameters ().len) { // get the current value
+                value.getValues()[i]
+            } else { // or when it is an expand of the rest values, create a tuple value containing the list of values                
+                let dmut rest = Vec!{&Value}::new ();
+                let dmut tupleTypes = Vec!{&Type}::new ();
+                
+                for j in i .. value.getValues ().len {
+                    rest:.push (value.getValues()[j]);
+                    tupleTypes:.push (value.getValues()[j].getType ());
+                }
+
+                let tupleType = TupleType::new (d.getParameters()[i].getLoc (), tupleTypes[], isMutable-> true);
+                cast!{&Value} (TupleValue::new (d.getParameters ()[i].getLoc (), tupleType, rest[]))
+            }
+            
+            match d.getParameters ()[i] {
+                vDecl : &VarDeclExpr => { // validate the current variable declaration
+                    let aux = VarDeclExpr::new (vDecl.getLoc (), vDecl.getName (), ValueWrapperExpr::new (vDecl.getLoc (), assocValue), vDecl.getType (), decos-> vDecl.getDecos ());
+                    
+                    values:.push (self.validateVarDecl (alias context, aux)); // using the classical variable declaration for code factorization
+                }
+                _ => __pragma!panic (); // destruct decl is malformed
+            }
+        }
+
+        // return the list of variable declaration
+        return BlockValue::new (d.getLoc (), VoidType::new (d.getLoc ()), values[], isSet-> true);
+    }
+
+    
+    /**
+     * Validate a destructor decl where right operand is neither a tuple nor an expand value
+     * @params: 
+     *   - context: the context of the validation
+     *   - d: the destructor declaration
+     *   - value: the value to put as the default value of the destructor decl
+     * @returns: the declaration value
+     * @throws:
+     *   - &ErrorMsg: if there is an error during the validaton
+     */
+    def validateDestructDeclSingle (self, dmut context : &Validator, d : &DestructVarDeclExpr, value : &Value)-> &Value
+        throws &ErrorMsg
+    {
+        // When using the dtor call syntax on single values, then we need to have one decl only
+        if (d.getParameters ().len != 1us) {
+            throw ErrorMsg::fatal (d.getLoc (), format (ValidateErrorMessage::TUPLE_ARITY_OVERFLOW, d.getParameters ().len, 1us));                    
+        }
+
+        match d.getParameters ()[0us] {
+            v : &VarDeclExpr => { // it contains a var decl
+                let aux = VarDeclExpr::new (v.getLoc (), v.getName (), ValueWrapperExpr::new (v.getLoc (), value), v.getType (), decos-> v.getDecos ());
+
+                // We just rewrite the destruct var decl into a simple var decl
+                return self.validateVarDecl (alias context, aux, needInitValue-> true);
+            }
+            _ => __pragma!panic (); // it is malformed
+        }        
+    }
+    
     
     /**
      * ================================================================================
@@ -715,6 +835,9 @@ pub class ValueValidator {
             IntrinsicKeys::TYPEOF => { // Typeof is necessarily a type (it's in the name)
                 throw ErrorMsg::fatal (i.getLoc (), ValidateErrorMessage::USE_AS_VALUE);
             }
+            IntrinsicKeys::EXPAND => {
+                return self.validateExpand (alias context, i);
+            }
         }
 
         __pragma!panic ();
@@ -780,6 +903,24 @@ pub class ValueValidator {
     {
         let content = context:.validateValue (n.getContent ());
         NamedValue::new (n.getLoc (), n.getLoc ().str (), content)
+    }
+
+
+    def validateExpand (self, dmut context : &Validator, i : &IntrinsicExpr)-> &Value
+        throws &ErrorMsg
+    {
+        let content = context:.validateValue (i.getContent ());
+        match content.getType () {
+            t : &TupleType => {
+                let dmut values = Vec!{&Value}::new ();
+                for it in 0us .. t.getInners ().len {
+                    values:.push (TupleFieldAccessValue::new (i.getLoc (), t.getInners ()[it], content, it));
+                }
+
+                return ExpandValue::new (i.getLoc (), values[]);
+            }
+            _ => return content;            
+        }          
     }
 
     
