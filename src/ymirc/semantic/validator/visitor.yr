@@ -757,7 +757,7 @@ pub class Validator {
         (alias (alias self._symbols)[self._symbols.len () - 1us])[0us]:.insert ("#{CLOSURE-VARREF}"s8, VarRefValue::new (Word::new ("#{CLOSURE-VARREF}"s8, loc), EOF_WORD, VoidType::new (EOF_WORD), false, refId));
         (alias (alias self._usedSyms)[self._usedSyms.len () - 1us])[0us]:.insert ("#{CLOSURE-VARREF}"s8);
         
-        self._closureType:.push (ClosureType::new (EOF_WORD, [], [], refId, (alias self._symbols)[closureIndex], alias (alias self._usedSyms)[closureIndex]));
+        self._closureType:.push (ClosureType::new (EOF_WORD, [], [], [], refId, (alias self._symbols)[closureIndex], alias (alias self._usedSyms)[closureIndex]));
     } catch {
         _ => __pragma!panic ();
     }
@@ -805,7 +805,7 @@ pub class Validator {
      * @throws: 
      *   - &ErrorMsg: if a symbol was declared but unused and warnUnused
      */
-    pub def safeQuitBlock (mut self) {    
+    pub def safeQuitBlock (mut self) {
         (alias self._symbols)[][$ - 1us]:.pop (1u64);
         (alias self._usedSyms)[][$ - 1us]:.pop (1u64);
     }
@@ -976,7 +976,9 @@ pub class Validator {
      *   - canBeInClosure: if the variable can be a variable from the parent of a closure
      * @returns: the generator of the variable or NoneValue
      */
-    pub def getLocal (mut self, name : [c8], canBeInClosure : bool = true)-> &Value {
+    pub def getLocal (mut self, loc : &Word, name : [c8], canBeInClosure : bool = true)-> &Value
+        throws &ErrorMsg
+    {
         for i in 0us .. self._symbols [][$ - 1us].len () {
             let ptr = self._symbols[][$ - 1us][][i].find (name);
             match ptr {
@@ -988,7 +990,7 @@ pub class Validator {
         }
 
         if (canBeInClosure) {
-            return self:.getInClosure (name);
+            return self:.getInClosure (loc, name);
         } else {
             return NoneValue::new ();
         }
@@ -1270,6 +1272,10 @@ pub class Validator {
                     f : &FuncPtrType => { f.getParameters () }
                     d : &DelegateType => { d.getParameters () }
                     _ => { throw ErrorMsg::fatal (val.getLoc (), format (ValidateErrorMessage::INCOMPATIBLE_TYPE, type, val.getType ())); } // The lambda value was found, but the result cannot be infered
+                }
+                
+                if (lmbd.getParameters ().len != paramTypes.len) {
+                    throw ErrorMsg::fatal (val.getLoc (), format (ValidateErrorMessage::INCOMPATIBLE_TYPE, type, val.getType ()));         
                 }
                 
                 return self._lambdaValidator.validateLambdaBody (alias self, Path::new (lmbd.getName ()), lmbd, paramTypes); // Validate the lambda from the parameters of  'type'
@@ -1904,11 +1910,13 @@ pub class Validator {
     /**
      * @returns: a local variable that is enclosed
      */
-    def getInClosure (mut self, name : [c8])-> &Value {
+    def getInClosure (mut self, loc : &Word, name : [c8])-> &Value
+        throws &ErrorMsg
+    {
         if (self._closureType.len () == 0us) return NoneValue::new ();
 
         let dmut closureType = (alias self._closureType) [self._closureType.len () - 1us];
-        let field = closureType.getField (name);
+        let (field, index) = closureType.getField (name);
         if (field.isOf!{&NoneType} ()) {
             let syms = closureType.getClosureSymbols ();
             let dmut used = closureType:.getClosureUsed ();
@@ -1917,38 +1925,70 @@ pub class Validator {
                 let ptr = syms[i].find (name);
                 match ptr {
                     Ok (g : &Value) => {
+                        let val = self.checkEnclosable (loc, g);
                         (alias used)[][i]:.insert (name);
                         let type = g.getType ();
 
                         let types = closureType.getInnerTypes () ~ [type];
                         let names = closureType.getInnerNames () ~ [name];
-                        let dmut secClosureType = ClosureType::new (closureType.getLoc (), types, names, closureType.getRefId (), syms, alias used);
-                        (alias self._closureType)[][$ - 1us] = alias secClosureType;
-
+                        let values = closureType.getInnerValues () ~ [val];
+                        let fndIndex = values.len - 1us;
                         
-                        let oldRef = self:.getLocal ("#{CLOSURE-VARREF}"s8, canBeInClosure-> false);
+                        let dmut secClosureType = ClosureType::new (closureType.getLoc (), types, names, values, closureType.getRefId (), syms, alias used);
+                        (alias self._closureType)[][$ - 1us] = alias secClosureType;
+                        
+                        let oldRef = self:.getLocal (EOF_WORD, "#{CLOSURE-VARREF}"s8, canBeInClosure-> false);
                         match oldRef {
                             v : &VarRefValue => {
                                 let closureRef = VarRefValue::new (oldRef.getLoc (), EOF_WORD, secClosureType, false, v.getRefId ());
                                 (alias (alias self._symbols)[self._symbols.len () - 1us])[0us]:.insert ("#{CLOSURE-VARREF}"s8, closureRef);
 
-                                return StructFieldAccessValue::new (EOF_WORD, type, closureRef, name);
+                                return ClosureFieldAccessValue::new (EOF_WORD, type, closureRef, fndIndex);
                             }
                             _ => __pragma!panic ();
                         }
                     }
                 }
-
-            }
-            
+            }            
         } else {
-            let closureRef = self:.getLocal ("#{CLOSURE-VARREF}"s8, canBeInClosure-> false);
-            return StructFieldAccessValue::new (EOF_WORD, field, closureRef, name);
+            let closureRef = self:.getLocal (EOF_WORD, "#{CLOSURE-VARREF}"s8, canBeInClosure-> false);
+            return ClosureFieldAccessValue::new (EOF_WORD, field, closureRef, index);
         }
         
         NoneValue::new ()
-    } catch {
-        _ => __pragma!panic ();
+    } catch {        
+        _ : &OutOfArray => __pragma!panic ();
+        err : &ErrorMsg => throw err;
     }
-        
+
+    /**
+     * Check that the value is enclosable, and return a the enclosable value derived from it
+     * @params:
+     *    - loc: the location of the enclosing
+     *    - value: the value being enclosed
+     */
+    def checkEnclosable (self, loc : &Word, value : &Value)-> &Value
+        throws &ErrorMsg
+    {
+        match value {
+            v : &VarDeclValue => {
+                match v.getType () {
+                    LambdaType () => {
+                        throw ErrorMsg::fatal (loc, format (ValidateErrorMessage::ENCLOSE_INCOMPLETE_TYPE, value.getType ()),
+                                               notes-> [ErrorMsg::note (value.getLoc (), ValidateErrorMessage::DECLARED_HERE)]);
+                    }
+                    _ => {
+                        cast!{&Value} (VarRefValue::new (loc, v.getLoc (), v.getType (), v.isMutable (), v.getUniqId (), isSelf-> false))
+                    }
+                }
+            }
+            p : &ProtoVarValue => {
+                cast!{&Value} (VarRefValue::new (loc, p.getLoc (), p.getType (), p.isMutable (), p.getUniqId (), isSelf-> p.isSelf ()))
+            }
+            _ => {
+                value
+            }
+        }        
+    }
+    
 }
