@@ -86,6 +86,7 @@ pub class LambdaValidator {
         let dmut errors = Vec!{&ErrorMsg}::new ();
         let mut uncomplete = false;
         let dmut parameters = Vec!{&ProtoVarValue}::new ();
+        let dmut references = Vec!{bool}::new ();
         let dmut types = Vec!{&Type}::new ();        
 
         // Enter a foreign because we don't want to pollute the current function scope (but this is only for the proto)
@@ -96,15 +97,16 @@ pub class LambdaValidator {
             {
                 match param {
                     v : &VarDeclExpr => { 
-                        let type = if (v.getType ().isOf!{&EmptyExpression} ()) { // If no type has been given in the definition of the lambda, then it is validated by calling it
+                        let (isRef, type) = if (v.getType ().isOf!{&EmptyExpression} ()) { // If no type has been given in the definition of the lambda, then it is validated by calling it
                             uncomplete = true;
-                            cast!{&Type} (NoneType::new (v.getLoc ()))
+                            (false, cast!{&Type} (NoneType::new (v.getLoc ())))
                         } else {
                             self.validateTypeParam (alias context, v) // Otherwise we can already make some validation
                         }
 
-                        let paramGen = ProtoVarValue::new (v.getLoc (), type, NoneValue::new (), type.isMutable (), isSelf-> false);
+                        let paramGen = ProtoVarValue::new (v.getLoc (), type, NoneValue::new (), type.isMutable (), isSelf-> false, isReference-> isRef);
                         parameters:.push (paramGen);
+                        references:.push (paramGen.isReference ());
                         types:.push (type);
                         
                         if (param.getLoc ().str () != Keys::UNDER) {
@@ -152,16 +154,16 @@ pub class LambdaValidator {
      * @throws: 
      *  - &ErrorMsg: if the type is not valid
      */
-    def validateTypeParam (self, dmut context : &Validator, vdecl : &VarDeclExpr)-> &Type
+    def validateTypeParam (self, dmut context : &Validator, vdecl : &VarDeclExpr)-> (bool, &Type)
         throws &ErrorMsg
     {
-        let type : &Type = {
-            context:.validateType (vdecl.getType (), decos-> vdecl.getDecos ())
+        let (isRef, type) = {
+            context:.validateType (vdecl.getType (), decos-> vdecl.getDecos (), canBeRef-> true)
         } catch {
             err : &ErrorMsg => throw ErrorMsg::note (vdecl.getLoc (), ValidateErrorMessage::VALIDATING, notes-> [err]);
         }                
         
-        if (type.isMutable () && !type.needExplicitAlias ()) { // Verification that the value is mutable iif it is aliasable
+        if (type.isMutable () && !type.needExplicitAlias () && !isRef) { // Verification that the value is mutable iif it is aliasable
             throw ErrorMsg::fatal (vdecl.getLoc (), ValidateErrorMessage::MUTABLE_CONST_PARAM);
         }
 
@@ -173,7 +175,7 @@ pub class LambdaValidator {
             TemporaryType () => throw ErrorMsg::fatal (vdecl.getType ().getLoc (), format (ValidateErrorMessage::INCOMPLETE_TYPE, type));
         }
         
-        type
+        (isRef, type)
     }
     
 
@@ -194,7 +196,7 @@ pub class LambdaValidator {
             let proto = {            
                 // Validate the parameters with the correct types
                 // insert them in context, and set the return type of the lambda
-                let params = self.validateFinalParameters (alias context, lmbd, paramTypes);
+                let (references, params) = self.validateFinalParameters (alias context, lmbd, paramTypes);
 
                 // Validate the body of the lambda
                 let (body, closure, retType, needFinalReturn) = self.validateLambdaBody (alias context, generator::base::generateUniqID (), lmbd);
@@ -205,8 +207,7 @@ pub class LambdaValidator {
                     cl : &ClosureType => {
                         let closureType = TupleType::new (cl.getLoc (), cl.getInnerTypes ());
                         let ptrType = PointerType::new (cl.getLoc (), closureType, isMutable-> false);
-
-                        let fstParam : &Value = ProtoVarValue::new (cl.getLoc (), ptrType, NoneValue::new (), false);
+                        let fstParam : &Value = ProtoVarValue::new (cl.getLoc (), ptrType, NoneValue::new (), false, isSelf-> false, isReference-> false);
 
                         let frame = FrameGenerator::new (lmbd.getLoc (), frameName, parameters-> ([fstParam] ~ params), retType, body, needFinalReturn-> needFinalReturn, isWeak-> true);
                         context:.insertNewGenerator (frame);
@@ -215,13 +216,13 @@ pub class LambdaValidator {
                                                               ptrType,
                                                               TupleValue::new (cl.getLoc (), closureType, cl.getInnerValues ()));
 
-                        DelegateValue::new (lmbd.getLoc (), frameName, closure-> closureValue, paramTypes, retType)                        
+                        DelegateValue::new (lmbd.getLoc (), frameName, closure-> closureValue, references, paramTypes, retType)                        
                     }
                     _ => {
                         let frame = FrameGenerator::new (lmbd.getLoc (), frameName, parameters-> params, retType, body, needFinalReturn-> needFinalReturn, isWeak-> true);
                         context:.insertNewGenerator (frame);
                         
-                        FuncPtrValue::new (lmbd.getLoc (), frameName, paramTypes, retType)
+                        FuncPtrValue::new (lmbd.getLoc (), frameName, references, paramTypes, retType)
                     }
                 }
             } catch {
@@ -259,12 +260,13 @@ pub class LambdaValidator {
      * @throws: 
      *   - &ErrorMsg: if there is a incompatibility between paramTypes and proto
      */
-    def validateFinalParameters (self, dmut context : &Validator, proto : &LambdaValue, paramTypes : [&Type])-> [&Value]
+    def validateFinalParameters (self, dmut context : &Validator, proto : &LambdaValue, paramTypes : [&Type])-> ([bool], [&Value])
         throws &ErrorMsg
     {
         if (proto.getParameters ().len != paramTypes.len) __pragma!panic ();
         
         let dmut parameters = Vec!{&Value}::new ();
+        let dmut references = Vec!{bool}::new ();
         let dmut errors = Vec!{&ErrorMsg}::new ();
         
         for i, param in proto.getParameters () {
@@ -275,8 +277,10 @@ pub class LambdaValidator {
                             context:.verifyCompatibleType (v.getLoc (), paramTypes[i].getLoc (), v.getType (), paramTypes[i]);
                         }
 
-                        let vVal = ProtoVarValue::new (v.getLoc (), paramTypes [i], NoneValue::new (v.getLoc ()), paramTypes [i].isMutable (), isSelf-> false);
+                        let vVal = ProtoVarValue::new (v.getLoc (), paramTypes [i], NoneValue::new (v.getLoc ()), paramTypes [i].isMutable (), isReference-> v.isReference (), isSelf-> false);
                         parameters:.push (vVal);
+                        references:.push (v.isReference ());
+                        
                         if (v.getLoc ().str () != Keys::UNDER) {
                             // Useless ? Is there a way for the var to avoid the shadowing verif made by the lambda validation ?
                             context:.verifyShadow (v.getLoc ()); 
@@ -293,7 +297,7 @@ pub class LambdaValidator {
         context:.setFunctionReturn (proto.getRetType ());
 
 
-        parameters[]
+        (references[], parameters[])
     }
 
     /**
@@ -342,7 +346,7 @@ pub class LambdaValidator {
                     need = true;
                 }
                 _ => { // There is a return, and we need to check the type mutability 
-                    context:.verifyMemoryOwner (body.getLoc (), retType, body, construct-> true);
+                    context:.verifyMemoryOwner (body.getLoc (), retType, body, construct-> true, byReference-> false);
                 }
             }
         }
