@@ -43,15 +43,20 @@ pub class IndexOpValidator {
     pub def validate (self, dmut context : &Validator, mult : &MultOperatorExpr) -> &Value
         throws &ErrorMsg
     {        
-        let left = context:.validateValue (mult.getLeft ());
-        let (rights, rTypes) = self.validateRightOperands (alias context, mult.getRights ());
-        
-        match left.getType () {
-            ArrayType () => { self.validateArray (alias context, mult.getLoc (), left, rights, rTypes) }
-            SliceType () => { self.validateSlice (alias context, mult.getLoc (), left, rights, rTypes) }
-            _ => {
-                throw ErrorMsg::fatal (mult.getLoc (), format (ValidateErrorMessage::UNDEFINED_INDEX_OP, left.getType (), rTypes));
+        let left = UniqValue::new (mult.getLoc (), context:.validateValue (mult.getLeft ()));
+        context:.enterDollar (left);
+        {
+            let (rights, rTypes) = self.validateRightOperands (alias context, mult.getRights ());
+
+            match left.getType () {
+                ArrayType () => { self.validateArray (alias context, mult.getLoc (), left, rights, rTypes) }
+                SliceType () => { self.validateSlice (alias context, mult.getLoc (), left, rights, rTypes) }
+                _ => {
+                    throw ErrorMsg::fatal (mult.getLoc (), format (ValidateErrorMessage::UNDEFINED_INDEX_OP, left.getType (), rTypes));
+                }
             }
+        } exit {
+            context:.exitDollar ();
         }
     }
 
@@ -171,7 +176,7 @@ pub class IndexOpValidator {
                 let arraySize = left.getType ().asOf!{&ArrayType} ().getSize ();
 
                 let rng = UniqValue::new (loc, right); // uniq value to make sure the value is constructed only once, because it is involved multiple times in the operation
-                let slice = self.validateArrayToSlice (alias context, loc, UniqValue::new (loc, left)); // Transforming the array into slice, to generalize pointer movements for slices only
+                let slice = self.validateArrayToSlice (alias context, loc, left); // Transforming the array into slice, to generalize pointer movements for slices only
 
                 let fstIndex = StructFieldAccessValue::new (right.getLoc (), indexType, rng, RangeKeys::FST);
                 let scdIndex = StructFieldAccessValue::new (right.getLoc (), indexType, rng, RangeKeys::SCD);
@@ -280,12 +285,11 @@ pub class IndexOpValidator {
 
         // If debug mode is active, we add a dynamic conditional to check the slice index overflow
         if (state::instance ().isDebugActive ()) {
-            let slice = UniqValue::new (loc, left);
-            let len = StructFieldAccessValue::new (loc, sizeType, slice, SliceKeys::LEN);
+            let len = StructFieldAccessValue::new (loc, sizeType, left, SliceKeys::LEN);
             
             let cmp = CmpIntOperatorValue::new (loc, BinaryOperators::INF_EQUAL, len, index);            
             let cond = self.createOutOfArrayTest (alias context, loc, cmp);
-            let sliceAccess = SliceAccessValue::new (loc, type, slice, index);
+            let sliceAccess = SliceAccessValue::new (loc, type, left, index);
             
             BlockValue::new (loc, type, [cond, sliceAccess], isSet-> true)            
         } else {
@@ -299,24 +303,20 @@ pub class IndexOpValidator {
     def verifyNotNegativeInt (self, dmut context : &Validator, loc : &Word, leftType : &Type, right : &Value, maximum : &BigInt = BigInt::new (u64::max))
         throws &ErrorMsg
     {
-        match right.getType ().asOf!{&IntType} ().isSigned () {
-            true => {
-                let (isNegative, isToBig, val) = {
-                    let i = context:.getCompileTimeInterpreter ().computeInt (right);
-                    (i < 0, i > maximum, i)
-                } catch {
-                    // The value is not cte
-                    _ => { (false, false, BigInt::new (0)) }
-                };
+        let (isNegative, isTooBig, val) = {
+            let i = context:.getCompileTimeInterpreter ().computeInt (right);
+            (i < 0, i >= maximum, i)
+        } catch {
+            // The value is not cte
+            _ => { (false, false, BigInt::new (0)) }
+        };
 
-                if (isNegative) { // The cte value is negative, that cannot happen when used as index
-                    throw ErrorMsg::fatal (loc, end-> right.getLoc (), format (ValidateErrorMessage::NEGATIVE_INT_INDEX, leftType, val));
-                }
+        if (isNegative) { // The cte value is negative, that cannot happen when used as index
+            throw ErrorMsg::fatal (loc, end-> right.getLoc (), format (ValidateErrorMessage::NEGATIVE_INT_INDEX, leftType, val));
+        }
 
-                if (isToBig) { // The cte value is bigger than the array length
-                    throw ErrorMsg::fatal (loc, end-> right.getLoc (), format (ValidateErrorMessage::ARRAY_OVERFLOW, maximum, val));
-                }
-            }
+        if (isTooBig) { // The cte value is bigger than the array length
+            throw ErrorMsg::fatal (loc, end-> right.getLoc (), format (ValidateErrorMessage::ARRAY_OVERFLOW, maximum, val));
         }
     }
     
@@ -331,28 +331,27 @@ pub class IndexOpValidator {
      * @throws:
      *    - &ErrorMsg: if the access is impossible
      */
-    def validateSliceRange (self, dmut context : &Validator, loc : &Word, left : &Value, right : &Value)-> &Value
+    def validateSliceRange (self, dmut context : &Validator, loc : &Word, slice : &Value, right : &Value)-> &Value
         throws &ErrorMsg
     {
         match right.getType ().asOf!{&RangeType} ().getInners ()[0] {
             indexType : &IntType => { // range access only works if the range is made of integers
                 let sizeType = IntType::new (loc, size-> 0u16, signed-> false);
-                let innerType = left.getType ().asOf!{&SliceType} ().getInners ()[0];
+                let innerType = slice.getType ().asOf!{&SliceType} ().getInners ()[0];
 
                 // We create uniq values, to make sure they are constructed only one time
                 // They are involved multiple times in the operation
                 let rng = UniqValue::new (loc, right);
-                let slice = UniqValue::new (loc, left);
 
                 let fstIndex = StructFieldAccessValue::new (loc, indexType, rng, RangeKeys::FST);
                 let scdIndex = StructFieldAccessValue::new (loc, indexType, rng, RangeKeys::SCD);
 
                 // Cte verification if possible, to check wether the range values are correctly bounded
-                self.verifyNotNegativeInt (alias context, loc, left.getType (), fstIndex);
-                self.verifyNotNegativeInt (alias context, loc, left.getType (), scdIndex);
+                self.verifyNotNegativeInt (alias context, loc, slice.getType (), fstIndex);
+                self.verifyNotNegativeInt (alias context, loc, slice.getType (), scdIndex);
 
                 // Cte verification to check wether the range is increasing or decreasing
-                self.verifyScdGTFst (alias context, loc, left.getType (), fstIndex, scdIndex);
+                self.verifyScdGTFst (alias context, loc, slice.getType (), fstIndex, scdIndex);
 
                 let (fstSizeIndex, scdSizeIndex) = match indexType.getSize () {
                     0us => { (fstIndex, scdIndex) }
@@ -387,7 +386,7 @@ pub class IndexOpValidator {
             }
         }
 
-        throw ErrorMsg::fatal (loc, format (ValidateErrorMessage::UNDEFINED_INDEX_OP, left.getType (), right.getType ()));
+        throw ErrorMsg::fatal (loc, format (ValidateErrorMessage::UNDEFINED_INDEX_OP, slice.getType (), right.getType ()));
     }
 
     /**
