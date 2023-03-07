@@ -77,14 +77,14 @@ pub class IndexOpValidator {
     def validateArray (self, dmut context : &Validator, loc : &Word, left : &Value, rights : [&Value], rTypes : [&Type])-> &Value
         throws &ErrorMsg
     {
-        if (rights.len == 0us) return self.validateArrayToSlice (alias context, loc, left); 
-        
-        context;
-        loc;
-        rTypes;
-        __pragma!fake_throw (&ErrorMsg);
-        __pragma!panic ();
-    
+        if (rights.len == 0us) return self.validateArrayToSlice (alias context, loc, left); // array[], => transform array in a slice
+        if (rTypes.len == 1us && rTypes [0].isOf!{&IntType} ()) {
+            return self.validateArrayInteger (alias context, loc, left, rights [0]);
+        } else if (rTypes.len == 1us && rTypes [0].isOf!{&RangeType} ()) {
+            return self.validateArrayRange (alias context, loc, left, rights [0]);
+        }
+
+        throw ErrorMsg::fatal (loc, format (ValidateErrorMessage::UNDEFINED_INDEX_OP, left.getType (), rTypes));
     }
 
     /**
@@ -98,12 +98,126 @@ pub class IndexOpValidator {
         match left.getType () {
             arr : &ArrayType => {
                 let inner = arr.getInners ()[0];
+
+                // A slice value constructed from the array (we let the backend manage the transformation, but it will more than probably be alike to SliceCtorValue {array, arrayLen})
                 let slcType = SliceType::new (loc, inner, isMutable-> arr.isMutable ());
                 
                 SliceValue::new (loc, slcType, left, implicitAlias-> false)                 
             }
+
+            // Called by something that should not
             _ => __pragma!panic ();
         }
+    }
+
+    /**
+     * Validate an index access on an array value using an integer value
+     * @params:
+     *    - context: the context of the validation
+     *    - loc: the location of the index
+     *    - left: the left operand (assumed to be of type array)
+     *    - right: the right operand (assumed to be of type int)
+     * @returns: the access value
+     * @throws:
+     *    - &ErrorMsg: if this operation is impossible
+     */
+    def validateArrayInteger (self, dmut context : &Validator, loc : &Word, left : &Value, right : &Value)-> &Value
+        throws &ErrorMsg
+    {
+        let sizeType = IntType::new (loc, size-> 0u16, signed-> false);
+        let innerType = left.getType ().asOf!{&ArrayType} ().getInners ()[0us];
+        let arraySize = left.getType ().asOf!{&ArrayType} ().getSize ();
+
+        // Cte verification if possible, to check wether the index is positive and does not overflow the array size
+        self.verifyNotNegativeInt (alias context, loc, left.getType (), right, maximum-> arraySize.getValue ());
+
+        // Index is cast into a usize (as it will have to, for pointer arithmetic)
+        let index = UniqValue::new (loc, match right.getType ().asOf!{&IntType} ().getSize () {
+            0us => { right }
+            _ => { cast!{&Value} (CastValue::new (loc, sizeType, right)) }
+        });
+
+        let arrayAccess = SliceAccessValue::new (loc, innerType, left, index);
+
+        // If debug mode is active, we add a dynamic conditional to check the slice index overflow
+        if (state::instance ().isDebugActive ()) {
+            let cmp = CmpIntOperatorValue::new (loc, BinaryOperators::INF_EQUAL, arraySize, index);
+            let cond = self.createOutOfArrayTest (alias context, loc, cmp);
+
+            BlockValue::new (loc, innerType, [cond, arrayAccess], isSet-> true)
+        } else {
+            arrayAccess
+        }
+    }
+
+    /**
+     * Validate an index access on an array value using a range value
+     * @params:
+     *    - context: the context of the validation
+     *    - loc: the location of the index
+     *    - left: the left operand (assumed to be of type array)
+     *    - right: the right operand (assumed to be of type range)
+     * @returns: the access value
+     * @throws:
+     *    - &ErrorMsg: if this operation is impossible
+     */
+    def validateArrayRange (self, dmut context : &Validator, loc : &Word, left : &Value, right : &Value)-> &Value
+        throws &ErrorMsg
+    {
+        match right.getType ().asOf!{&RangeType} ().getInners ()[0] {
+            indexType : &IntType => { // range access only works if the range is made of integers
+                let sizeType = IntType::new (loc, size-> 0u16, signed-> false);
+                let innerType = left.getType ().asOf!{&ArrayType} ().getInners ()[0];
+                let arraySize = left.getType ().asOf!{&ArrayType} ().getSize ();
+
+                let rng = UniqValue::new (loc, right); // uniq value to make sure the value is constructed only once, because it is involved multiple times in the operation
+                let slice = self.validateArrayToSlice (alias context, loc, UniqValue::new (loc, left)); // Transforming the array into slice, to generalize pointer movements for slices only
+
+                let fstIndex = StructFieldAccessValue::new (right.getLoc (), indexType, rng, RangeKeys::FST);
+                let scdIndex = StructFieldAccessValue::new (right.getLoc (), indexType, rng, RangeKeys::SCD);
+
+                // Cte verification if possible, to check wether the range values are correctly bounded
+                self.verifyNotNegativeInt (alias context, loc, left.getType (), fstIndex, maximum-> arraySize.getValue ());
+                self.verifyNotNegativeInt (alias context, loc, left.getType (), scdIndex, maximum-> arraySize.getValue ());
+
+                // Cte verification to check wether the range is increasing or decreasing
+                self.verifyScdGTFst (alias context, loc, left.getType (), fstIndex, scdIndex);
+
+                let (fstSizeIndex, scdSizeIndex) = match indexType.getSize () {
+                    0us => { (fstIndex, scdIndex) }
+                    _ => { // casting index values into usize, as they will be involved in pointer arithmetics
+                        (cast!{&Value}(CastValue::new (loc, sizeType, fstIndex)), cast!{&Value}(CastValue::new (loc, sizeType, scdIndex)))
+                    }
+                };
+
+                // The new len is the subtraction of (range.scd - range.fst)
+                let newLen = BinaryMathIntOperatorValue::new (loc, sizeType, BinaryOperators::MINUS, scdSizeIndex, fstSizeIndex);
+                let ptrType = PointerType::new (loc, innerType, isMutable-> innerType.isMutable ()); // the pointer type of the slice value [ptr ; len]
+                let newPtr = BinaryMathPointerOperatorValue::new (loc, ptrType, BinaryOperators::PLUS,
+                                                                  StructFieldAccessValue::new (loc, ptrType, slice, SliceKeys::PTR),
+                                                                  fstSizeIndex); // the new pointer is the old pointer + range.fst
+
+
+                let sliceCtor = SliceCtorValue::new (loc, slice.getType (), newPtr, newLen); // Construction of the slice from pointer and length
+                let sliceValue = SliceValue::new (loc, slice.getType (), sliceCtor, implicitAlias-> false); // Slicevalue from a slice construction
+
+                return if (state::instance ().isDebugActive ()) { // if the debug mode is active we add some dynamic tests to check the length and indexes overflow
+                    let len = StructFieldAccessValue::new (loc, sizeType, slice, SliceKeys::LEN);
+
+                    // The debug test is if (len < rng.scd || rng.scd < rng.fst) throw OutOfArray ();
+                    let cmpLen = CmpIntOperatorValue::new (loc, BinaryOperators::INF_EQUAL, len, scdIndex);
+                    let cmpRange = CmpIntOperatorValue::new (loc, BinaryOperators::INF, scdIndex, fstIndex);
+                    let cmp = LogicalBinBoolOperatorValue::new (loc, BinaryOperators::DPIPE, cmpLen, cmpRange);
+
+                    let cond = self.createOutOfArrayTest (alias context, loc, cmp);
+                    BlockValue::new (loc, slice.getType (), [cond, sliceValue], isSet-> true)
+                } else {
+                    sliceValue
+                };
+            }
+        }
+
+        throw ErrorMsg::fatal (loc, format (ValidateErrorMessage::UNDEFINED_INDEX_OP, left.getType (), right.getType ()));
     }
 
     /**
@@ -155,14 +269,17 @@ pub class IndexOpValidator {
         let sizeType = IntType::new (loc, size-> 0u16, signed-> false);
         let type = left.getType ().asOf!{&SliceType} ().getInners ()[0us];
 
+        // Cte verification if possible, to check wether the index is positive
         self.verifyNotNegativeInt (alias context, loc, left.getType (), right);
-        
+
+        // Index is cast into a usize (as it will have to, for pointer arithmetic)
+        let index = UniqValue::new (loc, match right.getType ().asOf!{&IntType} ().getSize () {
+            0us => { right }
+            _ => { cast!{&Value} (CastValue::new (loc, sizeType, right)) }
+        });
+
+        // If debug mode is active, we add a dynamic conditional to check the slice index overflow
         if (state::instance ().isDebugActive ()) {
-            let index = UniqValue::new (loc, match right.getType ().asOf!{&IntType} ().getSize () {
-                0us => { right }
-                _ => { cast!{&Value} (CastValue::new (loc, sizeType, right)) }
-            });
-            
             let slice = UniqValue::new (loc, left);
             let len = StructFieldAccessValue::new (loc, sizeType, slice, SliceKeys::LEN);
             
@@ -172,31 +289,33 @@ pub class IndexOpValidator {
             
             BlockValue::new (loc, type, [cond, sliceAccess], isSet-> true)            
         } else {
-            SliceAccessValue::new (loc, type, left, match right.getType ().asOf!{&IntType} ().getSize () {
-                0us => { right }
-                _ => { cast!{&Value} (CastValue::new (loc, sizeType, right)) }
-            })
+            SliceAccessValue::new (loc, type, left, index)
         }
     }
 
     /**
      * Verify that the index is not negative (if CTE)
      */
-    def verifyNotNegativeInt (self, dmut context : &Validator, loc : &Word, leftType : &Type, right : &Value)
+    def verifyNotNegativeInt (self, dmut context : &Validator, loc : &Word, leftType : &Type, right : &Value, maximum : &BigInt = BigInt::new (u64::max))
         throws &ErrorMsg
     {
         match right.getType ().asOf!{&IntType} ().isSigned () {
             true => {
-                let (isNegative, val) = {
+                let (isNegative, isToBig, val) = {
                     let i = context:.getCompileTimeInterpreter ().computeInt (right);
-                    (i < 0, i)
+                    (i < 0, i > maximum, i)
                 } catch {
-                    _ => { (false, BigInt::new (0)) }
+                    // The value is not cte
+                    _ => { (false, false, BigInt::new (0)) }
                 };
 
-                if (isNegative) {
+                if (isNegative) { // The cte value is negative, that cannot happen when used as index
                     throw ErrorMsg::fatal (loc, end-> right.getLoc (), format (ValidateErrorMessage::NEGATIVE_INT_INDEX, leftType, val));
-                }                
+                }
+
+                if (isToBig) { // The cte value is bigger than the array length
+                    throw ErrorMsg::fatal (loc, end-> right.getLoc (), format (ValidateErrorMessage::ARRAY_OVERFLOW, maximum, val));
+                }
             }
         }
     }
@@ -216,35 +335,40 @@ pub class IndexOpValidator {
         throws &ErrorMsg
     {
         match right.getType ().asOf!{&RangeType} ().getInners ()[0] {
-            indexType : &IntType => {
+            indexType : &IntType => { // range access only works if the range is made of integers
                 let sizeType = IntType::new (loc, size-> 0u16, signed-> false);
                 let innerType = left.getType ().asOf!{&SliceType} ().getInners ()[0];
+
+                // We create uniq values, to make sure they are constructed only one time
+                // They are involved multiple times in the operation
                 let rng = UniqValue::new (loc, right);
                 let slice = UniqValue::new (loc, left);
 
                 let fstIndex = StructFieldAccessValue::new (loc, indexType, rng, RangeKeys::FST);
                 let scdIndex = StructFieldAccessValue::new (loc, indexType, rng, RangeKeys::SCD);
 
+                // Cte verification if possible, to check wether the range values are correctly bounded
                 self.verifyNotNegativeInt (alias context, loc, left.getType (), fstIndex);
                 self.verifyNotNegativeInt (alias context, loc, left.getType (), scdIndex);
 
+                // Cte verification to check wether the range is increasing or decreasing
                 self.verifyScdGTFst (alias context, loc, left.getType (), fstIndex, scdIndex);
-
 
                 let (fstSizeIndex, scdSizeIndex) = match indexType.getSize () {
                     0us => { (fstIndex, scdIndex) }
-                    _ => {
+                    _ => { // casting index values into usize, as they will be involved in pointer arithmetics
                         (cast!{&Value}(CastValue::new (loc, sizeType, fstIndex)), cast!{&Value}(CastValue::new (loc, sizeType, scdIndex)))
                     }
                 };
 
+                // The new len is the subtraction of (range.scd - range.fst)
                 let newLen = BinaryMathIntOperatorValue::new (loc, sizeType, BinaryOperators::MINUS, scdSizeIndex, fstSizeIndex);
-                let ptrType = PointerType::new (loc, innerType, isMutable-> innerType.isMutable ());
+                let ptrType = PointerType::new (loc, innerType, isMutable-> innerType.isMutable ()); // the pointer type of the slice value [ptr ; len]
                 let newPtr = BinaryMathPointerOperatorValue::new (loc, ptrType, BinaryOperators::PLUS,
                                                                   StructFieldAccessValue::new (loc, ptrType, slice, SliceKeys::PTR),
-                                                                  fstSizeIndex);
+                                                                  fstSizeIndex); // the new pointer is the old pointer + range.fst
 
-                let sliceCtor = SliceCtorValue::new (loc, slice.getType (), newPtr, newLen);
+                let sliceCtor = SliceCtorValue::new (loc, slice.getType (), newPtr, newLen); // Construction of the slice from pointer and length
                 let sliceValue = SliceValue::new (loc, slice.getType (), sliceCtor, implicitAlias-> false);
 
                 return if (state::instance ().isDebugActive ()) {
