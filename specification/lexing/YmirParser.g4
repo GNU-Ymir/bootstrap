@@ -1,340 +1,3 @@
-* Input
-
-The input format of an ymir source file is interpreted as a sequence of Unicode
-code points in Utf-8. The file extension it ~.yr~
-
-* Keywords
-
-There are two type of keywords, strict keywords and weak ones. Strict keywords cannot be used as identifiers.
-
-** Strict keywords
-
-#+ATTR_LATEX: :environment longtable :align |l|l|
-|-------------+-------------------------------------------------------------------------|
-| value       | Short description                                                       |
-|-------------+-------------------------------------------------------------------------|
-| ~aka~       | As known as, to give a name to a value or a type to be                  |
-|             | used multiple times (can also be used in an import)                     |
-| ~alias~     | Memory management                                                       |
-| ~assert~    | Assertion expression                                                    |
-| ~atomic~    | Thread safe code section                                                |
-| ~break~     | Loop breaking                                                           |
-| ~cast~      | Type casting                                                            |
-| ~class~     | Class definition                                                        |
-| ~const~     | Constant attribute for a type or a value                                |
-| ~copy~      | Single level memory copy                                                |
-| ~cte~       | Compile time evaluation                                                 |
-| ~dcopy~     | Deep level memory copy                                                  |
-| ~def~       | Function definition                                                     |
-| ~dg~        | Delegate type (closure type)                                            |
-| ~dmut~      | Deeply mutable attribute for type or variable                           |
-| ~do~        | Do for do while loop                                                    |
-| ~__dtor~    | Destructor of class instance                                            |
-| ~else~      | Else part of an if else construction                                    |
-| ~enum~      | Definition of an enumeration                                            |
-| ~expand~    | Expand a tuple value into multiple parameters                           |
-| ~extern~    | Define an external definition (from another language)                   |
-| ~false~     | Literal false value of bool type                                        |
-| ~for~       | For loop                                                                |
-| ~fn~        | Type of function pointer type                                           |
-| ~if~        | If part of an if else construction                                      |
-| ~impl~      | Trait implementation in class                                           |
-| ~import~    | Module importation                                                      |
-| ~in~        | In operator (and for loop)                                              |
-| ~is~        | Pointer type and class instance equality operator                       |
-| ~lazy~      | Global var declaration or lazy value, variable                          |
-| ~let~       | Variable definition                                                     |
-| ~loop~      | Loop without terminal condition                                         |
-| ~macro~     | Macro definition                                                        |
-| ~match~     | pattern matching construction                                           |
-| ~mod~       | Module definition                                                       |
-| ~mut~       | Mutable property for type of variable                                   |
-| ~null~      | Null value for pointer type                                             |
-| ~of~        | Template specialization operator, and dynamic type comparison           |
-| ~over~      | Template specialization operator, method override and class inheritence |
-| ~__pragma~  | Pragma operations (compilable, panic, trusted...)                       |
-| ~prv~       | Private definition protection                                           |
-| ~prot~      | Protected definition protection                                         |
-| ~pub~       | Public definition protection                                            |
-| ~pure~      | Pure property for type or variable                                      |
-| ~ref~       | Reference property for variable                                         |
-| ~return~    | Function return statement                                               |
-| ~self~      | class instance object in methods                                        |
-| ~sizeof~    | Sizeof type                                                             |
-| ~struct~    | Structure definition                                                    |
-| ~super~     | Super object instance in methods                                        |
-| ~throw~     | Throw exception statement                                               |
-| ~throws~    | Throw list of exception in function definition                          |
-| ~trait~     | Trait definition                                                        |
-| ~true~      | True literal value of bool type                                         |
-| ~typeof~    | Get the type from a value                                               |
-| ~__test~    | unittest definition                                                     |
-| ~__version~ | version test                                                            |
-| ~while~     | While loop                                                              |
-| ~with~      | With construction (for disposable types)                                |
-|-------------+-------------------------------------------------------------------------|
-
-** Weak
-
-#+ATTR_LATEX: :environment longtable :align |l|l|
-|-----------+-----------------------------------------------|
-| value     | Short description                             |
-|-----------+-----------------------------------------------|
-| ~C~       | C language external                           |
-| ~new~     | allocation of new object, or slice allocation |
-| ~typeid~  | the type id of a type                         |
-| ~success~ | Success scope guard                           |
-| ~failure~ | Failure scope guard                           |
-| ~exit~    | Exit scope guard                              |
-| ~main~    | Main function name                            |
-| ~_~       | Anonymus variable name                        |
-| ~skips~   | Tokens skiped in macro definition             |
-| ~members~ | List of members of a enumeration              |
-|-----------+-----------------------------------------------|
-
-
-
-* Identifier
-
-Identifiers follow the grammar rule :
-
-\begin{code}
-Identifier := (_)* [a-zA-Z] ([a-zA-Z0-9] | '_')*
-\end{code}
-
-\noindent The token ~_~ is a valid identifier that indicates a variable that is intentionally unused.
-
-** Convention
-
-- Identifier beginning by the token ~_~ (e.g. ~_myVar~) are private or protected within the current context.
-- Global identifier are written in full upper case separated by the token ~_~ and surrounded by two ~_~ tokens (e.g. ~lazy __GLOBAL_VARIABLE__~).
-- Types start with an upper case letter and each new word also start with an upper case letter (e.g. ~struct MyStruct~, ~class Foo~).
-- All other identifiers are starting by a lower case letter and each new word starts with an upper case letter. (e.g. ~def functionDoingSomething~, ~let localVar~)
-
-* Grammar
-
-The complete grammar of Ymir is defined using Antlr syntax in the files :
-- YmirLexer.g4 :
-
-\begin{code}
-lexer grammar YmirLexer;
-
-IntegerLiteral:
-    DecimalLiteral IntegerSuffix?
-    | OctalLiteral IntegerSuffix?
-    | HexadecimalLiteral IntegerSuffix? ;
-
-BooleanLiteral: FALSE | TRUE ;
-
-IntNameNoSize:
-        'u8'
-        | 'i8'
-        | 'u16'
-        | 'i16'
-        | 'u32'
-        | 'i32'
-        | 'u64'
-        | 'i64'
-        ;
-
-IntName:
-    IntNameNoSize
-    | 'usize'
-    | 'isize' ;
-
-IntegerSuffix: IntNameNoSize
-               | IS
-               | 'us' ;
-
-FloatLiteral: DecimalLiteral DOT (DecimalLiteral)? FloatSuffix?
-              | DOT DecimalLiteral FloatSuffix?
-              ;
-
-FloatSuffix: 'f';
-
-fragment DIGIT: [0-9];
-fragment OCTALDIGIT: [0-7];
-fragment HEXADECIMALDIGIT: [0-9a-fA-F];
-
-DecimalLiteral : (DIGIT | '_')* DIGIT;
-OctalLiteral: '0o' (OCTALDIGIT | '_')* OCTALDIGIT;
-HexadecimalLiteral: '0x' (HEXADECIMALDIGIT | '_')* HEXADECIMALDIGIT;
-
-AT: '@';
-LBRACK: '{';
-RBRACK: '}';
-DCOLON: '::';
-COLON: ':';
-SEMI_COL: ';';
-LPAR: '(';
-RPAR: ')';
-EQUAL: '=';
-DIV_EQUAL: '/=';
-MINUS_EQUAL: '-=';
-ADD_EQUAL: '+=';
-STAR_EQUAL: '*=';
-MOD_EQUAL: '%=';
-TILDE_EQUAL: '~=';
-LEFTD_EQUAL: '>>=';
-RIGHTD_EQUAL: '<<=';
-EXCLAM: '?';
-COMA: ',';
-DARROW: '=>';
-SARROW: '->';
-LCRO: '[';
-RCRO: ']';
-DPIPE: '||';
-DAND: '&&';
-LT: '<';
-GT: '>';
-LEQ: '<=';
-GEQ: '>=';
-DEQUAL: '==';
-NOT_EQUAL: '!=';
-TDOT: '...';
-DDOT: '..';
-MINUS: '-';
-STAR: '*';
-AND: '&';
-NOT: '!';
-LEFTD: '<<';
-RIGHTD: '>>';
-PIPE: '|';
-XOR: '^';
-AND_LCRO: ':[';
-DOT: '.';
-AND_DOT: ':.';
-DOLLAR: '$';
-
-C: 'C';
-NEW: 'new';
-TYPEID: 'typeid';
-SUCCESS: 'success';
-FAILURE: 'failure';
-EXIT: 'exit';
-MAIN: 'main';
-UNDER: '_';
-SKIPS: 'skips';
-MEMBERS: 'members';
-
-AKA: 'aka';
-ALIAS: 'alias';
-ASSERT: 'assert';
-ATOMIC: 'atomic';
-BREAK: 'break';
-CAST: 'cast';
-CLASS: 'class';
-TUPLE: 'tuple';
-CONST: 'const';
-COPY: 'copy';
-CTE: 'cte';
-DCOPY: 'dcopy';
-DEF: 'def';
-DG: 'dg';
-DMUT: 'dmut';
-DO: 'do';
-DTOR: '__dtor';
-ELSE: 'else';
-ENUM: 'enum';
-EXPAND: 'expand';
-EXTERN: 'extern';
-FALSE: 'false';
-FOR: 'for';
-FN: 'fn';
-IF: 'if';
-IMPL: 'impl';
-IMPORT: 'import';
-IN: 'in';
-NOT_IN: '!in';
-NOT_IS: '!is';
-NOT_OF: '!of';
-IS: 'is';
-LAZY: 'lazy';
-LET: 'let';
-LOOP: 'loop';
-MACRO: 'macro';
-MATCH: 'match';
-MOD: 'mod';
-MUT: 'mut';
-NULL: 'null';
-OF: 'of';
-OVER: 'over';
-PRAGMA: '__pragma';
-PRV: 'prv';
-PROT: 'prot';
-PUB: 'pub';
-PURE: 'pure';
-REF: 'ref';
-RETURN: 'return';
-SELF: 'self';
-SIZEOF: 'sizeof';
-STRUCT: 'struct';
-SUPER: 'super';
-THROW: 'throw';
-THROWS: 'throws';
-TRAIT: 'trait';
-TRUE: 'true';
-TYPEOF: 'typeof';
-TEST: '__test';
-VERSION: '__version';
-WHILE: 'while';
-WITH: 'with';
-ADD: '+';
-TILDE: '~';
-DIV: '/';
-MODULO: '%';
-DXOR: '^^';
-C8: 'c8';
-C32: 'c32';
-C16: 'c16';
-S8: 's8';
-S16: 's16';
-S32: 's32';
-
-
-ID: (UNDER)* [a-zA-Z][a-zA-Z_0-9]* ;
-Whitespace: [ \t]+ -> skip;
-Newline: ('\r' '\n'? | '\n') -> skip;
-BlockComment: '/*' .*? '*/' -> skip;
-BlockComment2: '/++' .+? '+/' -> skip;
-LineComment: '//' ~ [\r\n]* -> skip;
-
-MacroLiteralC: MACRO_LCRO -> pushMode(MacroLCROCharSet) ;
-MacroLiteralB: MACRO_BRACK -> pushMode (MacroBRACKCharSet);
-MacroLiteralP: MACRO_PAR -> pushMode (MacroPARCharSet);
-
-StringLiteral: '"' -> pushMode (StringLiteralMode);
-CharLiteral: '\'' -> pushMode (CharLiteralMode);
-
-mode StringLiteralMode;
-STRING_TEXT: ~["\n\r]+ ;
-STRING_LIT_END : '"' -> popMode;
-
-mode CharLiteralMode;
-CHAR_TEXT: ~['\n\r]+ ;
-CHAR_LIT_END : '\'' -> popMode;
-
-MACRO_LCRO: '#[';
-mode MacroLCROCharSet;
-MACRO_TEXT_C: ~(']')+ ;
-MACRO_RCRO : ']' -> popMode;
-
-MACRO_BRACK: '#{';
-mode MacroBRACKCharSet;
-MACRO_TEXT_B: ~('}')+ ;
-MACRO_RBRACK : '}' -> popMode;
-
-MACRO_PAR: '#(';
-mode MacroPARCharSet;
-MACRO_TEXT_P: ~(')')+ ;
-MACRO_RPAR : ')' -> popMode;
-
-\end{code}
-
-#+LATEX: \pagebreak
-
-- and YmirParser.g4:
-\begin{code}
 parser grammar YmirParser;
 options {
 	tokenVocab = YmirLexer;
@@ -434,11 +97,11 @@ macro_expression: macro_inner_mult (multiplicator)?
     | ID EQUAL macro_expression
     | string_lit
     | any_expression_10
-    ;
+    ;            
 
 macro_body_rule: LBRACK ( ~(LBRACK | RBRACK) | macro_body_rule)* RBRACK ;
 multiplicator: (STAR | ADD | EXCLAM) ;
-
+  
 /**
  * ============================
  * MODULE
@@ -530,7 +193,7 @@ throws_decl: THROWS any_expression (COMA any_expression)* ;
 
 class: template_class
     | simple_class
-    ;
+    ; 
 
 template_class: CLASS (IF any_expression)? (attributes)?
                 ID template_param_list (OVER any_expression)?
@@ -694,7 +357,7 @@ operand_no_close_1: block
                     | match_expr
                     | version_expr
                     | with_expr
-                    | atomic_expr
+                    | atomic_expr 
                     ;
 
 
@@ -727,7 +390,7 @@ operand_3: cast_expr
 
 operand_follow: LPAR call_list RPAR (operand_follow)?
                 | (LCRO | AND_LCRO) call_list RCRO (operand_follow)?
-                | (DOT | AND_DOT) operand_3 (template_call)? (operand_follow)?
+                | (DOT | AND_DOT) operand_3 (template_call)? (operand_follow)? 
                 | macro_call (operand_follow)?
                 ;
 
@@ -823,7 +486,7 @@ with_body: block
 atomic_expr: ATOMIC (any_expression)? atomic_body ;
 atomic_body: block
              | ((expression_0 SEMI_COL) | (expression_no_close_0 SEMI_COL? ))
-             ;
+             ; 
 
 
 /**
@@ -842,10 +505,10 @@ lambda_body: block
 intrinsic: intrinsic_keys (any_expression_10 | (LPAR any_expression RPAR)) ;
 intrinsic_keys: COPY | EXPAND | TYPEOF | SIZEOF | ALIAS | DCOPY;
 
-decorated_expr: decorator (any_expression_10 | (LPAR any_expression RPAR)) ;
+decorated_expr: decorator (any_expression_10 | (LPAR any_expression RPAR)) ; 
 literal: IntegerLiteral
     | BooleanLiteral
-    | FloatLiteral
+    | FloatLiteral 
     | string_lit
     | CharLiteral CHAR_TEXT CHAR_LIT_END (C8 | C16 | C32)?
     | NULL
@@ -853,4 +516,3 @@ literal: IntegerLiteral
     ;
 
 string_lit: StringLiteral STRING_TEXT STRING_LIT_END (S8 | S16 | S32)? ;
-\end{code}
