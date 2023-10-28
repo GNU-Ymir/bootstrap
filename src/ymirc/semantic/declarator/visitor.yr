@@ -29,23 +29,21 @@ import std::concurrency::future;
  * The nodes of the tree are not validated, and have to be passed to a validator
  */
 pub class Declarator {
-    
-    /// The list of imported modules
-    let dmut _imported  = HashMap!{&Path, dmut &Symbol}::new ();
-    
+
+    /// Path to the root directory of the package
+    let  _packageDir : &Path;
+
     /// The root of all declarations
-    let dmut _root = ModuleSymbol::new (EOF_WORD, ""s8, isGlobal-> true);
+    let dmut _root = ModuleSymbol::new (EOF_WORD, EOF_WORD, ""s8, isGlobal-> true);
 
     /// True iif the symbols that are declarated are templates, this is a toggle variable
     let mut _templateDeclaration = false;
 
-    let mut _packagePath : &Path;
-
     /**
      * Create a new empty declarator
      */
-    pub self (packagePath : &Path) with
-        _packagePath = packagePath
+    pub self (packageDir : &Path) with
+        _packageDir = packageDir
     {}
 
     /**
@@ -115,6 +113,9 @@ pub class Declarator {
             gl : &GlobalDecl => {
                 return self.declareGlobal (gl, alias parent, protection-> protection);
             }
+            u : &UseDecl => {
+                return self:.declareUse (u, alias parent);
+            }
             _ => {
                 throw ErrorMsg::fatal (root.getLoc (), DeclareErrorMessage::UNEXPECTED_IN_MODULE);  
             }
@@ -136,31 +137,52 @@ pub class Declarator {
      *   - parent: the parent symbol that is declaring the module
      * @info: self._imported is updated if the module is global, as well a self._root
      */
-    fn declareModule (mut self, module : &ModuleDecl, dmut parent : &Symbol, protection : Protection = Protection::PRIVATE)-> dmut &Symbol
+    fn declareModule (mut self, module : &ModuleDecl, dmut parent : &Symbol, protection : Protection = Protection::PRIVATE, importLoc : &Word = EOF_WORD)-> dmut &Symbol
         throws &ErrorMsg
     {
-        let p = if (module.getName ().isEof ()) {
-            Path::new (Path::new (module.getLoc ().filename ()).stripExtension ().file ())
+        let name = if (module.isGlobal ()) {
+            if (module.getPath ().isEof ()) {
+                Path::new (module.getLoc ().filename ()).stripExtension ().file ()
+            } else {
+                module.getPath ().str ()
+            }
         } else {
-            Path::new (module.getName ().str ())
+            module.getLoc ().str ()
         };
 
-        let loc = if (module.isGlobal ()) Word::new (p.file (), module.getLoc ()) else { module.getLoc () }
-        let dmut ret = ModuleSymbol::new (loc, module.getComments (), isExtern-> false, isGlobal-> module.isGlobal (), protection-> protection);
-                              
+        let dmut ret = ModuleSymbol::new (Word::new (name, module.getLoc ()), importLoc-> importLoc, module.getComments (), isExtern-> false, isGlobal-> module.isGlobal (), protection-> protection);
         if (module.isGlobal ()) {
-            self._imported:.insert (p, alias ret);
+            let fileLoc = Path::new (module.getLoc ().filename ()).stripExtension ().file ();
+            if (fileLoc != name) {
+                throw ErrorMsg::fatal (module.getPath (), format (DeclareErrorMessage::WRONG_MODULE_NAME, module.getPath (), Path::new (name).addExtension (CommonVars::YMIR_EXTENSION).toStr ()));
+            }
+        }
 
-            let fileLoc = Path::new (Path::new (module.getLoc ().filename ()).stripExtension ().file ());
-            if (fileLoc != p) {
-                throw ErrorMsg::fatal (module.getLoc (), format (DeclareErrorMessage::WRONG_MODULE_NAME, module.getName (), p.addExtension (CommonVars::YMIR_EXTENSION).toStr ()));
+        // Check wether the module is already imported within the current package
+        let already = parent.getLocalSymbols (name, protection-> Protection::PRIVATE);
+        for a in already[] {
+            match a {
+                m : &ModuleSymbol => { // a module with the same name is already present in the referent
+                    let dmut notes = Vec!{&ErrorMsg}::new ();
+                    if (!importLoc.isEof ()) {
+                        notes:.push (ErrorMsg::note (importLoc, format (DeclareErrorMessage::IN_IMPORT, importLoc.str ())));
+                    }
+
+                    if (!m.getImportLoc ().isEof ()) {
+                        notes:.push (ErrorMsg::note (m.getImportLoc (), format (DeclareErrorMessage::IN_IMPORT, m.getImportLoc ().str ())));
+                    } else {
+                        notes:.push (ErrorMsg::note (m.getLoc (), DeclareErrorMessage::DECLARED_HERE));
+                    }
+
+                    throw ErrorMsg::fatal (ret.getLoc (), format (DeclareErrorMessage::SHADOWING_DECL, ret.getLoc ().str ()), notes-> notes[]);
+                }
             }
         }
 
         parent:.insert (alias ret, replace-> false, anonymus-> self._templateDeclaration);
 
         // if (!state::instance ().isStandalone ()) {
-        //     self:.useAllCoreFiles (alias ret);
+        //     self:.useCorePackage (alias ret, state::instance ().getCorePath ());
         // } catch {
         //     err : &ErrorMsg => throw err;
         //     fs : &FsError => {
@@ -173,6 +195,70 @@ pub class Declarator {
         }
         
         return alias ret;
+    }
+
+    /**
+     * Declare a use declaration
+     * @params:
+     *    - use_: the declaration
+     *    - parent: the current context
+     * */
+    fn declareUse (mut self, use_ : &UseDecl, dmut parent : &Symbol)-> dmut &Symbol
+        throws &ErrorMsg
+    {
+        let useP = use_.getModulePath ();
+        let p = self.toPath (useP);
+        let mut root = parent:.getSymbols (p.root (), protection-> Protection::PRIVATE)[]; // absolute access to the root of the path
+
+        if (root.len == 0us) { // root of the path does not exist
+            // this is an absolute access, thus an absolute error, thus absolute error has to be thrown
+            throw self.createGlobalAccessError (self.getPathIndexLoc (useP, 0us), p.root (), parent);
+        }
+
+        let mut current = parent, mut all = false;
+        let parts = p.parts ();
+        for i in 1us .. parts.len {
+            let mut found = false;
+            for r in root match r {
+                m : &ModuleSymbol => { // there can be only one module with a given name in another module, otherwise error would have been thrown during module declaration
+                    if (i == parts.len - 1us && parts [i] == Keys::UNDER) {
+                        // use all sub modules declared in current module
+                        root = self.getAllLocalFromContext (parent, m); // relative access, while ensuring protection access
+                        all = true;
+                    } else {
+                        root = self.getLocalFromContext (parts [i], parent, m); // relative access, while ensuring protection access
+                        if (root.len == 0us) { // no module named parts[i] in current module
+                            let errLoc = self.getPathIndexLoc (useP, i);
+                            throw ErrorMsg::fatal (errLoc, format (DeclareErrorMessage::NO_MODULE_NAMED, parts [i], m.getPath ().toStr (sep-> "::"s8)),
+                                                   notes-> self.createLocalAccessError (errLoc, parts[i], m));
+                        }
+                    }
+
+                    found = true;
+                    current = m;
+                }
+            }
+
+            // A symbol was found, but it was not a module
+            if (!found) {
+                throw ErrorMsg::fatal (self.getPathIndexLoc (useP, i - 1us), format (DeclareErrorMessage::NO_MODULE_NAMED, parts[i - 1us], current.getPath ().toStr (sep-> "::"s8)));
+            }
+        }
+
+        for r in root match r {
+            m : &ModuleSymbol => { // use all the module found at the end of the path
+                parent:.use (p, alias self:.getMutableSymbol (m));
+                all = true; // set all to true, because at least one module was found
+            }
+        }
+
+        if (!all) { // all is true if at least one module was used, or '_' was found, meaning use all sub modules from this path
+            // if not all, then symbol was found in current, but it was not a module
+            throw ErrorMsg::fatal (self.getPathIndexLoc (useP, parts.len - 1us),
+                                   format (DeclareErrorMessage::NO_MODULE_NAMED, parts[parts.len - 1us], current.getPath ().toStr (sep-> "::"s8)));
+        }
+
+        EmptySymbol::new ()
     }
 
     /**
@@ -193,61 +279,41 @@ pub class Declarator {
     fn declareImport (mut self, im : &ImportDecl, dmut parent : &Symbol, protection : Protection)-> dmut &Symbol
         throws &ErrorMsg
     {
-        let child = self._packagePath.push (parent.getPath ()).push (im.getModuleName ().str ()).addExtension (CommonVars::YMIR_EXTENSION);
-        let sibling = self._packagePath.push (parent.getPath ().parent ()).push (im.getModuleName ().str ()).addExtension (CommonVars::YMIR_EXTENSION);
+        let child = self._packageDir.push (parent.getPath ()).push (im.getModuleName ().str ()).addExtension (CommonVars::YMIR_EXTENSION);
+        let sibling = self._packageDir.push (parent.getPath ().parent ()).push (im.getModuleName ().str ()).addExtension (CommonVars::YMIR_EXTENSION);
 
-        let dmut where = alias parent;
-        let p = if (fs::sys::isFile (sibling) && !fs::sys::isFile (child)) {
-            where = alias (parent:.getReferent ());
-            sibling
-        } else {
-            child
-        };
+        let dmut referent = alias parent;
+        if (fs::sys::isFile (sibling) && fs::sys::isFile (child)) {
+            throw ErrorMsg::fatal (im.getModuleName (), format (DeclareErrorMessage::CONFLICT_MODULES, child.toStr (), sibling.toStr ()));
+        } else if (!fs::sys::isFile (sibling) && !fs::sys::isFile (child)) {
+            throw ErrorMsg::fatal (im.getModuleName (), format (DeclareErrorMessage::NO_SUCH_FILE, child.toStr (), sibling.toStr ()));
+        }
 
-        {
-            let dmut modO = self._imported:.find (p);
-            match ref modO {
-                _ => {
-                    let modDecl = self.readModuleFromImport (im.getLoc (), p);
-                    match modDecl {
-                        module : &ModuleDecl => {
-                            self:.declareModule (module, parent-> alias where, protection-> protection);
-                        }
-                        _ => __pragma!panic ();
-                    }
-                }
+        let decl = {
+            if (fs::sys::isFile (sibling)) {
+                referent = alias parent:.getReferent ();
+                SyntaxVisitor::new (sibling):.read ()
+            } else {
+                SyntaxVisitor::new (child):.read ()
             }
         } catch {
             err : &ErrorMsg => {
-                throw ErrorMsg::note (im.getLoc (), format (DeclareErrorMessage::IN_IMPORT, im.getModuleName ()), notes-> [err]);
+                throw err.withNote ([ErrorMsg::note (im.getModuleName (), format (DeclareErrorMessage::IN_IMPORT, im.getModuleName ().str ()))]);
+            }
+            _ => {
+                throw ErrorMsg::fatal (im.getModuleName (), format (DeclareErrorMessage::NO_SUCH_FILE, child.toStr (), sibling.toStr ()),
+                                       notes-> [ErrorMsg::note (im.getModuleName (), format (DeclareErrorMessage::IN_IMPORT, im.getModuleName ().str ()))]);
             }
         }
-        
+
+        match decl {
+            module : &ModuleDecl => {
+                self:.declareModule (module, alias referent, protection-> protection, importLoc-> im.getModuleName ())
+            }
+            _ => __pragma!panic ();
+        }
+
         return EmptySymbol::new ();
-    }
-
-    /**
-     * Read a module from a file path (search in Include directories, until the file is found)
-     * @params: 
-     *  - loc: the location of the importation
-     *   - path: the relative path of the module
-     * @returns: the module syntaxically read
-     * @throws: 
-     *   - &ErrorMsg: Or there is no file, or there is a syntax error inside the file
-     */
-    fn readModuleFromImport (self, loc : &Word, filePath : &Path)-> &Declaration
-        throws &ErrorMsg
-    {
-        if (fs::sys::isFile (filePath)) {
-            return SyntaxVisitor::open (filePath):.read ();
-        } catch {
-            err : &ErrorMsg => {
-                throw err;
-            }
-            _  : &FsError => {}
-        }
-
-        throw ErrorMsg::fatal (loc, format (DeclareErrorMessage::NO_SUCH_FILE, filePath.toStr ()));
     }
 
     /**
@@ -1107,47 +1173,7 @@ pub class Declarator {
 
         alias glSym
     }
-    
-    /**
-     * ================================================================================
-     * ================================================================================
-     * =========================          INSERTION           =========================
-     * ================================================================================
-     * ================================================================================
-     */
 
-    /**
-     * Insert a symbol into a module within a given path
-     * Create sub modules if needed
-     * @params: 
-     *   - p: the path of the insertion
-     *   - sym: the symbol to insert
-     *   - current: the module that will accept the insertion
-     */
-    fn insertByPath (mut self, p : &Path, dmut sym : &Symbol, dmut current : &Symbol, replace : bool = false) {
-        if (p.parts ().len == 1us) {
-            current:.insert (alias sym, replace-> replace, anonymus-> self._templateDeclaration);
-        } else {
-            let dmut lst = current:.getLocalSymbols (p.parts ()[0us]);
-            let dmut subs = lst:.opIndex ();
-            for i in 0us .. subs.len {
-                match ref subs [i] {
-                    dmut m : &ModuleSymbol => {
-                        self:.insertByPath (p.removeRoot (), alias sym, alias m, replace-> replace);
-                        return {}
-                    }
-                }
-            }
-
-            let dmut sub = ModuleSymbol::new (Word::new (p.parts ()[0us], sym.getLoc ()), ""s8, isGlobal-> true);
-            current:.insert (alias sub, replace-> false, anonymus-> self._templateDeclaration);
-            
-            self:.insertByPath (p.removeRoot (), alias sym, alias sub, replace-> replace);
-        }
-    }
-    
-    
-   
     /**
      * ================================================================================
      * ================================================================================
@@ -1173,6 +1199,44 @@ pub class Declarator {
     }
 
     /**
+     * @returns: the location of the 'index' path element in the path
+     * */
+    fn getPathIndexLoc (self, expr : &Expression, index : usize)-> &Word {
+        match expr {
+            p : &PathExpr => {
+                let locs = p.getLocs ();
+                if (locs.len < index) { expr.getLoc () }
+                else { locs [index] }
+            }
+            _ => {
+                expr.getLoc ()
+            }
+        }
+    }
+
+    /**
+     * @returns: the relative parts of which if from is the root path of which
+     * @example:
+     * ======
+     * which-> "/foo/bar/bad", from-> "/foo/bar" => "bad"
+     * ======
+     * */
+    fn getRelativePath (self, which : &Path, from : &Path)-> &Path {
+        if (self.isRootOf (from, which)) {
+            println ("ici ?");
+            let parts = which.parts ()[from.parts ().len .. $];
+            let mut res = Path::new (""s8);
+            for i in 0us .. parts.len {
+                res = res.push (parts[i]);
+            }
+
+            return res;
+        } else {
+            return which;
+        }
+    }
+
+    /**
      * @returns: true iif toTest is a relative path of from
      */
     fn isRelativeFrom (self, toTest : &Path, from : &Path) -> bool {
@@ -1184,6 +1248,21 @@ pub class Declarator {
         let flen = toTest.parts ().len;
         for i in 0us .. flen  {
             if (from.parts ()[$ - (i + 1us)] != toTest.parts ()[$ - (i + 1us)]) return false;
+        }
+
+        return true;
+    }
+
+    fn isRootOf (self, root : &Path, toTest : &Path)-> bool {
+        println (toTest, " ", root);
+        if (toTest.parts ().len == 0us) return true;
+        if (toTest.parts ().len < root.parts ().len) {
+            return false;
+        }
+
+        let flen = root.parts ().len;
+        for i in 0us .. flen  {
+            if (root.parts ()[i] != toTest.parts ()[i]) return false;
         }
 
         return true;
@@ -1217,7 +1296,165 @@ pub class Declarator {
             _ => { __pragma!panic (); }        
         }
     }
-    
+
+    /**
+     * @returns: the protection the 'context' has on the symbol 'sym'
+     * */
+    pub fn getProtectionFromContext (self, context : &Symbol, sym : &Symbol)-> Protection {
+        let mut current = context;
+        loop {
+            match current {
+                EmptySymbol () => { break Protection::PUBLIC; }
+                c : _ => {
+                    if (c is sym) {
+                        break Protection::PRIVATE;
+                    }
+                }
+            }
+            current = current.getReferent ();
+        }
+    }
+
+    /**
+     * Get a list of symbol declared locally inside 'sym' from the context 'context' that might have no access to private syms
+     * @params:
+     *    - name: the name of the symbol to access
+     *    - context: the context of the access
+     *    - sym: the symbol being accessed
+     *    - protection: the protection to apply if symbol only have public access
+     * */
+    pub fn getLocalFromContext (mut self, name : [c8], context : &Symbol, sym : &Symbol, protection : Protection = Protection::PUBLIC)-> dmut [&Symbol] {
+        let dmut module = self:.getMutableSymbol (sym);
+        let mut contextProt = self.getProtectionFromContext (context, sym);
+        if (contextProt == Protection::PUBLIC) { contextProt = protection; }
+
+        let dmut res = alias (alias module:.getLocalSymbols (name, protection-> contextProt))[];
+        alias res
+    }
+
+    /**
+     * Get a list of symbol declared locally inside 'sym' from the context 'context' that might have no access to private syms
+     * @params:
+     *    - name: the name of the symbol to access
+     *    - context: the context of the access
+     *    - sym: the symbol being accessed
+     *    - protection: the protection to apply if symbol only have public access
+     * */
+    pub fn getLocalFromContext (self, name : [c8], context : &Symbol, sym : &Symbol, protection : Protection = Protection::PUBLIC)-> [&Symbol] {
+        let mut contextProt = self.getProtectionFromContext (context, sym);
+        if (contextProt == Protection::PUBLIC) { contextProt = protection; }
+
+        let res = (sym.getLocalSymbols (name, protection-> contextProt))[];
+        res
+    }
+
+    /**
+     * Get the list of symbol declared locally in 'sym' that are reachable from 'context'
+     * @params:
+     *     - context: the context of the access
+     *     - sym: the symbol being accessed
+     *     - protection: the protection to apply if symbol only have public access
+     * */
+    pub fn getAllLocalFromContext (self, context : &Symbol, sym : &Symbol, protection : Protection = Protection::PUBLIC)-> [&Symbol] {
+        let mut contextProt = self.getProtectionFromContext (context, sym);
+        if (contextProt == Protection::PUBLIC) { contextProt = protection; }
+
+        let res = (sym.getAllLocalSymbols (protection-> contextProt));
+        res
+    }
+
+    /**
+     * Get a list of symbol declared locally inside 'sym' from the context 'context' that might have no access to private syms
+     * And whose name are close to 'name' with a distance of 'distance'
+     * @params:
+     *    - name: the name of the symbol to access
+     *    - distance: the distance between the names to seek and the symbols in the module 'sym'
+     *    - context: the context of the access
+     *    - sym: the symbol being accessed
+     *    - protection: the protection to apply if symbol only have public access
+     * */
+    pub fn getCloseLocalFromContext (self, name : [c8], distance : usize = 2us, context : &Symbol, sym : &Symbol, protection : Protection = Protection::PUBLIC)-> [&Symbol] {
+        let mut contextProt = self.getProtectionFromContext (context, sym);
+        if (contextProt == Protection::PUBLIC) { contextProt = protection; }
+
+        let res = (sym.getCloseLocalSymbols (name, distance-> distance, protection-> contextProt))[];
+        res
+    }
+
+    /**
+     * Create an error message for a global access that was unsuccessful
+     * @params:
+     *    - loc: the location of the access
+     *    - name: the name of the symbol being accessed
+     *    - sym: the context of the access
+     * */
+    pub fn createGlobalAccessError (self, loc : &Word, name : [c8], sym : &Symbol)-> &ErrorMsg {
+        let dmut notes = Vec!{&ErrorMsg}::new ();
+        let mut syms = sym.getSymbols (name, protection-> Protection::PRIVATE)[];
+
+        let mut msgFrom = DeclareErrorMessage::PRIVATE_IN_THIS_CONTEXT_FROM_MOD, mut msgNonFrom = DeclareErrorMessage::PRIVATE_IN_THIS_CONTEXT;
+        if (syms.len == 0us) { // if no symbol is named 'name', then maybe there is typo in the variable name
+            syms = sym.getCloseSymbols (name, distance-> 2us)[]; // Get all the symbols whose names are close to 'name'
+
+            // Change the error messages
+            msgFrom = DeclareErrorMessage::MAYBE_WAS_MEANT_FROM_MOD;
+            msgNonFrom = DeclareErrorMessage::MAYBE_WAS_MEANT;
+        }
+
+        let dmut used = HashSet!{&Path}::new ();
+        for s in syms { // add the notes to the error
+            if (s.getPath () !in used) {
+                let p = s.getPath ().parent ().toStr (sep-> Tokens::DCOLON);
+                if (p.len != 0us) {
+                    notes:.push (ErrorMsg::note (s.getLoc (), oneLine-> true, format (msgFrom, s.getPath ().file (), p)));
+                } else
+                    notes:.push (ErrorMsg::note (s.getLoc (), oneLine-> true, format (msgNonFrom, s.getPath ().file ())));
+
+                used:.insert (s.getPath ());
+            }
+        }
+
+        // Not thrown, it will be thrown by the caller function
+        ErrorMsg::fatal (loc, format (DeclareErrorMessage::UNDEF_VAR, name), notes-> notes[])
+    }
+
+    /**
+     * Create an error message for a local access that was unsuccessful
+     * @params:
+     *    - loc: the location of the access
+     *    - name: the name of the symbol being accessed
+     *    - sym: the context of the access
+     * */
+    pub fn createLocalAccessError (self, _ : &Word, name : [c8], sym : &Symbol)-> [&ErrorMsg] {
+        let dmut notes = Vec!{&ErrorMsg}::new ();
+
+        // Search all the local symbols with the same name but that are not accessible
+        let mut syms = sym.getLocalSymbols (name, protection-> Protection::PRIVATE)[];
+        let mut msgFrom = DeclareErrorMessage::PRIVATE_IN_THIS_CONTEXT_FROM_MOD, mut msgNonFrom = DeclareErrorMessage::PRIVATE_IN_THIS_CONTEXT;
+        if (syms.len == 0us) { // if no symbol is named 'name', then maybe there is typo in the variable name
+            syms = sym.getCloseLocalSymbols (name, distance-> 2us)[]; // Get all the local symbols whose names are close to 'name'
+
+            // Change the error messages
+            msgFrom = DeclareErrorMessage::MAYBE_WAS_MEANT_FROM_MOD;
+            msgNonFrom = DeclareErrorMessage::MAYBE_WAS_MEANT;
+        }
+
+        let dmut used = HashSet!{&Path}::new ();
+        for s in syms { // add the notes to the error
+            if (s.getPath () !in used) {
+                let p = s.getPath ().parent ().toStr (sep-> Tokens::DCOLON);
+                if (p.len != 0us) {
+                    notes:.push (ErrorMsg::note (s.getLoc (), oneLine-> true, format (msgFrom, s.getPath ().file (), p)));
+                } else
+                    notes:.push (ErrorMsg::note (s.getLoc (), oneLine-> true, format (msgNonFrom, s.getPath ().file ())));
+
+                used:.insert (s.getPath ());
+            }
+        }
+
+        notes[]
+    }
+
 
     /**
      * ================================================================================
