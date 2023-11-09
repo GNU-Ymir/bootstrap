@@ -17,6 +17,7 @@ import ymirc::lexing::word;
 import ymirc::lexing::tokens;
 import ymirc::global::common;
 import ymirc::global::state;
+import ymirc::global::core_;
 
 import ymirc::syntax::visitor;
 import ymirc::utils::format;
@@ -36,8 +37,14 @@ pub class Declarator {
     /// The root of all declarations
     let dmut _root = ModuleSymbol::new (EOF_WORD, EOF_WORD, ""s8, isGlobal-> true);
 
+    /// The root of all foreign declaration (imported packages)
+    let dmut _foreignRoot = ModuleSymbol::new (EOF_WORD, EOF_WORD, ""s8, isGlobal-> true);
+
     /// True iif the symbols that are declarated are templates, this is a toggle variable
     let mut _templateDeclaration = false;
+
+    /// The list of core use declaration, to insert in module symbols
+    let dmut _coreDecls = Vec!{&UseDecl}::new ();
 
     /**
      * Create a new empty declarator
@@ -57,6 +64,34 @@ pub class Declarator {
     {
         self:.declare (root, parent-> alias self._root, protection-> Protection::PUBLIC);
         alias self._root
+    }
+
+    /**
+     * Transform a declaration syntax into a symbol tree, that won't be validated but is accessible during validation
+     * @params:
+     *    - root: the root to declare
+     * @throws: &ErrorMsg
+     * */
+    pub fn declareExtern (mut self, root : &Declaration)-> dmut &Symbol
+        throws &ErrorMsg
+    {
+        self:.declare (root, parent-> alias self._foreignRoot, protection-> Protection::PUBLIC);
+        alias self._foreignRoot
+    }
+
+    /**
+     * Compute the list of use decl to implicitely insert during module declaration
+     * This list is the list of core modules computed from the core module tree
+     * */
+    pub fn computeCoreUseDecls (mut self) {
+        let coreMod = self._foreignRoot.getLocalSymbols (CoreNames::CORE_MODULE, protection-> Protection::PUBLIC)[];
+        for c in coreMod {
+            match c {
+                m : &ModuleSymbol => {
+                    self:.computeCoreUseDecls (alias self._coreDecls, root-> m);
+                }
+            }
+        }
     }
 
     /**
@@ -181,14 +216,12 @@ pub class Declarator {
 
         parent:.insert (alias ret, replace-> false, anonymus-> self._templateDeclaration);
 
-        // if (!state::instance ().isStandalone ()) {
-        //     self:.useCorePackage (alias ret, state::instance ().getCorePath ());
-        // } catch {
-        //     err : &ErrorMsg => throw err;
-        //     fs : &FsError => {
-        //         throw ErrorMsg::fatal (module.getLoc (), format (DeclareErrorMessage::CORE_DIR_NOT_FOUND, fs));
-        //     }
-        // }
+        // If compilation is not standalone, then core modules have to be implicitly used
+        if (!state::instance ().isStandalone ()) {
+            for it in self._coreDecls {
+                ret:.insertUse (it);
+            }
+        }
 
         for i in module.getDeclarations () {
             self:.declare (i, alias ret);
@@ -226,8 +259,9 @@ pub class Declarator {
     fn declareImport (mut self, im : &ImportDecl, dmut parent : &Symbol, protection : Protection)-> dmut &Symbol
         throws &ErrorMsg
     {
-        let child = self._packageDir.push (parent.getPath ()).push (im.getModuleName ().str ()).addExtension (CommonVars::YMIR_EXTENSION);
-        let sibling = self._packageDir.push (parent.getPath ().parent ()).push (im.getModuleName ().str ()).addExtension (CommonVars::YMIR_EXTENSION);
+        let packageLoc = Path::new (im.getLoc ().filename ()).parent ();
+        let child = packageLoc.push (parent.getPath ()).push (im.getModuleName ().str ()).addExtension (CommonVars::YMIR_EXTENSION);
+        let sibling = packageLoc.push (parent.getPath ().parent ()).push (im.getModuleName ().str ()).addExtension (CommonVars::YMIR_EXTENSION);
 
         let dmut referent = alias parent;
         if (fs::sys::isFile (sibling) && fs::sys::isFile (child)) {
@@ -264,6 +298,22 @@ pub class Declarator {
     }
 
     /**
+     * Recursively insert implicit use declaration of the core modules tree
+     * */
+    fn computeCoreUseDecls (mut self, dmut list : &Vec!{&UseDecl}, root : &Symbol) {
+        let path = self.fromPath (EOF_WORD, root.getPath ());
+        list:.push (UseDecl::new (EOF_WORD, ""s8, path));
+
+        for c in root.getAllLocalSymbols (protection-> Protection::PUBLIC) {
+            match c {
+                m : &ModuleSymbol => {
+                    self:.computeCoreUseDecls (alias list, root-> m);
+                }
+            }
+        }
+    }
+
+    /**
      * ================================================================================
      * ================================================================================
      * =========================            CLASS             =========================
@@ -273,7 +323,7 @@ pub class Declarator {
 
     /**
      * Declare the symbol of a class
-     * @params: 
+     * @params:
      *   - cl: the class to declare
      *   - parent: the module that is declaring the class
      *   - protection: the protection of the class
@@ -288,32 +338,32 @@ pub class Declarator {
                 TemplateSymbol () => {}
                 _ => {
                     throw ErrorMsg::fatal (cl.getLoc (),
-                                       format (DeclareErrorMessage::SHADOWING_DECL, cl.getLoc ().str ()),
-                                       notes-> [ErrorMsg::note (s.getLoc (), ""s8)]);
+                                           format (DeclareErrorMessage::SHADOWING_DECL, cl.getLoc ().str ()),
+                                           notes-> [ErrorMsg::note (s.getLoc (), ""s8)]);
                 }
             }
         }
-        
-        let (isAbstract, isFinal) = self.validateAbstractFinal (cl.getAttributes ());        
+
+        let (isAbstract, isFinal) = self.validateAbstractFinal (cl.getAttributes ());
         let dmut clSym = ClassSymbol::new (cl.getLoc (), cl.getComments (), ancestor-> cl.getAncestor (), isAbstract-> isAbstract, isFinal-> isFinal, protection-> protection);
         parent:.insert (alias clSym, replace-> false, anonymus-> self._templateDeclaration);
 
         for d in cl.getDeclarations () {
             self:.declareInnerClass (d, alias clSym, protection-> Protection::PROTECTED);
         }
-        
+
         alias clSym
     }
 
 
     /**
      * Validate the custom attributes of a class definition
-     * @params: 
+     * @params:
      *   - attributes: the list of custom attributes of the class
-     * @returns: 
+     * @returns:
      *   - .0: isAbstract
      *   - .1: isFinal
-     * @throws: 
+     * @throws:
      *   - ErrorMsg: if (isAbstract && isFinal), or if an attributes is not defined for class
      */
     fn validateAbstractFinal (self, attributes : [AttributeWord])-> (bool, bool)
@@ -338,14 +388,14 @@ pub class Declarator {
                 }
             }
         }
-        
+
         (isAbstract, isFinal)
     }
 
 
     /**
      * Declare the content of a class
-     * @params: 
+     * @params:
      *   - d: the declaration to transform into symbol
      *   - cl: the class symbol that is filled
      *   - protection: the current protection of the symbol to declare
@@ -387,16 +437,16 @@ pub class Declarator {
                 self.declareFunction (f, alias cl, protection-> protection);
             }
             _ => {
-                throw ErrorMsg::fatal (current.getLoc (), DeclareErrorMessage::UNEXPECTED_IN_CLASS);   
+                throw ErrorMsg::fatal (current.getLoc (), DeclareErrorMessage::UNEXPECTED_IN_CLASS);
             }
         }
     }
 
     /**
      * Declare a class constructor
-     * @params: 
+     * @params:
      *   - cstr: the constructor to declare
-     *   - cl: the parent class 
+     *   - cl: the parent class
      *   - protection: the protection of the constructor
      */
     fn declareConstructor (self, cstr : &ConstructorDecl, dmut cl : &ClassSymbol, protection : Protection)
@@ -410,10 +460,10 @@ pub class Declarator {
 
     /**
      * Declare the destructor of the class
-     * @params: 
+     * @params:
      *   - dtor: the destructor
      *   - cl: the parent class
-     * @throws: 
+     * @throws:
      *    - &ErrorMsg: if there are multiple destructor
      */
     fn declareDestructor (self, dtor : &DestructorDecl, dmut cl : &ClassSymbol)
@@ -428,7 +478,7 @@ pub class Declarator {
         }
 
         let dmut dtorSym = DestructorSymbol::new (dtor.getLoc (), dtor.getComments (), dtor, alias cl);
-        cl:.setDestructor (alias dtorSym);        
+        cl:.setDestructor (alias dtorSym);
     }
 
     /**
@@ -455,8 +505,8 @@ pub class Declarator {
     }
 
     /**
-     * Declare an implementation 
-     * @params: 
+     * Declare an implementation
+     * @params:
      *   - impl: the implementation to declare
      *   - cl: the parent class
      */
@@ -473,7 +523,7 @@ pub class Declarator {
 
     /**
      * Declare the content of an implementation
-     * @params: 
+     * @params:
      *   - current: the declaration to transform
      *   - im: the implementation that is being declared
      *   - protection: the protection of the implementation
@@ -504,9 +554,9 @@ pub class Declarator {
 
     /**
      * Declare a field in a class
-     * @params: 
+     * @params:
      *   - field: the field to declare
-     *   - cl: the class symbol 
+     *   - cl: the class symbol
      *   - protection: the protection of the field
      */
     fn declareFieldClass (self, field : &GlobalDecl, dmut cl : &ClassSymbol, protection : Protection)
@@ -516,24 +566,24 @@ pub class Declarator {
 
     /**
      * Declare an assertion in a class
-     * @params: 
+     * @params:
      *    - wrap: the assertion to declare
      *    - cl: the class symbol
      */
     fn declareAssertClass (self, wrap : &ExpressionWrapperDecl, dmut cl : &ClassSymbol) {
         cl:.addAssertion (wrap.getContent (), wrap.getComments ());
     }
-    
+
     /**
      * Declare a conditional block in a class
-     * @params: 
+     * @params:
      *    - c: the conditional to declare
      *    - cl: the class symbol
      */
     fn declareCondBlockClass (self, c : &CondBlockDecl, dmut cl : &ClassSymbol) {
         cl:.addCondBlock (c);
     }
-    
+
     /**
      * ================================================================================
      * ================================================================================
@@ -544,7 +594,7 @@ pub class Declarator {
 
     /**
      * Declare a function declaration
-     * @params: 
+     * @params:
      *   - func: the function to declare
      *   - parent: the parent of the declaration
      *   - protection: the protection of the declaration
@@ -562,7 +612,7 @@ pub class Declarator {
         let isUnsafe = if (isExtern && lang == Keys::CLANG) {
             true
         } else { isUnsafe_ };
-        
+
         let dmut funcSym = FunctionSymbol::new (func.getLoc (), func.getComments (), func, isOver-> func.isOver (), isFinal-> isFinal, isUnsafe-> isUnsafe, isCVariadic-> isCVariadic, isTest-> false, protection-> protection);
         parent:.insert (alias funcSym, replace-> false, anonymus-> self._templateDeclaration);
 
@@ -571,7 +621,7 @@ pub class Declarator {
 
     /**
      * Validate that the function is not shadowing another declaration of a different type
-     * @params: 
+     * @params:
      *   - loc: the location of the function decl
      *   - parent: the parent symbol in which the function will be declared
      */
@@ -585,7 +635,7 @@ pub class Declarator {
                 ModuleSymbol () => {}
                 TemplateSymbol () => {}
                 _ => {
-                    
+
                     throw ErrorMsg::fatal (loc,
                                            format (DeclareErrorMessage::SHADOWING_DECL, loc.str ()),
                                            notes-> [ErrorMsg::note (s.getLoc (), ""s8)]);
@@ -596,10 +646,10 @@ pub class Declarator {
 
     /**
      * Validate the custom attributes of a function definition
-     * @params: 
+     * @params:
      *   - attributes: the list of custom attributes of the function
      * @returns: (isFinal, isUnsafe)
-     * @throws: 
+     * @throws:
      *   - ErrorMsg:  if an attributes is not defined for function
      */
     fn validateFinalUnsafeFunction (self, attributes : [AttributeWord])-> (bool, bool)
@@ -948,7 +998,7 @@ pub class Declarator {
                 }
             }
         }
-               
+
         let dmut enSym = EnumSymbol::new (en.getLoc (), en.getComments (), en, protection);        
         parent:.insert (alias enSym, replace-> false, anonymus-> self._templateDeclaration);
         
@@ -987,7 +1037,7 @@ pub class Declarator {
                 }
             }
         }
-               
+
         let dmut enSym = AkaSymbol::new (en.getLoc (), en.getComments (), en, protection);        
         parent:.insert (alias enSym, replace-> false, anonymus-> self._templateDeclaration);
         
@@ -1056,7 +1106,7 @@ pub class Declarator {
             f : &FunctionDecl => {
                 let sym = self.declareFunction (f, alias tr, protection-> protection);
                 if (f.isOver ())
-                    throw ErrorMsg::fatal (f.getLoc (), format (DeclareErrorMessage::NOT_OVERRIDE, sym.getPath ().toStr (sep-> Tokens::DCOLON)));
+                throw ErrorMsg::fatal (f.getLoc (), format (DeclareErrorMessage::NOT_OVERRIDE, sym.getPath ().toStr (sep-> Tokens::DCOLON)));
             }
             wrap : &ExpressionWrapperDecl => {
                 self.declareAssertTrait (wrap, alias tr);
@@ -1070,7 +1120,7 @@ pub class Declarator {
         }
     }
 
-        /**
+    /**
      * Declare an assertion in a class
      */
     fn declareAssertTrait (self, wrap : &ExpressionWrapperDecl, dmut tr : &TraitSymbol) {
@@ -1146,6 +1196,25 @@ pub class Declarator {
     }
 
     /**
+     * Transform a path into a path expression
+     * */
+    fn fromPath (self, loc : &Word, path : &Path)-> &Expression {
+        let mut current : &Expression = EmptyExpression::new ();
+        for p in path.parts () {
+            match current {
+                EmptyExpression () => {
+                    current = VarExpr::new (Word::new (p, loc));
+                }
+                _ => {
+                    current = PathExpr::new (Word::new (Tokens::DCOLON, loc), current, VarExpr::new (Word::new (p, loc)));
+                }
+            }
+        }
+
+        current
+    }
+
+    /**
      * @params:
      *    - template: iif true, all future declaration will be anonymus
      */
@@ -1169,7 +1238,17 @@ pub class Declarator {
         let dmut r = self._root:.getMutableSymbol (sym);
         match ref r {
             Ok (dmut v : _) => return alias v;
-            _ => { __pragma!panic (); }        
+            _ => {
+
+                let dmut forR = self._foreignRoot:.getMutableSymbol (sym);
+                match ref forR {
+                    Ok (dmut v : _) => { return alias v; }
+                    _ => {
+                        eprintln ("Symbol not found in sym table : ", sym.getPath ().toStr (sep-> "::"s8));
+                        __pragma!panic ();
+                    }
+                }
+            }
         }
     }
 
@@ -1190,6 +1269,21 @@ pub class Declarator {
             current = current.getReferent ();
         }
     }
+
+    /**
+     * Get a list of symbol from a global access, where current context is 'context'
+     * @params:
+     *    - name: the name of the symbol to find
+     *    - context: the context in which symbols is searched
+     * */
+    pub fn getGlobal (mut self, name : [c8], context : &Symbol)-> [&Symbol] {
+        let mut root = context.getSymbols (name)[];
+        if (root.len  == 0us) {
+            root = self._foreignRoot.getSymbols (name)[];
+        }
+
+        root
+    } 
 
     /**
      * Get a list of symbol declared locally inside 'sym' from the context 'context' that might have no access to private syms
@@ -1301,14 +1395,15 @@ pub class Declarator {
      *    - name: the name of the symbol being accessed
      *    - sym: the context of the access
      * */
-    pub fn createLocalAccessError (self, _ : &Word, name : [c8], sym : &Symbol)-> [&ErrorMsg] {
+    pub fn createLocalAccessError (self, _ : &Word, name : [c8], sym : &Symbol, context : &Symbol)-> [&ErrorMsg] {
         let dmut notes = Vec!{&ErrorMsg}::new ();
 
         // Search all the local symbols with the same name but that are not accessible
         let mut syms = sym.getLocalSymbols (name, protection-> Protection::PRIVATE)[];
         let mut msgFrom = DeclareErrorMessage::PRIVATE_IN_THIS_CONTEXT_FROM_MOD, mut msgNonFrom = DeclareErrorMessage::PRIVATE_IN_THIS_CONTEXT;
         if (syms.len == 0us) { // if no symbol is named 'name', then maybe there is typo in the variable name
-            syms = sym.getCloseLocalSymbols (name, distance-> 2us)[]; // Get all the local symbols whose names are close to 'name'
+            let contextProt = self.getProtectionFromContext (context, sym);
+            syms = sym.getCloseLocalSymbols (name, distance-> 2us, protection-> contextProt)[]; // Get all the local symbols whose names are close to 'name'
 
             // Change the error messages
             msgFrom = DeclareErrorMessage::MAYBE_WAS_MEANT_FROM_MOD;
@@ -1343,7 +1438,10 @@ pub class Declarator {
     impl Formattable {
 
         pub over format (self, dmut stream : &Formatter) {
-            self._root.format (alias stream);
+            stream:.write (" LOCAL : \n");
+            self._root.formatSymTree (alias stream);
+            stream:.write (" EXTERNAL : \n");
+            self._foreignRoot.formatSymTree (alias stream);
         }
     }
     
