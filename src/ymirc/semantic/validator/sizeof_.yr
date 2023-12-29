@@ -4,6 +4,8 @@ import ymirc::syntax::expression::_;
 import ymirc::semantic::validator::visitor;
 import ymirc::semantic::validator::errors;
 
+import ymirc::semantic::symbol::base;
+
 import ymirc::semantic::generator::_;
 import ymirc::errors::_;
 import ymirc::utils::format;
@@ -12,6 +14,7 @@ import ymirc::lexing::word;
 import ymirc::lexing::tokens;
 import ymirc::syntax::keys;
 
+import std::collection::vec;
 import std::algorithm::searching;
 import std::io;
 import std::conv;
@@ -20,6 +23,12 @@ import std::conv;
  * The validator responsible for the validation of 'sizeof' expressions
  */
 pub class SizeofValidator {
+
+    // The struct symbol whose size is being computed, to avoid infinite recursivity
+    let dmut _sizeStruct = Vec!{&Symbol}::new ();
+
+    // The struct symbol whose alignment is being computed, to avoid infinite recursivity
+    let dmut _alignStruct = Vec!{&Symbol}::new ();
 
     /**
      * Create a new empty validator
@@ -34,11 +43,11 @@ pub class SizeofValidator {
      *    - i: the intrinsic expression to validate
      * @returns: the validated expression
      */
-    pub fn validate (self, dmut context : &Validator, i : &IntrinsicExpr)-> &Value
+    pub fn validate (mut self, dmut context : &Validator, i : &IntrinsicExpr)-> &Value
         throws &ErrorMsg
     {
         let t = context:.validateType (i.getContent ());
-        let size = self.validateType (alias context, i.getLoc (), t);
+        let size = self:.validateType (alias context, i.getLoc (), t);
 
         let u = IntType::new (i.getLoc (), size-> 0u16, signed-> false);
 
@@ -52,10 +61,10 @@ pub class SizeofValidator {
      *   - type: the type whose size has to be computed
      * @returns: a int value containing the size
      * */
-    pub fn validate (self, dmut context : &Validator, loc : &Word, type : &Type)-> &Value
+    pub fn validate (mut self, dmut context : &Validator, loc : &Word, type : &Type)-> &Value
         throws &ErrorMsg
     {
-        let size = self.validateType (alias context, loc, type);
+        let size = self:.validateType (alias context, loc, type);
         let u = IntType::new (loc, size-> 0u16, signed-> false);
         IntValue::new (loc, u, size)
     }
@@ -69,7 +78,7 @@ pub class SizeofValidator {
      *    - t: the type whose size is being computed
      * @returns: the size
      * */
-    fn validateType (self, dmut context : &Validator, loc : &Word, t : &Type)-> usize
+    pub fn validateType (mut self, dmut context : &Validator, loc : &Word, t : &Type)-> usize
         throws &ErrorMsg
     {
         match t {
@@ -95,28 +104,28 @@ pub class SizeofValidator {
                 return self.validateVoidType (alias context, loc, v);
             }
             a : &ArrayType => {
-                return self.validateArrayType (alias context, loc, a);
+                return self:.validateArrayType (alias context, loc, a);
             }
             p : &PointerType => {
                 return self.validatePointerType (alias context, loc, p);
             }
             r : &RangeType => {
-                return self.validateRangeType (alias context, loc, r);
+                return self:.validateRangeType (alias context, loc, r);
             }
             s : &SliceType => {
                 return self.validateSliceType (alias context, loc, s);
             }
             tu : &TupleType => {
-                return self.validateTupleType (alias context, loc, tu);
+                return self:.validateTupleType (alias context, loc, tu);
             }
             c : &ClassPtrType => {
                 return self.validateClassPtrType (alias context, loc, c);
             }
             e : &EnumType => {
-                return self.validateType (alias context, loc, e.getProxy ());
+                return self:.validateType (alias context, loc, e.getProxy ());
             }
             s : &StructType => {
-                return self.validateStructType (alias context, loc, s);
+                return self:.validateStructType (alias context, loc, s);
             }
         }
 
@@ -144,14 +153,54 @@ pub class SizeofValidator {
      *     - s: the struct type
      * @returns: the size
      * */
-    fn validateStructType (self, dmut context : &Validator, loc : &Word, s : &StructType)-> usize
+    fn validateStructType (mut self, dmut context : &Validator, loc : &Word, s : &StructType)-> usize
         throws &ErrorMsg
     {
-        context;
-        loc;
-        s;
-        __pragma!fake_throw (&ErrorMsg);
-        __pragma!panic ();
+        for sy in self._sizeStruct {
+            if (sy is s.getSymbol ()) {
+                throw ErrorMsg::fatal (s.getSymbol ().getLoc (), format (ValidateErrorMessage::NO_SIZE_FORWARD_REF, s));
+            }
+        }
+
+        let mut current = 0us;
+        let mut glob = 0us;
+        let mut globAlign = 1us;
+
+        self._sizeStruct:.push (s.getSymbol ());
+        {
+            for inner in s.getFields () {
+                match inner {
+                    v : &VarDeclValue => {
+                        {
+                            let innerS = self:.validateType (alias context, v.getLoc (), v.getVarType ());
+                            let align = self:.validateAlignOf (loc, v.getVarType ());
+                            if (align > globAlign) { globAlign = align; }
+
+                            let padding = (align - (current % align)) % align;
+                            let aligned = current + padding;
+
+                            current = aligned + innerS;
+                            glob += padding + innerS;
+
+                        } catch {
+                            err : &ErrorMsg => {
+                                let note = ErrorMsg::note (s.getSymbol ().getLoc (), format (ValidateErrorMessage::WITHIN_STRUCT_TYPE, s));
+                                throw err.withNote ([ErrorMsg::note (v.getLoc (), format (ValidateErrorMessage::FOR_FIELD, v.getLoc ().str ()), notes-> [note])]);
+                            }
+                        }
+                    }
+                    _ => __pragma!panic (); // struct only contains vardeclvalues
+                }
+            }
+        } exit {
+            __pragma!trusted ({self._sizeStruct:.pop ();});
+        }
+
+        if (glob % globAlign != 0us) {
+            glob = glob + (globAlign - (glob % globAlign));
+        }
+
+        glob
     }
 
     /**
@@ -162,7 +211,7 @@ pub class SizeofValidator {
      *     - t: the tuple type
      * @returns: the size
      * */
-    fn validateTupleType (self, dmut context : &Validator, loc : &Word, t : &TupleType)-> usize
+    fn validateTupleType (mut self, dmut context : &Validator, loc : &Word, t : &TupleType)-> usize
         throws &ErrorMsg
     {
         let mut current = 0us;
@@ -170,8 +219,8 @@ pub class SizeofValidator {
         let mut globAlign = 1us;
 
         for inner in t.getInners () {
-            let innerS = self.validateType (alias context, loc, inner);
-            let align = self.validateAlignOf (loc, inner);
+            let innerS = self:.validateType (alias context, loc, inner);
+            let align = self:.validateAlignOf (loc, inner);
             if (align > globAlign) { globAlign = align; }
 
             let padding = (align - (current % align)) % align;
@@ -197,10 +246,10 @@ pub class SizeofValidator {
      *     - p: the pointer type
      * @returns: the size
      * */
-    fn validateRangeType (self, dmut context : &Validator, loc : &Word, r : &RangeType)-> usize
+    fn validateRangeType (mut self, dmut context : &Validator, loc : &Word, r : &RangeType)-> usize
         throws &ErrorMsg
     {
-        self.validateType (alias context, loc, r.getInners ()[0us]) * 4us
+        self:.validateType (alias context, loc, r.getInners ()[0us]) * 4us
     }
 
     /**
@@ -235,8 +284,8 @@ pub class SizeofValidator {
      *    - a: the array type
      * @returns: the size
      * */
-    fn validateArrayType (self, dmut context : &Validator, loc : &Word, a : &ArrayType)-> usize {
-        self.validateType (alias context, loc, a.getInners ()[0us]) * a.getSize ().getValue ().to!{usize} ()
+    fn validateArrayType (mut self, dmut context : &Validator, loc : &Word, a : &ArrayType)-> usize {
+        self:.validateType (alias context, loc, a.getInners ()[0us]) * a.getSize ().getValue ().to!{usize} ()
     } catch {
         _ => __pragma!panic ();
     }
@@ -342,7 +391,7 @@ pub class SizeofValidator {
     /**
      * @returns: the type alignment of t
      * */
-    fn validateAlignOf (self, loc : &Word, t : &Type)-> usize
+    fn validateAlignOf (mut self, loc : &Word, t : &Type)-> usize
         throws &ErrorMsg
     {
         match t {
@@ -375,29 +424,91 @@ pub class SizeofValidator {
                 return 1us;
             }
             a : &ArrayType => {
-                return self.validateAlignOf (loc, a.getInners ()[0us]);
+                return self:.validateAlignOf (loc, a.getInners ()[0us]);
             }
             _ : &PointerType => {
                 return cast!usize (global::state::instance ().getSizeTypeSize () / 8u32);
             }
             r : &RangeType => {
-                return self.validateAlignOf (loc, r.getInners ()[0us]);
+                return self:.validateAlignOf (loc, r.getInners ()[0us]);
             }
             _ : &SliceType => {
                 return cast!usize (global::state::instance ().getSizeTypeSize () / 8u32);
             }
             tu : &TupleType => {
-                let mut max = 1us;
-                for inner in tu.getInners () {
-                    let align = self.validateAlignOf (loc, inner);
-                    if (align > max) { max = align; }
-                }
-
-                return max;
+                return self:.validateAlignOfTuple (loc, tu);
+            }
+            s : &StructType => {
+                return self:.validateAlignOfStruct (loc, s);
             }
         }
 
         throw ErrorMsg::fatal (loc, format (ValidateErrorMessage::TYPE_HAS_NO_SIZE, t));
+    }
+
+    /**
+     * Validate the alignement of a struct type
+     * @params:
+     *    - loc: the location of the struct
+     *    - s: the struct to validate
+     * @returns: the alignement of the type
+     * @throws:
+     *    - &ErrorMsg: if the type has no size
+     * */
+    fn validateAlignOfStruct (mut self, loc : &Word, s : &StructType)-> usize
+        throws &ErrorMsg
+    {
+        for sy in self._alignStruct {
+            if (sy is s.getSymbol ()) {
+                throw ErrorMsg::fatal (s.getSymbol ().getLoc (), format (ValidateErrorMessage::NO_SIZE_FORWARD_REF, s));
+            }
+        }
+
+        let mut max = 1us;
+        self._alignStruct:.push (s.getSymbol ());
+        {
+            for inner in s.getFields () {
+                match inner {
+                    v : &VarDeclValue => {
+                        {
+                            let align = self:.validateAlignOf (loc, v.getVarType ());
+                            if (align > max) { max = align; }
+                        } catch {
+                            err : &ErrorMsg => {
+                                let note = ErrorMsg::note (s.getSymbol ().getLoc (), format (ValidateErrorMessage::WITHIN_STRUCT_TYPE, s));
+                                throw err.withNote ([ErrorMsg::note (v.getLoc (), format (ValidateErrorMessage::FOR_FIELD, v.getLoc ().str ()), notes-> [note])]);
+                            }
+                        }
+                    }
+                    _ => __pragma!panic ();
+                }
+            }
+        } exit {
+            __pragma!trusted ({self._alignStruct:.pop ();});
+        }
+
+        max
+    }
+
+    /**
+     * Validate the alignement of a tuple type
+     * @params:
+     *    - loc: the location of the tuple
+     *    - tu: the tuple to validate
+     * @returns: the alignement of the type
+     * @throws:
+     *    - &ErrorMsg: if the type has no size
+     * */
+    fn validateAlignOfTuple (mut self, loc : &Word, tu : &TupleType)-> usize
+        throws &ErrorMsg
+    {
+        let mut max = 1us;
+        for inner in tu.getInners () {
+            let align = self:.validateAlignOf (loc, inner);
+            if (align > max) { max = align; }
+        }
+
+        max
     }
 
 
