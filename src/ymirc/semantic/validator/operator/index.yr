@@ -152,12 +152,69 @@ pub class IndexOpValidator {
     fn validateArrayRange (self, dmut context : &Validator, loc : &Word, left : &Value, right : &Value)-> &Value
         throws &ErrorMsg
     {
-        context;
-        loc;
-        left;
-        right;
-        __pragma!fake_throw (&ErrorMsg);
-        __pragma!panic ();
+        match right.getType ().asOf!{&RangeType} ().getInners ()[0] {
+            indexType : &IntType => {
+                let sizeType = IntType::new (loc, size-> 0u16, signed-> false);
+                let innerType = left.getType ().asOf!{&ArrayType} ().getInners ()[0];
+                let arraySize = left.getType ().asOf!{&ArrayType} ().getSize ();
+
+                // We create uniq values, to make sure they are constructed only one time
+                // They are involved multiple times in the operation
+                let rng = context:.createUniqValue (loc-> loc, right);
+                let (_, fstIndex) = context:.getCompileTimeInterpreter ().simplify (StructFieldAccessValue::new (loc, indexType, rng, RangeKeys::FST));
+                let (_, scdIndex) = context:.getCompileTimeInterpreter ().simplify (StructFieldAccessValue::new (loc, indexType, rng, RangeKeys::SCD));
+
+                // Cte verification if possible, to check wether the range values are correctly bounded
+                let cteFst = self.verifyNotNegativeInt (alias context, loc, left.getType (), fstIndex);
+                let cteScd = self.verifyNotNegativeInt (alias context, loc, left.getType (), scdIndex, maximum-> arraySize.getValue ());
+
+                // Cte verification to check wether the range is increasing or decreasing
+                let cteOrder = self.verifyScdGTFst (alias context, loc, left.getType (), fstIndex, scdIndex);
+
+
+                let (fstSizeIndex, scdSizeIndex) = match indexType.getSize () {
+                    0us => { (fstIndex, scdIndex) }
+                    _ => { // casting index values into usize, as they will be involved in pointer arithmetics
+                        (context:.getCompileTimeInterpreter ().simplify (CastValue::new (loc, sizeType, fstIndex))._1,
+                         context:.getCompileTimeInterpreter ().simplify (CastValue::new (loc, sizeType, scdIndex))._1)
+                    }
+                };
+
+                // The new len is the subtraction of (range.scd - range.fst)
+                let (_, newLen) = context:.getCompileTimeInterpreter ().simplify (BinaryMathIntOperatorValue::new (loc, sizeType, BinaryOperators::MINUS, scdSizeIndex, fstSizeIndex));
+                let ptrType = PointerType::new (loc, innerType, isMutable-> innerType.isMutable ()); // the pointer type of the slice value [ptr ; len]
+                let arrayAddr = AddressValue::new (loc, ptrType, left);
+                let newPtr = BinaryMathPointerOperatorValue::new (loc, ptrType, BinaryOperators::PLUS,
+                                                                  arrayAddr,
+                                                                  fstSizeIndex); // the new pointer is the address of the array + range.fst
+
+                let sliceType = SliceType::new (loc, innerType, isMutable-> true);
+                let sliceCtor = SliceCtorValue::new (loc, sliceType, newPtr, newLen); // Construction of the slice from pointer and length
+                let sliceValue = SliceValue::new (loc, sliceType, sliceCtor, implicitAlias-> false);
+
+                // If tests cannot be made at cte, then add runtime checks
+                return if (!cteFst || !cteScd || !cteOrder) {
+                    // The debug test is if (len < rng.scd || rng.scd < rng.fst) throw OutOfArray ();
+                    let cmpLen = CmpIntOperatorValue::new (loc, BinaryOperators::INF_EQUAL, arraySize, scdIndex);
+                    let cmpRange = CmpIntOperatorValue::new (loc, BinaryOperators::INF, scdIndex, fstIndex);
+                    let cmp = LogicalBinBoolOperatorValue::new (loc, BinaryOperators::DPIPE, cmpLen, cmpRange);
+
+                    let cond = self.createOutOfArrayTest (alias context, loc, cmp);
+                    BlockValue::new (loc, sliceType, [cond, sliceValue], isSet-> true)
+                } else {
+                    // The debug test is if (len < rng.scd) throw OutOfArray ();
+                    let (cteLen, cmpLen) = context:.getCompileTimeInterpreter ().simplify (CmpIntOperatorValue::new (loc, BinaryOperators::INF_EQUAL, arraySize, scdIndex));
+                    if (!cteLen) {
+                        let cond = self.createOutOfArrayTest (alias context, loc, cmpLen);
+                        BlockValue::new (loc, sliceType, [cond, sliceValue], isSet-> true)
+                    } else {
+                        sliceValue
+                    }
+                }
+            }
+        }
+
+        throw ErrorMsg::fatal (loc, format (ValidateErrorMessage::UNDEFINED_INDEX_OP, left.getType (), right.getType ()));
     }
 
     /**
@@ -309,21 +366,22 @@ pub class IndexOpValidator {
 
                 let sliceCtor = SliceCtorValue::new (loc, slice.getType (), newPtr, newLen); // Construction of the slice from pointer and length
                 let sliceValue = SliceValue::new (loc, slice.getType (), sliceCtor, implicitAlias-> false);
+                let len = StructFieldAccessValue::new (loc, sizeType, slice, SliceKeys::LEN);
+                let cmpLen = CmpIntOperatorValue::new (loc, BinaryOperators::INF_EQUAL, len, scdIndex);
 
                 // If tests cannot be made at cte, then add runtime checks
                 return if (!cteFst || !cteScd || !cteOrder) {
-                    let len = StructFieldAccessValue::new (loc, sizeType, slice, SliceKeys::LEN);
-
                     // The debug test is if (len < rng.scd || rng.scd < rng.fst) throw OutOfArray ();
-                    let cmpLen = CmpIntOperatorValue::new (loc, BinaryOperators::INF_EQUAL, len, scdIndex);
                     let cmpRange = CmpIntOperatorValue::new (loc, BinaryOperators::INF, scdIndex, fstIndex);
                     let cmp = LogicalBinBoolOperatorValue::new (loc, BinaryOperators::DPIPE, cmpLen, cmpRange);
 
                     let cond = self.createOutOfArrayTest (alias context, loc, cmp);
                     BlockValue::new (loc, slice.getType (), [cond, sliceValue], isSet-> true)
                 } else {
-                    sliceValue
-                };
+                    // The debug test is if (len < rng.scd) throw OutOfArray ();, we already know that rng.scd >= rng.fst
+                    let cond = self.createOutOfArrayTest (alias context, loc, cmpLen);
+                    BlockValue::new (loc, slice.getType (), [cond, sliceValue], isSet-> true)
+                }
             }
         }
 
