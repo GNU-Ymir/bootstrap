@@ -88,11 +88,11 @@ pub class IndexOpValidator {
         if (rTypes.len == 1us && rTypes [0].isOf!{&IntType} ()) {
             return self.validateArrayInteger (alias context, loc, left, rights [0]);
         } else if (rTypes.len == 1us && rTypes [0].isOf!{&RangeType} ()) {
-            if (!inCopy) {
-                throw ErrorMsg::fatal (loc, format (ValidateErrorMessage::RANGE_ON_ARRAY_NO_COPY, left.getType (), rTypes[0]));
+            if inCopy {
+                return self.validateArrayRangeAsSlice (alias context, loc, left, rights [0]);
+            } else {
+                return self.validateArrayRange (alias context, loc, left, rights [0]);
             }
-
-            return self.validateArrayRange (alias context, loc, left, rights [0]);
         }
 
         throw ErrorMsg::fatal (loc, format (ValidateErrorMessage::UNDEFINED_INDEX_OP, left.getType (), rTypes));
@@ -149,7 +149,7 @@ pub class IndexOpValidator {
      * @throws:
      *    - &ErrorMsg: if this operation is impossible
      * */
-    fn validateArrayRange (self, dmut context : &Validator, loc : &Word, left : &Value, right : &Value)-> &Value
+    fn validateArrayRangeAsSlice (self, dmut context : &Validator, loc : &Word, left : &Value, right : &Value)-> &Value
         throws &ErrorMsg
     {
         match right.getType ().asOf!{&RangeType} ().getInners ()[0] {
@@ -192,25 +192,77 @@ pub class IndexOpValidator {
                 let sliceCtor = SliceCtorValue::new (loc, sliceType, newPtr, newLen); // Construction of the slice from pointer and length
                 let sliceValue = SliceValue::new (loc, sliceType, sliceCtor, implicitAlias-> false);
 
+
                 // If tests cannot be made at cte, then add runtime checks
                 return if (!cteFst || !cteScd || !cteOrder) {
                     // The debug test is if (len < rng.scd || rng.scd < rng.fst) throw OutOfArray ();
-                    let cmpLen = CmpIntOperatorValue::new (loc, BinaryOperators::INF_EQUAL, arraySize, scdIndex);
+                    let cmpLen = CmpIntOperatorValue::new (loc, BinaryOperators::INF, arraySize, scdIndex);
                     let cmpRange = CmpIntOperatorValue::new (loc, BinaryOperators::INF, scdIndex, fstIndex);
                     let cmp = LogicalBinBoolOperatorValue::new (loc, BinaryOperators::DPIPE, cmpLen, cmpRange);
 
                     let cond = self.createOutOfArrayTest (alias context, loc, cmp);
+
                     BlockValue::new (loc, sliceType, [cond, sliceValue], isSet-> true)
                 } else {
-                    // The debug test is if (len < rng.scd) throw OutOfArray ();
-                    let (cteLen, cmpLen) = context:.getCompileTimeInterpreter ().simplify (CmpIntOperatorValue::new (loc, BinaryOperators::INF_EQUAL, arraySize, scdIndex));
-                    if (!cteLen) {
-                        let cond = self.createOutOfArrayTest (alias context, loc, cmpLen);
-                        BlockValue::new (loc, sliceType, [cond, sliceValue], isSet-> true)
-                    } else {
-                        sliceValue
+                    sliceValue
+                };
+            }
+        }
+
+        throw ErrorMsg::fatal (loc, format (ValidateErrorMessage::UNDEFINED_INDEX_OP, left.getType (), right.getType ()));
+    }
+
+
+    /**
+     * Validate an index access on an array value using a range operand
+     * @params:
+     *    - context: the context of the validation
+     *    - loc: the location of the index
+     *    - left: the left operand (assumed to be of type array)
+     *    - right: the right operand (assumed to be of type range)
+     * @returns: the access value (of type slice)
+     * @throws:
+     *    - &ErrorMsg: if this operation is impossible
+     * */
+    fn validateArrayRange (self, dmut context : &Validator, loc : &Word, left : &Value, right : &Value)-> &Value
+        throws &ErrorMsg
+    {
+        match right.getType ().asOf!{&RangeType} ().getInners ()[0] {
+            indexType : &IntType => {
+                let sizeType = IntType::new (loc, size-> 0u16, signed-> false);
+                let innerType = left.getType ().asOf!{&ArrayType} ().getInners ()[0];
+                let arraySize = left.getType ().asOf!{&ArrayType} ().getSize ();
+
+                // We create uniq values, to make sure they are constructed only one time
+                // They are involved multiple times in the operation
+                let rng = context:.createUniqValue (loc-> loc, right);
+                let (fst, scd) = {
+                    let fstIndex = context:.getCompileTimeInterpreter ().computeInt (StructFieldAccessValue::new (loc, indexType, rng, RangeKeys::FST));
+                    let scdIndex = context:.getCompileTimeInterpreter ().computeInt (StructFieldAccessValue::new (loc, indexType, rng, RangeKeys::SCD));
+                    (fstIndex, scdIndex)
+                } catch {
+                    err : &ErrorMsg => {
+                        throw ErrorMsg::fatal (loc, format (ValidateErrorMessage::RANGE_ON_ARRAY_NO_COPY, left.getType (), right.getType ()), notes-> [err]);
                     }
                 }
+
+                if (fst < 0) throw ErrorMsg::fatal (loc, end-> right.getLoc (), format (ValidateErrorMessage::NEGATIVE_INT_INDEX, left.getType (), fst));
+                if (scd < 0) throw ErrorMsg::fatal (loc, end-> right.getLoc (), format (ValidateErrorMessage::NEGATIVE_INT_INDEX, left.getType (), scd));
+                if (scd > arraySize.getValue ()) throw ErrorMsg::fatal (loc, end-> right.getLoc (), format (ValidateErrorMessage::ARRAY_OVERFLOW, arraySize, scd));
+                if (fst > scd) throw ErrorMsg::fatal (loc, end-> right.getLoc (), format (ValidateErrorMessage::DECREASING_RANGE_ACCESS, left.getType (), fst, scd));
+
+                let dmut values = Vec!{&Value}::new ();
+                {
+                    for i in fst.to!{usize} () .. scd.to!{usize} () {
+                        values:.push (ArrayAccessValue::new (loc, innerType, left, usize (loc, i)));
+                    }
+                } catch {
+                    _ => __pragma!panic ();
+                }
+
+                let finInner = if (!innerType.isMutable ()) { innerType.clone (1u32) } else { innerType };
+                let finType = ArrayType::new (loc, finInner, IntValue::new (loc, sizeType, scd - fst), isMutable-> true);
+                return ArrayValue::new (loc, finType, values[]);
             }
         }
 
@@ -299,7 +351,7 @@ pub class IndexOpValidator {
     {
         let (isNegative, isTooBig, val) = {
             let i = context:.getCompileTimeInterpreter ().computeInt (right);
-            (i < 0, i >= maximum, i)
+            (i < 0, i > maximum, i)
         } catch {
             // The value is not cte
             _ => { return false; }
@@ -367,7 +419,7 @@ pub class IndexOpValidator {
                 let sliceCtor = SliceCtorValue::new (loc, slice.getType (), newPtr, newLen); // Construction of the slice from pointer and length
                 let sliceValue = SliceValue::new (loc, slice.getType (), sliceCtor, implicitAlias-> false);
                 let len = StructFieldAccessValue::new (loc, sizeType, slice, SliceKeys::LEN);
-                let cmpLen = CmpIntOperatorValue::new (loc, BinaryOperators::INF_EQUAL, len, scdIndex);
+                let cmpLen = CmpIntOperatorValue::new (loc, BinaryOperators::INF, len, scdIndex);
 
                 // If tests cannot be made at cte, then add runtime checks
                 return if (!cteFst || !cteScd || !cteOrder) {
