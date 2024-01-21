@@ -371,7 +371,11 @@ pub class ValueValidator {
         throws &ErrorMsg
     {
         if (l.isArray ()) {
-            self.validateListStaticArray (alias context, l)
+            if (context.isDynamic (l)) {
+                self.validateListSlice (alias context, l)
+            } else {
+                self.validateListStaticArray (alias context, l)
+            }
         } else {
             self.validateListTuple (alias context, l)
         }
@@ -416,6 +420,25 @@ pub class ValueValidator {
                                       isMutable-> true);
 
         ArrayValue::new (l.getLoc (), arrType, parameters [])
+    }
+
+    /**
+     * Validate a list expression containing a slice literal (same as array literal but within a copy or dcopy context)
+     * @params:
+     *    - context: the context of the validation
+     *    - l: the list to validate
+     * @returns: the validated value
+     * */
+    fn validateListSlice (self, dmut context : &Validator, l : &ListExpr)-> &Value
+        throws &ErrorMsg
+    {
+        let content = self.validateListStaticArray (alias context, l);
+        let arrType = content.getType ().asOf!{&ArrayType} ();
+
+        let slcType = SliceType::new (l.getLoc (), arrType.getInners ()[0], isMutable-> true);
+        let ctor = SliceValue::new (l.getLoc (), slcType, content);
+
+        CopierValue::new (l.getLoc (), slcType, ctor)
     }
 
     /**
@@ -516,14 +539,13 @@ pub class ValueValidator {
      * @params:
      *     - context: the context of the validation
      *     - alloc: the allocation to validate
-     *     - inCopy: true iif the slice allocator is within a copy
      *  @throws: &ErrorMsg: if the expression is not valid
      *  @returns: the value containing the allocation
      */
-    fn validateSliceAllocator (self, dmut context : &Validator, alloc : &SliceAllocatorExpr, inCopy : bool = false)-> &Value
+    fn validateSliceAllocator (self, dmut context : &Validator, alloc : &SliceAllocatorExpr)-> &Value
         throws &ErrorMsg
     {
-        if (inCopy) {
+        if (context.isDynamic (alloc)) {
             self.validateDynamicSliceAllocator (alias context, alloc)
         } else {
             self.validateStaticSliceAllocator (alias context, alloc)
@@ -622,10 +644,10 @@ pub class ValueValidator {
      *    - context: the context of the validation
      *    - alloc: the allocator to validate
      * */
-    fn validateSliceFor (self, dmut context : &Validator, alloc : &SliceForAllocatorExpr, inCopy : bool = false)-> &Value
+    fn validateSliceFor (self, dmut context : &Validator, alloc : &SliceForAllocatorExpr)-> &Value
         throws &ErrorMsg
     {
-        context:.getForLoopValidator ():.validateListComprehension (alias context, alloc, dynamic-> inCopy)
+        context:.getForLoopValidator ():.validateListComprehension (alias context, alloc)
     }
 
     /**
@@ -757,7 +779,7 @@ pub class ValueValidator {
      *   - o: the operator to validate
      * @returns: the validated value
      */
-    fn validateOperator (self, dmut context : &Validator, o : &OperatorExpr, inCopy : bool = false)-> &Value
+    fn validateOperator (self, dmut context : &Validator, o : &OperatorExpr)-> &Value
         throws &ErrorMsg
     {
         match o {
@@ -768,7 +790,7 @@ pub class ValueValidator {
                         return context:.getCallOpValidator ().validate (alias context, m);
                     }
                     _ => {
-                        return context:.getIndexOpValidator ().validate (alias context, m, inCopy-> inCopy);
+                        return context:.getIndexOpValidator ().validate (alias context, m);
                     }
                 }
             }
@@ -1136,22 +1158,17 @@ pub class ValueValidator {
     fn validateCopy (self, dmut context : &Validator, i : &IntrinsicExpr)-> &Value
         throws &ErrorMsg
     {
-        let content = match i.getContent () {
-            slc : &SliceForAllocatorExpr => {
-                // we return, because it already allocates memory
-                return self.validateSliceFor (alias context, slc, inCopy-> true);
-            }
-            s : &SliceAllocatorExpr => {
-                // Idem, it already allocated memory, no need to copy again
-                return self.validateSliceAllocator (alias context, s, inCopy-> true);
-            }
-            m : &OperatorExpr => { // need to send in copy to index operator to allow range access on arrays within copies
-                self.validateOperator (alias context, m, inCopy-> true)
-            }
-            e : _ => {
-                context:.validateValue (e)
-            }
+        let content = {
+            context:.enterCopy (i);
+            context:.validateValue (i.getContent ())
+        } exit {
+            context:.exitCopy ();
         };
+
+        // Not need to copy something that is already allocated
+        if (context.isAllocated (content, deeply-> false)) {
+            return content;
+        }
 
         // The only aliasable type that is one level copiable is slice
         match content.getType () {
@@ -1186,7 +1203,18 @@ pub class ValueValidator {
     fn validateDeepCopy (self, dmut context : &Validator, i : &IntrinsicExpr)-> &Value
         throws &ErrorMsg
     {
-        let content = context:.validateValue (i.getContent ());
+        let content = {
+            context:.enterCopy (i);
+            context:.validateValue (i.getContent ())
+        } exit {
+            context:.exitCopy ();
+        };
+
+        // Not need to copy something that is already allocated
+        if (context.isAllocated (content, deeply-> true)) {
+            return content;
+        }
+
         match content.getType () {
             cptr : &ClassPtrType => {
                 let tr = context.createSyntaxVarFromPath (i.getLoc (), [CoreNames::CORE_MODULE, CoreNames::DUPLICATION_MODULE, CoreNames::DCOPY_TRAIT]);
@@ -1199,18 +1227,33 @@ pub class ValueValidator {
                                                       Word::new (Tokens::RPAR, i.getLoc ()),
                                                       left-> dot, rights-> [], canBeDotCall-> false);
                 let v = context:.validateValue (syntCall);
-                cast!{&Value} (CastValue::new (i.getLoc (), cptr.toDeeplyMutable (), v))
+                return cast!{&Value} (CastValue::new (i.getLoc (), cptr.toDeeplyMutable (), v));
             }
-            _ => {
-                let f = context.createSyntaxVarFromPath (i.getLoc (), [CoreNames::CORE_MODULE, CoreNames::DUPLICATION_MODULE, CoreNames::DCOPY_OP_OVERRIDE]);
-                let call = MultOperatorExpr::new (Word::new (Tokens::LPAR, i.getLoc ()),
-                                                  Word::new (Tokens::RPAR, i.getLoc ()),
-                                                  left-> f,
-                                                  rights-> [ValueWrapperExpr::new (content.getLoc (), content)], canBeDotCall-> false);
-
-                context:.validateValue (call)
+            s : &SliceType => {
+                let res = s.toDeeplyMutable ();
+                if (res.mutabilityLevel () == 2us) {
+                    return self.validateCopy (alias context, IntrinsicExpr::new (i.getLoc (), IntrinsicKeys::COPY, ValueWrapperExpr::new (i.getLoc (), content)));
+                }
+            }
+            a : &ArrayType => {
+                println (format ("% => %", a, content), " ", content::typeinfo.name);
+                let res = a.toDeeplyMutable ();
+                if (res.mutabilityLevel () == 2us) {
+                    return self.validateCopy (alias context, IntrinsicExpr::new (i.getLoc (), IntrinsicKeys::COPY, ValueWrapperExpr::new (i.getLoc (), content)));
+                }
+                // else { Should we do that in the compiler, instead of calling core function ?
+                // probably
             }
         }
+
+        // For any other values, we need to call the deep copy operator
+        let f = context.createSyntaxVarFromPath (i.getLoc (), [CoreNames::CORE_MODULE, CoreNames::DUPLICATION_MODULE, CoreNames::DCOPY_OP_OVERRIDE]);
+        let call = MultOperatorExpr::new (Word::new (Tokens::LPAR, i.getLoc ()),
+                                          Word::new (Tokens::RPAR, i.getLoc ()),
+                                          left-> f,
+                                          rights-> [ValueWrapperExpr::new (content.getLoc (), content)], canBeDotCall-> false);
+
+        context:.validateValue (call)
     }
     
 
