@@ -15,6 +15,8 @@ import ymirc::lexing::word;
 import ymirc::lexing::tokens;
 import ymirc::syntax::keys;
 import ymirc::syntax::expression::_;
+import ymirc::utils::bigint;
+import ymirc::utils::bigfloat;
 
 import std::algorithm::comparison;
 import std::collection::vec;
@@ -45,23 +47,42 @@ pub class CastValidator {
         let value = context:.validateValue (c.getValue ());
         let type = context:.validateType (c.getType ());
 
+        self.validateCast (alias context, loc-> c.getLoc (), value, type)
+    }
+
+    /**
+     * Validate the implicit cast of 'value' into 'type'
+     * @params:
+     *     - context: the context of the validation
+     *     - loc: the location of the cast
+     *     - value: the value to cast
+     *     - type: the type into which to cast
+     * @returns: a value
+     * @throws:
+     *      - &ErrorMsg: if the validation failed
+     * */
+    pub fn validateCast (self, dmut context : &Validator, loc : &Word = EOF_WORD, value : &Value, type : &Type)-> &Value
+        throws &ErrorMsg
+    {
+        let iLoc = if (loc.isEof ()) { value.getLoc () } else { loc };
+
         // It is possible to cast into the following types, with some conditions
         match type {
-            i : &IntType => return self.validateIntCast (alias context, c.getLoc (), i, value, value.getType ());
-            f : &FloatType => return self.validateFloatCast (alias context, c.getLoc (), f, value, value.getType ());
-            ct : &CharType => return self.validateCharCast (alias context, c.getLoc (), ct, value, value.getType ());
-            b : &BoolType => return self.validateBoolCast (alias context, c.getLoc (), b, value, value.getType ());
-            p : &PointerType => return self.validatePointerCast (alias context, c.getLoc (), p, value, value.getType ());
-            cp : &ClassPtrType => return self.validateClassPtrCast (alias context, c.getLoc (), cp, value, value.getType ());            
+            i : &IntType => return self.validateIntCast (alias context, iLoc, i, value, value.getType ());
+            f : &FloatType => return self.validateFloatCast (alias context, iLoc, f, value, value.getType ());
+            ct : &CharType => return self.validateCharCast (alias context, iLoc, ct, value, value.getType ());
+            b : &BoolType => return self.validateBoolCast (alias context, iLoc, b, value, value.getType ());
+            p : &PointerType => return self.validatePointerCast (alias context, iLoc, p, value, value.getType ());
+            cp : &ClassPtrType => return self.validateClassPtrCast (alias context, iLoc, cp, value, value.getType ());
         }
 
         // If the value contains an enumeration, it can be casted into the proxy type
         match value.getType () {
-            en : &EnumType => return self.validateFromEnumCast (alias context, c.getLoc (), type, value, en);
+            en : &EnumType => return self.validateFromEnumCast (alias context, iLoc, type, value, en);
         }
 
         /// Other casts are not allowed
-        throw ErrorMsg::fatal (c.getLoc (), format (ValidateErrorMessage::UNDEFINED_CAST_OP, value.getType (), type));
+        throw ErrorMsg::fatal (iLoc, format (ValidateErrorMessage::UNDEFINED_CAST_OP, value.getType (), type));
     }
 
     /**
@@ -84,26 +105,61 @@ pub class CastValidator {
      * @throws:
      *    - &ErrorMsg: if the cast is impossible
      */
-    fn validateIntCast (self, dmut _ : &Validator, loc : &Word, i : &IntType, value : &Value, vType : &Type)-> &Value
+    fn validateIntCast (self, dmut context : &Validator, loc : &Word, i : &IntType, value : &Value, vType : &Type)-> &Value
         throws &ErrorMsg
     {
         match vType {
-            IntType () => { // int value can be casted to any int value
-                return CastValue::new (loc, i.clone (0u32), value);
+            iC : &IntType => { // int value can be casted to any int value signed or unsigned
+                match context:.getCompileTimeInterpreter ().simplify (value) {
+                    (_, iv : &IntValue) => {
+                        return IntValue::new (loc, i.clone (0u32), iv.getValue ());
+                    }
+                    (_, v : _) => {
+                        if (iC.getSize () == i.getSize () && iC.isSigned () == i.isSigned ()) {
+                            return v;
+                        }
+
+                        return CastValue::new (loc, i.clone (0u32), v);
+                    }
+                }
             }
             c : &CharType => {
-                if (!i.isSigned () && c.getSize () == i.getSize ()) { // char values can be casted to unsigned int, if they have the same size (i.e. c8 => u8, c32 => u32)
-                    return CastValue::new (loc, i.clone (0u32), value);
+                // char values can be casted to unsigned int, if they have the same size (i.e. c8 => u8, c32 => u32)
+                if (!i.isSigned () && c.getSize () == i.getSize ()) {
+                    match context:.getCompileTimeInterpreter ().simplify (value) {
+                        (_, cv : &CharValue) => {
+                            return IntValue::new (loc, i.clone (0u32), cv.getValueAsInt ());
+                        }
+                        (_, v : _) => {
+                            return CastValue::new (loc, i.clone (0u32), v);
+                        }
+                    }
                 }
             }
             BoolType () => {
+                // bool values can be casted to u8
                 if (!i.isSigned () && i.getSize () == 8u16) {
-                    return CastValue::new (loc, i.clone (0u32), value);
+                    match context:.getCompileTimeInterpreter ().simplify (value) {
+                        (_, bv : &BoolValue) => {
+                            return IntValue::new (loc, i.clone (0u32), if (bv.isTrue ()) { 1us } else { 0us });
+                        }
+                        (_, v : _) => {
+                            return CastValue::new (loc, i.clone (0u32), v);
+                        }
+                    }
                 }
             }
             FloatType () => {
+                // float values can be casted to i32,i64, ..., or u32, u64, ...
                 if (i.getSize () >= 32u16) {
-                    return CastValue::new (loc, i.clone (0u32), value);
+                    match context:.getCompileTimeInterpreter ().simplify (value) {
+                        (_, fv : &FloatValue) => {
+                            return IntValue::new (loc, i.clone (0u32), BigInt::new (fv.getValue ()));
+                        }
+                        (_, v : _) => {
+                            return CastValue::new (loc, i.clone (0u32), v);
+                        }
+                    }
                 }
             }
         }
@@ -132,16 +188,34 @@ pub class CastValidator {
      * @throws:
      *    - &ErrorMsg: if the cast is impossible
      */
-    fn validateFloatCast (self, dmut _ : &Validator, loc : &Word, f : &FloatType, value : &Value, vType : &Type)-> &Value
+    fn validateFloatCast (self, dmut context : &Validator, loc : &Word, f : &FloatType, value : &Value, vType : &Type)-> &Value
         throws &ErrorMsg
     {
         match vType {
-            FloatType () => { // only float types are castable to float types
-                return CastValue::new (loc, f.clone (0u32), value);
+            fC : &FloatType => { // only float types are castable to float types
+                match context:.getCompileTimeInterpreter ().simplify (value) {
+                    (_, fv : &FloatValue) => {
+                        return FloatValue::new (loc, f.clone (0u32), fv.getValue ());
+                    }
+                    (_, v : _) => {
+                        if (fC.getSize () == f.getSize ()) {
+                            return v;
+                        }
+
+                        return CastValue::new (loc, f.clone (0u32), v);
+                    }
+                }
             }
             i : &IntType => {
                 if (i.getSize () >= 32u16) {
-                    return CastValue::new (loc, f.clone (0u32), value);
+                    match context:.getCompileTimeInterpreter ().simplify (value) {
+                        (_, iv : &IntValue) => {
+                            return FloatValue::new (loc, f.clone (0u32), BigFloat::new (iv.getValue ()));
+                        }
+                        (_, v : _) => {
+                            return CastValue::new (loc, f.clone (0u32), v);
+                        }
+                    }
                 }
             }
         }
@@ -170,16 +244,36 @@ pub class CastValidator {
      * @throws:
      *    - &ErrorMsg: if the cast is impossible
      */
-    fn validateCharCast (self, dmut _ : &Validator, loc : &Word, c : &CharType, value : &Value, vType : &Type)-> &Value
+    fn validateCharCast (self, dmut context : &Validator, loc : &Word, c : &CharType, value : &Value, vType : &Type)-> &Value
         throws &ErrorMsg
     {
         match vType {
-            CharType () => { // char can be casted into other chars, it is up to the user to make sure there is no lost in data (no warning if the data is known at compile time?)
-                return CastValue::new (loc, c.clone (0u32), value);
+            cC : &CharType => { // char can be casted into other chars, it is up to the user to make sure there is no lost in data (no warning if the data is known at compile time?)
+                match context:.getCompileTimeInterpreter ().simplify (value) {
+                    (_, cv : &CharValue) => {
+                        // toT is OK, it fits in a char
+                        return char::charValue (loc, size-> c.getSize (), c-> cv.getValueAsInt ().toT!{u32} ());
+                    }
+                    (_, v : _) => {
+                        if (cC.getSize () == c.getSize ()) {
+                            return v;
+                        }
+
+                        return CastValue::new (loc, c.clone (0u32), v);
+                    }
+                }
             }
             i : &IntType => { // int can be casted into char if they are of the same size and unsigned (u8 -> c8, u32 -> c32)
                 if (!i.isSigned () && i.getSize () == c.getSize ()) {
-                    return CastValue::new (loc, c.clone (0u32), value);
+                    match context:.getCompileTimeInterpreter ().simplify (value) {
+                        (_, iv : &IntValue) => {
+                            // toT is OK, the size is always < 32, and is value always unsigned
+                            return char::charValue (loc, size-> c.getSize (), c-> iv.getValue ().toT!{u32} ());
+                        }
+                        _ => {
+                            return CastValue::new (loc, c.clone (0u32), value);
+                        }
+                    }
                 }
             }
         }
@@ -208,14 +302,28 @@ pub class CastValidator {
      * @throws:
      *    - &ErrorMsg: if the cast is impossible
      */
-    fn validateBoolCast (self, dmut _ : &Validator, loc : &Word, b : &BoolType, value : &Value, vType : &Type)-> &Value
+    fn validateBoolCast (self, dmut context : &Validator, loc : &Word, b : &BoolType, value : &Value, vType : &Type)-> &Value
         throws &ErrorMsg
     {
         match vType {
             i : &IntType => { // int can be casted into bool if they are of size 8 and unsigned (u8 -> bool)
                 if (!i.isSigned () && i.getSize () == 8u16) {
-                    return CastValue::new (loc, b.clone (0u32), value);
+                    match context:.getCompileTimeInterpreter ().simplify (value) {
+                        (_, iv : &IntValue) => {
+                            if (iv.getValue () != 0us) {
+                                return BoolValue::new (loc, true);
+                            } else {
+                                return BoolValue::new (loc, false);
+                            }
+                        }
+                        (_, v : _) => {
+                            return CastValue::new (loc, b.clone (0u32), v);
+                        }
+                    }
                 }
+            }
+            BoolType () => {
+                return value;
             }
         }
 

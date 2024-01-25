@@ -17,6 +17,8 @@ import ymirc::semantic::declarator::errors;
 import ymirc::semantic::generator::base;
 import ymirc::semantic::symbol::base;
 
+import ymirc::lint::_;
+
 import std::time::_;
 import std::fs::_;
 import std::env;
@@ -30,8 +32,21 @@ import std::collection::vec;
  */
 pub class Parser {
 
+    // Options passed to the parser
     let _args : YmirArguments;
-    
+
+    // The syntaxic node read during syntax step
+    let mut _syntNode : &SyntaxNode = UnitExpr::new ();
+
+    // The list of generators created during validation
+    let mut _semGenerators : [&Generator] = [];
+
+    // The list of generator created after optimization
+    let mut _optGenerators : [&Generator] = [];
+
+    // The list of YIL nodes created after finalization
+    let mut _yilNodes : [&LintNode] = [];
+
     /**
      * Create an empty file parser
      */
@@ -54,6 +69,42 @@ pub class Parser {
     /***
      * ============================================================================
      * ============================================================================
+     * =========================          GETTERS        ==========================
+     * ============================================================================
+     * ============================================================================
+     */
+
+    /**
+     * @returns: the syntaxic node read during parsing
+     * */
+    pub fn getSyntaxNode (self)-> &SyntaxNode {
+        self._syntNode
+    }
+
+    /**
+     * @returns: the list of generators after validation before optimization
+     * */
+    pub fn getSemGenerators (self)-> [&Generator] {
+        self._semGenerators
+    }
+
+    /**
+     * @returns: the list of generators after optimization
+     * */
+    pub fn getOptGenerators (self)-> [&Generator] {
+        self._optGenerators
+    }
+
+    /**
+     * @returns: the list of YIL nodes
+     * */
+    pub fn getYilNodes (self)-> [&LintNode] {
+        self._yilNodes
+    }
+
+    /***
+     * ============================================================================
+     * ============================================================================
      * =========================          PARSING        ==========================
      * ============================================================================
      * ============================================================================
@@ -64,7 +115,7 @@ pub class Parser {
      * @returns:
      *    - the generators created by validation process
      */
-    pub fn parseAll (mut self)-> [&Generator]
+    pub fn parseAll (mut self)
         throws &ErrorMsg
     {
         let mut path = Path::new (self._args.file);
@@ -72,30 +123,90 @@ pub class Parser {
             path = env::currentDir ().push (path);
         }
 
-        self:.parsePackage (path)
+        self:.parsePackage (path);
     }
-        
-    
+
     /**
      * Parse a given file
      * @params: 
      *  - file: the path of the file
      */
-    prv fn parsePackage (mut self, file : &Path)-> [&Generator]
+    fn parsePackage (mut self, file : &Path)
         throws &ErrorMsg
     {
-        let modSynt = SyntaxVisitor::new (file):.read ();
+        let s1 = self:.syntaxStep (file);
+        self._syntNode = s1;
+
+        let s2 = self:.validationStep (file, s1);
+        self._semGenerators = s2;
+
+        let s3 = self:.optimizationStep (file, s2);
+        self._optGenerators = s3;
+
+        let s4 = self:.yilStep (file, s3);
+        self._yilNodes = s4;
+    }
+
+    /***
+     * ============================================================================
+     * ============================================================================
+     * =========================          SYNTAX        ===========================
+     * ============================================================================
+     * ============================================================================
+     */
+
+
+    /**
+     * Syntax read of the module root file
+     * @params:
+     *    - file: the file to read
+     * @returns: the module declaration contained in the file
+     * @throws:
+     *    - &ErrorMsg: if there are syntaxic errors
+     * */
+    fn syntaxStep (mut self, file : &Path)-> &ModuleDecl
+        throws &ErrorMsg
+    {
+        SyntaxVisitor::new (file):.read ()
+    } catch {
+        err : &ErrorMsg => throw err;
+        _ : &FsError => {
+            throw ErrorMsg::fatal (EOF_WORD, format (DeclareErrorMessage::NO_SUCH_FILE, file.toStr ()), oneLine-> true);
+        }
+    }
+
+    /***
+     * ============================================================================
+     * ============================================================================
+     * =======================          VALIDATION        =========================
+     * ============================================================================
+     * ============================================================================
+     */
+
+    /**
+     * Validate a module (declaration of symbols, and type validation)
+     * @params:
+     *     - file: the path of the file in which the module was read
+     *     - modSynt: the module to declare and validate
+     * @returns: the list of generators created by the module
+     * @throws:
+     *     - &ErrorMsg: if there are error during the validation
+     * */
+    fn validationStep (mut self, file : &Path, modSynt : &ModuleDecl)-> [&Generator]
+        throws &ErrorMsg
+    {
+        if (self._args.noSem) return [];
+
         let dmut declarator = Declarator::new (packageDir-> file.parent ());
         self:.importExternPackages (alias declarator);
 
         let dmut modSym = declarator:.declareGlobal (modSynt);
-
         let dmut valid = Validator::new (alias declarator);
         valid:.validate (alias modSym);
 
         if (global::state::instance ().isYmirDumping ()) {
             {
-                with dmut f = File::create (file.addExtension ("ydump"s8), write-> true) {
+                with dmut f = File::create (file.addExtension ("ydump-sem"s8), write-> true) {
                     for i in valid.getGenerators () {
                         f:.write (format ("%\n", i));
                     }
@@ -105,33 +216,13 @@ pub class Parser {
             }
         }
 
-        let dmut optim = Optimizer::new ();
-        let finals = optim:.optimize (valid.getGenerators ());
-
-        if (global::state::instance ().isYmirDumping ()) {
-            {
-                with dmut f = File::create (file.addExtension ("ydump-opt"s8), write-> true) {
-                    for i in finals {
-                        f:.write (format ("%\n", i));
-                    }
-                }
-            } catch {
-                err : &FsError => println( err );
-            }
-        }
-
-        finals
-    } catch {
-        err : &ErrorMsg => throw err;
-        _ : &FsError => {
-            throw ErrorMsg::fatal (EOF_WORD, format (DeclareErrorMessage::NO_SUCH_FILE, file.toStr ()), oneLine-> true);
-        }
+        return valid.getGenerators ();
     }
 
     /**
      * Import a external package imported using the -I option
      * */
-    prv fn importExternPackages (mut self, dmut declarator : &Declarator)
+    fn importExternPackages (mut self, dmut declarator : &Declarator)
         throws &ErrorMsg
     {
         let dmut errors = Vec!{&ErrorMsg}::new ();
@@ -158,7 +249,7 @@ pub class Parser {
     /**
      * Import the external package at path 'path'
      * */
-    prv fn importExternPackage (mut self, dmut declarator : &Declarator, path : &Path)
+    fn importExternPackage (mut self, dmut declarator : &Declarator, path : &Path)
         throws &ErrorMsg
     {
         let file = if (fs::sys::isDir (path)) {
@@ -177,6 +268,82 @@ pub class Parser {
             throw ErrorMsg::fatal (EOF_WORD, format (DeclareErrorMessage::IMPORT_EXTERN_PACKAGE, path), oneLine-> true,
                                    notes-> [ErrorMsg::fatal (EOF_WORD, format (DeclareErrorMessage::NO_SUCH_FILE, path.toStr ()), oneLine-> true)]);
         }
+    }
+
+    /***
+     * ============================================================================
+     * ============================================================================
+     * ======================          OPTIMIZATION        ========================
+     * ============================================================================
+     * ============================================================================
+     */
+
+    /**
+     * Optimize the generators validated during the validation step
+     * @params:
+     *     - file: the file in which everything was originated
+     *     - gen: the list of generators to optimize
+     * @returns: the list of optimized generators
+     * */
+    fn optimizationStep (mut self, file : &Path, gens : [&Generator])-> [&Generator] {
+        if (self._args.noOpt) return gens;
+
+        let dmut optim = Optimizer::new ();
+        let finals = optim:.optimize (gens);
+
+        if (global::state::instance ().isYmirDumping ()) {
+            {
+                with dmut f = File::create (file.addExtension ("ydump-opt"s8), write-> true) {
+                    for i in finals {
+                        f:.write (format ("%\n", i));
+                    }
+                }
+            } catch {
+                err : &FsError => println( err );
+            }
+        }
+
+        finals
+    }
+
+    /***
+     * ============================================================================
+     * ============================================================================
+     * =======================          GENERATION        =========================
+     * ============================================================================
+     * ============================================================================
+     */
+
+    /**
+     * Transform the generators into Ymir Intermediate Language
+     * This language is the last step of the frontend, and can be send to backend for target generation
+     * @params:
+     *     - file : &Path,
+     *     - gens: the list of generators to transform
+     * @returns: the list of YIL nodes to send to the backend
+     * */
+    fn yilStep (mut self, file : &Path, gens : [&Generator])-> [&LintNode] {
+        if (self._args.noLint) return [];
+
+        let dmut lint = GenerateVisitor::new ();
+        let dmut res = Vec!{&LintNode}::new ();
+        for i in gens {
+            res:.push (lint:.generate (i));
+        }
+
+        if (global::state::instance ().isYmirDumping ()) {
+            {
+                with dmut f = File::create (file.addExtension ("ydump-yil"s8), write-> true) {
+                    for i in res {
+                        f:.write (format ("%\n", i));
+                    }
+                }
+            } catch {
+                err : &FsError => println( err );
+            }
+        }
+
+        return res[];
     }
 
 }
