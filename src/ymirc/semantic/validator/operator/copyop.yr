@@ -1,0 +1,251 @@
+mod ymirc::semantic::validator::operator::copyop;
+
+
+import std::io;
+import std::collection::vec;
+
+import ymirc::semantic::validator::visitor;
+import ymirc::semantic::validator::errors;
+import ymirc::semantic::validator::template::_;
+
+import ymirc::errors::_;
+import ymirc::utils::format;
+import ymirc::semantic::generator::value::_;
+import ymirc::syntax::expression::_;
+import ymirc::syntax::keys;
+import ymirc::lexing::word;
+import ymirc::lexing::tokens;
+import ymirc::global::core_;
+
+import ymirc::semantic::generator::type::_;
+
+/**
+ * The validator for copy and deep copy
+ * */
+pub class CopyOpValidator {
+
+    /**
+     * Create an empty validator
+     * */
+    pub self () {}
+
+    /**
+     * Validate a single level copy
+     * @params:
+     *    - context: the context of the copy
+     *    - i: the intrinsic expression to validate
+     * @returns: the value copied (by multiple means depending on the type)
+     * @throws:
+     *    - &ErrorMsg: if the validation failed
+     * */
+    pub fn validateCopy (self, dmut context : &Validator, i : &IntrinsicExpr)-> &Value
+        throws &ErrorMsg
+    {
+        let content = {
+            context:.enterCopy (i);
+            context:.validateValue (i.getContent ())
+        } exit {
+            context:.exitCopy ();
+        };
+
+        // No need to copy something that is already allocated
+        if (self.isAllocated (content, deeply-> false)) return content;
+
+        // The only aliasable type that is one level copiable is slice
+        match content.getType () {
+            slc : &SliceType => {
+                let inner = slc.getInners ()[0].clone (1u32);
+                let type = SliceType::new (i.getLoc (), inner, isMutable-> true);
+
+                CopierValue::new (i.getLoc (), type, content)
+            }
+            a : &ArrayType => {
+                let inner = a.getInners ()[0].clone (1u32);
+                let type = SliceType::new (i.getLoc (), inner, isMutable-> true);
+                let ctor = SliceValue::new (i.getLoc (), type, content);
+
+                CopierValue::new (i.getLoc (), type, ctor)
+            }
+            _ => {
+                throw ErrorMsg::fatal (i.getLoc (), format (ValidateErrorMessage::NO_COPY_EXIST, content.getType ()));
+            }
+        }
+    }
+
+    /**
+     * Validate a deep level copy
+     * @params:
+     *    - context: the context of the copy
+     *    - i: the intrinsic expression to validate
+     * @returns: the value deep copied (by multiple means depending on the type)
+     * @throws:
+     *    - &ErrorMsg: if the validation failed
+     * */
+    pub fn validateDeepCopy (self, dmut context : &Validator, i : &IntrinsicExpr)-> &Value
+        throws &ErrorMsg
+    {
+        let content = {
+            context:.enterCopy (i);
+            context:.validateValue (i.getContent ())
+        } exit {
+            context:.exitCopy ();
+        };
+
+        // No need to copy something that is already allocated
+        if (self.isAllocated (content, deeply-> true)) return content;
+
+        match content.getType () {
+            cptr : &ClassPtrType => {
+                let tr = context.createSyntaxVarFromPath (i.getLoc (), [CoreNames::CORE_MODULE, CoreNames::DUPLICATION_MODULE, CoreNames::DCOPY_TRAIT]);
+                let im = context:.validateType (tr);
+                context:.verifyImplement (i.getLoc (), cptr, im);
+
+                let dcopyName = context.createSyntaxVarFromPath (i.getLoc (), [CoreNames::DCOPY_OP_OVERRIDE]);
+                let dot = BinaryExpr::new (Word::new (Tokens::DOT, i.getLoc ()), ValueWrapperExpr::new (content.getLoc (), content), dcopyName);
+                let syntCall = MultOperatorExpr::new (Word::new (Tokens::LPAR, i.getLoc ()),
+                                                      Word::new (Tokens::RPAR, i.getLoc ()),
+                                                      left-> dot, rights-> [], canBeDotCall-> false);
+                let v = context:.validateValue (syntCall);
+                return cast!{&Value} (CastValue::new (i.getLoc (), cptr.toDeeplyMutable (), v));
+            }
+            s : &SliceType => {
+                return self.validateDeepCopySlice (alias context, i, content, s);
+            }
+            a : &ArrayType => {
+                return self.validateDeepCopyArray (alias context, i, content, a);
+            }
+        }
+
+        throw ErrorMsg::fatal (i.getLoc (), format (ValidateErrorMessage::NO_COPY_EXIST, content.getType ()));
+    }
+
+
+    /**
+     * =================================================================================
+     * =================================================================================
+     * =========================           CORE COPY            ========================
+     * =================================================================================
+     * =================================================================================
+     */
+
+    /**
+     * Validate a deep copy on an array value
+     * @params:
+     *    - context: the context of the validation
+     *    - i: the expression to validate
+     *    - value: the value of the deep copy
+     *    - type: the type of the copy
+     * @returns: the deep copied value
+     * @throws:
+     *    - &ErrorMsg: if the validation failed
+     * */
+    fn validateDeepCopyArray (self, dmut context : &Validator, i : &IntrinsicExpr, value : &Value, type : &ArrayType)-> &Value
+        throws &ErrorMsg
+    {
+        if (self.pointerLevelAfterDCopy (type) == 1us) {
+            return self.validateCopy (alias context, IntrinsicExpr::new (i.getLoc (), IntrinsicKeys::COPY, ValueWrapperExpr::new (i.getLoc (), value)));
+        }
+
+        let dmut parameters = Vec!{&Value}::new ();
+        let inner = type.getInners ()[0];
+        let mut innerR : &Type = NONE_TYPE;
+
+        for z in 0us .. type.getSizeCte () {
+            let curr = context:.getIndexOpValidator ().createArrayAccess (i.getLoc (), inner, value, usize (i.getLoc (), z));
+            let dc = IntrinsicExpr::new (i.getLoc (), IntrinsicKeys::DCOPY, ValueWrapperExpr::new (i.getLoc (), curr));
+            let p = self.validateDeepCopy (alias context, dc);
+            innerR = p.getType ();
+            parameters:.push (p);
+        }
+
+        let arrType = ArrayType::new (i.getLoc (), innerR, int::usize (i.getLoc (), parameters.len ()), isMutable-> true);
+        let arrValue = ArrayValue::new (i.getLoc (), arrType, parameters []);
+
+        let slcType = SliceType::new (i.getLoc (), innerR, isMutable-> true);
+        let ctor = SliceValue::new (i.getLoc (), slcType, arrValue);
+
+        CopierValue::new (i.getLoc (), slcType, ctor, isDeep-> true)
+    }
+
+    /**
+     * Validate a deep copy on a slice value
+     * @params:
+     *    - context: the context of the validation
+     *    - i: the expression to validate
+     *    - value: the value to deep copy
+     *    - type: the type of the copy
+     * @returns: the deep copied value
+     * @throws:
+     *    - &ErrorMsg: if the validation failed
+     * */
+    fn validateDeepCopySlice (self, dmut context : &Validator, i : &IntrinsicExpr, value : &Value, type : &SliceType)-> &Value
+        throws &ErrorMsg
+    {
+        if (self.pointerLevelAfterDCopy (type) == 1us) {
+            return self.validateCopy (alias context, IntrinsicExpr::new (i.getLoc (), IntrinsicKeys::COPY, ValueWrapperExpr::new (i.getLoc (), value)));
+        }
+
+        __pragma!panic ();
+    }
+
+    /**
+     * ================================================================================
+     * ================================================================================
+     * =========================           CHECKING            ========================
+     * ================================================================================
+     * ================================================================================
+     */
+
+    /**
+     * Check if the value is an allocation value, that is already complying to the copy/dcopy statement
+     * This can happen for literal values, such as slice from array literal, or class ctors
+     * @params:
+     *   - alloc: the value to check
+     *   - deeply: true iif we need the value to be deeply mutable
+     * @returns: true iif the value is allocated
+     * */
+    fn isAllocated (self, alloc : &Value, deeply : bool = false)-> bool {
+        return match alloc {
+            c : &CopierValue => {
+                (c.isDeep () || !deeply)
+            }
+            _ => { false }
+        }
+    }
+
+    /**
+     * Count the height of the type (in term of pointers) if the type is deeply copied
+     * @returns: the height of the type
+     * */
+    fn pointerLevelAfterDCopy (self, type : &Type)-> usize {
+        return match type {
+            a : &ArrayType => { 1us + self.pointerLevelAfterDCopy (a.getInners ()[0]) }
+            s : &SliceType => { 1us + self.pointerLevelAfterDCopy (s.getInners ()[0]) }
+            t : &TupleType => {
+                let mut ret = 0us;
+                for inner in t.getInners () {
+                    let h = self.pointerLevelAfterDCopy (inner);
+                    if (ret < h) ret = h;
+                }
+                ret
+            }
+            _ : &ClassPtrType => { 1us }
+            s : &StructType => {
+                let mut ret = 0us;
+                for v in s.getFields () match v {
+                    var : &VarDeclValue => {
+                        let h = self.pointerLevelAfterDCopy (var.getVarType ());
+                        if (ret < h) ret = h;
+                    }
+                }
+                ret
+            }
+            e : &EnumType => {
+                self.pointerLevelAfterDCopy (e.getProxy ())
+            }
+            _ : &PointerType => { 0us } // pointers are not deep copied ?
+            _ => { 0us }
+        };
+    }
+
+}
