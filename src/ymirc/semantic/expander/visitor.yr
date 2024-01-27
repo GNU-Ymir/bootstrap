@@ -1,0 +1,576 @@
+mod ymirc::semantic::expander::visitor;
+
+
+import std::collection::map;
+import std::collection::vec;
+import std::io;
+
+import ymirc::utils::format;
+import ymirc::semantic::generator::_;
+import ymirc::semantic::expander::stmtlist;
+
+import ymirc::lexing::word;
+
+/**
+ * The expander class simplifies previously validated symbols
+ */
+pub class Expander {
+
+    /**
+     * =====================================================================================
+     * =====================================================================================
+     * =========================         GLOBAL GENERATORS         =========================
+     * =====================================================================================
+     * =====================================================================================
+     */
+
+    // The list of generators provided by the previous pass (validation)
+    let mut _generators : [&Generator] = [];
+
+    // The list of expanded frames (for inlining)
+    let dmut _frames : &HashMap!{[c8], &Generator} = HashMap!{[c8], &Generator}::new ();
+
+    // The list of expanded generators
+    let dmut _expanded = Vec!{&Generator}::new ();
+
+    /**
+     * =====================================================================================
+     * =====================================================================================
+     * =========================         FRAME GENERATION         ==========================
+     * =====================================================================================
+     * =====================================================================================
+     */
+
+    // The current scope variable declarations
+    let dmut _variables = Vec!{dmut &HashMap!{usize, usize}}::new ();
+
+    /**
+     * =====================================================================================
+     * =====================================================================================
+     * ==============================         CTORS         ================================
+     * =====================================================================================
+     * =====================================================================================
+     */
+
+
+    /**
+     * Create a new empty expander
+     * */
+    pub self () {}
+
+    /**
+     * Expande a list of generators
+     * */
+    pub fn finalize (mut self, generators : [&Generator])-> [&Generator] {
+        self._generators = generators;
+        for gen in self._generators {
+            self:.finalize (gen);
+        }
+
+        self._expanded[]
+    }
+
+    /**
+     * Expande a generator
+     * */
+    pub fn finalize (mut self, gen : &Generator) {
+        match gen {
+            frame : &FrameGenerator => {
+                self:.finalizeFrame (frame);
+            }
+            _ => {
+                self._expanded:.push (gen);
+            }
+        }
+    }
+
+    /**
+     * =====================================================================================
+     * =====================================================================================
+     * =========================          FRAME EXPANSION          =========================
+     * =====================================================================================
+     * =====================================================================================
+     */
+
+    /**
+     * Expande a frame generator
+     * @params:
+     *    - frame: the frame to expande
+     * */
+    pub fn finalizeFrame (mut self, frame : &FrameGenerator) {
+        let dmut list = StmtList::new ();
+        let _ = self:.finalizeValue (frame.getBody (), alias list);
+
+        let body = if (list.len () == 1us) {
+            list [0]
+        } else {
+            cast!{&Value} (BlockValue::new (frame.getBody ().getLoc (), NONE_TYPE, list[]))
+        };
+
+        let final = FrameGenerator::new (frame.getLoc (),
+                                         frame.getName (),
+                                         frame.getParameters (),
+                                         frame.getReturnType (),
+                                         body-> body,
+                                         externLang-> frame.getExternalLang (),
+                                         isWeak-> frame.isWeak (),
+                                         templateMapper-> frame.getTemplateMapper ());
+
+        self._expanded:.push (final);
+    }
+
+    /**
+     * =====================================================================================
+     * =====================================================================================
+     * =========================          VALUE EXPANSION          =========================
+     * =====================================================================================
+     * =====================================================================================
+     */
+
+    /**
+     * Finalize a value
+     * @params:
+     *    - value: the value to finalize
+     * */
+    fn finalizeValue (mut self, val : &Value, dmut list : &StmtList)-> &Value {
+        match val {
+            b : &BreakValue => { self:.finalizeBreak (b, alias list) }
+            n : &NamedValue => { self:.finalizeValue (n.getContent (), alias list) }
+            r : &ReturnValue => { self:.finalizeReturn (r, alias list) }
+            t : &ThrowValue => { self:.finalizeThrow (t, alias list) }
+            v : &VarDeclValue => { self:.finalizeVarDecl (v, alias list) }
+            v : &VarRefValue => { self:.finalizeVarRef (v, alias list) }
+            s : &ScopeValue => { self:.finalizeScope (s, alias list) }
+            l : &LiteralValue => { self:.finalizeLiteral (l, alias list) }
+            c : &CallOperatorValue => { self:.finalizeCall (c, alias list) }
+            c : _ => {
+                eprintln (c::typeinfo.name);
+                __pragma!panic ();
+            }
+        }
+    }
+
+    /**
+     * Finalize a break statement
+     * @params:
+     *    -  b: the break statement to finalize
+     * @returns: UNIT_VALUE, break values are never right operands
+     * */
+    fn finalizeBreak (mut self, b : &BreakValue, dmut list : &StmtList)-> &Value {
+        match b.getValue () {
+            UnitValue () => { return b; }
+        }
+
+        let decl = self.getLoopValueDecl ();
+        let inner = self:.finalizeValue (b.getValue (), alias list);
+        list:.append (AffectValue::new (b.getLoc (), decl.getType (), decl, inner));
+        list:.append (BreakValue::new (b.getLoc (), UNIT_VALUE));
+
+        UNIT_VALUE
+    }
+
+    /**
+     * Finalize a return statement
+     * @params:
+     *    - t: the return stmt to finalize
+     * @returns: UNIT_VALUE, return values are never right operands
+     * */
+    fn finalizeReturn (mut self, r : &ReturnValue, dmut list : &StmtList)-> &Value {
+        match r.getValue () {
+            UnitValue () => { return r; }
+        }
+
+        let inner = self:.finalizeValue (r.getValue (), alias list);
+        list:.append (ReturnValue::new (r.getLoc (), inner));
+
+        UNIT_VALUE
+    }
+
+    /**
+     * Finalize a throw statement
+     * @params:
+     *    - t: the throw stmt to finalize
+     * @returns: UNIT_VALUE, throw values are never right operands
+     * */
+    fn finalizeThrow (mut self, t : &ThrowValue, dmut list : &StmtList)-> &Value {
+        let inner = self:.finalizeValue (t.getValue (), alias list);
+        let ti = self:.finalizeValue (t.getTypeInfo (), alias list);
+        list:.append (ThrowValue::new (t.getLoc (), inner, ti));
+
+        UNIT_VALUE
+    }
+
+    /**
+     * Finalize a variable declaration statement
+     * @params:
+     *    - v: the variable declaration to finalize
+     * @returns: UNIT_VALUE, variable decl are never right operands
+     * */
+    fn finalizeVarDecl (mut self, v : &VarDeclValue, dmut list : &StmtList)-> &Value {
+        let inner = self:.finalizeValue (v.getValue (), alias list);
+        let ret = VarDeclValue::new (v.getLoc (), v.getVarType (), inner, v.isMutable (), v.isPure (), isCte-> v.isCte ());
+        list:.append (ret);
+        self:.registerVariable (v.getUniqId (), ret.getUniqId ());
+
+        UNIT_VALUE
+    }
+
+    /**
+     * Finalize a variable reference value
+     * @params:
+     *   - v: the variable to finalize
+     * @returns: a variable reference
+     * */
+    fn finalizeVarRef (mut self, v : &VarRefValue, dmut _ : &StmtList)-> &Value {
+        let id = match self.getVariable (v.getUniqId ()) {
+            Ok (u : usize) => { u }
+            _ => { v.getRefId () }
+        };
+
+        VarRefValue::new (v.getLoc (),
+                          v.getDeclLoc (),
+                          v.getType (),
+                          refId-> id)
+    }
+
+
+    /**
+     * =====================================================================================
+     * =====================================================================================
+     * =========================          SCOPE EXPANSION          =========================
+     * =====================================================================================
+     * =====================================================================================
+     */
+
+    /**
+     * Finalize a scope value
+     * @params:
+     *    - sc: the scope value to finalize
+     *    - list: the statement list to fill
+     * @returns: the final value of the scope
+     * */
+    fn finalizeScope (mut self, sc : &ScopeValue, dmut list : &StmtList)-> &Value {
+        match sc {
+            b : &BlockValue => { self:.finalizeBlock (b, alias list) }
+            c : &ConditionalValue => { self:.finalizeCond (c, alias list) }
+            l : &LoopValue => { self:.finalizeLoop (l, alias list) }
+            _ => {
+                eprintln (sc::typeinfo.name);
+                __pragma!panic ();
+            }
+        }
+    }
+
+    /**
+     * Finalize a block of values
+     * @params:
+     *    - b: the block of values to finalize
+     *    - list: the list of statement to fill
+     * @returns: the final value of the block if any
+     * */
+    fn finalizeBlock (mut self, b : &BlockValue, dmut list : &StmtList)-> &Value {
+        if (b.isSet ()) return self:.finalizeSet (b, alias list);
+
+        let mut finVal : &Value = UNIT_VALUE;
+        let dmut innerList = StmtList::new ();
+        self:.enterBlock ();
+        let retVal = self:.finalizeSet (b, alias innerList);
+
+        if (!retVal.isOf!{&UnitValue} ()) {
+            let name = Word::new (format ("b_%", b.getLoc ().line ()), b.getLoc ());
+            let blockVar = VarDeclValue::new (name, b.getType (), NONE_VALUE, false, false);
+            list:.append (blockVar);
+
+            let varRef = VarRefValue::new (name, name, b.getType (), refId-> blockVar.getUniqId ());
+            innerList:.append (AffectValue::new (retVal.getLoc (), varRef.getType (), varRef, retVal));
+            finVal = varRef;
+        }
+
+        self:.exitBlock ();
+        list:.append (BlockValue::new (b.getLoc (), VOID_TYPE, innerList[]));
+
+        finVal
+    }
+
+    /**
+     * Finalize a set of value
+     * @params:
+     *    - s: the set of values to finalize
+     *    - list: the list of statement to fill
+     * @returns: the final value of the set if any
+     * */
+    fn finalizeSet (mut self, s : &BlockValue, dmut list : &StmtList)-> &Value {
+        let mut finVal : &Value = UNIT_VALUE;
+        for inner in s.getValues () {
+            finVal = self:.finalizeValue (inner, alias list);
+        }
+
+        finVal
+    }
+
+    /**
+     * Finalize a branch statement
+     * @params:
+     *    - c: the conditional statement to finalize
+     *    - list: the list of statement to fill
+     * @returns: the final value of the condition if any
+     * */
+    fn finalizeCond (mut self, c : &ConditionalValue, dmut list : &StmtList)-> &Value {
+        let test = self:.finalizeValue (c.getTest (), alias list);
+        let dmut ifList = StmtList::new ();
+        let dmut elseList = StmtList::new ();
+
+        self:.enterBlock ();
+        let ifVal = self:.finalizeValue (c.getContent (), alias ifList);
+        self:.exitBlock ();
+
+        let mut elseVal : &Value = UNIT_VALUE;
+        if (!c.getElse ().isOf!{&UnitValue} ()) {
+            self:.enterBlock ();
+            elseVal = self:.finalizeValue (c.getElse (), alias elseList);
+            self:.exitBlock ();
+        }
+
+        let mut finVal : &Value = UNIT_VALUE;
+        if (!c.getType ().isOf!{&VoidType} ()) {
+            let name = Word::new (format ("cnd_%", c.getLoc ().line ()), c.getLoc ());
+            let blockVar = VarDeclValue::new (name, c.getType (), NONE_VALUE, false, false);
+            list:.append (blockVar);
+
+            let varRef = VarRefValue::new (name, name, c.getType (), refId-> blockVar.getUniqId ());
+
+            ifList:.append (AffectValue::new (c.getLoc (), c.getType (), varRef, ifVal));
+            if (!elseVal.isOf!{&UnitValue} ()) {
+                elseList:.append (AffectValue::new (c.getLoc (), c.getType (), varRef, elseVal));
+            }
+
+            finVal = varRef;
+        }
+
+        let ifBlock = BlockValue::new (c.getContent ().getLoc (), NONE_TYPE, ifList[]);
+        let elseBlock = if (elseList.len () != 0us) {
+            BlockValue::new (c.getElse ().getLoc (), NONE_TYPE, elseList[])
+        } else {
+            cast!{&Value} (UNIT_VALUE)
+        };
+
+        list:.append (ConditionalValue::new (c.getLoc (), NONE_TYPE, test, ifBlock, elseBlock, isComplete-> c.isComplete ()));
+        finVal
+    }
+
+    /**
+     * Finalize a loop statement
+     * @params:
+     *    - l: the loop statement to finalize
+     *    - list: the list of statement to fill
+     * @returns: the final value of the loop if any
+     * */
+    fn finalizeLoop (mut self, l : &LoopValue, dmut list : &StmtList)-> &Value {
+        l;
+        list;
+        __pragma!panic ();
+    }
+
+    /**
+     * =====================================================================================
+     * =====================================================================================
+     * ========================          LITERAL EXPANSION          ========================
+     * =====================================================================================
+     * =====================================================================================
+     */
+
+    /**
+     * Finalize a literal value
+     * @params:
+     *    - l: the literal value to finalize
+     *    - list: the scope list of statement to fill
+     * @returns: the finalized value
+     * */
+    fn finalizeLiteral (mut self, l : &LiteralValue, dmut list : &StmtList)-> &Value {
+        match l {
+            a : &ArrayValue => { return self:.finalizeArray (a, alias list); }
+            a : &ArrayAllocValue => { return self:.finalizeArrayAlloc (a, alias list); }
+            t : &TupleValue => { return self:.finalizeTuple (t, alias list); }
+            BoolValue () => { return l; }
+            CharValue () => { return l; }
+            FakeValue () => { return l; }
+            FloatValue () => { return l; }
+            IntValue () => { return l; }
+            NoneValue () => { return l; }
+            NullValue () => { return l; }
+            StringValue () => { return l; }
+            UnitValue () => { return l; }
+            _ => {
+                eprintln (l::typeinfo.name);
+                __pragma!panic ();
+            }
+        }
+    }
+
+    /**
+     * Finalize an array value
+     * @params:
+     *    - a: the array value to finalize
+     *    - list: the list of statement to fill
+     * @returns: the value
+     * */
+    fn finalizeArray (mut self, a : &ArrayValue, dmut list : &StmtList)-> &Value {
+        let dmut res = Vec!{&Value}::new ();
+        for i in a.getInners () {
+            res:.push (self:.finalizeValue (i, alias list));
+        }
+
+        ArrayValue::new (a.getLoc (), a.getType (), res[])
+    }
+
+    /**
+     * Finalize an array allocation value
+     * @params:
+     *     - a: the array allocation to finalize
+     *     - list: the list of statement to fill
+     * @returns: the value
+     * */
+    fn finalizeArrayAlloc (mut self, a : &ArrayAllocValue, dmut list : &StmtList)-> &Value {
+        let inner = self:.finalizeValue (a.getValue (), alias list);
+        let len = self:.finalizeValue (a.getLen (), alias list);
+
+        ArrayAllocValue::new (a.getLoc (), a.getType (), inner, len, dyn-> a.isDynamic ())
+    }
+
+    /**
+     * Finalize a tuple value
+     * @params:
+     *    - t: the tuple value to finalize
+     *    - list: the list of statement to fill
+     * @returns: the value
+     * */
+    fn finalizeTuple (mut self, t : &TupleValue, dmut list : &StmtList)-> &Value {
+        let dmut res = Vec!{&Value}::new ();
+        for i in t.getInners () {
+            res:.push (self:.finalizeValue (i, alias list));
+        }
+
+        TupleValue::new (t.getLoc (), t.getType (), res[])
+    }
+
+    /**
+     * =====================================================================================
+     * =====================================================================================
+     * ========================            CALL EXPANSION           ========================
+     * =====================================================================================
+     * =====================================================================================
+     */
+
+    /**
+     * Finalize a call operator value
+     * @params:
+     *    - c: the call operator to validate
+     *    - list: the list of statement to fill
+     * @returns: the value of the call if any
+     * */
+    fn finalizeCall (mut self, c : &CallOperatorValue, dmut list : &StmtList)-> &Value {
+        match self.getVariable (c.getUniqId ()) {
+            Ok (u : usize) => { // The call was already seen and validated
+                return VarRefValue::new (c.getLoc (), c.getLoc (), c.getType (), refId-> u);
+            }
+        };
+
+        match c {
+            ca : &CallValue => { return self:.finalizeSimpleCall (ca, alias list); }
+            _ => {
+                eprintln (c::typeinfo.name);
+                __pragma!panic ();
+            }
+        }
+    }
+
+    /**
+     * Finalize a simple call value
+     * @params:
+     *   -
+     * */
+    fn finalizeSimpleCall (mut self, c : &CallValue, dmut list : &StmtList)-> &Value {
+        let mut varref : &Value = UNIT_VALUE;
+        if (!c.getType ().isOf!{&VoidType} ()) {
+            let name = Word::new (format ("c_%", c.getLoc ().line ()), c.getLoc ());
+            let vdecl = VarDeclValue::new (name, c.getType (), NONE_VALUE, false, false);
+            list:.append (vdecl);
+
+            varref = VarRefValue::new (name, name, c.getType (), refId-> vdecl.getUniqId ());
+            self:.registerVariable (c.getUniqId (), vdecl.getUniqId ());
+        }
+
+        let dmut params = Vec!{&Value}::new ();
+        let dmut addParams = Vec!{&Value}::new ();
+        for i in c.getParameters () {
+            params:.push (self:.finalizeValue (i, alias list));
+        }
+
+        for i in c.getAddParameters () {
+            addParams:.push (self:.finalizeValue (i, alias list));
+        }
+
+        if (c.getType ().isOf!{&VoidType} ()) {
+            list:.append (CallValue::new (c.getLoc (), c.getType (), c.getPrototype (), params[], addParams-> addParams[]));
+            return UNIT_VALUE;
+        } else {
+            list:.append (AffectValue::new (c.getLoc (), c.getType (), varref, CallValue::new (c.getLoc (), c.getType (), c.getPrototype (), params[], addParams-> addParams[])));
+            return varref;
+        }
+    }
+
+    /**
+     * =====================================================================================
+     * =====================================================================================
+     * =========================              CONTEXT              =========================
+     * =====================================================================================
+     * =====================================================================================
+     */
+
+    /**
+     * @returns: the declaration of the variable containing the value of the current loop
+     * */
+    fn getLoopValueDecl (self)-> &Value {
+        __pragma!panic ();
+    }
+
+    /**
+     * Enter a new scope of variables
+     * */
+    fn enterBlock (mut self) {
+        self._variables:.push (HashMap!{usize, usize}::new ());
+    }
+
+    /**
+     * Exit a scope of variables
+     * */
+    fn exitBlock (mut self) {
+        self._variables:.pop (1u64);
+    }
+
+    /**
+     * Register a variable declaration in the scope
+     * @params:
+     *    - old: the uniq id of the previous declaration
+     *    - new: the uniq id of the new declaration
+     * */
+    fn registerVariable (mut self, old : usize, new : usize) {
+        (alias self._variables)[$ - 1us]:.insert (old, new);
+    }
+
+    /**
+     * Search the id of a variable declared in the current frame
+     * @returns: the id, or None if the variable is not in the frame
+     * */
+    fn getVariable (self, old : usize)-> usize? {
+        for i in self._variables {
+            match i.find (old) {
+                Ok (n : usize) => { return n?; }
+            }
+        }
+
+        (usize?)::__err__
+    }
+
+
+}
