@@ -45,6 +45,7 @@ pub class ValueExpander {
             s : &ScopeValue => { self.finalizeScope (alias context, s, alias list) }
             l : &LiteralValue => { self.finalizeLiteral (alias context, l, alias list) }
             o : &OperatorValue => { self.finalizeOperator (alias context, o, alias list) }
+            m : &MemoryValue => { self.finalizeMemory (alias context, m, alias list) }
             c : _ => {
                 eprintln (c::typeinfo.name);
                 __pragma!panic ();
@@ -234,7 +235,7 @@ pub class ValueExpander {
         context:.exitBlock ();
 
         let mut elseVal : &Value = UNIT_VALUE;
-        if (!c.getElse ().isOf!{&UnitValue} ()) {
+        if (!c.getElse ().isOf!{&UnitValue} () && !c.getElse ().isOf!{&NoneValue} ()) {
             context:.enterBlock ();
             elseVal = context:.finalizeValue (c.getElse (), alias elseList);
             context:.exitBlock ();
@@ -414,10 +415,7 @@ pub class ValueExpander {
      * @returns: the finalized value
      * */
     fn finalizeLiteral (self, dmut context : &Expander, l : &LiteralValue, dmut list : &StmtList)-> &Value {
-        match l {
-            a : &ArrayValue => { return self.finalizeArray (alias context, a, alias list); }
-            a : &ArrayAllocValue => { return self.finalizeArrayAlloc (alias context, a, alias list); }
-            t : &TupleValue => { return self.finalizeTuple (alias context, t, alias list); }
+        match l { // simple literals
             StringValue () => { return l; }
             BoolValue () => { return l; }
             CharValue () => { return l; }
@@ -427,11 +425,30 @@ pub class ValueExpander {
             NoneValue () => { return l; }
             NullValue () => { return l; }
             UnitValue () => { return l; }
+        }
+
+        match context.getVariable (l.getUniqId ()) {
+            Ok (u : &Value) => { // The call was already seen and validated
+                return u;
+            }
+        };
+
+        let ltype = context:.finalizeType (l.getType ());
+        let varref = self.createVarForBlock (l.getLoc (), ltype, alias list);
+        context:.registerVariable (l.getUniqId (), varref);
+
+        let val = match l {
+            a : &ArrayValue => { self.finalizeArray (alias context, a, alias list) }
+            a : &ArrayAllocValue => { self.finalizeArrayAlloc (alias context, a, alias list) }
+            t : &TupleValue => { self.finalizeTuple (alias context, t, alias list) }
             _ => {
                 eprintln (l::typeinfo.name);
                 __pragma!panic ();
             }
         }
+
+        list:.append (AffectValue::new (l.getLoc (), ltype, varref, val));
+        varref
     }
 
     /**
@@ -447,8 +464,8 @@ pub class ValueExpander {
             res:.push (context:.finalizeValue (i, alias list));
         }
 
-        let type = context:.finalizeType (a.getType ());
-        ArrayValue::new (a.getLoc (), type, res[])
+        let atype = context:.finalizeType (a.getType ());
+        ArrayValue::new (a.getLoc (), atype, res[])
     }
 
     /**
@@ -460,10 +477,24 @@ pub class ValueExpander {
      * */
     fn finalizeArrayAlloc (self, dmut context : &Expander, a : &ArrayAllocValue, dmut list : &StmtList)-> &Value {
         let inner = context:.finalizeValue (a.getValue (), alias list);
-        let len = context:.finalizeValue (a.getLen (), alias list);
-
         let type = context:.finalizeType (a.getType ());
-        ArrayAllocValue::new (a.getLoc (), type, inner, len, dyn-> a.isDynamic ())
+
+        if (a.isDynamic ()) {
+            let len = context:.finalizeValue (a.getLen (), alias list);
+            let innerType = inner.getType ();
+            let size = int::usize (a.getLoc (), context:.computeSize (innerType));
+
+            let valPtr = AddressValue::new (a.getValue ().getLoc (), PointerType::new (a.getLoc (), innerType), inner);
+            NameCallValue::new (a.getLoc (), type, Path::new (CoreNames::YRT_ALLOC_SET_SLICE), [valPtr, size, len])
+        } else {
+            let dmut params = Vec!{&Value}::new ();
+            let len = a.getLen ().asOf!{&IntValue} ().getValue ().toT!{usize} ();
+            for _ in 0us .. len {
+                params:.push (inner);
+            }
+
+            ArrayValue::new (a.getLoc (), type, params[])
+        }
     }
 
     /**
@@ -479,8 +510,8 @@ pub class ValueExpander {
             res:.push (context:.finalizeValue (i, alias list));
         }
 
-        let type = context:.finalizeType (t.getType ());
-        TupleValue::new (t.getLoc (), type, res[])
+        let ttype = context:.finalizeType (t.getType ());
+        TupleValue::new (t.getLoc (), ttype, res[])
     }
 
     /**
@@ -504,6 +535,7 @@ pub class ValueExpander {
             b : &BinaryOperatorValue => { self.finalizeBinary (alias context, b, alias list) }
             f : &FieldOperatorValue => { self.finalizeField (alias context, f, alias list) }
             s : &SliceOrArrayOperatorValue => { self.finalizeSliceOrArrayOp (alias context, s, alias list) }
+            u : &UnaryOperatorValue => { self.finalizeUnary (alias context, u, alias list) }
             _ => {
                 eprintln (op::typeinfo.name);
                 __pragma!panic ();
@@ -580,6 +612,20 @@ pub class ValueExpander {
         self.finalizeCond (b.getLoc (), alias list, left, ifL, ifNL);
         var
     }
+
+    /**
+     * Finalize an unary operator
+     * @params:
+     *    - context: the context of the expansion
+     *    - u: the unary operator to finalize
+     *    - list: the list of statement to fill
+     * */
+    fn finalizeUnary (self, dmut context : &Expander, u : &UnaryOperatorValue, dmut list : &StmtList)-> &Value {
+        let value = context:.finalizeValue (u.getInner (), alias list);
+        let type = context:.finalizeType (u.getType ());
+
+        UnaryOperatorValue::new (u.getLoc (), type, u.getOperator (), value)
+    } 
 
     /**
      * =====================================================================================
@@ -680,6 +726,8 @@ pub class ValueExpander {
      * @returns: the value of the call if any
      * */
     fn finalizeCall (self, dmut context : &Expander, c : &CallOperatorValue, dmut list : &StmtList)-> &Value {
+        // Call of function performs heavy computation with possible side effects
+        // Function call must appear only once in the finalized code
         match context.getVariable (c.getUniqId ()) {
             Ok (u : &Value) => { // The call was already seen and validated
                 return u;
@@ -884,9 +932,19 @@ pub class ValueExpander {
      * @returns: the finalized version of the prototype
      * */
     fn finalizePrototype (self, dmut context : &Expander, proto : &PrototypeValue)-> &PrototypeValue {
-        context;
-        proto;
-        __pragma!panic ();
+        let name = context.getMangler ().mangle (proto);
+        let dmut params = Vec!{&ProtoVarValue}::new ();
+        for pi in proto.getParameters () {
+            let mut type = context:.finalizeType (pi.getType ());
+            if (pi.isReference ()) {
+                type = PointerType::new (pi.getLoc (), type);
+            }
+
+            params:.push (ProtoVarValue::new (pi.getLoc (), type, NONE_VALUE, false, false));
+        }
+
+        let retType = context:.finalizeType (proto.getRetType ());
+        NamePrototypeValue::new (proto.getLoc (), name, params[], retType)
     }
 
     /**
@@ -904,10 +962,349 @@ pub class ValueExpander {
      *    - list: the list of statement to fill
      * */
     fn finalizeSliceOrArrayOp (self, dmut context : &Expander, sl : &SliceOrArrayOperatorValue, dmut list : &StmtList)-> &Value {
+        match sl {
+            a : &ArrayAccessValue => { self.finalizeArrayAccess (alias context, a, alias list) }
+            c : &SliceConcatValue => { self.finalizeSliceConcat (alias context, c, alias list) }
+            s : &SliceAccessValue => { self.finalizeSliceAccess (alias context, s, alias list) }
+            s : &SliceCompareValue => { self.finalizeSliceCompare (alias context, s, alias list) }
+            _ => {
+                eprintln (sl::typeinfo.name);
+                __pragma!panic ();
+            }
+        }
+    }
+
+    /**
+     * Finalize an array access value
+     * @params:
+     *    - context: the context of the finalization
+     *    - a: the array access to finalize
+     *    - list: the list of statement to fill
+     * */
+    fn finalizeArrayAccess (self, dmut context : &Expander, a : &ArrayAccessValue, dmut list : &StmtList)-> &Value {
+        let arr = context:.finalizeValue (a.getArray (), alias list);
+        let index = context:.finalizeValue (a.getIndex (), alias list);
+        let type = context:.finalizeType (a.getType ());
+
+        ArrayAccessValue::new (a.getLoc (), type, arr, index)
+    }
+
+    /**
+     * Finalize a slice concatenation operation
+     * @params:
+     *    - context: the context of the finalization
+     *    - a: the slice concat to finalize
+     *    - list: the list of statement to fill
+     * */
+    fn finalizeSliceConcat (self, dmut context : &Expander, s : &SliceConcatValue, dmut list : &StmtList)-> &Value {
+        // Slice concat allocates values, thus must be performed only once
+        match context.getVariable (s.getUniqId ()) {
+            Ok (u : &Value) => { // The call was already seen and validated
+                return u;
+            }
+        };
+
+        let left = context:.finalizeValue (s.getLeft (), alias list);
+        let right = context:.finalizeValue (s.getRight (), alias list);
+        let type = context:.finalizeType (s.getType ());
+        let inner = context:.finalizeType (s.getType ().asOf!{&SliceType} ().getInners ()[0]);
+        let size = context:.computeSize (inner);
+
+        let varref = self.createVarForBlock (s.getLoc (), type, alias list);
+        if (!varref.isOf!{&UnitValue} ()) {
+            context:.registerVariable (s.getUniqId (), varref);
+        }
+
+        let call = NameCallValue::new (s.getLoc (), type, Path::new (CoreNames::YRT_CONCAT_SLICE), [left, right, int::usize (s.getLoc (), size)]);
+        list:.append (AffectValue::new (s.getLoc (), type, varref, call));
+
+        varref
+    }
+
+    /**
+     * Finalize a slice access value
+     * @params:
+     *    - context: the context of the finalization
+     *    - s: the slice access to finalize
+     *    - list: the list of statement to fill
+     * */
+    fn finalizeSliceAccess (self, dmut context : &Expander, s : &SliceAccessValue, dmut list : &StmtList)-> &Value {
+        let slc = context:.finalizeValue (s.getSlice (), alias list);
+        let index = context:.finalizeValue (s.getIndex (), alias list);
+
+        let resType = context:.finalizeType (s.getType ());
+        let size = int::usize (s.getLoc (), context:.computeSize (resType));
+
+        let indexV = BinaryOperatorValue::new (s.getLoc (), size.getType (), BinaryOperators::STAR, size, index);
+        let ptrT = PointerType::new (s.getLoc (), resType);
+        let ptrVoid = PointerType::new (s.getLoc (), VOID_TYPE);
+
+        let data_field = BinaryOperatorValue::new (s.getLoc (),
+                                                   ptrVoid,
+                                                   BinaryOperators::PLUS,
+                                                   StructFieldAccessValue::new (s.getLoc (), ptrVoid, slc, SliceKeys::PTR),
+                                                   indexV);
+
+        let finalPtrV = CastValue::new (s.getLoc (), ptrT, data_field);
+        DereferencerValue::new (s.getLoc (), resType, finalPtrV)
+    }
+
+    /**
+     * Finalize the comparison of two slices
+     * @params:
+     *    - context: the context of the finalization
+     *    - s: the slice compare to finalize
+     *    - list: the list of statement to fill
+     * */
+    fn finalizeSliceCompare (self, dmut context : &Expander, s : &SliceCompareValue, dmut list : &StmtList)-> &Value {
         context;
-        sl;
+        s;
         list;
         __pragma!panic ();
+    }
+
+    /**
+     * =====================================================================================
+     * =====================================================================================
+     * ========================            MEMORY EXPANSION           ======================
+     * =====================================================================================
+     * =====================================================================================
+     */
+
+    /**
+     * Finalize a memory operation value
+     * @params:
+     *    - context: the context of the finalization
+     *    - mem: the memory value to finalize
+     *    - list: the list of statement to fill
+     * */
+    fn finalizeMemory (self, dmut context : &Expander, mem : &MemoryValue, dmut list : &StmtList)-> &Value {
+        match mem {
+            a : &AddressValue => { self.finalizeAddress (alias context, a, alias list) }
+            a : &AliaserValue => { context:.finalizeValue (a.getInnerValue (), alias list) }
+            c : &CopierValue => { self.finalizeCopier (alias context, c, alias list) }
+            d : &DereferencerValue => { self.finalizeDeref (alias context, d, alias list) }
+            r : &ReferencerValue => { self.finalizeRef (alias context, r, alias list) }
+            s : &SliceValue => { self.finalizeSliceMem (alias context, s, alias list) }
+            _ => {
+                eprintln (mem::typeinfo.name);
+                __pragma!panic ();
+            }
+        }
+    }
+
+    /**
+     * Finalize an address value
+     * @params:
+     *    - context: the context of the finalization
+     *    - add: the address value to finalize
+     *    - list: the list of statement to fill
+     * */
+    fn finalizeAddress (self, dmut context : &Expander, add : &AddressValue, dmut list : &StmtList)-> &Value {
+        let type = context:.finalizeType (add.getType ());
+        let value = context:.finalizeValue (add.getInner (), alias list);
+
+        let depthRet = context.getTypeExpander ().getPointerDepth (type);
+        let depthVal = context.getTypeExpander ().getPointerDepth (value.getType ());
+
+        // sometimes AddressValue are used on already constructed addresses (references, string literals, ...)
+        // So if we get a pointer value that has the same depth, meaning pointer of pointer of ...
+        // Then we can assume it is already constructed, and can be returned as it is, with a cast though
+        if (depthVal == depthRet) {
+            CastValue::new (add.getLoc (), type, value)
+        } else {
+            AddressValue::new (add.getLoc (), type, value)
+        }
+    }
+
+    /**
+     * Finalize a copier value
+     * @params:
+     *    - context: the context of the finalization
+     *    - c: the copier value to copy
+     *    - list: the list of statement to fill
+     * */
+    fn finalizeCopier (self, dmut context : &Expander, c : &CopierValue, dmut list : &StmtList)-> &Value {
+        // Copy performs heavy computation with possible side effects
+        // Copy values must appear only once in the finalized code
+        match context.getVariable (c.getUniqId ()) {
+            Ok (u : &Value) => { // The copy was already seen and validated
+                return u;
+            }
+        };
+
+        let ctype = context:.finalizeType (c.getType ());
+        let varref = self.createVarForBlock (c.getLoc (), ctype, alias list);
+        if (!varref.isOf!{&UnitValue} ()) {
+            context:.registerVariable (c.getUniqId (), varref);
+        }
+
+        let call = match c.getType () {
+            slc : &SliceType => { self.finalizeCopierSlice (alias context, c, slc, alias list) }
+            t : _ => {
+                eprintln (t::typeinfo.name);
+                __pragma!panic ();
+            }
+        };
+
+        if (!varref.isOf!{&UnitValue} ()) {
+            list:.append (AffectValue::new (c.getLoc (), varref.getType (), varref, call));
+        } else {
+            list:.append (call);
+        }
+
+        varref
+    }
+
+    /**
+     * Finalize a copier value that returns a slice
+     * */
+    fn finalizeCopierSlice (self, dmut context : &Expander, c : &CopierValue, slc : &SliceType, dmut list : &StmtList)-> &Value {
+        let value = context:.finalizeValue (c.getValue (), alias list);
+        if (slc.getInners ()[0].isOf!{&VoidType} ()) { return value; } // copy []
+
+        let retType = context:.finalizeType (c.getType ());
+        let innerType = context:.finalizeType (slc.getInners ()[0]);
+        let innerSize = int::intValue (c.getLoc (), context:.computeSize (innerType), size-> 32u16, signed-> false);
+
+        NameCallValue::new (c.getLoc (), retType, Path::new (CoreNames::YRT_DUPLICATE_SLICE), [value, innerSize])
+    }
+
+    /**
+     * Finalize a dereferencer value
+     * */
+    fn finalizeDeref (self, dmut context : &Expander, d : &DereferencerValue, dmut list : &StmtList)-> &Value {
+        let value = context:.finalizeValue (d.getInner (), alias list);
+        let type = context:.finalizeType (d.getType ());
+
+        DereferencerValue::new (d.getLoc (), type, value)
+    }
+
+    /**
+     * Finalize a referencer value
+     * */
+    fn finalizeRef (self, dmut context : &Expander, r : &ReferencerValue, dmut list : &StmtList)-> &Value {
+
+        // same as an addresser but storing the inner type only
+        let type = PointerType::new (r.getLoc (), context:.finalizeType (r.getType ()));
+        let value = context:.finalizeValue (r.getInnerValue (), alias list);
+
+        let depthRet = context.getTypeExpander ().getPointerDepth (type);
+        let depthVal = context.getTypeExpander ().getPointerDepth (value.getType ());
+
+        // sometimes references are used on already constructed addresses (references, string literals, ...)
+        // So if we get a pointer value that has the same depth, meaning pointer of pointer of ...
+        // Then we can assume it is already constructed, and can be returned as it is, with a cast though
+        if (depthVal == depthRet) {
+            CastValue::new (r.getLoc (), type, value)
+        } else {
+            AddressValue::new (r.getLoc (), type, value)
+        }
+    }
+
+    /**
+     * =====================================================================================
+     * =====================================================================================
+     * =========================            SLICE EXPANSION           ======================
+     * =====================================================================================
+     * =====================================================================================
+     */
+
+    /**
+     * Finalize the construction of a slice using a value, instead of the fields
+     * */
+    fn finalizeSliceMem (self, dmut context : &Expander, s : &SliceValue, dmut list : &StmtList)-> &Value {
+        // Specific direct values that can be found in the slice
+        match s.getInner () {
+            ctor : &SliceCtorValue => { return self.finalizeSliceCtor (alias context, ctor, alias list); }
+            str : &StringValue => { return self.finalizeSliceFromStr (alias context, s, str, alias list); }
+            arr : &ArrayValue => { return self.finalizeSliceFromArray (alias context, s, arr, alias list); }
+            arr : &ArrayAllocValue => { return self.finalizeSliceFromAlloc (alias context, s, arr, alias list); }
+        }
+
+        // It can be references to values also
+        match s.getInner ().getType () {
+            arr : &ArrayType => { self.finalizeSliceFromArrayType (alias context, s, arr, alias list) }
+            t : _ => {
+                eprintln (t::typeinfo.name);
+                __pragma!panic ();
+            }
+        }
+    }
+
+    /**
+     * Finalize a slice ctor value
+     * */
+    fn finalizeSliceCtor (self, dmut context : &Expander, ctor : &SliceCtorValue, dmut list : &StmtList)-> &Value {
+        let type = context:.finalizeType (ctor.getType ());
+        let len = context:.finalizeValue (ctor.getLen (), alias list);
+        let ptr = context:.finalizeValue (ctor.getPointer (), alias list);
+
+        TupleValue::new (ctor.getLoc (), type, [len, ptr], fieldNames-> [SliceKeys::LEN, SliceKeys::PTR])
+    }
+
+    /**
+     * Finalize a slice memory value containing a string literal
+     * */
+    fn finalizeSliceFromStr (self, dmut context : &Expander, slc : &SliceValue, str : &StringValue, dmut list : &StmtList)-> &Value {
+        let value = context:.finalizeValue (str, alias list);
+        let type = context:.finalizeType (slc.getType ());
+
+        let len = int::usize (slc.getLoc (), str.getLen ());
+
+        TupleValue::new (slc.getLoc (), type, [len, value], fieldNames-> [SliceKeys::LEN, SliceKeys::PTR])
+    }
+
+    /**
+     * Finalize a slice memory valeu containing an array literal
+     * */
+    fn finalizeSliceFromArray (self, dmut context : &Expander, slc : &SliceValue, arr : &ArrayValue, dmut list : &StmtList)-> &Value {
+        let arrValue = context:.finalizeValue (arr, alias list);
+        let type = context:.finalizeType (slc.getType ());
+
+        let len = int::usize (slc.getLoc (), arr.getLen ());
+        let innerType = context:.finalizeType (slc.getType ().asOf!{&SliceType} ().getInners ()[0]);
+        let ptrType = PointerType::new (slc.getLoc (), innerType);
+        let ptrValue = AddressValue::new (slc.getLoc (), ptrType, arrValue);
+
+        TupleValue::new (slc.getLoc (), type, [len, ptrValue], fieldNames-> [SliceKeys::LEN, SliceKeys::PTR])
+    }
+
+    /**
+     * Finalize a slice memory value containing an array allocation literal
+     * */
+    fn finalizeSliceFromAlloc (self, dmut context : &Expander, slc : &SliceValue, arr : &ArrayAllocValue, dmut list : &StmtList)-> &Value {
+        let arrValue = context:.finalizeValue (arr, alias list);
+        if (arr.isDynamic ()) return arrValue; // already returning a slice
+
+        // Else this is an array that is returned, thus we need to put it in a slice
+        let len = context:.finalizeValue (arr.getLen (), alias list);
+        let type = context:.finalizeType (slc.getType ());
+
+        let innerType = context:.finalizeType (slc.getType ().asOf!{&SliceType} ().getInners ()[0]);
+        let ptrType = PointerType::new (slc.getLoc (), innerType);
+        let ptrValue = AddressValue::new (slc.getLoc (), ptrType, arrValue);
+
+        TupleValue::new (slc.getLoc (), type, [len, ptrValue], fieldNames-> [SliceKeys::LEN, SliceKeys::PTR])
+    }
+
+    /**
+     * Finalize a slice memory value containing a value whose size is an array (but not a arrayvalue, nor an arrayallocvalue)
+     * */
+    fn finalizeSliceFromArrayType (self, dmut context : &Expander, slc : &SliceValue, arr : &ArrayType, dmut list : &StmtList)-> &Value {
+        let len = context:.finalizeValue (arr.getSize (), alias list);
+        let type = context:.finalizeType (slc.getType ());
+
+        if (arr.getSize ().getValue () == 0us) { // []
+             return TupleValue::new (slc.getLoc (), type, [len, NullValue::new (slc.getLoc ())]);
+        }
+
+        let arrValue = context:.finalizeValue (slc.getInner (), alias list);
+        let innerType = context:.finalizeType (slc.getType ().asOf!{&SliceType} ().getInners ()[0]);
+        let ptrType = PointerType::new (slc.getLoc (), innerType);
+        let ptrValue = AddressValue::new (slc.getLoc (), ptrType, arrValue);
+        
+        TupleValue::new (slc.getLoc (), type, [len, ptrValue], fieldNames-> [SliceKeys::LEN, SliceKeys::PTR])
     }
 
 
