@@ -1,8 +1,11 @@
-mod ymirc::semantic::expander::visitor;
+mod ymirc::lint::expander::visitor;
 
 
-import ymirc::semantic::expander::value;
-import ymirc::semantic::expander::type;
+import ymirc::lint::expander::value;
+import ymirc::lint::expander::type;
+import ymirc::lint::expander::stmtlist;
+
+import ymirc::lint::node::_;
 
 import std::collection::map;
 import std::collection::vec;
@@ -10,12 +13,11 @@ import std::collection::set;
 import std::io;
 
 import ymirc::utils::format;
-import ymirc::semantic::validator::sizeof_;
 import ymirc::semantic::validator::interpret;
 import ymirc::semantic::generator::_;
 
 import ymirc::global::core_;
-import ymirc::semantic::expander::stmtlist;
+
 import ymirc::syntax::keys;
 
 import ymirc::lexing::word;
@@ -37,25 +39,27 @@ pub class Expander {
     // The list of generators provided by the previous pass (validation)
     let mut _generators : [&Generator] = [];
 
-    // The list of expanded frames (for inlining)
-    let dmut _frames : &HashMap!{[c8], &Generator} = HashMap!{[c8], &Generator}::new ();
-
     // The list of expanded frames
-    let dmut _expFrames = Vec!{&Generator}::new ();
+    let dmut _expFrames = Vec!{&YILNode}::new ();
 
     // The list of expanded constants
-    let dmut _expConsts = Vec!{&Generator}::new ();
+    let dmut _expConsts = Vec!{&YILNode}::new ();
+
+    /**
+     * =====================================================================================
+     * =====================================================================================
+     * ====================         FINALIZER AND MISC VISITORS         ====================
+     * =====================================================================================
+     * =====================================================================================
+     */
 
     // The mangler used to mangle symbol names
     let _mangler = Mangler::new ();
 
-    // Sizeof validator used to compute the size of types
-    let dmut _sizeOf = SizeofValidator::new ();
-
     // Compile time interpret used to simplify values
     let dmut _cteInterpret = CompileTimeInterpreter::new ();
 
-    // The expander responsible for value expansions
+    // // The expander responsible for value expansions
     let dmut _valueExpander = ValueExpander::new ();
 
     // The expander responsible for value expansions
@@ -64,28 +68,37 @@ pub class Expander {
     /**
      * =====================================================================================
      * =====================================================================================
-     * =========================         FRAME GENERATION         ==========================
+     * =======================         CONTEXT FINALIZATION         ========================
      * =====================================================================================
      * =====================================================================================
      */
 
     // The current scope variable declarations
-    let dmut _variables = Vec!{dmut &HashMap!{usize, &Value}}::new ();
+    let dmut _variables = Vec!{dmut &HashMap!{usize, &YILValue}}::new ();
 
-    // The current uniq id for the current frame
-    let dmut _uniqId = Vec!{usize}::new ();
+    // The current uniq id for variables in the current frame
+    let dmut _varUniqId = Vec!{usize}::new ();
+
+    // The current uniq id for labels in the current frame
+    let dmut _lblUniqId = Vec!{usize}::new ();
 
     // The var in which to put the result of loops (when breaking)
-    let dmut _loopVar = Vec!{&Value}::new ();
+    let dmut _loopVar = Vec!{&YILValue}::new ();
 
     // The label to exit the loop
-    let dmut _loopLabel = Vec!{&LabelValue}::new ();
+    let dmut _loopLabel = Vec!{&YILLabel}::new ();
 
     // The list of classes already validated
-    let dmut _classValidated = HashMap!{&Path, &Type}::new ();
+    let dmut _classValidated = HashMap!{&Path, &YILType}::new ();
 
     // The list of class currently in validation
     let dmut _inClassValidation = HashSet!{&Path}::new ();
+
+    // Global string stored in the text segment
+    let dmut _strConsts = HashMap!{[c8], &YILValue}::new ();
+
+    // THe uniq ID of string literals
+    let mut _strUniqId = 0us;
 
     /**
      * =====================================================================================
@@ -103,7 +116,7 @@ pub class Expander {
     /**
      * Expande a list of generators
      * */
-    pub fn finalize (mut self, generators : [&Generator])-> [&Generator] {
+    pub fn finalize (mut self, generators : [&Generator])-> [&YILNode] {
         self._generators = generators;
         for gen in self._generators {
             self:.finalize (gen);
@@ -145,24 +158,29 @@ pub class Expander {
     pub fn finalizeFrame (mut self, frame : &FrameGenerator) {
         let dmut list = StmtList::new ();
         self:.enterFrame ();
+        self:.enterBlock ();
+
+        let dmut parameters = Vec!{&YILVarDecl}::new ();
+        for pi in frame.getParameters () match pi {
+            p : &ProtoVarValue => {
+                let varId = self:.generateVarId ();
+                let type = self:.finalizeType (p.getType ());
+                parameters:.push (YILVarDecl::new (p.getLoc (), p.getLoc ().str (), type, varId));
+                self:.registerVariable (p.getUniqId (), YILVar::new (p.getLoc (), p.getLoc ().str (), type, varId));
+            }
+        }
+
         let _ = self:.finalizeValue (frame.getBody (), alias list);
+        self:.exitBlock ();
         self:.exitFrame ();
 
-        let body = if (list.len () == 1us && list[][0].isOf!{&BlockValue} ()) {
-            list [][0]
-        } else {
-            cast!{&Value} (BlockValue::new (frame.getBody ().getLoc (), NONE_TYPE, list[], noValue-> true))
-        };
-
         let name = self._mangler.mangle (frame);
-        let final = FrameGenerator::new (frame.getLoc (),
-                                         Path::new (name),
-                                         frame.getParameters (),
-                                         self:.finalizeType (frame.getReturnType ()),
-                                         body-> body,
-                                         externLang-> frame.getExternalLang (),
-                                         isWeak-> frame.isWeak (),
-                                         templateMapper-> frame.getTemplateMapper ());
+        let final = YILFrame::new (frame.getLoc (),
+                                   name,
+                                   parameters[],
+                                   self:.finalizeType (frame.getReturnType ()),
+                                   body-> YILBlock::new (frame.getLoc (), list[]),
+                                   isWeak-> frame.isWeak ());
 
         self._expFrames:.push (final);
     }
@@ -187,38 +205,36 @@ pub class Expander {
         let tiName = self._mangler.mangleTypeInfo (cl);
 
         // Const VTABLE
-        self._expConsts:.push (ConstGenerator::new (cl.getLoc (),
-                                                   Path::new (vtableName),
-                                                   vtableValue,
-                                                   isWeak-> cl.getSymbol ().isWeak ()));
+        self._expConsts:.push (YILConstant::new (cl.getLoc (),
+                                                 vtableName,
+                                                 vtableValue,
+                                                 isWeak-> cl.getSymbol ().isWeak ()));
 
         // Const TYPEINFO
-        self._expConsts:.push (ConstGenerator::new (cl.getLoc (),
-                                                   Path::new (tiName),
-                                                   typeinfoValue,
-                                                   isWeak-> cl.getSymbol ().isWeak ()));
+        self._expConsts:.push (YILConstant::new (cl.getLoc (),
+                                                 tiName,
+                                                 typeinfoValue,
+                                                 isWeak-> cl.getSymbol ().isWeak ()));
     }
 
     /**
      * Finalize the typeinfo value of a class type, to write it in the text as a global variable
      * */
-    pub fn finalizeClassTypeInfo (mut self, cl : &ClassRefType)-> &Value {
+    pub fn finalizeClassTypeInfo (mut self, cl : &ClassRefType)-> &YILValue {
         let dmut list = StmtList::new ();
 
         let slcType = self:.finalizeType (SliceType::new (cl.getLoc (), VOID_TYPE));
         let ancestorSlice = match cl.getAncestor () {
             anc : &ClassRefType => {
-                let ancTIN = Word::new (self._mangler.mangleTypeInfo (anc), cl.getLoc ());
-                let ancTIV = AddressValue::new (cl.getLoc (), PointerType::new (cl.getLoc (), VOID_TYPE),
-                                                VarRefValue::new (ancTIN, ancTIN, PointerType::new (cl.getLoc (), VOID_TYPE), isGlobal-> true, refId-> 0us));
+                let ancTIN = self._mangler.mangleTypeInfo (anc);
+                let ancTIV = YILAddrValue::new (cl.getLoc (), YIL_PTR_VOID,
+                                                YILVar::new (cl.getLoc (), ancTIN, YIL_PTR_VOID, 0us));
 
-                let len = int::usize (cl.getLoc (), 1us);
-                TupleValue::new (cl.getLoc (), slcType, [len, ancTIV], fieldNames-> [SliceKeys::LEN, SliceKeys::PTR])
+                let len = YILIntValue::new (cl.getLoc (), YIL_UINT_MAX, 1us);
+                YILTupleValue::new (cl.getLoc (), slcType, [len, ancTIV], fieldNames-> [SliceKeys::LEN, SliceKeys::PTR])
             }
             _ => {
-                let ancTIV = NullValue::new (cl.getLoc ());
-                let len = int::usize (cl.getLoc (), 0us);
-                TupleValue::new (cl.getLoc (), slcType, [len, ancTIV], fieldNames-> [SliceKeys::LEN, SliceKeys::PTR])
+                YILTupleValue::new (cl.getLoc (), slcType, [YIL_NULL_VALUE, YIL_NULL_VALUE], fieldNames-> [SliceKeys::LEN, SliceKeys::PTR])
             }
         };
 
@@ -231,37 +247,42 @@ pub class Expander {
         // Dynamic objects in the typeinfo
         if (list.len () != 0us) __pragma!panic ();
 
-        TupleValue::new (cl.getLoc (), type, [id, size, ancestorSlice, name])
+        YILTupleValue::new (cl.getLoc (), type, [id, size, ancestorSlice, name])
     }
 
     /**
      * Finalize the vtable value of a class to write it in the text as a global variable
      * */
-    pub fn finalizeClassVtable (mut self, cl : &ClassRefType)-> &Value {
+    pub fn finalizeClassVtable (mut self, cl : &ClassRefType)-> &YILValue {
         let len = cl.getVtable ().len + 2us; // TI, Dtor, vtable
 
-        let resultType = ArrayType::new (cl.getLoc (), PointerType::new (cl.getLoc (), VOID_TYPE), int::usize (cl.getLoc (), len));
-        let dmut params = Vec!{&Value}::new ();
+        let resultType = YILArray::new (YIL_PTR_VOID, len);
+        let dmut params = Vec!{&YILValue}::new ();
 
-        let TIN = Word::new (self._mangler.mangleTypeInfo (cl), cl.getLoc ());
-        let TIV = AddressValue::new (cl.getLoc (), PointerType::new (cl.getLoc (), VOID_TYPE),
-                                     VarRefValue::new (TIN, TIN, PointerType::new (cl.getLoc (), VOID_TYPE), isGlobal-> true, refId-> 0us));
+        let TIN = self._mangler.mangleTypeInfo (cl);
+        let TIV = YILAddrValue::new (cl.getLoc (), YIL_PTR_VOID, YILVar::new (cl.getLoc (), TIN, YIL_PTR_VOID, 0us));
         params:.push (TIV);
+
+
         match cl.getDestructor () {
             NoneValue () => {
-                params:.push (NullValue::new (cl.getLoc ()));
+                params:.push (YIL_NULL_VALUE);
             }
             p : &PrototypeValue => {
-                params:.push (self._valueExpander.finalizePrototype (alias self, p));
+                let name = self._mangler.mangle (p);
+                let addr = YILAddrValue::new (p.getLoc (), YIL_PTR_VOID, YILVar::new (p.getLoc (), name, YIL_VOID, 0us));
+                params:.push (addr);
             }
             _ => __pragma!panic ();
         };
 
         for mt in cl.getVtable () {
-            params:.push (self._valueExpander.finalizePrototype (alias self, mt));
+            let name = self._mangler.mangle (mt);
+            let addr = YILAddrValue::new (mt.getLoc (), YIL_PTR_VOID, YILVar::new (mt.getLoc (), name, YIL_VOID, 0us));
+            params:.push (addr);
         }
 
-        ArrayValue::new (cl.getLoc (), resultType, params[])
+        YILArrayValue::new (cl.getLoc (), resultType, params[])
     }
 
     /**
@@ -277,7 +298,7 @@ pub class Expander {
      * @params:
      *    - value: the value to finalize
      * */
-    pub fn finalizeValue (mut self, val : &Value, dmut list : &StmtList)-> &Value {
+    pub fn finalizeValue (mut self, val : &Value, dmut list : &StmtList)-> &YILValue {
         self._valueExpander:.finalize (alias self, val, alias list)
     }
 
@@ -286,20 +307,8 @@ pub class Expander {
      * @params:
      *    - ty: the type to finalize
      * */
-    pub fn finalizeType (mut self, ty : &Type)-> &Type {
+    pub fn finalizeType (mut self, ty : &Type)-> &YILType {
         self._typeExpander.finalize (alias self, ty)
-    }
-
-    /**
-     * Compute the size of a type
-     * @params:
-     *    - ty: the type whose size to compute
-     * */
-    pub fn computeSize (mut self, ty : &Type)-> usize {
-        self._sizeOf:.validateType (EOF_WORD, ty)
-    } catch {
-        // Here, all types should have size, as they are only expanded types?
-        _ => __pragma!panic ();
     }
 
     /**
@@ -342,21 +351,21 @@ pub class Expander {
     /**
      * @returns: the declaration of the variable containing the value of the current loop
      * */
-    pub fn getLoopVarRef (self)-> &Value {
+    pub fn getLoopVarRef (self)-> &YILValue {
         self._loopVar [$ - 1us]
     }
 
     /**
      * @returns: the label exiting the current loop
      * */
-    pub fn getLoopExitLabel (self)-> &LabelValue {
+    pub fn getLoopExitLabel (self)-> &YILLabel {
         self._loopLabel [$ - 1us]
     }
 
     /**
      * Enter a loop where varref is the value of the loop
      * */
-    pub fn enterLoop (mut self, varref : &Value, lbl : &LabelValue) {
+    pub fn enterLoop (mut self, varref : &YILValue, lbl : &YILLabel) {
         self._loopVar:.push (varref);
         self._loopLabel:.push (lbl);
     }
@@ -375,22 +384,33 @@ pub class Expander {
      * Enter a new frame
      * */
     pub fn enterFrame (mut self) {
-        self._uniqId:.push (0us);
+        self._varUniqId:.push (1us); // first ID id 1, 0 means no ref
+        self._lblUniqId:.push (1us);
     }
 
     /**
      * Exit the current frame
      * */
     pub fn exitFrame (mut self) {
-        self._uniqId:.pop (1u64);
+        self._varUniqId:.pop (1u64);
+        self._lblUniqId:.pop (1u64);
     }
 
     /**
      * @returns: the next uniq id for a variable in the current frame
      * */
     pub fn generateVarId (mut self)-> usize {
-        let id = self._uniqId [$ - 1us];
-        (alias self._uniqId) [self._uniqId.len () - 1us] += 1us;
+        let id = self._varUniqId [$ - 1us];
+        (alias self._varUniqId) [self._varUniqId.len () - 1us] += 1us;
+        id
+    }
+
+    /**
+     * @returns: the next uniq id for a variable in the current frame
+     * */
+    pub fn generateLblId (mut self)-> usize {
+        let id = self._lblUniqId [$ - 1us];
+        (alias self._lblUniqId) [self._lblUniqId.len () - 1us] += 1us;
         id
     }
 
@@ -398,7 +418,7 @@ pub class Expander {
      * Enter a new scope of variables
      * */
     pub fn enterBlock (mut self) {
-        self._variables:.push (HashMap!{usize, &Value}::new ());
+        self._variables:.push (HashMap!{usize, &YILValue}::new ());
     }
 
     /**
@@ -414,7 +434,7 @@ pub class Expander {
      *    - old: the uniq id of the previous declaration
      *    - new: the uniq id of the new declaration
      * */
-    pub fn registerVariable (mut self, old : usize, vref : &Value) {
+    pub fn registerVariable (mut self, old : usize, vref : &YILValue) {
         (alias self._variables)[$ - 1us]:.insert (old, vref);
     }
 
@@ -422,20 +442,45 @@ pub class Expander {
      * Search the id of a variable declared in the current frame
      * @returns: the id, or None if the variable is not in the frame
      * */
-    pub fn getVariable (self, old : usize)-> (&Value)? {
+    pub fn getVariable (self, old : usize)-> (&YILValue)? {
         for i in self._variables {
             match i.find (old) {
-                Ok (n : &Value) => { return n?; }
+                Ok (n : &YILValue) => { return n?; }
             }
         }
 
-        ((&Value)?)::__err__
+        ((&YILValue)?)::__err__
+    }
+
+    /**
+     * Find a global string already containing the following val
+     * */
+    pub fn findGlobalString (self, val : [c8])-> (&YILValue)? {
+        self._strConsts.find (val)
+    }
+
+    /**
+     * Register a global const to contain the string value
+     * @returns: the varref to this global const
+     * */
+    pub fn registerGlobalString (mut self, val : [c8], value : &YILValue)-> &YILValue {
+        let name = format (".__STR%", self._strUniqId);
+        self._strUniqId += 1us;
+
+        let cst = YILConstant::new (EOF_WORD, name, value, isLocal -> true);
+        let vref = YILAddrValue::new (EOF_WORD,
+                                      YIL_PTR_VOID,
+                                      YILVar::new (EOF_WORD, name, YIL_VOID, 0us));
+
+        self._expConsts:.push (cst);
+        self._strConsts:.insert (val, vref);
+        vref
     }
 
     /**
      * =====================================================================================
      * =====================================================================================
-     * =========================              TYPE CONTEXT              =========================
+     * =======================              TYPE CONTEXT              ======================
      * =====================================================================================
      * =====================================================================================
      */
@@ -443,7 +488,7 @@ pub class Expander {
     /**
      * Find the type of the class if already validated
      * */
-    pub fn findClassValidation (self, cr : &ClassRefType)-> (&Type)? {
+    pub fn findClassValidation (self, cr : &ClassRefType)-> (&YILType)? {
         self._classValidated.find (cr.getSymbol ().getPath ())
     }
 
@@ -464,7 +509,7 @@ pub class Expander {
     /**
      * Class finalized
      * */
-    pub fn exitClassValidation (mut self, cr : &ClassRefType, res : &Type) {
+    pub fn exitClassValidation (mut self, cr : &ClassRefType, res : &YILType) {
         self._inClassValidation:.remove (cr.getSymbol ().getPath ());
         self._classValidated:.insert (cr.getSymbol ().getPath (), res);
     }

@@ -1,16 +1,21 @@
-mod ymirc::semantic::expander::value;
+mod ymirc::lint::expander::value;
 
-import ymirc::semantic::expander::visitor;
-import ymirc::semantic::expander::type;
+import ymirc::lint::expander::visitor;
+import ymirc::lint::expander::type;
+import ymirc::lint::expander::stmtlist;
+
+import ymirc::lint::node::_;
 
 import std::collection::map;
 import std::collection::vec;
 import std::io;
 
 import ymirc::utils::format;
+import ymirc::utils::bigint;
+import ymirc::utils::bigfloat;
+
 import ymirc::semantic::generator::_;
 import ymirc::global::core_;
-import ymirc::semantic::expander::stmtlist;
 import ymirc::syntax::keys;
 
 import ymirc::lexing::word;
@@ -34,7 +39,7 @@ pub class ValueExpander {
      *    - list: the list of statement to fill
      * @returns: the final value
      * */
-    pub fn finalize (self, dmut context : &Expander, val : &Value, dmut list : &StmtList)-> &Value {
+    pub fn finalize (self, dmut context : &Expander, val : &Value, dmut list : &StmtList)-> &YILValue {
         match val {
             b : &BreakValue => { self.finalizeBreak (alias context, b, alias list) }
             n : &NamedValue => { context:.finalizeValue (n.getContent (), alias list) }
@@ -61,16 +66,16 @@ pub class ValueExpander {
      *    -  b: the break statement to finalize
      * @returns: UNIT_VALUE, break values are never right operands
      * */
-    fn finalizeBreak (self, dmut context : &Expander, b : &BreakValue, dmut list : &StmtList)-> &Value {
+    fn finalizeBreak (self, dmut context : &Expander, b : &BreakValue, dmut list : &StmtList)-> &YILValue {
         let endLabel = context.getLoopExitLabel ();
         let decl = context.getLoopVarRef ();
-        if (!decl.isOf!{&UnitValue} ()) {
+        if (!decl.isOf!{&YILUnit} ()) {
             let inner = context:.finalizeValue (b.getValue (), alias list);
-            list:.append (AffectValue::new (b.getLoc (), VOID_TYPE, decl, inner));
+            list:.append (YILAffect::new (b.getLoc (), decl, inner));
         }
 
-        list:.append (GotoValue::new (b.getLoc (), endLabel.getUniqId (), endLabel.getName ()));
-        UNIT_VALUE
+        list:.append (YILGoto::new (b.getLoc (), endLabel));
+        YIL_UNIT_VALUE
     }
 
     /**
@@ -80,15 +85,11 @@ pub class ValueExpander {
      *    - t: the return stmt to finalize
      * @returns: UNIT_VALUE, return values are never right operands
      * */
-    fn finalizeReturn (self, dmut context : &Expander, r : &ReturnValue, dmut list : &StmtList)-> &Value {
-        match r.getValue () {
-            UnitValue () => { return r; }
-        }
-
+    fn finalizeReturn (self, dmut context : &Expander, r : &ReturnValue, dmut list : &StmtList)-> &YILValue {
         let inner = context:.finalizeValue (r.getValue (), alias list);
-        list:.append (ReturnValue::new (r.getLoc (), inner));
+        list:.append (YILReturn::new (r.getLoc (), inner));
 
-        UNIT_VALUE
+        YIL_UNIT_VALUE
     }
 
     /**
@@ -97,12 +98,11 @@ pub class ValueExpander {
      *    - t: the throw stmt to finalize
      * @returns: UNIT_VALUE, throw values are never right operands
      * */
-    fn finalizeThrow (self, dmut context : &Expander, t : &ThrowValue, dmut list : &StmtList)-> &Value {
-        let inner = context:.finalizeValue (t.getValue (), alias list);
-        let ti = context:.finalizeValue (t.getTypeInfo (), alias list);
-        list:.append (ThrowValue::new (t.getLoc (), inner, ti));
-
-        UNIT_VALUE
+    fn finalizeThrow (self, dmut context : &Expander, t : &ThrowValue, dmut list : &StmtList)-> &YILValue {
+        context;
+        t;
+        list;
+        __pragma!panic ();
     }
 
     /**
@@ -111,24 +111,26 @@ pub class ValueExpander {
      *    - v: the variable declaration to finalize
      * @returns: UNIT_VALUE, variable decl are never right operands
      * */
-    fn finalizeVarDecl (self, dmut context : &Expander, v : &VarDeclValue, dmut list : &StmtList)-> &Value {
+    fn finalizeVarDecl (self, dmut context : &Expander, v : &VarDeclValue, dmut list : &StmtList)-> &YILValue {
         // Lambda definition, is not generated
-        if (v.getVarType ().isOf!{&LambdaType} ()) return UNIT_VALUE;
+        if (v.getVarType ().isOf!{&LambdaType} ()) return YIL_UNIT_VALUE;
 
         let inner = context:.finalizeValue (v.getValue (), alias list);
         let type = context:.finalizeType (v.getVarType ());
 
-        let ret = VarDeclValue::new (v.getLoc (), type, NONE_VALUE, v.isMutable (), v.isPure (), isCte-> v.isCte ());
-        let varref = VarRefValue::new (v.getLoc (), v.getLoc (), type, refId-> ret.getUniqId ());
-        list:.append (ret);
+        let varId = context:.generateVarId ();
+        let decl = YILVarDecl::new (v.getLoc (), v.getLoc ().str (), type, varId);
+        let varref = YILVar::new (v.getLoc (), v.getLoc ().str (), type, varId);
 
-        if (!inner.isOf!{&UnitValue} ()) {
-            list:.append (AffectValue::new (v.getLoc (), VOID_TYPE, varref, inner));
+        list:.append (decl);
+
+        if (!inner.isOf!{&YILUnit} ()) {
+            list:.append (YILAffect::new (v.getLoc (), varref, inner));
         }
 
         context:.registerVariable (v.getUniqId (), varref);
 
-        UNIT_VALUE
+        YIL_UNIT_VALUE
     }
 
     /**
@@ -137,16 +139,13 @@ pub class ValueExpander {
      *   - v: the variable to finalize
      * @returns: a variable reference
      * */
-    fn finalizeVarRef (self, dmut context : &Expander, v : &VarRefValue, dmut _ : &StmtList)-> &Value {
+    fn finalizeVarRef (self, dmut context : &Expander, v : &VarRefValue, dmut _ : &StmtList)-> &YILValue {
         match context.getVariable (v.getUniqId ()) {
-            Ok (vref : &Value) => { return vref; }
+            Ok (vref : &YILValue) => { return vref; }
         };
 
         let type = context:.finalizeType (v.getType ());
-        VarRefValue::new (v.getLoc (),
-                          v.getDeclLoc (),
-                          type,
-                          refId-> v.getRefId ())
+        YILVar::new (v.getLoc (), v.getDeclLoc ().str (), type, 0us)
     }
 
 
@@ -165,18 +164,12 @@ pub class ValueExpander {
      *    - list: the statement list to fill
      * @returns: the final value of the scope
      * */
-    fn finalizeScope (self, dmut context : &Expander, sc : &ScopeValue, dmut list : &StmtList)-> &Value {
+    fn finalizeScope (self, dmut context : &Expander, sc : &ScopeValue, dmut list : &StmtList)-> &YILValue {
         match context.getVariable (sc.getUniqId ()) {
-            Ok (u : &Value) => { // The call was already seen and validated
+            Ok (u : &YILValue) => { // The call was already seen and validated
                 return u;
             }
         };
-
-        let ltype = context:.finalizeType (sc.getType ());
-        let varref = self.createVarForBlock (alias context, sc.getLoc (), ltype, alias list);
-        if (!varref.isOf!{&UnitValue} ()) {
-            context:.registerVariable (sc.getUniqId (), varref);
-        }
 
         let retVal = match sc {
             b : &BlockValue => { self.finalizeBlock (alias context, b, alias list) }
@@ -188,11 +181,7 @@ pub class ValueExpander {
             }
         }
 
-        if (!varref.isOf!{&UnitValue} ()) {
-            list:.append (AffectValue::new (retVal.getLoc (), VOID_TYPE, varref, retVal));
-        }
-
-        varref
+        return self.registerUniqValue (alias context, sc, retVal, alias list);
     }
 
     /**
@@ -202,7 +191,7 @@ pub class ValueExpander {
      *    - list: the list of statement to fill
      * @returns: the final value of the block if any
      * */
-    fn finalizeBlock (self, dmut context : &Expander, b : &BlockValue, dmut list : &StmtList)-> &Value {
+    fn finalizeBlock (self, dmut context : &Expander, b : &BlockValue, dmut list : &StmtList)-> &YILValue {
         if (b.isSet ()) return self.finalizeSet (alias context, b, alias list);
         let dmut innerList = StmtList::new ();
         context:.enterBlock ();
@@ -211,8 +200,8 @@ pub class ValueExpander {
         let var = self.createVarForBlock (alias context, b.getLoc (), type, alias list);
         let retVal = self.finalizeSet (alias context, b, alias innerList);
 
-        if (!var.isOf!{&UnitValue} ()) {
-            innerList:.append (AffectValue::new (retVal.getLoc (), VOID_TYPE, var, retVal));
+        if (!var.isOf!{&YILUnit} ()) {
+            innerList:.append (YILAffect::new (retVal.getLoc (), var, retVal));
         }
 
         context:.exitBlock ();
@@ -229,8 +218,8 @@ pub class ValueExpander {
      *    - list: the list of statement to fill
      * @returns: the final value of the set if any
      * */
-    fn finalizeSet (self, dmut context : &Expander, s : &BlockValue, dmut list : &StmtList)-> &Value {
-        let mut finVal : &Value = UNIT_VALUE;
+    fn finalizeSet (self, dmut context : &Expander, s : &BlockValue, dmut list : &StmtList)-> &YILValue {
+        let mut finVal : &YILValue = YIL_UNIT_VALUE;
         for inner in s.getValues () {
             finVal = context:.finalizeValue (inner, alias list);
         }
@@ -245,7 +234,7 @@ pub class ValueExpander {
      *    - list: the list of statement to fill
      * @returns: the final value of the condition if any
      * */
-    fn finalizeCond (self, dmut context : &Expander, c : &ConditionalValue, dmut list : &StmtList)-> &Value {
+    fn finalizeCond (self, dmut context : &Expander, c : &ConditionalValue, dmut list : &StmtList)-> &YILValue {
         let type = context:.finalizeType (c.getType ());
         let var = self.createVarForBlock (alias context, c.getLoc (), type, alias list);
 
@@ -257,21 +246,18 @@ pub class ValueExpander {
         let ifVal = context:.finalizeValue (c.getContent (), alias ifList);
         context:.exitBlock ();
 
-        let mut elseVal : &Value = UNIT_VALUE;
-        if (!c.getElse ().isOf!{&UnitValue} () && !c.getElse ().isOf!{&NoneValue} ()) {
-            context:.enterBlock ();
-            elseVal = context:.finalizeValue (c.getElse (), alias elseList);
-            context:.exitBlock ();
-        }
+        context:.enterBlock ();
+        let elseVal = context:.finalizeValue (c.getElse (), alias elseList);
+        context:.exitBlock ();
 
-        if (!var.isOf!{&UnitValue} ()) {
-            ifList:.append (AffectValue::new (c.getLoc (), VOID_TYPE, var, ifVal));
-            if (!elseVal.isOf!{&UnitValue} ()) {
-                elseList:.append (AffectValue::new (c.getLoc (), VOID_TYPE, var, elseVal));
+        if (!var.isOf!{&YILUnit} ()) {
+            ifList:.append (YILAffect::new (c.getLoc (), var, ifVal));
+            if (!elseVal.isOf!{&YILUnit} ()) {
+                elseList:.append (YILAffect::new (c.getLoc (), var, elseVal));
             }
         }
 
-        self.finalizeCond (c.getLoc (), alias list, test, ifList, elseList);
+        self.finalizeCond (c.getLoc (), alias context,  alias list, test, ifList, elseList);
         var
     }
 
@@ -284,24 +270,21 @@ pub class ValueExpander {
      *    - thenList: the list of statement to execute if the condition is met
      *    - elseList: the list of statement to execute if the condition is not met
      * */
-    fn finalizeCond (self, loc : &Word, dmut list : &StmtList, test : &Value, thenList : &StmtList, elseList : &StmtList) {
-        let thenLabel = LabelValue::new (loc, format ("then_%", loc.line ()));
-        let endLabel = LabelValue::new (loc, format ("end_%", loc.line ()));
+    fn finalizeCond (self, loc : &Word, dmut context : &Expander, dmut list : &StmtList, test : &YILValue, thenList : &StmtList, elseList : &StmtList) {
+        let thenLabel = YILLabel::new (loc, "then"s8, context:.generateLblId ());
+        let endLabel = YILLabel::new (loc, "end"s8, context:.generateLblId ());
         let elseLabel = if (elseList.len () != 0us) {
-            LabelValue::new (loc, format ("else_%", loc.line ()))
+            YILLabel::new (loc, "else"s8, context:.generateLblId ())
         } else {
             endLabel
         };
 
-        list:.append (CondJmpValue::new (loc, test,
-                                         thenLabel.getUniqId (), thenLabel.getName (),
-                                         elseLabel.getUniqId (), elseLabel.getName ()));
-
+        list:.append (YILCondJmp::new (loc, test, thenLabel, elseLabel));
         list:.append (thenLabel);
         list:.append (thenList);
 
         if (elseList.len () != 0us) {
-            list:.append (GotoValue::new (loc, endLabel.getUniqId (), endLabel.getName ()));
+            list:.append (YILGoto::new (loc, endLabel));
             list:.append (elseLabel);
             list:.append (elseList);
         }
@@ -316,7 +299,7 @@ pub class ValueExpander {
      *    - list: the list of statement to fill
      * @returns: the final value of the loop if any
      * */
-    fn finalizeLoop (self, dmut context : &Expander, l : &LoopValue, dmut list : &StmtList)-> &Value {
+    fn finalizeLoop (self, dmut context : &Expander, l : &LoopValue, dmut list : &StmtList)-> &YILValue {
         if (l.isCteFor ()) {
             self.finalizeCteForLoop (alias context, l, alias list)
         } else {
@@ -330,18 +313,18 @@ pub class ValueExpander {
      *    - l: the for loop statement to finalize
      *    - list: the list of statement to fill
      * */
-    fn finalizeCteForLoop (self, dmut context : &Expander, l : &LoopValue, dmut list : &StmtList)-> &Value {
+    fn finalizeCteForLoop (self, dmut context : &Expander, l : &LoopValue, dmut list : &StmtList)-> &YILValue {
         let type = context:.finalizeType (l.getType ());
         let var = self.createVarForBlock (alias context, l.getLoc (), type, alias list);
 
         context:.enterBlock ();
-        let endLabel = LabelValue::new (l.getLoc (), format ("end_%", l.getLoc ().line ()));
+        let endLabel = YILLabel::new (l.getLoc (), "end"s8, context:.generateLblId ());
         context:.enterLoop (var, endLabel);
 
         let dmut innerList = StmtList::new ();
         let innerValue = context:.finalizeValue (l.getContent (), alias innerList);
-        if (!var.isOf!{&UnitValue} () && !l.getContent ().isBreaker ()) {
-            innerList:.append (AffectValue::new (l.getLoc (), VOID_TYPE, var, innerValue));
+        if (!var.isOf!{&YILUnit} () && !l.getContent ().isBreaker ()) {
+            innerList:.append (YILAffect::new (l.getLoc (), var, innerValue));
         }
 
         context:.exitLoop ();
@@ -359,39 +342,37 @@ pub class ValueExpander {
      *    - list: the statement list to fill
      * @returns: the value of the loop if any
      * */
-    fn finalizeClassicLoop (self, dmut context : &Expander, l : &LoopValue, dmut list : &StmtList)-> &Value {
+    fn finalizeClassicLoop (self, dmut context : &Expander, l : &LoopValue, dmut list : &StmtList)-> &YILValue {
         let type = context:.finalizeType (l.getType ());
         let varref = self.createVarForBlock (alias context, l.getLoc (), type, alias list);
         let test = context:.finalizeValue (l.getTest (), alias list);
 
         context:.enterBlock ();
         let dmut loopList = StmtList::new ();
-        let endLabel = LabelValue::new (l.getLoc (), format ("end_%", l.getLoc ().line ()));
+        let endLabel = YILLabel::new (l.getLoc (), "end"s8, context:.generateLblId ());
         context:.enterLoop (varref, endLabel);
 
         let contentVal = context:.finalizeValue (l.getContent (), alias loopList);
-        if (!varref.isOf!{&UnitValue} () && !l.getContent ().isBreaker () && !test.isOf!{&UnitValue} ()) {
-            loopList:.append (AffectValue::new (l.getLoc (), VOID_TYPE, varref, contentVal));
+        if (!varref.isOf!{&YILUnit} () && !l.getContent ().isBreaker () && !test.isOf!{&YILUnit} ()) {
+            loopList:.append (YILAffect::new (l.getLoc (), varref, contentVal));
         }
 
         context:.exitLoop ();
         context:.exitBlock ();
 
-        let begLabel = LabelValue::new (l.getLoc (), format ("beg_%", l.getLoc ().line ()));
-        let testLabel = LabelValue::new (l.getLoc (), format ("test_%", l.getLoc ().line ()));
+        let begLabel = YILLabel::new (l.getLoc (), "beg"s8, context:.generateLblId ());
+        let testLabel = YILLabel::new (l.getLoc (), "test"s8, context:.generateLblId ());
 
-        if (!l.isDo () && !test.isOf!{&UnitValue} ()) {
-            list:.append (GotoValue::new (l.getLoc (), testLabel.getUniqId (), testLabel.getName ()));
+        if (!l.isDo () && !test.isOf!{&YILUnit} ()) {
+            list:.append (YILGoto::new (l.getLoc (), testLabel));
         }
 
         list:.append (begLabel);
         list:.append (loopList);
 
-        if (!test.isOf!{&UnitValue} ()) {
+        if (!test.isOf!{&YILUnit} ()) {
             list:.append (testLabel);
-            list:.append (CondJmpValue::new (l.getLoc (), test,
-                                             begLabel.getUniqId (), begLabel.getName (),
-                                             endLabel.getUniqId (), endLabel.getName ()));
+            list:.append (YILCondJmp::new (l.getLoc (), test, begLabel, endLabel));
         }
 
         list:.append (endLabel);
@@ -408,19 +389,34 @@ pub class ValueExpander {
      *    - name: the name of the variable (with a possible formatter, its uniq Id)
      * @returns: a varref or unit value, if the type is empty
      * */
-    fn createVarForBlock (self, dmut context : &Expander, loc : &Word, type : &Type, dmut list : &StmtList, name : [c8] = "YI_%"s8)-> &Value {
+    fn createVarForBlock (self, dmut context : &Expander, loc : &Word, type : &YILType, dmut list : &StmtList, name : [c8] = "YI_%"s8)-> &YILValue {
         match type {
-            VoidType () => { return UNIT_VALUE; }
-            NoneType () => { return UNIT_VALUE; }
+            YILVoid () => { return YIL_UNIT_VALUE; }
             _ => {
-                let fullName = Word::new (format (name, context:.generateVarId ()), loc);
-                let blckVar = VarDeclValue::new (fullName, type, NONE_VALUE, false, false);
+                let fullName = format (name, context:.generateVarId ());
+                let varId = context:.generateVarId ();
+                let blckVar = YILVarDecl::new (loc, fullName, type, varId);
                 list:.append (blckVar);
 
-                return VarRefValue::new (fullName, fullName, type, refId-> blckVar.getUniqId ());
+                return YILVar::new (loc, fullName, type, varId);
             }
         };
     }
+
+    /**
+     * Register a uniq value in a variable
+     * @returns: the uniq var ref, or YIL_UNIT_VALUE depending on the type
+     * * */
+    fn registerUniqValue (self, dmut context : &Expander, gen : &Value, value : &YILValue, dmut list : &StmtList, name : [c8] = "YI_%"s8) -> &YILValue {
+        let type = context:.finalizeType (gen.getType ());
+        let varref = self.createVarForBlock (alias context, gen.getLoc (), type, alias list, name-> name);
+        if (!varref.isOf!{&YILUnit} ()) {
+            context:.registerVariable (gen.getUniqId (), varref);
+            list:.append (YILAffect::new (gen.getLoc (), varref, value));
+        }
+
+        varref
+    } 
 
     /**
      * =====================================================================================
@@ -437,28 +433,23 @@ pub class ValueExpander {
      *    - list: the scope list of statement to fill
      * @returns: the finalized value
      * */
-    fn finalizeLiteral (self, dmut context : &Expander, l : &LiteralValue, dmut list : &StmtList)-> &Value {
+    fn finalizeLiteral (self, dmut context : &Expander, l : &LiteralValue, dmut list : &StmtList)-> &YILValue {
         match l { // simple literals
-            StringValue () => { return l; }
-            BoolValue () => { return l; }
-            CharValue () => { return l; }
-            FakeValue () => { return l; }
-            FloatValue () => { return l; }
-            IntValue () => { return l; }
-            NoneValue () => { return l; }
-            NullValue () => { return l; }
-            UnitValue () => { return l; }
+            s : &StringValue => { return self.finalizeStr (alias context, s); }
+            b : &BoolValue => { return self.finalizeBool (alias context, b); }
+            c : &CharValue => { return self.finalizeChar (alias context, c); }
+            f : &FloatValue => { return self.finalizeFloat (alias context, f); }
+            i : &IntValue => { return self.finalizeInt (alias context, i); }
+            NullValue () => { return YIL_NULL_VALUE; }
+            NoneValue () => { return YIL_UNIT_VALUE; }
+            UnitValue () => { return YIL_UNIT_VALUE; }
         }
 
         match context.getVariable (l.getUniqId ()) {
-            Ok (u : &Value) => { // The call was already seen and validated
+            Ok (u : &YILValue) => { // The call was already seen and validated
                 return u;
             }
         };
-
-        let ltype = context:.finalizeType (l.getType ());
-        let varref = self.createVarForBlock (alias context, l.getLoc (), ltype, alias list);
-        context:.registerVariable (l.getUniqId (), varref);
 
         let val = match l {
             a : &ArrayValue => { self.finalizeArray (alias context, a, alias list) }
@@ -470,8 +461,74 @@ pub class ValueExpander {
             }
         }
 
-        list:.append (AffectValue::new (l.getLoc (), VOID_TYPE, varref, val));
-        varref
+        return self.registerUniqValue (alias context, l, val, alias list);
+    }
+
+    /**
+     * Finalize a string literal
+     * */
+    fn finalizeStr (self, dmut context : &Expander, str : &StringValue)-> &YILValue {
+        let strContent = format ("%", str);
+        match context.findGlobalString (strContent) {
+            Ok (v : &YILValue) => return v;
+        }
+
+        let dmut res = Vec!{&YILValue}::new ();
+        let content = str.getValue ();
+        let innerType = match str.getEncodingSize () {
+            8u16 => {
+                for i in 0us .. str.getLen () {
+                    res:.push (YILIntValue::new (str.getLoc (), YIL_UINT_8, BigInt::new (content.utf8 [i])));
+                }
+                YIL_UINT_8
+            }
+            16u16 => {
+                for i in 0us .. str.getLen () {
+                    res:.push (YILIntValue::new (str.getLoc (), YIL_UINT_16, BigInt::new (content.utf16 [i])));
+                }
+                YIL_UINT_16
+            }
+            _ => {
+                for i in 0us .. str.getLen () {
+                    res:.push (YILIntValue::new (str.getLoc (), YIL_UINT_32, BigInt::new (content.utf32 [i])));
+                }
+                YIL_UINT_32
+            }
+        };
+
+        let array = YILArrayValue::new (str.getLoc (), YILArray::new (innerType, res.len ()), res[]);
+        return context:.registerGlobalString (format ("%", str), array);
+    }
+
+    /**
+     * Finalize a bool literal
+     * */
+    fn finalizeBool (self, dmut _ : &Expander, b : &BoolValue)-> &YILValue {
+        YILIntValue::new (b.getLoc (), YIL_UINT_8, if b.isTrue () { 1us } else { 0us })
+    }
+
+    /**
+     * Finalize a char literal
+     * */
+    fn finalizeChar (self, dmut context : &Expander, c : &CharValue)-> &YILValue {
+        let type = context:.finalizeType (c.getType ());
+        YILIntValue::new (c.getLoc (), type, c.getValueAsInt ())
+    }
+
+    /**
+     * Finalize a float literal
+     * */
+    fn finalizeFloat (self, dmut context : &Expander, f : &FloatValue)-> &YILValue {
+        let type = context:.finalizeType (f.getType ());
+        YILFloatValue::new (f.getLoc (), type, f.getValue ())
+    }
+
+    /**
+     * Finalize an int literal value
+     * */
+    fn finalizeInt (self, dmut context : &Expander, i : &IntValue)-> &YILValue {
+        let type = context:.finalizeType (i.getType ());
+        YILIntValue::new (i.getLoc (), type, i.getValue ())
     }
 
     /**
@@ -481,14 +538,14 @@ pub class ValueExpander {
      *    - list: the list of statement to fill
      * @returns: the value
      * */
-    fn finalizeArray (self, dmut context : &Expander, a : &ArrayValue, dmut list : &StmtList)-> &Value {
-        let dmut res = Vec!{&Value}::new ();
+    fn finalizeArray (self, dmut context : &Expander, a : &ArrayValue, dmut list : &StmtList)-> &YILValue {
+        let dmut res = Vec!{&YILValue}::new ();
         for i in a.getInners () {
             res:.push (context:.finalizeValue (i, alias list));
         }
 
         let atype = context:.finalizeType (a.getType ());
-        ArrayValue::new (a.getLoc (), atype, res[])
+        YILArrayValue::new (a.getLoc (), atype, res[])
     }
 
     /**
@@ -498,25 +555,25 @@ pub class ValueExpander {
      *     - list: the list of statement to fill
      * @returns: the value
      * */
-    fn finalizeArrayAlloc (self, dmut context : &Expander, a : &ArrayAllocValue, dmut list : &StmtList)-> &Value {
+    fn finalizeArrayAlloc (self, dmut context : &Expander, a : &ArrayAllocValue, dmut list : &StmtList)-> &YILValue {
         let inner = context:.finalizeValue (a.getValue (), alias list);
         let type = context:.finalizeType (a.getType ());
 
         if (a.isDynamic ()) {
             let len = context:.finalizeValue (a.getLen (), alias list);
             let innerType = inner.getType ();
-            let size = int::usize (a.getLoc (), context:.computeSize (innerType));
+            let size = YILIntValue::new (a.getLoc (), YIL_UINT_MAX, innerType.getSize ());
 
-            let valPtr = AddressValue::new (a.getValue ().getLoc (), PointerType::new (a.getLoc (), innerType), inner);
-            NameCallValue::new (a.getLoc (), type, Path::new (CoreNames::YRT_ALLOC_SET_SLICE), [valPtr, size, len])
+            let valPtr = YILAddrValue::new (a.getValue ().getLoc (), YILPointer::new (innerType), inner);
+            YILNameCallValue::new (a.getLoc (), type, CoreNames::YRT_ALLOC_SET_SLICE, [valPtr, size, len])
         } else {
-            let dmut params = Vec!{&Value}::new ();
+            let dmut params = Vec!{&YILValue}::new ();
             let len = a.getLen ().asOf!{&IntValue} ().getValue ().toT!{usize} ();
             for _ in 0us .. len {
                 params:.push (inner);
             }
 
-            ArrayValue::new (a.getLoc (), type, params[])
+            YILArrayValue::new (a.getLoc (), type, params[])
         }
     }
 
@@ -527,14 +584,14 @@ pub class ValueExpander {
      *    - list: the list of statement to fill
      * @returns: the value
      * */
-    fn finalizeTuple (self, dmut context : &Expander, t : &TupleValue, dmut list : &StmtList)-> &Value {
-        let dmut res = Vec!{&Value}::new ();
+    fn finalizeTuple (self, dmut context : &Expander, t : &TupleValue, dmut list : &StmtList)-> &YILValue {
+        let dmut res = Vec!{&YILValue}::new ();
         for i in t.getInners () {
             res:.push (context:.finalizeValue (i, alias list));
         }
 
         let ttype = context:.finalizeType (t.getType ());
-        TupleValue::new (t.getLoc (), ttype, res[])
+        YILTupleValue::new (t.getLoc (), ttype, res[])
     }
 
     /**
@@ -551,7 +608,7 @@ pub class ValueExpander {
      *    - op: the operator to finalize
      *    - list: the list of stmtlist to fill
      * */
-    fn finalizeOperator (self, dmut context : &Expander, op : &OperatorValue, dmut list : &StmtList)-> &Value {
+    fn finalizeOperator (self, dmut context : &Expander, op : &OperatorValue, dmut list : &StmtList)-> &YILValue {
         let (_cte, val) = context.getCompileTimeInterpret ().simplify (op);
         if (_cte) return context:.finalizeValue (val, alias list);
 
@@ -576,11 +633,11 @@ pub class ValueExpander {
      *     - list: the list of statement to fill
      * @returns: the left operand
      * */
-    fn finalizeAffect (self, dmut context : &Expander, a : &AffectValue, dmut list : &StmtList)-> &Value {
+    fn finalizeAffect (self, dmut context : &Expander, a : &AffectValue, dmut list : &StmtList)-> &YILValue {
         let left = context:.finalizeValue (a.getLeft (), alias list);
         let right = context:.finalizeValue (a.getRight (), alias list);
 
-        list:.append (AffectValue::new (a.getLoc (), VOID_TYPE, left, right));
+        list:.append (YILAffect::new (a.getLoc (), left, right));
         left
     }
 
@@ -591,7 +648,7 @@ pub class ValueExpander {
      *    - list: the list of statement to fill
      * @returns: the finalized binary
      * */
-    fn finalizeBinary (self, dmut context : &Expander, b : &BinaryOperatorValue, dmut list : &StmtList)-> &Value {
+    fn finalizeBinary (self, dmut context : &Expander, b : &BinaryOperatorValue, dmut list : &StmtList)-> &YILValue {
         match b {
             bl : &LogicalBinBoolOperatorValue => { return self.finalizeLogicalBool (alias context, bl, alias list); }
             r : &RangeContainValue => { return context:.finalizeValue (r.getCall (), alias list); }
@@ -600,28 +657,18 @@ pub class ValueExpander {
         }
 
         match context.getVariable (b.getUniqId ()) {
-            Ok (u : &Value) => { // The call was already seen and validated
+            Ok (u : &YILValue) => { // The call was already seen and validated
                 return u;
             }
         };
-
-        let ctype = context:.finalizeType (b.getType ());
-        let varref = self.createVarForBlock (alias context, b.getLoc (), ctype, alias list);
-        if (!varref.isOf!{&UnitValue} ()) {
-            context:.registerVariable (b.getUniqId (), varref);
-        }
 
         let left = context:.finalizeValue (b.getLeft (), alias list);
         let right = context:.finalizeValue (b.getRight (), alias list);
 
         let type = context:.finalizeType (b.getType ());
-        let ret = BinaryOperatorValue::new (b.getLoc (), type, b.getOperator (), left, right);
+        let ret = YILBinaryValue::new (b.getLoc (), type, b.getOperator (), left, right);
 
-        if (!varref.isOf!{&UnitValue} ()) {
-            list:.append (AffectValue::new (b.getLoc (), VOID_TYPE, varref, ret));
-        }
-
-        varref
+        return self.registerUniqValue (alias context, b, ret, alias list);
     }
 
     /**
@@ -631,7 +678,7 @@ pub class ValueExpander {
      *    - list: the list of stmt to fill
      * @returns: the value of the expression
      * */
-    fn finalizeLogicalBool (self, dmut context : &Expander, b : &LogicalBinBoolOperatorValue, dmut list : &StmtList)-> &Value {
+    fn finalizeLogicalBool (self, dmut context : &Expander, b : &LogicalBinBoolOperatorValue, dmut list : &StmtList)-> &YILValue {
         let dmut rightList = StmtList::new ();
         let left = context:.finalizeValue (b.getLeft (), alias list);
         let right = context:.finalizeValue (b.getRight (), alias rightList);
@@ -642,17 +689,17 @@ pub class ValueExpander {
 
         if (b.getOperator () == BinaryOperators::DAND) { // if (left) { right } else { left }
             ifL:.append (rightList);
-            ifL:.append (AffectValue::new (b.getLoc (), VOID_TYPE, var, right));
+            ifL:.append (YILAffect::new (b.getLoc (), var, right));
 
-            ifNL:.append (AffectValue::new (b.getLoc (), VOID_TYPE, var, left));
+            ifNL:.append (YILAffect::new (b.getLoc (), var, left));
         } else { // operator == ||
-            ifL:.append (AffectValue::new (b.getLoc (), VOID_TYPE, var, left));
+            ifL:.append (YILAffect::new (b.getLoc (), var, left));
 
             ifNL:.append (rightList);
-            ifNL:.append (AffectValue::new (b.getLoc (), VOID_TYPE, var, right));
+            ifNL:.append (YILAffect::new (b.getLoc (), var, right));
         };
 
-        self.finalizeCond (b.getLoc (), alias list, left, ifL, ifNL);
+        self.finalizeCond (b.getLoc (), alias context, alias list, left, ifL, ifNL);
         var
     }
 
@@ -663,11 +710,11 @@ pub class ValueExpander {
      *    - u: the unary operator to finalize
      *    - list: the list of statement to fill
      * */
-    fn finalizeUnary (self, dmut context : &Expander, u : &UnaryOperatorValue, dmut list : &StmtList)-> &Value {
+    fn finalizeUnary (self, dmut context : &Expander, u : &UnaryOperatorValue, dmut list : &StmtList)-> &YILValue {
         let value = context:.finalizeValue (u.getInner (), alias list);
         let type = context:.finalizeType (u.getType ());
 
-        UnaryOperatorValue::new (u.getLoc (), type, u.getOperator (), value)
+        YILUnaryValue::new (u.getLoc (), type, u.getOperator (), value)
     } 
 
     /**
@@ -685,7 +732,7 @@ pub class ValueExpander {
      *    - list: the list of statement to fill
      * @returns: the value of the access
      * */
-    fn finalizeField (self, dmut context : &Expander, f : &FieldOperatorValue, dmut list : &StmtList)-> &Value {
+    fn finalizeField (self, dmut context : &Expander, f : &FieldOperatorValue, dmut list : &StmtList)-> &YILValue {
         match f {
             c : &ClassFieldAccessValue => { self.finalizeClassFieldAccess (alias context, c, alias list) }
             c : &ClosureFieldAccessValue => { self.finalizeClosureFieldAccess (alias context, c, alias list) }
@@ -704,13 +751,13 @@ pub class ValueExpander {
      *    - f: the field access to finalize
      *    - list: the list of statement to fill
      * */
-    fn finalizeClassFieldAccess (self, dmut context : &Expander, f : &ClassFieldAccessValue, dmut list : &StmtList)-> &Value {
+    fn finalizeClassFieldAccess (self, dmut context : &Expander, f : &ClassFieldAccessValue, dmut list : &StmtList)-> &YILValue {
         let cl = context:.finalizeValue (f.getClassInstance (), alias list);
         let type = cl.getType ();
         let retType = context:.finalizeType (f.getType ());
 
-        let clR = DereferencerValue::new (f.getLoc (), type.asOf!{&PointerType} ().getInners ()[0], cl);
-        StructFieldAccessValue::new (f.getLoc (), retType, clR, f.getFieldName ())
+        let clR = YILUnrefValue::new (f.getLoc (), type.asOf!{&YILPointer} ().getInner (), cl);
+        YILFieldValue::new (f.getLoc (), retType, clR, name-> f.getFieldName ())
     }
 
     /**
@@ -719,12 +766,12 @@ pub class ValueExpander {
      *    - f: the field access to finalize
      *    - list: the list of statement to fill
      * */
-    fn finalizeClosureFieldAccess (self, dmut context : &Expander, f : &ClosureFieldAccessValue, dmut list : &StmtList)-> &Value {
+    fn finalizeClosureFieldAccess (self, dmut context : &Expander, f : &ClosureFieldAccessValue, dmut list : &StmtList)-> &YILValue {
         let cl = context:.finalizeValue (f.getClosure (), alias list);
         let retType = context:.finalizeType (f.getType ());
-        let clR = DereferencerValue::new (f.getLoc (), cl.getType ().asOf!{&PointerType} ().getInners ()[0], cl);
+        let clR = YILUnrefValue::new (f.getLoc (), cl.getType ().asOf!{&YILPointer} ().getInner (), cl);
 
-        TupleFieldAccessValue::new (f.getLoc (), retType, clR, f.getFieldIndex ())
+        YILFieldValue::new (f.getLoc (), retType, clR, index-> f.getFieldIndex ())
     }
 
     /**
@@ -733,11 +780,11 @@ pub class ValueExpander {
      *    - f: the field access to finalize
      *    - list: the list of statement to fill
      * */
-    fn finalizeStructFieldAccess (self, dmut context : &Expander, f : &StructFieldAccessValue, dmut list : &StmtList)-> &Value {
+    fn finalizeStructFieldAccess (self, dmut context : &Expander, f : &StructFieldAccessValue, dmut list : &StmtList)-> &YILValue {
         let retType = context:.finalizeType (f.getType ());
         let str = context:.finalizeValue (f.getStruct (), alias list);
 
-        StructFieldAccessValue::new (f.getLoc (), retType, str, f.getFieldName ())
+        YILFieldValue::new (f.getLoc (), retType, str, name-> f.getFieldName ())
     }
 
     /**
@@ -746,11 +793,11 @@ pub class ValueExpander {
      *    - f: the field access to finalize
      *    - list: the list of statement to fill
      * */
-    fn finalizeTupleFieldAccess (self, dmut context : &Expander, f : &TupleFieldAccessValue, dmut list : &StmtList)-> &Value {
+    fn finalizeTupleFieldAccess (self, dmut context : &Expander, f : &TupleFieldAccessValue, dmut list : &StmtList)-> &YILValue {
         let retType = context:.finalizeType (f.getType ());
         let str = context:.finalizeValue (f.getTuple (), alias list);
 
-        TupleFieldAccessValue::new (f.getLoc (), retType, str, f.getFieldIndex ())
+        YILFieldValue::new (f.getLoc (), retType, str, index-> f.getFieldIndex ())
     }
 
     /**
@@ -768,40 +815,32 @@ pub class ValueExpander {
      *    - list: the list of statement to fill
      * @returns: the value of the call if any
      * */
-    fn finalizeCall (self, dmut context : &Expander, c : &CallOperatorValue, dmut list : &StmtList)-> &Value {
+    fn finalizeCall (self, dmut context : &Expander, c : &CallOperatorValue, dmut list : &StmtList)-> &YILValue {
         // Call of function performs heavy computation with possible side effects
         // Function call must appear only once in the finalized code
         match context.getVariable (c.getUniqId ()) {
-            Ok (u : &Value) => { // The call was already seen and validated
+            Ok (u : &YILValue) => { // The call was already seen and validated
                 return u;
             }
         };
 
-        let ctype = context:.finalizeType (c.getType ());
-        let varref = self.createVarForBlock (alias context, c.getLoc (), ctype, alias list);
-        if (!varref.isOf!{&UnitValue} ()) {
-            context:.registerVariable (c.getUniqId (), varref);
-        }
-
         let call = match c {
-            ca : &CallValue => { self.finalizeSimpleCall (alias context, ctype, ca, alias list) }
-            ctor : &CtorCallValue => { self.finalizeCtorCall (alias context, ctype, ctor, alias list) }
-            fptr : &FuncPtrCallValue => { self.finalizeFuncPtrCall (alias context, ctype, fptr, alias list) }
-            meth : &MethodCallValue => { self.finalizeMethodCall (alias context, ctype, meth, alias list) }
-            name : &NameCallValue => { self.finalizeNameCall (alias context, ctype, name, alias list) }
+            ca : &CallValue => { self.finalizeSimpleCall (alias context, ca, alias list) }
+            ctor : &CtorCallValue => { self.finalizeCtorCall (alias context, ctor, alias list) }
+            fptr : &FuncPtrCallValue => { self.finalizeFuncPtrCall (alias context, fptr, alias list) }
+            meth : &MethodCallValue => { self.finalizeMethodCall (alias context, meth, alias list) }
             _ => {
                 eprintln (c::typeinfo.name);
                 __pragma!panic ();
             }
         };
 
-        if (!varref.isOf!{&UnitValue} ()) {
-            list:.append (AffectValue::new (c.getLoc (), VOID_TYPE, varref, call));
-        } else {
-            list:.append (call);
+        let result = self.registerUniqValue (alias context, c, call, alias list);
+        if (result.isOf!{&YILUnit} ()) {
+            list:.append (YILCall::new (c.getLoc (), call));
         }
 
-        varref
+        result
     }
 
     /**
@@ -811,19 +850,20 @@ pub class ValueExpander {
      *   - list: the statement list to fill
      * @returns: the value of the call
      * */
-    fn finalizeSimpleCall (self, dmut context : &Expander, retType : &Type, c : &CallValue, dmut list : &StmtList)-> &Value {
-        let dmut params = Vec!{&Value}::new ();
-        let dmut addParams = Vec!{&Value}::new ();
+    fn finalizeSimpleCall (self, dmut context : &Expander, c : &CallValue, dmut list : &StmtList)-> &YILValue {
+        let retType = context:.finalizeType (c.getType ());
+
+        let dmut params = Vec!{&YILValue}::new ();
         for i in c.getParameters () {
             params:.push (context:.finalizeValue (i, alias list));
         }
 
         for i in c.getAddParameters () {
-            addParams:.push (context:.finalizeValue (i, alias list));
+            params:.push (context:.finalizeValue (i, alias list));
         }
 
-        let proto = self.finalizePrototype (alias context, c.getPrototype ());
-        CallValue::new (c.getLoc (), retType, proto, params[], addParams-> addParams[])
+        let name = context.getMangler ().mangle (c.getPrototype ());
+        YILNameCallValue::new (c.getLoc (), retType, name, params[])
     }
 
     /**
@@ -831,10 +871,11 @@ pub class ValueExpander {
      * @params:
      *     -
      * */
-    fn finalizeCtorCall (self, dmut context : &Expander, retType : &Type, c : &CtorCallValue, dmut list : &StmtList)-> &Value {
+    fn finalizeCtorCall (self, dmut context : &Expander, c : &CtorCallValue, dmut list : &StmtList)-> &YILValue {
+        let retType = context:.finalizeType (c.getType ());
         let inst = self.finalizeCtorSelf (alias context, c.getLoc (), retType, c.getType (), c.getCtor ().getInstance (), alias list);
 
-        let dmut params = Vec!{&Value}::new ();
+        let dmut params = Vec!{&YILValue}::new ();
         params:.push (inst);
         for pi in c.getParameters () {
             params:.push (context:.finalizeValue (pi, alias list));
@@ -843,8 +884,8 @@ pub class ValueExpander {
             params:.push (context:.finalizeValue (pi, alias list));
         }
 
-        let proto = self.finalizePrototype (alias context, c.getCtor ().getPrototype ());
-        list:.append (CallValue::new (c.getLoc (), VOID_TYPE, proto, params[]));
+        let name = context.getMangler ().mangle (c.getCtor ().getPrototype ());
+        list:.append (YILCall::new (c.getLoc (), YILNameCallValue::new (c.getLoc (), retType, name, params[])));
         inst
     }
 
@@ -852,25 +893,24 @@ pub class ValueExpander {
      * Finalize the creation of a new class instance, that is not constructed but only allocated
      * @params:
      *     - loc: the location of the ctor construction
-     *     - retType: the finalize version of the class type
      *     - clType: the ClassPtr version of the type of the class to construct
      *     - inst: the instance value generator (if nonevalue, then call class allocation)
      *     - list: the list to fill
      * @returns: the instance of the class
      * */
-    fn finalizeCtorSelf (self, dmut context : &Expander, loc : &Word, retType : &Type, clType : &Type, inst : &Value, dmut list : &StmtList)-> &Value {
+    fn finalizeCtorSelf (self, dmut context : &Expander, loc : &Word, retType : &YILType, clType : &Type, inst : &Value, dmut list : &StmtList)-> &YILValue {
         // We gave a value to the ctor
         if (!inst.isOf!{&NoneValue} ())  return context:.finalizeValue (inst, alias list);
 
         let varref = self.createVarForBlock (alias context, loc, retType, alias list, name-> "__self_%"s8);
 
-        let vtableName = Word::new (context:.getMangler ().mangleVtable (clType.asOf!{&ClassPtrType} ().getInner ()), loc);
-        let vtableAddr = AddressValue::new (loc, PointerType::new (loc, PointerType::new (loc, VOID_TYPE)),
-                                            VarRefValue::new (vtableName, vtableName, PointerType::new (loc, VOID_TYPE), isGlobal-> true, refId-> 0us));
+        let vtableName = context:.getMangler ().mangleVtable (clType.asOf!{&ClassPtrType} ().getInner ());
+        let vtableAddr = YILAddrValue::new (loc, YIL_PTR_2_VOID,
+                                            YILVar::new (loc, vtableName, YIL_PTR_VOID, 0us));
 
 
-        let callVal = NameCallValue::new (loc, retType, Path::new (CoreNames::YRT_ALLOC_CLASS), [vtableAddr]);
-        list:.append (AffectValue::new (loc, VOID_TYPE, varref, callVal));
+        let callVal = YILNameCallValue::new (loc, retType, CoreNames::YRT_ALLOC_CLASS, [vtableAddr]);
+        list:.append (YILAffect::new (loc, varref, callVal));
 
         varref
     }
@@ -882,14 +922,15 @@ pub class ValueExpander {
      *    - list: the list of statement to fill
      * @returns: the call
      * */
-    fn finalizeFuncPtrCall (self, dmut context : &Expander, retType : &Type, f : &FuncPtrCallValue, dmut list : &StmtList)-> &Value {
+    fn finalizeFuncPtrCall (self, dmut context : &Expander, f : &FuncPtrCallValue, dmut list : &StmtList)-> &YILValue {
+        let retType = context:.finalizeType (f.getType ());
         let fptr = context:.finalizeValue (f.getFuncPtr (), alias list);
-        let dmut params = Vec!{&Value}::new ();
+        let dmut params = Vec!{&YILValue}::new ();
         for pi in f.getParameters () {
             params:.push (context:.finalizeValue (pi, alias list));
         }
 
-        FuncPtrCallValue::new (f.getLoc (), retType, fptr, params[])
+        YILPtrCallValue::new (f.getLoc (), retType, fptr, params[])
     }
 
     /**
@@ -899,8 +940,10 @@ pub class ValueExpander {
      *     - list: the list of statement to fill
      * @returns: the result of the call
      * */
-    fn finalizeMethodCall (self, dmut context : &Expander, retType : &Type, f : &MethodCallValue, dmut list : &StmtList)-> &Value {
-        let dmut params = Vec!{&Value}::new ();
+    fn finalizeMethodCall (self, dmut context : &Expander,  f : &MethodCallValue, dmut list : &StmtList)-> &YILValue {
+        let retType = context:.finalizeType (f.getType ());
+
+        let dmut params = Vec!{&YILValue}::new ();
         let methProto = f.getMethod ();
         let inst = context:.finalizeValue (methProto.getClosure (), alias list);
 
@@ -913,12 +956,12 @@ pub class ValueExpander {
             params:.push (context:.finalizeValue (pi, alias list));
         }
 
-        let proto = self.finalizePrototype (alias context, methProto.getPrototype ());
         if (methProto.isDirect ()) {
-            CallValue::new (f.getLoc (), retType, proto, params[])
+            let name = context.getMangler ().mangle (methProto.getPrototype ());
+            YILNameCallValue::new (f.getLoc (), retType, name, params[])
         } else {
-            let fptr = self.createVtableAccess (f.getLoc (), inst, proto.getType (), methProto.getVtableIndex ());
-            FuncPtrCallValue::new (f.getLoc (), retType, fptr, params[])
+            let fptr = self.createVtableAccess (f.getLoc (), inst, methProto.getVtableIndex ());
+            YILPtrCallValue::new (f.getLoc (), retType, fptr, params[])
         }
     }
 
@@ -930,64 +973,20 @@ pub class ValueExpander {
      *    - index: the index of the function in the vtable
      * @returns: the address of the method to call
      * */
-    fn createVtableAccess (self, loc : &Word, inst : &Value, type : &Type, index : usize)-> &Value {
+    fn createVtableAccess (self, loc : &Word, inst : &YILValue, index : usize)-> &YILValue {
         let ptrSize = global::state::instance ().getSizeTypeSize () / 8us;
-        let ptrVoid = PointerType::new (loc, VOID_TYPE);
 
-        let derefInst = DereferencerValue::new (loc, inst.getType ().asOf!{&PointerType} ().getInners ()[0], inst);
-        let vtableAddr = StructFieldAccessValue::new (loc, ptrVoid, derefInst, "#_vtable"s8);
+        let derefInst = YILUnrefValue::new (loc, inst.getType ().asOf!{&YILPointer} ().getInner (), inst);
+        let vtableAddr = YILFieldValue::new (loc, YIL_PTR_VOID, derefInst, name-> "#_vtable"s8);
 
         // +1us because 0 is the dtor
-        let funcInVtableAddr = BinaryOperatorValue::new (loc, ptrVoid, BinaryOperators::PLUS, vtableAddr, int::usize (loc, (index + 1us) * cast!{usize} (ptrSize)));
+        let funcInVtableAddr = YILBinaryValue::new (loc,
+                                                    YIL_PTR_VOID,
+                                                    BinaryOperators::PLUS,
+                                                    vtableAddr,
+                                                    YILIntValue::new (loc, YIL_UINT_MAX, (index + 1us) * cast!{usize} (ptrSize)));
 
-        DereferencerValue::new (loc, type, funcInVtableAddr)
-    }
-
-    /**
-     * Finalize a function call where the prototype is just a symbol name
-     * @params:
-     *    - name: the name call to finalize
-     *    - list: the list of statement to fill
-     * @returns: the value of the call
-     * */
-    fn finalizeNameCall (self, dmut context : &Expander, retType : &Type, name : &NameCallValue, dmut list : &StmtList)-> &Value {
-        let dmut params = Vec!{&Value}::new ();
-        for pi in name.getParameters () {
-            params:.push (context:.finalizeValue (pi, alias list));
-        }
-
-        NameCallValue::new (name.getLoc (), retType, name.getFunctionName (), params[])
-    }
-
-    /**
-     * =====================================================================================
-     * =====================================================================================
-     * ===================            PROTOTYPE VALUE EXPANSION           ==================
-     * =====================================================================================
-     * =====================================================================================
-     */
-
-    /**
-     * Finalize a prototype value
-     * @params:
-     *    - context: the context of the finalization
-     *    - proto: the prototype to finalize
-     * @returns: the finalized version of the prototype
-     * */
-    pub fn finalizePrototype (self, dmut context : &Expander, proto : &PrototypeValue)-> &PrototypeValue {
-        let name = context.getMangler ().mangle (proto);
-        let dmut params = Vec!{&ProtoVarValue}::new ();
-        for pi in proto.getParameters () {
-            let mut type = context:.finalizeType (pi.getType ());
-            if (pi.isReference ()) {
-                type = PointerType::new (pi.getLoc (), type);
-            }
-
-            params:.push (ProtoVarValue::new (pi.getLoc (), type, NONE_VALUE, false, false));
-        }
-
-        let retType = context:.finalizeType (proto.getRetType ());
-        NamePrototypeValue::new (proto.getLoc (), name, params[], retType, isMangled-> true)
+        YILUnrefValue::new (loc, YIL_PTR_VOID, funcInVtableAddr)
     }
 
     /**
@@ -1004,7 +1003,7 @@ pub class ValueExpander {
      *    - sl: the operator to finalize
      *    - list: the list of statement to fill
      * */
-    fn finalizeSliceOrArrayOp (self, dmut context : &Expander, sl : &SliceOrArrayOperatorValue, dmut list : &StmtList)-> &Value {
+    fn finalizeSliceOrArrayOp (self, dmut context : &Expander, sl : &SliceOrArrayOperatorValue, dmut list : &StmtList)-> &YILValue {
         match sl {
             a : &ArrayAccessValue => { self.finalizeArrayAccess (alias context, a, alias list) }
             c : &SliceConcatValue => { self.finalizeSliceConcat (alias context, c, alias list) }
@@ -1024,12 +1023,12 @@ pub class ValueExpander {
      *    - a: the array access to finalize
      *    - list: the list of statement to fill
      * */
-    fn finalizeArrayAccess (self, dmut context : &Expander, a : &ArrayAccessValue, dmut list : &StmtList)-> &Value {
+    fn finalizeArrayAccess (self, dmut context : &Expander, a : &ArrayAccessValue, dmut list : &StmtList)-> &YILValue {
         let arr = context:.finalizeValue (a.getArray (), alias list);
         let index = context:.finalizeValue (a.getIndex (), alias list);
         let type = context:.finalizeType (a.getType ());
 
-        ArrayAccessValue::new (a.getLoc (), type, arr, index)
+        YILArrayAccessValue::new (a.getLoc (), type, arr, index)
     }
 
     /**
@@ -1039,10 +1038,10 @@ pub class ValueExpander {
      *    - a: the slice concat to finalize
      *    - list: the list of statement to fill
      * */
-    fn finalizeSliceConcat (self, dmut context : &Expander, s : &SliceConcatValue, dmut list : &StmtList)-> &Value {
+    fn finalizeSliceConcat (self, dmut context : &Expander, s : &SliceConcatValue, dmut list : &StmtList)-> &YILValue {
         // Slice concat allocates values, thus must be performed only once
         match context.getVariable (s.getUniqId ()) {
-            Ok (u : &Value) => { // The call was already seen and validated
+            Ok (u : &YILValue) => { // The call was already seen and validated
                 return u;
             }
         };
@@ -1051,17 +1050,11 @@ pub class ValueExpander {
         let right = context:.finalizeValue (s.getRight (), alias list);
         let type = context:.finalizeType (s.getType ());
         let inner = context:.finalizeType (s.getType ().asOf!{&SliceType} ().getInners ()[0]);
-        let size = context:.computeSize (inner);
+        let size = YILIntValue::new (s.getLoc (), YIL_UINT_MAX, inner.getSize ());
 
-        let varref = self.createVarForBlock (alias context, s.getLoc (), type, alias list);
-        if (!varref.isOf!{&UnitValue} ()) {
-            context:.registerVariable (s.getUniqId (), varref);
-        }
+        let call = YILNameCallValue::new (s.getLoc (), type, CoreNames::YRT_CONCAT_SLICE, [left, right, size]);
 
-        let call = NameCallValue::new (s.getLoc (), type, Path::new (CoreNames::YRT_CONCAT_SLICE), [left, right, int::usize (s.getLoc (), size)]);
-        list:.append (AffectValue::new (s.getLoc (), VOID_TYPE, varref, call));
-
-        varref
+        return self.registerUniqValue (alias context, s, call, alias list);
     }
 
     /**
@@ -1071,25 +1064,24 @@ pub class ValueExpander {
      *    - s: the slice access to finalize
      *    - list: the list of statement to fill
      * */
-    fn finalizeSliceAccess (self, dmut context : &Expander, s : &SliceAccessValue, dmut list : &StmtList)-> &Value {
+    fn finalizeSliceAccess (self, dmut context : &Expander, s : &SliceAccessValue, dmut list : &StmtList)-> &YILValue {
         let slc = context:.finalizeValue (s.getSlice (), alias list);
         let index = context:.finalizeValue (s.getIndex (), alias list);
 
         let resType = context:.finalizeType (s.getType ());
-        let size = int::usize (s.getLoc (), context:.computeSize (resType));
+        let size = YILIntValue::new (s.getLoc (), YIL_UINT_MAX, resType.getSize ());
 
-        let indexV = BinaryOperatorValue::new (s.getLoc (), size.getType (), BinaryOperators::STAR, size, index);
-        let ptrT = PointerType::new (s.getLoc (), resType);
-        let ptrVoid = PointerType::new (s.getLoc (), VOID_TYPE);
+        let indexV = YILBinaryValue::new (s.getLoc (), YIL_UINT_MAX, BinaryOperators::STAR, size, index);
+        let ptrT = YILPointer::new (resType);
 
-        let data_field = BinaryOperatorValue::new (s.getLoc (),
-                                                   ptrVoid,
-                                                   BinaryOperators::PLUS,
-                                                   StructFieldAccessValue::new (s.getLoc (), ptrVoid, slc, SliceKeys::PTR),
-                                                   indexV);
+        let data_field = YILBinaryValue::new (s.getLoc (),
+                                              YIL_PTR_VOID,
+                                              BinaryOperators::PLUS,
+                                              YILFieldValue::new (s.getLoc (), YIL_PTR_VOID, slc, name-> SliceKeys::PTR),
+                                              indexV);
 
-        let finalPtrV = CastValue::new (s.getLoc (), ptrT, data_field);
-        DereferencerValue::new (s.getLoc (), resType, finalPtrV)
+        let finalPtrV = YILCastValue::new (s.getLoc (), ptrT, data_field);
+        YILUnrefValue::new (s.getLoc (), resType, finalPtrV)
     }
 
     /**
@@ -1099,7 +1091,7 @@ pub class ValueExpander {
      *    - s: the slice compare to finalize
      *    - list: the list of statement to fill
      * */
-    fn finalizeSliceCompare (self, dmut context : &Expander, s : &SliceCompareValue, dmut list : &StmtList)-> &Value {
+    fn finalizeSliceCompare (self, dmut context : &Expander, s : &SliceCompareValue, dmut list : &StmtList)-> &YILValue {
         context;
         s;
         list;
@@ -1121,7 +1113,7 @@ pub class ValueExpander {
      *    - mem: the memory value to finalize
      *    - list: the list of statement to fill
      * */
-    fn finalizeMemory (self, dmut context : &Expander, mem : &MemoryValue, dmut list : &StmtList)-> &Value {
+    fn finalizeMemory (self, dmut context : &Expander, mem : &MemoryValue, dmut list : &StmtList)-> &YILValue {
         match mem {
             a : &AddressValue => { self.finalizeAddress (alias context, a, alias list) }
             a : &AliaserValue => { context:.finalizeValue (a.getInnerValue (), alias list) }
@@ -1143,7 +1135,7 @@ pub class ValueExpander {
      *    - add: the address value to finalize
      *    - list: the list of statement to fill
      * */
-    fn finalizeAddress (self, dmut context : &Expander, add : &AddressValue, dmut list : &StmtList)-> &Value {
+    fn finalizeAddress (self, dmut context : &Expander, add : &AddressValue, dmut list : &StmtList)-> &YILValue {
         let type = context:.finalizeType (add.getType ());
         let value = context:.finalizeValue (add.getInner (), alias list);
 
@@ -1154,9 +1146,9 @@ pub class ValueExpander {
         // So if we get a pointer value that has the same depth, meaning pointer of pointer of ...
         // Then we can assume it is already constructed, and can be returned as it is, with a cast though
         if (depthVal == depthRet) {
-            CastValue::new (add.getLoc (), type, value)
+            YILCastValue::new (add.getLoc (), type, value)
         } else {
-            AddressValue::new (add.getLoc (), type, value)
+            YILAddrValue::new (add.getLoc (), type, value)
         }
     }
 
@@ -1167,20 +1159,14 @@ pub class ValueExpander {
      *    - c: the copier value to copy
      *    - list: the list of statement to fill
      * */
-    fn finalizeCopier (self, dmut context : &Expander, c : &CopierValue, dmut list : &StmtList)-> &Value {
+    fn finalizeCopier (self, dmut context : &Expander, c : &CopierValue, dmut list : &StmtList)-> &YILValue {
         // Copy performs heavy computation with possible side effects
         // Copy values must appear only once in the finalized code
         match context.getVariable (c.getUniqId ()) {
-            Ok (u : &Value) => { // The copy was already seen and validated
+            Ok (u : &YILValue) => { // The copy was already seen and validated
                 return u;
             }
         };
-
-        let ctype = context:.finalizeType (c.getType ());
-        let varref = self.createVarForBlock (alias context, c.getLoc (), ctype, alias list);
-        if (!varref.isOf!{&UnitValue} ()) {
-            context:.registerVariable (c.getUniqId (), varref);
-        }
 
         let call = match c.getType () {
             slc : &SliceType => { self.finalizeCopierSlice (alias context, c, slc, alias list) }
@@ -1199,60 +1185,59 @@ pub class ValueExpander {
             }
         };
 
-        if (!varref.isOf!{&UnitValue} ()) {
-            list:.append (AffectValue::new (c.getLoc (), VOID_TYPE, varref, call));
-        } else {
-            list:.append (call);
-        }
-
-        varref
+        return self.registerUniqValue (alias context, c, call, alias list);
     }
 
     /**
      * Finalize a copier value that returns a slice
      * */
-    fn finalizeCopierSlice (self, dmut context : &Expander, c : &CopierValue, slc : &SliceType, dmut list : &StmtList)-> &Value {
+    fn finalizeCopierSlice (self, dmut context : &Expander, c : &CopierValue, slc : &SliceType, dmut list : &StmtList)-> &YILValue {
         let value = context:.finalizeValue (c.getValue (), alias list);
         if (slc.getInners ()[0].isOf!{&VoidType} ()) { return value; } // copy []
 
         let retType = context:.finalizeType (c.getType ());
         let innerType = context:.finalizeType (slc.getInners ()[0]);
-        let innerSize = int::intValue (c.getLoc (), context:.computeSize (innerType), size-> 32u16, signed-> false);
+        let innerSize = YILIntValue::new (c.getLoc (), YIL_UINT_32, innerType.getSize ());
 
-        NameCallValue::new (c.getLoc (), retType, Path::new (CoreNames::YRT_DUPLICATE_SLICE), [value, innerSize])
+        YILNameCallValue::new (c.getLoc (), retType, CoreNames::YRT_DUPLICATE_SLICE, [value, innerSize])
     }
 
 
     /**
      * Finalize the copy of a tuple value
      * */
-    fn finalizeCopierTuple (self, dmut context : &Expander, c : &CopierValue, t : &TupleType, dmut list : &StmtList)-> &Value {
+    fn finalizeCopierTuple (self, dmut context : &Expander, c : &CopierValue, t : &TupleType, dmut list : &StmtList)-> &YILValue {
+        if (t.getInners ().len == 0us) return YIL_NULL_VALUE;
+
         let value = context:.finalizeValue (c.getValue (), alias list);
         let retType = context:.finalizeType (c.getType ());
-        let innerType = context:.finalizeType (t);
-        let innerSize = int::intValue (c.getLoc (), context:.computeSize (innerType), size-> 32u16, signed-> false);
 
-        NameCallValue::new (c.getLoc (), retType, Path::new (CoreNames::YRT_DUPLICATE_TUPLE), [AddressValue::new (c.getLoc (), retType, value), innerSize])
+        let innerType = context:.finalizeType (t);
+        let innerSize = YILIntValue::new (c.getLoc (), YIL_UINT_32, innerType.getSize ());
+
+        let tuAddr = YILAddrValue::new (c.getLoc (), retType, value);
+
+        YILNameCallValue::new (c.getLoc (), retType, CoreNames::YRT_DUPLICATE_TUPLE, [tuAddr, innerSize])
     }
 
 
     /**
      * Finalize a dereferencer value
      * */
-    fn finalizeDeref (self, dmut context : &Expander, d : &DereferencerValue, dmut list : &StmtList)-> &Value {
+    fn finalizeDeref (self, dmut context : &Expander, d : &DereferencerValue, dmut list : &StmtList)-> &YILValue {
         let value = context:.finalizeValue (d.getInner (), alias list);
         let type = context:.finalizeType (d.getType ());
 
-        DereferencerValue::new (d.getLoc (), type, value)
+        YILUnrefValue::new (d.getLoc (), type, value)
     }
 
     /**
      * Finalize a referencer value
      * */
-    fn finalizeRef (self, dmut context : &Expander, r : &ReferencerValue, dmut list : &StmtList)-> &Value {
+    fn finalizeRef (self, dmut context : &Expander, r : &ReferencerValue, dmut list : &StmtList)-> &YILValue {
 
         // same as an addresser but storing the inner type only
-        let type = PointerType::new (r.getLoc (), context:.finalizeType (r.getType ()));
+        let type = YILPointer::new (context:.finalizeType (r.getType ()));
         let value = context:.finalizeValue (r.getInnerValue (), alias list);
 
         let depthRet = context.getTypeExpander ().getPointerDepth (type);
@@ -1262,9 +1247,9 @@ pub class ValueExpander {
         // So if we get a pointer value that has the same depth, meaning pointer of pointer of ...
         // Then we can assume it is already constructed, and can be returned as it is, with a cast though
         if (depthVal == depthRet) {
-            CastValue::new (r.getLoc (), type, value)
+            YILCastValue::new (r.getLoc (), type, value)
         } else {
-            AddressValue::new (r.getLoc (), type, value)
+            YILAddrValue::new (r.getLoc (), type, value)
         }
     }
 
@@ -1279,7 +1264,7 @@ pub class ValueExpander {
     /**
      * Finalize the construction of a slice using a value, instead of the fields
      * */
-    fn finalizeSliceMem (self, dmut context : &Expander, s : &SliceValue, dmut list : &StmtList)-> &Value {
+    fn finalizeSliceMem (self, dmut context : &Expander, s : &SliceValue, dmut list : &StmtList)-> &YILValue {
         // Specific direct values that can be found in the slice
         match s.getInner () {
             ctor : &SliceCtorValue => { return self.finalizeSliceCtor (alias context, ctor, alias list); }
@@ -1301,45 +1286,45 @@ pub class ValueExpander {
     /**
      * Finalize a slice ctor value
      * */
-    fn finalizeSliceCtor (self, dmut context : &Expander, ctor : &SliceCtorValue, dmut list : &StmtList)-> &Value {
+    fn finalizeSliceCtor (self, dmut context : &Expander, ctor : &SliceCtorValue, dmut list : &StmtList)-> &YILValue {
         let type = context:.finalizeType (ctor.getType ());
         let len = context:.finalizeValue (ctor.getLen (), alias list);
         let ptr = context:.finalizeValue (ctor.getPointer (), alias list);
 
-        TupleValue::new (ctor.getLoc (), type, [len, ptr], fieldNames-> [SliceKeys::LEN, SliceKeys::PTR])
+        YILTupleValue::new (ctor.getLoc (), type, [len, ptr], fieldNames-> [SliceKeys::LEN, SliceKeys::PTR])
     }
 
     /**
      * Finalize a slice memory value containing a string literal
      * */
-    fn finalizeSliceFromStr (self, dmut context : &Expander, slc : &SliceValue, str : &StringValue, dmut list : &StmtList)-> &Value {
+    fn finalizeSliceFromStr (self, dmut context : &Expander, slc : &SliceValue, str : &StringValue, dmut list : &StmtList)-> &YILValue {
         let value = context:.finalizeValue (str, alias list);
         let type = context:.finalizeType (slc.getType ());
+        let len = YILIntValue::new (slc.getLoc (), YIL_UINT_MAX, str.getLen ());
 
-        let len = int::usize (slc.getLoc (), str.getLen ());
-
-        TupleValue::new (slc.getLoc (), type, [len, value], fieldNames-> [SliceKeys::LEN, SliceKeys::PTR])
+        YILTupleValue::new (slc.getLoc (), type, [len, value], fieldNames-> [SliceKeys::LEN, SliceKeys::PTR])
     }
 
     /**
      * Finalize a slice memory valeu containing an array literal
      * */
-    fn finalizeSliceFromArray (self, dmut context : &Expander, slc : &SliceValue, arr : &ArrayValue, dmut list : &StmtList)-> &Value {
+    fn finalizeSliceFromArray (self, dmut context : &Expander, slc : &SliceValue, arr : &ArrayValue, dmut list : &StmtList)-> &YILValue {
         let arrValue = context:.finalizeValue (arr, alias list);
         let type = context:.finalizeType (slc.getType ());
 
-        let len = int::usize (slc.getLoc (), arr.getLen ());
+        let len = YILIntValue::new (slc.getLoc (), YIL_UINT_MAX, arr.getLen ());
         let innerType = context:.finalizeType (slc.getType ().asOf!{&SliceType} ().getInners ()[0]);
-        let ptrType = PointerType::new (slc.getLoc (), innerType);
-        let ptrValue = AddressValue::new (slc.getLoc (), ptrType, arrValue);
+        let ptrType = YILPointer::new (innerType);
 
-        TupleValue::new (slc.getLoc (), type, [len, ptrValue], fieldNames-> [SliceKeys::LEN, SliceKeys::PTR])
+        let ptrValue = YILAddrValue::new (slc.getLoc (), ptrType, arrValue);
+
+        YILTupleValue::new (slc.getLoc (), type, [len, ptrValue], fieldNames-> [SliceKeys::LEN, SliceKeys::PTR])
     }
 
     /**
      * Finalize a slice memory value containing an array allocation literal
      * */
-    fn finalizeSliceFromAlloc (self, dmut context : &Expander, slc : &SliceValue, arr : &ArrayAllocValue, dmut list : &StmtList)-> &Value {
+    fn finalizeSliceFromAlloc (self, dmut context : &Expander, slc : &SliceValue, arr : &ArrayAllocValue, dmut list : &StmtList)-> &YILValue {
         let arrValue = context:.finalizeValue (arr, alias list);
         if (arr.isDynamic ()) return arrValue; // already returning a slice
 
@@ -1348,29 +1333,29 @@ pub class ValueExpander {
         let type = context:.finalizeType (slc.getType ());
 
         let innerType = context:.finalizeType (slc.getType ().asOf!{&SliceType} ().getInners ()[0]);
-        let ptrType = PointerType::new (slc.getLoc (), innerType);
-        let ptrValue = AddressValue::new (slc.getLoc (), ptrType, arrValue);
+        let ptrType = YILPointer::new (innerType);
+        let ptrValue = YILAddrValue::new (slc.getLoc (), ptrType, arrValue);
 
-        TupleValue::new (slc.getLoc (), type, [len, ptrValue], fieldNames-> [SliceKeys::LEN, SliceKeys::PTR])
+        YILTupleValue::new (slc.getLoc (), type, [len, ptrValue], fieldNames-> [SliceKeys::LEN, SliceKeys::PTR])
     }
 
     /**
      * Finalize a slice memory value containing a value whose size is an array (but not a arrayvalue, nor an arrayallocvalue)
      * */
-    fn finalizeSliceFromArrayType (self, dmut context : &Expander, slc : &SliceValue, arr : &ArrayType, dmut list : &StmtList)-> &Value {
+    fn finalizeSliceFromArrayType (self, dmut context : &Expander, slc : &SliceValue, arr : &ArrayType, dmut list : &StmtList)-> &YILValue {
         let len = context:.finalizeValue (arr.getSize (), alias list);
         let type = context:.finalizeType (slc.getType ());
 
         if (arr.getSize ().getValue () == 0us) { // []
-             return TupleValue::new (slc.getLoc (), type, [len, NullValue::new (slc.getLoc ())]);
+             return YILTupleValue::new (slc.getLoc (), type, [len, YIL_NULL_VALUE]);
         }
 
         let arrValue = context:.finalizeValue (slc.getInner (), alias list);
         let innerType = context:.finalizeType (slc.getType ().asOf!{&SliceType} ().getInners ()[0]);
-        let ptrType = PointerType::new (slc.getLoc (), innerType);
-        let ptrValue = AddressValue::new (slc.getLoc (), ptrType, arrValue);
+        let ptrType = YILPointer::new (innerType);
+        let ptrValue = YILAddrValue::new (slc.getLoc (), ptrType, arrValue);
         
-        TupleValue::new (slc.getLoc (), type, [len, ptrValue], fieldNames-> [SliceKeys::LEN, SliceKeys::PTR])
+        YILTupleValue::new (slc.getLoc (), type, [len, ptrValue], fieldNames-> [SliceKeys::LEN, SliceKeys::PTR])
     }
 
     /**
@@ -1388,21 +1373,18 @@ pub class ValueExpander {
      *    - ctor: the construct value to finalize
      *    - list: the list of statement to fill
      * */
-    fn finalizeConstruct (self, dmut context : &Expander, ctor : &ConstructValue, dmut list : &StmtList)-> &Value {
+    fn finalizeConstruct (self, dmut context : &Expander, ctor : &ConstructValue, dmut list : &StmtList)-> &YILValue {
         match context.getVariable (ctor.getUniqId ()) {
-            Ok (u : &Value) => { // The call was already seen and validated
+            Ok (u : &YILValue) => { // The call was already seen and validated
                 return u;
             }
         };
-
-        let ctype = context:.finalizeType (ctor.getType ());
-        let varref = self.createVarForBlock (alias context, ctor.getLoc (), ctype, alias list);
-        context:.registerVariable (ctor.getUniqId (), varref);
 
         let val = match ctor {
             c : &CastValue => { self.finalizeCast (alias context, c, alias list) }
             c : &CtorDelegateValue => { self.finalizeCtorDG (alias context, c, alias list) }
             d : &NameDelegateValue => { self.finalizeNameDG (alias context, d, alias list) }
+            n : &NameFuncPtrValue => { self.finalizeNameFptr (alias context, n, alias list) }
             m : &MethodDelegateValue => { self.finalizeMethodDG (alias context, m, alias list) }
             r : &RangeValue => { self.finalizeRange (alias context, r, alias list) }
             s : &SliceCtorValue => { self.finalizeSliceCtor (alias context, s, alias list) }
@@ -1413,8 +1395,7 @@ pub class ValueExpander {
             }
         }
 
-        list:.append (AffectValue::new (ctor.getLoc (), VOID_TYPE, varref, val));
-        varref
+        return self.registerUniqValue (alias context, ctor, val, alias list);
     }
 
     /**
@@ -1424,71 +1405,83 @@ pub class ValueExpander {
      *    - ct: the cast value to finalize
      *    - list: the list of statement to fill
      * */
-    fn finalizeCast (self, dmut context : &Expander, ct : &CastValue, dmut list : &StmtList)-> &Value {
+    fn finalizeCast (self, dmut context : &Expander, ct : &CastValue, dmut list : &StmtList)-> &YILValue {
         let value = context:.finalizeValue (ct.getContent (), alias list);
         let type = context:.finalizeType (ct.getType ());
 
-        CastValue::new (ct.getLoc (), type, value)
+        YILCastValue::new (ct.getLoc (), type, value)
     }
 
     /**
      * Finalize a delegate to a constructor prototype
      * */
-    fn finalizeCtorDG (self, dmut context : &Expander, ctor : &CtorDelegateValue, dmut list : &StmtList)-> &Value {
-        let proto = self.finalizePrototype (alias context, ctor.getPrototype ());
+    fn finalizeCtorDG (self, dmut context : &Expander, ctor : &CtorDelegateValue, dmut list : &StmtList)-> &YILValue {
+        let name = context.getMangler ().mangle (ctor.getPrototype ());
+
+        let protoRef = YILAddrValue::new (ctor.getLoc (), YIL_PTR_VOID, YILVar::new (ctor.getLoc (), name, YIL_VOID, 0us));
         let instance = context:.finalizeValue (ctor.getInstance (), alias list);
         let type = context:.finalizeType (ctor.getType ());
 
-        TupleValue::new (ctor.getLoc (), type, [instance, proto], fieldNames-> [DelegateKeys::CLOSURE, DelegateKeys::FUNC])
+        YILTupleValue::new (ctor.getLoc (), type, [instance, protoRef], fieldNames-> [DelegateKeys::CLOSURE, DelegateKeys::FUNC])
     }
 
     /**
      * Finalize a delegate referenced by a function name
      * */
-    fn finalizeNameDG (self, dmut context : &Expander, name : &NameDelegateValue, dmut list : &StmtList)-> &Value {
-        let proto = self.finalizePrototype (alias context, name.getProto ());
+    fn finalizeNameDG (self, dmut context : &Expander, name : &NameDelegateValue, dmut list : &StmtList)-> &YILValue {
+        let pname = context.getMangler ().mangle (name.getProto ());
+
+        let protoRef = YILAddrValue::new (name.getLoc (), YIL_PTR_VOID, YILVar::new (name.getLoc (), pname, YIL_VOID, 0us));
         let instance = context:.finalizeValue (name.getClosure (), alias list);
         let type = context:.finalizeType (name.getType ());
 
-        TupleValue::new (name.getLoc (), type, [instance, proto], fieldNames-> [DelegateKeys::CLOSURE, DelegateKeys::FUNC])
+        YILTupleValue::new (name.getLoc (), type, [instance, protoRef], fieldNames-> [DelegateKeys::CLOSURE, DelegateKeys::FUNC])
+    }
+
+    /**
+     * Finalize a function pointer referenced by a function name
+     * */
+    fn finalizeNameFptr (self, dmut context : &Expander, name : &NameFuncPtrValue, dmut _ : &StmtList)-> &YILValue {
+        let pname = context.getMangler ().mangle (name.getProto ());
+        YILAddrValue::new (name.getLoc (), YIL_PTR_VOID, YILVar::new (name.getLoc (), pname, YIL_VOID, 0us))
     }
 
     /**
      * Finalize the creation of a method delegate value
      * */
-    fn finalizeMethodDG (self, dmut context : &Expander, meth : &MethodDelegateValue, dmut list : &StmtList)-> &Value {
+    fn finalizeMethodDG (self, dmut context : &Expander, meth : &MethodDelegateValue, dmut list : &StmtList)-> &YILValue {
         let inst = context:.finalizeValue (meth.getClosure (), alias list);
-        let proto = self.finalizePrototype (alias context, meth.getPrototype ());
-        let fptr = self.createVtableAccess (meth.getLoc (), inst, proto.getType (), meth.getVtableIndex ());
+
+        let fptr = self.createVtableAccess (meth.getLoc (), inst, meth.getVtableIndex ());
         let type = context:.finalizeType (meth.getType ());
 
-        TupleValue::new (meth.getLoc (), type, [inst, fptr], fieldNames-> [DelegateKeys::CLOSURE, DelegateKeys::FUNC])
+        YILTupleValue::new (meth.getLoc (), type, [inst, fptr], fieldNames-> [DelegateKeys::CLOSURE, DelegateKeys::FUNC])
     }
 
     /**
      * Finalize the creation of a range value
      * */
-    fn finalizeRange (self, dmut context : &Expander, rng : &RangeValue, dmut list : &StmtList)-> &Value {
+    fn finalizeRange (self, dmut context : &Expander, rng : &RangeValue, dmut list : &StmtList)-> &YILValue {
         let left = context:.finalizeValue (rng.getLeft (), alias list);
         let right = context:.finalizeValue (rng.getRight (), alias list);
         let step = context:.finalizeValue (rng.getStep (), alias list);
         let contain = context:.finalizeValue (rng.getIsFull (), alias list);
         let type = context:.finalizeType (rng.getType ());
 
-        TupleValue::new (rng.getLoc (), type, [left, right, step, contain], fieldNames-> [RangeKeys::FST, RangeKeys::SCD, RangeKeys::STEP, RangeKeys::CONTAIN])
+        YILTupleValue::new (rng.getLoc (), type, [left, right, step, contain], fieldNames-> [RangeKeys::FST, RangeKeys::SCD, RangeKeys::STEP, RangeKeys::CONTAIN])
     }
 
     /**
      * Finalize the creation of a typeinfo
      * */
-    fn finalizeTypeInfo (self, dmut context : &Expander, ti : &TypeInfoValue, dmut list : &StmtList)-> &Value {
+    fn finalizeTypeInfo (self, dmut context : &Expander, ti : &TypeInfoValue, dmut list : &StmtList)-> &YILValue {
         let id = context:.finalizeValue (ti.getId (), alias list);
         let size = context:.finalizeValue (ti.getSize (), alias list);
         let inner = context:.finalizeValue (ti.getInners (), alias list);
         let name = context:.finalizeValue (ti.getName (), alias list);
 
         let type = context:.finalizeType (ti.getType ());
-        TupleValue::new (ti.getLoc (), type, [id, size, inner, name])
+        YILTupleValue::new (ti.getLoc (), type, [id, size, inner, name])
     }
 
 }
