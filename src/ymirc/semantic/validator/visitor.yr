@@ -1637,14 +1637,14 @@ pub class Validator {
             (c : &CharType, v : &Value) => {
                 return self.verifyCompatibleTypeCharValue (loc, c, v);
             }
+            (a : &ArrayType, av : &ArrayValue) => {
+                return self.verifyCompatibleTypeArrayValue (loc, a, av);
+            }
             (s : &SliceType, _) => {
                 return self.verifyCompatibleTypeSliceValue (loc, s, value);
             }
-            (a : &ArrayType, s : &SliceValue) => {
-                return self.verifyCompatibleTypeSliceValue (loc, a, s);
-            }
-            (a : &ArrayType, av : &ArrayValue) => {
-                return self.verifyCompatibleTypeArrayValue (loc, a, av);
+            (a : &ArrayType, _) => {
+                return self.verifyCompatibleTypeSliceValue (loc, a, value);
             }
             (t : &TupleType, v : &TupleValue) => {
                 return self.verifyCompatibleTypeTupleValue (loc, t, v);
@@ -1705,7 +1705,7 @@ pub class Validator {
         {
             match (left, right) {
                 (lArr : &ArrayType, rArr : &ArrayType) => { // [&A ; 4] <= [&B ; 4] iif B over A
-                    if (lArr.getSize () == rArr.getSize ()) {
+                    if (lArr.getLen () == rArr.getLen ()) {
                         let innerLeft = lArr.getInners ()[0];
                         let innerRight = rArr.getInners ()[0];
                         self.verifyCompatibleType (innerLeft.getLoc (), innerRight.getLoc (), innerLeft, innerRight, noAncestor-> false);
@@ -1869,7 +1869,7 @@ pub class Validator {
                     }
                 }
 
-                let type = TupleType::new (v.getLoc (), types[]).clone (pattern-> v.getType ());
+                let type = TupleType::new (v.getLoc (), types[]).clone (pattern-> v.getType ()).asOf!{&TupleType} ();
                 return TupleValue::new (v.getLoc (), type, params[]);
             }
             _ => __pragma!panic ();
@@ -1893,13 +1893,13 @@ pub class Validator {
             Err (err : &ErrorMsg) => {
                 let (_, sv) = self.getCompileTimeInterpreter ().simplify (value); // simplify, maybe it is more complex than a string lit, but still cte string lit
                 match (sv, sv.getType ()) {
-                    (svLc : &SliceValue, sr : &SliceType) => {
-                        match (svLc.getInner (), slc.getInners ()[0]) { // convert the encoding of a string literal
-                            (str : &StringValue, ch : &CharType) => {
-                                return literal::string::convertStringSliceValue (value.getLoc (), str, resultSize-> ch.getSize ());
-                            }
+                    (str : &StringValue, _ : &SliceType) => {
+                        if (slc.getInners ()[0].isOf!{&CharType} ()) {
+                            let ch = slc.getInners ()[0].asOf!{&CharType} ();
+                            return literal::string::convertStringSliceValue (value.getLoc (), str, resultSize-> ch.getSize ());
                         }
-
+                    }
+                    (_ : &SliceCtorValue, sr : &SliceType) => {
                         if sr.getInners ()[0].isOf!{&VoidType} () { // slice = [];
                             return value;
                         }
@@ -1925,21 +1925,24 @@ pub class Validator {
      *     - loc: the location of the operation
      *     - a: the type of the array to alias
      *     - v: the value of the array to alias
+     *     - mutable: true if the alias is mutable (if array is not mutable, does not override its real mutability)
      * @returns: a slice ctor values, containing the address of the array as a pointer
      * */
-    pub fn createSliceAliasFromArray (self, loc : &Word, a : &ArrayType, v : &Value)-> &Value {
-        let inner = a.getInners ()[0];
-        let ptrType = PointerType::new (loc, inner, isMutable-> inner.isMutable ());
-        let arrayAddr = AddressValue::new (loc, ptrType, v);
+    pub fn createSliceAliasFromArray (self, loc : &Word, a : &ArrayType, v : &Value, mutable : bool = true)-> &Value {
+        let inner = if (mutable) {
+            a.getInners ()[0]
+        } else { a.getInners ()[0].clone (0u32) }
+        
+        let sliceType = SliceType::new (loc, inner, isMutable-> (inner.isMutable () && mutable));
 
-        let sliceType = SliceType::new (loc, inner, isMutable-> inner.isMutable ());
-        let sliceCtor = SliceCtorValue::new (loc, sliceType, arrayAddr, a.getSize ());
-        let sliceValue = SliceValue::new (loc, sliceType, sliceCtor, implicitAlias-> false);
-
-        sliceValue
+        if (a.getLen () != 0us) {
+            let ptrType = PointerType::new (loc, inner, isMutable-> inner.isMutable ());
+            let arrayAddr = AddressValue::new (loc, ptrType, v);
+            SliceCtorValue::new (loc, sliceType, arrayAddr, makeIntValue (loc, a.getLen ()))
+        } else {
+            SliceCtorValue::new (loc, sliceType, NullValue::new (loc), makeIntValue (loc, 0us))
+        }
     }
-
-
 
     /**
      * Verify that a slice value can be implicitely casted into an array value
@@ -1952,44 +1955,24 @@ pub class Validator {
      * @throws:
      *    - &ErrorMsg: if the cast is impossible or forbidden implicitely
      * */
-    fn verifyCompatibleTypeSliceValue (self, loc : &Word, arr : &ArrayType, slc : &SliceValue)-> &Value
+    fn verifyCompatibleTypeSliceValue (self, loc : &Word, arr : &ArrayType, slc : &Value)-> &Value
         throws &ErrorMsg
     {
         match self.verifyCompatibleType (loc, slc.getLoc (), arr, slc.getType ())? {
             Ok () => { return slc; } // mmh, does not seem possible ?
             Err (err : &ErrorMsg) => {
-                let (_, sv) = self.getCompileTimeInterpreter ().simplify (slc); // simplify, maybe it is more complex than a string lit, but still cte string lit
-                if (!sv.isOf!{&SliceValue} ()) throw err; // Did not return a slice ?
-                match sv.asOf!{&SliceValue} ().getInner () {
-                    s : &StringValue => {
-                        if (s.getLen () == arr.getSize ().getValue ()) { // transform a string literal into an array literal ?
-                            let dmut params = Vec!{&Value}::new ();
-                            {
-                                for i in 0us .. s.getLen () {
-                                    let cValue = match s.getEncodingSize () { // string literal can be viewed as an array literal of chars
-                                        8u16 => { makeCharValue (s.getLoc (), cast!u32 (s.getValue ().utf8[i]), size-> 8u16) }
-                                        16u16 => {  makeCharValue (s.getLoc (), cast!u32 (s.getValue ().utf16[i]), size-> 16u16) }
-                                        _ => {  makeCharValue (s.getLoc (), s.getValue ().utf32 [i], size-> 32u16) }
-                                    }
+                match arr.getInners ()[0] {
+                    c : &CharType => {
+                        let (_, sv) = self.getCompileTimeInterpreter ().simplify (slc); // simplify, maybe it is more complex than a string lit, but still cte string lit
+                        if (!sv.isOf!{&StringValue} ()) throw err; // Did not return a string value ?
+                        let s = sv.asOf!{&StringValue} ();
 
-                                    // trying implicit cast of char values to inner char of the array
-                                    // It will work if the array is indeed an array of chars, and there is no overflow
-                                    let innerV = self.verifyCompatibleTypeWithValue (s.getLoc (), arr.getInners ()[0], cValue);
-                                    params:.push (innerV);
-                                }
-                            } catch {
-                                innerErr : &ErrorMsg => {
-                                    throw err.withNote (notes-> [innerErr]);
-                                }
-                            }
-
-                            // transformed the string lit into an array lit
-                            return ArrayValue::new (slc.getLoc (), arr, params[]);
-                        }
+                        let result = convertStringArrayValue (loc, s, resultSize-> c.getSize ());
+                        if (result.getLen () == arr.getLen ()) return result;
                     }
                 }
 
-                throw err;
+                throw err
             }
             _ => __pragma!panic ();
         }
@@ -2013,11 +1996,11 @@ pub class Validator {
         match self.verifyCompatibleType (loc, value.getLoc (), arr, value.getType (), noAncestor-> true)? {
             Ok () => { return value; }
             Err (err : &ErrorMsg) => {
-                let typeLen = arr.getSize ().getValue ().toT!{usize} ();
+                let typeLen = arr.getLen ();
                 let typeInnerType = arr.getInners ()[0];
 
                 let valueInnerType = value.getType ().asOf!{&ArrayType} ().getInners ()[0];
-                let valueLen = value.getType ().asOf!{&ArrayType} ().getSize ().getValue ().toT!{usize} ();
+                let valueLen = value.getType ().asOf!{&ArrayType} ().getLen ();
 
                 match (valueLen, valueInnerType, typeLen, typeInnerType) {
                     (0us, VoidType (), 0us, _) => { // [void ; 0] -> [T ; 0]
@@ -2182,9 +2165,6 @@ pub class Validator {
     pub fn needExplicitAlias (self, type : &Type, value : &Value)-> bool {
         if (!type.needExplicitAlias ()) return false; // no data are borrowed
         match value {
-            s : &SliceValue => {
-                if (s.isAliaser ()) return false;
-            }
             AddressValue () => return false;
             AliaserValue () => return false; 
             CopierValue () => return false;
