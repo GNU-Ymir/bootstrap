@@ -441,20 +441,30 @@ pub class ForLoopValidator {
         let loc = f.getLoc ();
         let dmut values = Vec!{&Value}::new ();
 
-        let (_, fst)  = context:.getCompileTimeInterpreter ().simplify (StructFieldAccessValue::new (loc, rngType.getInners ()[0], value, RangeKeys::FST));
-        let (_, scd)  = context:.getCompileTimeInterpreter ().simplify (StructFieldAccessValue::new (loc, rngType.getInners ()[0], value, RangeKeys::SCD));
-        let (_, step) = context:.getCompileTimeInterpreter ().simplify (StructFieldAccessValue::new (loc, rngType.getInners ()[1], value, RangeKeys::STEP));
-        let (_, contains) = context:.getCompileTimeInterpreter ().simplify (StructFieldAccessValue::new (loc, BoolType::new (loc), value, RangeKeys::CONTAIN));
+        let (cteF, fst)  = context:.getCompileTimeInterpreter ().simplify (StructFieldAccessValue::new (loc, rngType.getInners ()[0], value, RangeKeys::FST));
+        let (cteE, scd)  = context:.getCompileTimeInterpreter ().simplify (StructFieldAccessValue::new (loc, rngType.getInners ()[0], value, RangeKeys::SCD));
+        let (cteS, step) = if (cteE && cteF) {
+            context:.getCompileTimeInterpreter ().simplify (StructFieldAccessValue::new (loc, rngType.getInners ()[1], value, RangeKeys::STEP))
+        } else { // if the fst and scd are unknown, we cannot know the step (even if set by stepBy that might change its sign if fst > scd)
+            (false, StructFieldAccessValue::new (loc, rngType.getInners ()[1], value, RangeKeys::STEP))
+        };
+
+        let (cteC, contains) = context:.getCompileTimeInterpreter ().simplify (StructFieldAccessValue::new (loc, BoolType::new (loc), value, RangeKeys::CONTAIN));
 
         let iterDecl = VarDeclValue::new (Word::new ("#_iter"s8, loc), IntType::new (loc, signed-> false, size-> 0u16), makeIntValue (loc, 0us), isMutable-> true, isPure-> false);
         let mut iterRef = VarRefValue::new (iterDecl.getLoc (), loc, iterDecl.getVarType (), iterDecl.getUniqId (), isSelf-> false, canCte-> false);
-
-        let nbIteration = self.validateComputeNbIterations (loc, alias context, fst, scd, step, contains);
-        let nbIterDecl = VarDeclValue::new (Word::new ("#_nb_iter"s8, loc), IntType::new (loc, signed-> false, size-> 0u16), nbIteration, isMutable-> true, isPure-> false);
-        let mut nbIterRef = VarRefValue::new (nbIterDecl.getLoc (), loc, nbIterDecl.getVarType (), nbIterDecl.getUniqId (), isSelf-> false, canCte-> false);
-
         values:.push (iterDecl);
-        values:.push (nbIterDecl);
+
+        let nbIterRef = if (!cteF || !cteE || !cteS || !cteC) {
+            let nbIteration = self.validateComputeNbIterations (loc, alias context, fst, scd, step, contains);
+            let nbIterDecl = VarDeclValue::new (Word::new ("#_nb_iter"s8, loc), IntType::new (loc, signed-> false, size-> 0u16), nbIteration, isMutable-> true, isPure-> false);
+            let mut nbIterRef = VarRefValue::new (nbIterDecl.getLoc (), loc, nbIterDecl.getVarType (), nbIterDecl.getUniqId (), isSelf-> false, canCte-> false);
+
+            values:.push (nbIterDecl);
+            nbIterRef
+        } else {
+            context:.getCompileTimeInterpreter ().compute (self.validateComputeNbIterations (loc, alias context, fst, scd, step, contains))
+        }
 
         let _loop = self.validateRangeInnerLoop (alias context, rngType, f, iterRef, nbIterRef, fst, step);
 
@@ -606,13 +616,15 @@ pub class ForLoopValidator {
      * @returns: the number of iterations of the range
      * */
     fn validateCteComputeNbIterations (self, fst : &BigInt, scd : &BigInt, step : &BigInt, max : &BigInt, contains : bool)-> &BigInt {
-        let (stepU, fstU, scdU, mut subU) = if (step < 0) {
-            (0 - step, scd, fst, fst - scd)
+        let stepU = if (step < 0) { 0 - step } else { step };
+        let (fstU, scdU, mut subU) = if (fst > scd) {
+            (scd, fst, fst - scd)
         } else {
-            (step, fst, scd, scd - fst)
+            (fst, scd, scd - fst)
         };
 
         if (stepU == 0) return BigInt::new (0);
+
         let nbAll = subU / stepU;
 
         if (nbAll == max) return nbAll;
@@ -756,21 +768,26 @@ pub class ForLoopValidator {
 
         context:.enterBlock ();
         {
-            let start = context:.getCompileTimeInterpreter ().compute (StructFieldAccessValue::new (loc, rngType.getInners ()[0], value, RangeKeys::FST));
-            let step = context:.getCompileTimeInterpreter ().compute (StructFieldAccessValue::new (loc, rngType.getInners ()[1], value, RangeKeys::STEP));
+            let start = context:.getCompileTimeInterpreter ().computeInt (StructFieldAccessValue::new (loc, rngType.getInners ()[0], value, RangeKeys::FST));
+            let step = context:.getCompileTimeInterpreter ().computeInt (StructFieldAccessValue::new (loc, rngType.getInners ()[1], value, RangeKeys::STEP));
             let contains = context:.getCompileTimeInterpreter ().computeBool (StructFieldAccessValue::new (loc, BoolType::new (loc), value, RangeKeys::CONTAIN));
-            let end = context:.getCompileTimeInterpreter ().compute (StructFieldAccessValue::new (loc, rngType.getInners ()[0], value, RangeKeys::SCD));
+            let end = context:.getCompileTimeInterpreter ().computeInt (StructFieldAccessValue::new (loc, rngType.getInners ()[0], value, RangeKeys::SCD));
 
-            let mut current = start;
+            let sizeType = IntType::new (loc, size-> 0u16, signed-> false);
+            let max = context.getCompileTimeInterpreter ().createIntMaxValue (sizeType);
+            let nbIterations = self.validateCteComputeNbIterations (start, end, step, max, contains);
 
-            loop {
-                let (isEnding, next) = self.checkEndCteRangeLoop (alias context, f.getLoc (), contains, current, end, step, rngType);
-                if (!isEnding) {
-                    let block = self.createCurrentCteBlock (alias context, f.getBlock (), rngType, vars, [current]);
-                    innerValues:.push (context:.validateValue (block));
-                    current = next;
-                    if (current.isOf!{&NoneValue} ()) break {}
-                } else break {}
+            if (nbIterations > global::state::instance ().getMaxCteLoopIter ()) {
+                throw ErrorMsg::fatal (loc, format (ValidateErrorMessage::MAX_LOOP_ITERATIONS, nbIterations, global::state::instance ().getMaxCteLoopIter ()));
+            }
+
+            let mut index = BigInt::new (0us);
+            while (index < nbIterations) {
+                let current = IntValue::new (loc, rngType.getInners ()[0].asOf!{&IntType} (), index * step + start);
+
+                let block = self.createCurrentCteBlock (alias context, f.getBlock (), rngType, vars, [current]);
+                innerValues:.push (context:.validateValue (block));
+                index += 1;
             }
         } catch {
             err : &ErrorMsg => { errors:.push (err); }
@@ -785,90 +802,6 @@ pub class ForLoopValidator {
         if (errors.len () != 0us) throw ErrorMsg::list (errors[]);
         BlockValue::new (loc, VoidType::new (loc), innerValues[])
     }
-
-    /**
-     * Check wether the current iteration is past the end of the range value
-     * @params:
-     *    - context: the context of the validation
-     *    - loc: the location of the loop
-     *    - contains: true iif the end value is contained in the range
-     *    - current: the current iteration value
-     *    - end: the end of the range value
-     *    - rngType: the type of the range
-     * */
-    fn checkEndCteRangeLoop (self, dmut context : &Validator, loc : &Word, contains : bool, current : &Value, end : &Value, step : &Value, rngType : &RangeType)-> (bool, &Value)
-        throws &ErrorMsg
-    {
-        let (inf, infEq, sup, supEq) = match rngType.getInners ()[0] {
-            IntType () => {
-                (cast!{&Value} (CmpIntOperatorValue::new (loc, BinaryOperators::INF, current, end)),
-                 cast!{&Value} (CmpIntOperatorValue::new (loc, BinaryOperators::INF_EQUAL, current, end)),
-                 cast!{&Value} (CmpIntOperatorValue::new (loc, BinaryOperators::SUP, current, end)),
-                 cast!{&Value} (CmpIntOperatorValue::new (loc, BinaryOperators::SUP_EQUAL, current, end)))
-            }
-            FloatType () => {
-                (cast!{&Value} (CmpFloatOperatorValue::new (loc, BinaryOperators::INF, current, end)),
-                 cast!{&Value} (CmpFloatOperatorValue::new (loc, BinaryOperators::INF_EQUAL, current, end)),
-                 cast!{&Value} (CmpFloatOperatorValue::new (loc, BinaryOperators::SUP, current, end)),
-                 cast!{&Value} (CmpFloatOperatorValue::new (loc, BinaryOperators::SUP_EQUAL, current, end)))
-            }
-            CharType () => {
-                (cast!{&Value} (CmpCharOperatorValue::new (loc, BinaryOperators::INF, current, end)),
-                 cast!{&Value} (CmpCharOperatorValue::new (loc, BinaryOperators::INF_EQUAL, current, end)),
-                 cast!{&Value} (CmpCharOperatorValue::new (loc, BinaryOperators::SUP, current, end)),
-                 cast!{&Value} (CmpCharOperatorValue::new (loc, BinaryOperators::SUP_EQUAL, current, end)))
-            }
-            _ => __pragma!panic ();
-        };
-
-        let stepCmp = context:.getCompileTimeInterpreter ():.computeBool (match rngType.getInners ()[1] {
-            i : &IntType => {
-                CmpIntOperatorValue::new (loc, BinaryOperators::INF, step, makeIntValue (loc, 0us, size-> i.getSize (), signed-> true))
-            }
-            f : &FloatType => {
-                CmpFloatOperatorValue::new (loc, BinaryOperators::INF, step, makeFloatValue (loc, 0.0, size-> f.getSize ()))
-            }
-            c : &CharType => {
-                CmpCharOperatorValue::new (loc, BinaryOperators::INF, step, makeCharValue (loc, 0u32, size-> c.getSize ()))
-            }
-            _ => __pragma!panic ()
-        });
-
-        let isLooping = context:.getCompileTimeInterpreter ().computeBool (match (contains, stepCmp) {
-            (true, true)  => { supEq }
-            (true, false) => { infEq }
-            (false, true) => { sup }
-            _   => { inf }
-        });
-
-        {
-            // varRef = varRef + cast!(typeof (varRef)) (step)
-            let increment = context:.getCompileTimeInterpreter ().compute (match rngType.getInners ()[0] {
-                i : &IntType => {
-                    let currentC = context:.getCastValidator ().validateCast (alias context, current, step.getType ());
-                    let bin = BinaryMathIntOperatorValue::new (loc, step.getType (), BinaryOperators::PLUS, currentC, step);
-                    context:.getCastValidator ().validateCast (alias context, bin, i)
-                }
-                f : &FloatType => {
-                    cast!{&Value} (BinaryMathFloatOperatorValue::new (loc, f, BinaryOperators::PLUS, current, step))
-                }
-                c : &CharType => {
-                    let currentC = context:.getCastValidator ().validateCast (alias context, current, step.getType ());
-                    let bin = BinaryMathIntOperatorValue::new (loc, step.getType (), BinaryOperators::PLUS, currentC, step);
-                    context:.getCastValidator ().validateCast (alias context, bin, c)
-                }
-                _ => __pragma!panic ();
-            });
-
-            (!isLooping, increment)
-        } catch {
-            err : _ => { // can fail if it reach the end of the encoding capacities of the step type, thus there is no next value
-                throw err;
-                // (!isLooping, NoneValue::new ())
-            }
-        }
-    }
-
 
 
     /**
