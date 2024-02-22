@@ -85,7 +85,7 @@ pub class TemplateSolver {
 
         if (consumed < rights.len) {
             throw ErrorMsg::fatal (rights[consumed].getLoc (), format (ValidateErrorMessage::TEMPLATE_REST, rights[consumed .. $]), notes-> [ErrorMsg::note (left.getSymbol ().getLoc (), format (ValidateErrorMessage::VALIDATING_SYMBOL, left))]);
-        } 
+        }
 
         TemplateRewriter::new (mapper) // return the rewriter that can then be used to finalize the syntax rewritting before semantic validation                
     }
@@ -454,6 +454,72 @@ pub class TemplateSolver {
     }
 
     /**
+     * Validate an explicit inner part of an of var, where the inner part is a decorated expression (A of dmut T, T)
+     * @params:
+     *     - context: the context of the validation
+     *     - alls: the list of template parameters that are not validated yet
+     *     - deco: the decorated of expression (=> ofv.getSpecialization ())
+     *     - type: the type passed to the template call
+     * @returns: the template mapper specialization
+     * @throws:
+     *    - &ErrorMsg: if the specialization failed
+     */
+    fn validateOfDecoratedExplicit (self, dmut context : &Validator, varName : [c8], alls : [&Expression], deco : &DecoratedExpr, types : [&Type])-> (&TemplateMapper, usize)
+        throws &ErrorMsg
+    {
+        let type = types [0];
+
+        let mut hasMut = EOF_WORD, mut hasDmut = EOF_WORD, mut hasConst = EOF_WORD;
+        for d in deco.getDecorators () { // Deco in template specialization can only be mut, dmut and const (not ref, cte, static, pure )
+            if (d.deco == Decorators::MUT) { hasMut = d.loc; }
+            else if (d.deco == Decorators::DMUT) { hasDmut = d.loc; }
+            else if (d.deco == Decorators::CONST) { hasConst = d.loc; }
+            else { // other decorators cannot be used for template specialization
+                throw ErrorMsg::fatal (d.loc, format (ValidateErrorMessage::UNDEF_DECORATOR_TEMPLATE, d.deco));
+            }
+        }
+
+        if (!hasDmut.isEof () && !hasMut.isEof ()) { // MUT and DMUT cannot appear at the same time
+            throw ErrorMsg::fatal (hasMut, format (ValidateErrorMessage::MULTIPLE_DECORATORS, hasMut.str ()),
+                                   notes-> [ErrorMsg::note (hasDmut, ValidateErrorMessage::DECLARED_HERE)]);
+        }
+
+        if ((!hasMut.isEof () || !hasDmut.isEof ()) && !hasConst.isEof ()) { // Same for CONST and DMUT or MUT
+            let other = if hasMut.isEof () { hasDmut } else { hasMut };
+            throw ErrorMsg::fatal (hasConst, format (ValidateErrorMessage::CONFLIT_DECORATORS, hasConst.str (), other.str ()),
+                                   notes-> [ErrorMsg::note (other, ValidateErrorMessage::DECLARED_HERE)]);
+        }
+
+        // Validate the type inside the template specialization
+        // final template type won't have the mutability lvl, this is just a checking to see wether the decorator was used in the template call
+        // For example MyTemplate!{dmut [i32]}, MyTemplate!{mut [i32]}, ...
+        let (mapper, _) = self.validateOfVarExprFromExplicit (alias context, alls, deco.getContent (), [type]);
+        if (!hasDmut.isEof ()) {
+            let lvl = type.mutabilityLevel ();
+            let lvlDMut = type.toDeeplyMutable ().mutabilityLevel ();
+            if (lvl != lvlDMut) { // if it was deeply mutable, it should have the same lvl as the same type but deeply mutable
+                throw ErrorMsg::fatal (hasDmut, format (ValidateErrorMessage::DISCARD_CONST_LEVEL,
+                                                        lvlDMut, lvl));
+            }
+        } else if (!hasMut.isEof ()) {
+            if (!type.isMutable ()) { // If the mut decorator is used the type has to be mutable
+                throw ErrorMsg::fatal (hasMut, ValidateErrorMessage::DISCARD_CONST);
+            }
+        } else if (!hasConst.isEof ()) {
+            if (type.isMutable ()) { // If the const decorator is used the type has to be const
+                let lvl = type.mutabilityLevel ();
+                throw ErrorMsg::fatal (hasMut, format (ValidateErrorMessage::DISCARD_CONST_LEVEL, lvl, 0));
+            }
+        }
+
+        let dmut retMapper = TemplateMapper::new (score-> TemplateScore::VAR * 2us);
+        retMapper:.merge (mapper);
+        retMapper:.insert (varName, self.createTypeWrapper (deco.getLoc (), type), mutable-> !hasMut.isEof (), deeplyMut-> !hasDmut.isEof ());
+
+        return (retMapper, 1us); // return the mapper containing the sub specialization
+    }
+    
+    /**
      * Validate an explicit template specialization within another one (A of U, or A : U)
      * @params:
      *    - context: the context of the validation
@@ -491,8 +557,20 @@ pub class TemplateSolver {
         if (types.len == 0us) throw ErrorMsg::fatal (expr.getLoc (), format (ValidateErrorMessage::TEMPLATE_SPECIALIZATION_FAILS, alls, types));
 
         match expr {
+            slc : &SliceAllocatorExpr => {
+                return self.validateOfSliceAllocInnerExplicit (alias context, alls, slc, types);
+            }
+            c : &TemplateCallExpr => {
+                return self.validateOfTemplateCallInnerExplicit (alias context, alls, c, types);
+            }
             var : &VarExpr => {
                 return self.validateOfVarInnerExplicit (alias context, alls, var, types);
+            }
+            p : &PathExpr => {
+                return self.validateOfPathInnerExplicit (alias context, alls, p, types);
+            }
+            b : &BinaryExpr => {
+                return self.validateOfBinaryInnerExplicit (alias context, alls, b, types);
             }
             un : &UnaryExpr => {
                 return self.validateOfUnaryInnerExplicit (alias context, alls, un, types);
@@ -507,9 +585,6 @@ pub class TemplateSolver {
                     return self.validateOfTupleInnerExplicit (alias context, alls, lst, types);
                 }
             }
-            slc : &SliceAllocatorExpr => {
-                return self.validateOfSliceAllocInnerExplicit (alias context, alls, slc, types);
-            }
             f : &FunctionPtrTypeExpr => {
                 return self.validateOfFuncPtrInnerExplicit (alias context, alls, f, types);
             }
@@ -522,7 +597,139 @@ pub class TemplateSolver {
             }                    
         }    
     }
-    
+
+    /**
+     * Validate an explicit inner part of an of var, where the inner part is a slice allocator (A of [T ; N])
+     * @params:
+     *    - context: the context of the validation
+     *    - alls: the list of template parameters that are not validated yet
+     *    - slc: the slice allocator (=> ofV.getSpecialization ())
+     *    - type: the type passed to the template call
+     * @returns: the template parameter specialization
+     * @throws:
+     *    - &ErrorMsg: if the specialization failed
+     */
+    fn validateOfSliceAllocInnerExplicit (self, dmut context : &Validator, alls : [&Expression], slc : &SliceAllocatorExpr, types : [&Type])-> (&TemplateMapper, usize)
+        throws &ErrorMsg
+    {
+        let type = types [0];
+
+        // This verification is close to slices, but with the verification of the size of the alloc that must be known at compile time
+        match type {
+            arr : &ArrayType => {
+                let dmut retMapper = TemplateMapper::new (score-> TemplateScore::VAR * 2u32);
+                let (typeMapper, _) = self.validateOfVarExprFromExplicit (alias context, alls, slc.getValue (), arr.getInners ());
+                retMapper:.merge (typeMapper);
+
+                match slc.getSize () {
+                    v : &VarExpr => {
+                        let expr = self.findExpression (v.getLoc ().str (), alls);
+                        if !expr.isOf!{&EmptyExpression} () {
+                            let (valMapper, _) = self.validateParamTemplateFromExplicit (alias context, alls, expr, [cast!(&Generator) (makeIntValue (arr.getLoc (), arr.getLen ()))]);
+                            retMapper:.merge (valMapper);
+                        }
+                    }
+                }
+
+                let finalType = self.performTemplateRewrite (slc, retMapper);
+                let ofType = context:.validateType (finalType);
+                context:.verifyCompatibleType (slc.getLoc (), type.getLoc (), ofType, type);
+
+                return (retMapper, 1us);
+            }
+            arr : &SliceType => {
+                if (!arr.getSize ().isOf!{&NoneValue} ()) {
+                    let dmut retMapper = TemplateMapper::new (score-> TemplateScore::VAR * 2u32);
+                    let (typeMapper, _) = self.validateOfVarExprFromExplicit (alias context, alls, slc.getValue (), arr.getInners ());
+                    retMapper:.merge (typeMapper);
+
+                    match slc.getSize () {
+                        v : &VarExpr => {
+                            let expr = self.findExpression (v.getLoc ().str (), alls);
+                            if !expr.isOf!{&EmptyExpression} () {
+                                let (valMapper, _) = self.validateParamTemplateFromExplicit (alias context, alls, expr, [cast!(&Generator) (arr.getSize ())]);
+                                retMapper:.merge (valMapper);
+                            }
+                        }
+                    }
+
+                    let finalType = self.performTemplateRewrite (slc, retMapper);
+                    let ofType = context:.validateType (finalType);
+                    context:.verifyCompatibleType (slc.getLoc (), type.getLoc (), ofType, type);
+
+                    return (retMapper, 1us);
+                }
+            }
+        }
+
+
+        throw ErrorMsg::fatal (type.getLoc (), format (ValidateErrorMessage::NOT_AN_ARRAY, type),
+                               notes-> [ErrorMsg::note (slc.getLoc (), ""s8)]);
+    }
+
+
+    /**
+     * Validate an explicit inner part of an of var, where the inner part is a template call (A of T!{U})
+     * @params:
+     *    - context: the context of the validation
+     *    - alls: the list of template parameters that are not validated yet
+     *    - tmp: the template call to specialize
+     *    - values: the list of values passed to the template call
+     * @returns:
+     *    - .0: the template parameter specialization
+     *    - .1: the number of consumed parameters (should be 1us)
+     * @throws:
+     *    - &ErrorMsg: if the values cannot be used to specialize the template parameter
+     * */
+    fn validateOfTemplateCallInnerExplicit (self, dmut context : &Validator, alls : [&Expression], tmp : &TemplateCallExpr, types : [&Type])-> (&TemplateMapper, usize)
+        throws &ErrorMsg
+    {
+        let type = types [0];
+        let (has, clTemplates) = self.createTemplateListOfType (type);;
+        if (!has || tmp.getRights ().len > clTemplates.len) throw ErrorMsg::fatal (type.getLoc (), format (ValidateErrorMessage::TEMPLATE_SPECIALIZATION_FAILS, tmp, type),
+                                                                                   notes-> [ErrorMsg::fatal (tmp.getLoc (), format (ValidateErrorMessage::INCOMPATIBLE_TYPE, tmp, type))]);
+
+        let dmut retMapper = TemplateMapper::new (score-> TemplateScore::VAR);
+        let rewriter = TemplateRewriter::new (retMapper);
+        let mut consumed = 0us;
+        let mut syntaxTemplate = alls;
+
+        for i in 0us .. tmp.getRights ().len {
+            let currentParam = rewriter.rewrite (tmp.getRights ()[i]);
+            let rest = clTemplates.len - consumed;
+            let syntaxRest = (tmp.getRights ().len - i) - 1us;
+
+            let consomableTypes = clTemplates [consumed .. consumed + (rest - syntaxRest)];
+            let (mapper, localConsumed) = if (consomableTypes.len > 0us && consomableTypes [0].isOf!{&Value} ()) {
+                let (mp, _) = self.validateParamTemplateFromExplicit (alias context, syntaxTemplate, currentParam, [consomableTypes [0]]);
+                (mp, 1us)
+            } else {
+                let dmut lst = Vec!{&Type}::new ();
+                for ti in consomableTypes match ti {
+                    t : &Type => { lst:.push (t); }
+                    _ => { break {} }
+                }
+                self.validateOfVarExprFromExplicit (alias context, syntaxTemplate, currentParam, lst[])
+            }
+
+            retMapper:.merge (mapper);
+            consumed += cast!usize (localConsumed);
+            syntaxTemplate = rewriter.replaceSyntaxTempl (syntaxTemplate);
+        }
+
+        {
+            let finalType = rewriter.rewrite (tmp);
+            let ofType = context:.validateType (finalType);
+            context:.verifyCompatibleType (tmp.getLoc (), type.getLoc (), ofType, type);
+        } catch {
+            err : &ErrorMsg => {
+                throw ErrorMsg::note (tmp.getLoc (), format (ValidateErrorMessage::TEMPLATE_SPE, retMapper), notes-> [err]);
+            }
+        }
+
+        return (retMapper, 1us);
+    }
+
     /**
      * Validate an explicit inner part of an of var, where the inner part is simply a VarExpr (A of T)
      * @params: 
@@ -556,7 +763,54 @@ pub class TemplateSolver {
         }
     }
 
-    
+    /**
+     * Validate an explicit inner part of an of var, where the inner part is a path expression (A of T::U)
+     * @params:
+     *    - context: the context of the validation
+     *    - alls: the list of template parameters that are not validated yet
+     *    - p: the inner part of the ofvar (=> ofV.getSpecialization ())
+     *    - values: the list of values passed to the template call
+     * @returns:
+     *    - .0: the template parameter specialization
+     *    - .1: the number of consumed parameters (should be 1us)
+     * @throws:
+     *    - &ErrorMsg: if the values cannot be used to specialize the template parameter
+     * */
+    fn validateOfPathInnerExplicit (self, dmut context : &Validator, alls : [&Expression], p : &PathExpr, types : [&Type])-> (&TemplateMapper, usize)
+        throws &ErrorMsg
+    {
+        context;
+        alls;
+        p;
+        types;
+        __pragma!fake_throw (&ErrorMsg);
+        __pragma!panic ();
+    }
+
+    /**
+     * Validate an explicit inner part of an of var, where the inner part is a binary expression (A of T::U)
+     * @params:
+     *    - context: the context of the validation
+     *    - alls: the list of template parameters that are not validated yet
+     *    - bin: the inner part of the ofvar (=> ofV.getSpecialization ())
+     *    - values: the list of values passed to the template call
+     * @returns:
+     *    - .0: the template parameter specialization
+     *    - .1: the number of consumed parameters (should be 1us)
+     * @throws:
+     *    - &ErrorMsg: if the values cannot be used to specialize the template parameter
+     * */
+    fn validateOfBinaryInnerExplicit (self, dmut context : &Validator, alls : [&Expression], bin : &BinaryExpr, types : [&Type])-> (&TemplateMapper, usize)
+        throws &ErrorMsg
+    {
+        context;
+        alls;
+        bin;
+        types;
+        __pragma!fake_throw (&ErrorMsg);
+        __pragma!panic ();
+    }
+
     /**
      * Validate an explicit inner part of an of var, where the inner part is a UnaryExpr (A of &T)
      * @params: 
@@ -637,7 +891,110 @@ pub class TemplateSolver {
         return (retMapper, 1us);
     }
 
+    /**
+     * Validate an explicit inner part of an of var, where the inner part is a slice ListExpr (A of [T])
+     * @params:
+     *    - context: the context of the validation
+     *    - alls: the list of template parameters that are not validated yet
+     *    - ofV: the of var expression
+     *    - lst: the lsit expression (=> ofV.getSpecialization ())
+     *    - type: the type passed to the template call
+     * @returns:
+     *    - .0: the template parameter specialization
+     *    - .1: the number of consumed parameters (should be 1us)
+     * @throws:
+     *    - &ErrorMsg: if the specialization failed
+     */
+    fn validateOfSliceInnerExplicit (self, dmut context : &Validator, alls : [&Expression], lst : &ListExpr, types : [&Type])-> (&TemplateMapper, usize)
+        throws &ErrorMsg
+    {
+        let type = types [0];
+        if (lst.getParameters ().len != 1us)  throw ErrorMsg::fatal (lst.getLoc (), format (ValidateErrorMessage::USE_AS_TYPE_TEMPLATE, lst)); // the template is malformed
 
+        match type {
+            slc : &SliceType => { // This verification is pretty straightfoward, we just need to verify that we have a slice, and validate what is inner the template slice
+                let (mapper, _) = self.validateOfVarExprFromExplicit (alias context, alls, lst.getParameters ()[0us], slc.getInners ()); // so, we validate the inner part
+
+                let finalType = self.performTemplateRewrite (lst, mapper);
+                let ofType = context:.validateType (finalType);
+                context:.verifyCompatibleType (lst.getLoc (), type.getLoc (), ofType, type); // and verify that the two elements are equivalent
+
+                let dmut retMapper = TemplateMapper::new (score-> TemplateScore::VAR);
+                retMapper:.merge (mapper);
+
+                return (retMapper, 1us);
+            }
+            _ => {
+                throw ErrorMsg::fatal (type.getLoc (), format (ValidateErrorMessage::NOT_A_SLICE, type),
+                                       notes-> [ErrorMsg::note (lst.getLoc (), ""s8)]);
+
+            }
+        }
+    }
+
+    /**
+     * Validate an explicit inner part of an of var, where the inner part is a tuple ListExpr (A of (T, U, V))
+     * @params:
+     *    - context: the context of the validation
+     *    - alls: the list of template parameters that are not validated yet
+     *    - lst: the list expression (=> ofV.getSpecialization ())
+     *    - type: the type passed to the template call
+     * @returns: the template parameter specialization
+     * @throws:
+     *    - &ErrorMsg: if the specialization failed
+     */
+    fn validateOfTupleInnerExplicit (self, dmut context : &Validator, alls : [&Expression], lst : &ListExpr, types : [&Type])-> (&TemplateMapper, usize)
+        throws &ErrorMsg
+    {
+        let type = types [0];
+
+        match type {
+            t : &TupleType => {
+                // Because the inner elements of the template tuple could be variadic templates, we must manage it
+                let dmut retMapper = TemplateMapper::new (score-> TemplateScore::VAR * 2u32);
+                let mut consumed = 0us;
+
+                // For the specialization to work, we need to have more or same number of types in the tuple than in the template => (T of (U, J...), J),  call!{(i32, i32, i32)}
+                if (lst.getParameters ().len > t.getInners ().len) throw ErrorMsg::fatal (t.getLoc (), format (ValidateErrorMessage::MISMATCH_TUPLE_ARITY, t.getInners ().len, lst.getParameters ().len),
+                                                                                          notes-> [ErrorMsg::note (lst.getLoc (), ""s8)]);
+                let rewriter = TemplateRewriter::new (retMapper);
+                let mut syntTemplate = alls;
+                for i in 0us .. lst.getParameters ().len {
+                    let currentParam = rewriter.rewrite (lst.getParameters ()[i]); // maybe some resolution already happened, we don't want to have collision in the mapper (e.g. (T of (U, U, U), U))
+                    let rest = t.getInners ().len - consumed;
+                    let syntaxRest = (lst.getParameters ().len - i) - 1us;
+
+                    // Give all the types that rests for variadics, I don't see a better way, because last elements could be other things than templates, so variadics must be the last template elements
+                    let consomableTypes = t.getInners ()[consumed .. consumed + (rest - syntaxRest)];
+                    let (mapper, localConsumed) = self.validateOfVarExprFromExplicit (alias context, syntTemplate, currentParam, consomableTypes);
+
+                    // Merging the mapper
+                    retMapper:.merge (mapper);
+                    consumed += cast!usize (localConsumed); // increment the number of used types
+                    syntTemplate = rewriter.replaceSyntaxTempl (syntTemplate);
+                }
+
+                {
+                    // we don't check if all types of "type" were used,
+                    // there is not need, because we validate the template, and check if it is equivalent to "type", so if some elements of "type" were unused, it should fail here
+                    let finalType = rewriter.rewrite (lst);
+                    let ofType = context:.validateType (finalType);
+                    context:.verifyCompatibleType (lst.getLoc (), type.getLoc (), ofType, type);
+                } catch {
+                    err : &ErrorMsg => {
+                        throw ErrorMsg::note (lst.getLoc (), format (ValidateErrorMessage::TEMPLATE_SPE, retMapper), notes-> [err]);
+                    }
+                }
+
+                return (retMapper, 1us);
+            }
+            _ => {
+                throw ErrorMsg::fatal (type.getLoc (), format (ValidateErrorMessage::NOT_A_TUPLE, type),
+                                       notes-> [ErrorMsg::note (lst.getLoc (), ""s8)]);
+            }
+        }
+    }
+    
     /**
      * Validate an explicit inner part of an of var, where the inner part is a FunctionPtrTypeExpr (A of fn (U)-> J)
      * @params:
@@ -700,246 +1057,8 @@ pub class TemplateSolver {
         return (retMapper, 1us);
     }
 
-    /**
-     * Validate an explicit inner part of an of var, where the inner part is a slice ListExpr (A of [T])
-     * @params: 
-     *    - context: the context of the validation
-     *    - alls: the list of template parameters that are not validated yet
-     *    - ofV: the of var expression
-     *    - lst: the lsit expression (=> ofV.getSpecialization ())
-     *    - type: the type passed to the template call
-     * @returns: 
-     *    - .0: the template parameter specialization
-     *    - .1: the number of consumed parameters (should be 1us)
-     * @throws:
-     *    - &ErrorMsg: if the specialization failed
-     */
-    fn validateOfSliceInnerExplicit (self, dmut context : &Validator, alls : [&Expression], lst : &ListExpr, types : [&Type])-> (&TemplateMapper, usize)
-        throws &ErrorMsg
-    {
-        let type = types [0];
-        if (lst.getParameters ().len != 1us)  throw ErrorMsg::fatal (lst.getLoc (), format (ValidateErrorMessage::USE_AS_TYPE_TEMPLATE, lst)); // the template is malformed
-
-        match type {
-            slc : &SliceType => { // This verification is pretty straightfoward, we just need to verify that we have a slice, and validate what is inner the template slice
-                let (mapper, _) = self.validateOfVarExprFromExplicit (alias context, alls, lst.getParameters ()[0us], slc.getInners ()); // so, we validate the inner part
-
-                let finalType = self.performTemplateRewrite (lst, mapper);
-                let ofType = context:.validateType (finalType); 
-                context:.verifyCompatibleType (lst.getLoc (), type.getLoc (), ofType, type); // and verify that the two elements are equivalent
-
-                let dmut retMapper = TemplateMapper::new (score-> TemplateScore::VAR);
-                retMapper:.merge (mapper);
-
-                return (retMapper, 1us);
-            }
-            _ => {
-                throw ErrorMsg::fatal (type.getLoc (), format (ValidateErrorMessage::NOT_A_SLICE, type),
-                                       notes-> [ErrorMsg::note (lst.getLoc (), ""s8)]);
-                
-            }
-        }
-    }
-
-    /**
-     * Validate an explicit inner part of an of var, where the inner part is a decorated expression (A of dmut T, T)
-     * @params:
-     *     - context: the context of the validation
-     *     - alls: the list of template parameters that are not validated yet
-     *     - deco: the decorated of expression (=> ofv.getSpecialization ())
-     *     - type: the type passed to the template call
-     * @returns: the template mapper specialization
-     * @throws:
-     *    - &ErrorMsg: if the specialization failed
-     */
-    fn validateOfDecoratedExplicit (self, dmut context : &Validator, varName : [c8], alls : [&Expression], deco : &DecoratedExpr, types : [&Type])-> (&TemplateMapper, usize)
-        throws &ErrorMsg
-    {
-        let type = types [0];
-
-        let mut hasMut = EOF_WORD, mut hasDmut = EOF_WORD, mut hasConst = EOF_WORD;
-        for d in deco.getDecorators () { // Deco in template specialization can only be mut, dmut and const (not ref, cte, static, pure )
-            if (d.deco == Decorators::MUT) { hasMut = d.loc; }
-            else if (d.deco == Decorators::DMUT) { hasDmut = d.loc; }
-            else if (d.deco == Decorators::CONST) { hasConst = d.loc; }
-            else { // other decorators cannot be used for template specialization
-                throw ErrorMsg::fatal (d.loc, format (ValidateErrorMessage::UNDEF_DECORATOR_TEMPLATE, d.deco));
-            }
-        }
-
-        if (!hasDmut.isEof () && !hasMut.isEof ()) { // MUT and DMUT cannot appear at the same time
-            throw ErrorMsg::fatal (hasMut, format (ValidateErrorMessage::MULTIPLE_DECORATORS, hasMut.str ()),
-                                   notes-> [ErrorMsg::note (hasDmut, ValidateErrorMessage::DECLARED_HERE)]);      
-        }
-
-        if ((!hasMut.isEof () || !hasDmut.isEof ()) && !hasConst.isEof ()) { // Same for CONST and DMUT or MUT
-            let other = if hasMut.isEof () { hasDmut } else { hasMut };
-            throw ErrorMsg::fatal (hasConst, format (ValidateErrorMessage::CONFLIT_DECORATORS, hasConst.str (), other.str ()),
-                                   notes-> [ErrorMsg::note (other, ValidateErrorMessage::DECLARED_HERE)]);      
-        }
-        
-        // Validate the type inside the template specialization
-        // final template type won't have the mutability lvl, this is just a checking to see wether the decorator was used in the template call
-        // For example MyTemplate!{dmut [i32]}, MyTemplate!{mut [i32]}, ...
-        let (mapper, _) = self.validateOfVarExprFromExplicit (alias context, alls, deco.getContent (), [type]);
-        if (!hasDmut.isEof ()) { 
-            let lvl = type.mutabilityLevel ();
-            let lvlDMut = type.toDeeplyMutable ().mutabilityLevel (); 
-            if (lvl != lvlDMut) { // if it was deeply mutable, it should have the same lvl as the same type but deeply mutable
-                throw ErrorMsg::fatal (hasDmut, format (ValidateErrorMessage::DISCARD_CONST_LEVEL,
-                                                        lvlDMut, lvl));
-            }
-        } else if (!hasMut.isEof ()) {
-            if (!type.isMutable ()) { // If the mut decorator is used the type has to be mutable
-                throw ErrorMsg::fatal (hasMut, ValidateErrorMessage::DISCARD_CONST);
-            }
-        } else if (!hasConst.isEof ()) {
-            if (type.isMutable ()) { // If the const decorator is used the type has to be const
-                let lvl = type.mutabilityLevel ();
-                throw ErrorMsg::fatal (hasMut, format (ValidateErrorMessage::DISCARD_CONST_LEVEL, lvl, 0));
-            }
-        }
-
-        let dmut retMapper = TemplateMapper::new (score-> TemplateScore::VAR);
-        retMapper:.merge (mapper);
-        retMapper:.insert (varName, self.createTypeWrapper (deco.getLoc (), type), mutable-> !hasMut.isEof (), deeplyMut-> !hasDmut.isEof ());
-
-        return (retMapper, 1us); // return the mapper containing the sub specialization
-    }    
-    
-    /**
-     * Validate an explicit inner part of an of var, where the inner part is a tuple ListExpr (A of (T, U, V))
-     * @params: 
-     *    - context: the context of the validation
-     *    - alls: the list of template parameters that are not validated yet
-     *    - lst: the list expression (=> ofV.getSpecialization ())
-     *    - type: the type passed to the template call
-     * @returns: the template parameter specialization
-     * @throws:
-     *    - &ErrorMsg: if the specialization failed
-     */
-    fn validateOfTupleInnerExplicit (self, dmut context : &Validator, alls : [&Expression], lst : &ListExpr, types : [&Type])-> (&TemplateMapper, usize)
-        throws &ErrorMsg
-    {
-        let type = types [0];
-
-        match type {
-            t : &TupleType => {
-                // Because the inner elements of the template tuple could be variadic templates, we must manage it
-                let dmut retMapper = TemplateMapper::new (score-> TemplateScore::VAR * 2u32);
-                let mut consumed = 0us;
-                
-                // For the specialization to work, we need to have more or same number of types in the tuple than in the template => (T of (U, J...), J),  call!{(i32, i32, i32)} 
-                if (lst.getParameters ().len > t.getInners ().len) throw ErrorMsg::fatal (t.getLoc (), format (ValidateErrorMessage::MISMATCH_TUPLE_ARITY, t.getInners ().len, lst.getParameters ().len),
-                                                                                          notes-> [ErrorMsg::note (lst.getLoc (), ""s8)]);
-                let rewriter = TemplateRewriter::new (retMapper);
-                let mut syntTemplate = alls;
-                for i in 0us .. lst.getParameters ().len {
-                    let currentParam = rewriter.rewrite (lst.getParameters ()[i]); // maybe some resolution already happened, we don't want to have collision in the mapper (e.g. (T of (U, U, U), U))
-                    let rest = t.getInners ().len - consumed;
-                    let syntaxRest = (lst.getParameters ().len - i) - 1us;
-
-                    // Give all the types that rests for variadics, I don't see a better way, because last elements could be other things than templates, so variadics must be the last template elements
-                    let consomableTypes = t.getInners ()[consumed .. consumed + (rest - syntaxRest)];
-                    let (mapper, localConsumed) = self.validateOfVarExprFromExplicit (alias context, syntTemplate, currentParam, consomableTypes);
-
-                    // Merging the mapper
-                    retMapper:.merge (mapper);
-                    consumed += cast!usize (localConsumed); // increment the number of used types
-                    syntTemplate = rewriter.replaceSyntaxTempl (syntTemplate);
-                }
-
-                {
-                    // we don't check if all types of "type" were used,
-                    // there is not need, because we validate the template, and check if it is equivalent to "type", so if some elements of "type" were unused, it should fail here
-                    let finalType = rewriter.rewrite (lst);
-                    let ofType = context:.validateType (finalType);
-                    context:.verifyCompatibleType (lst.getLoc (), type.getLoc (), ofType, type);
-                } catch {
-                    err : &ErrorMsg => {
-                        throw ErrorMsg::note (lst.getLoc (), format (ValidateErrorMessage::TEMPLATE_SPE, retMapper), notes-> [err]);
-                    }
-                }
-
-                return (retMapper, 1us);
-            }
-            _ => {
-                throw ErrorMsg::fatal (type.getLoc (), format (ValidateErrorMessage::NOT_A_TUPLE, type),
-                                       notes-> [ErrorMsg::note (lst.getLoc (), ""s8)]);
-            }
-        }
-    }
 
 
-    /**
-     * Validate an explicit inner part of an of var, where the inner part is a slice allocator (A of [T ; N])
-     * @params: 
-     *    - context: the context of the validation
-     *    - alls: the list of template parameters that are not validated yet
-     *    - slc: the slice allocator (=> ofV.getSpecialization ())
-     *    - type: the type passed to the template call
-     * @returns: the template parameter specialization
-     * @throws:
-     *    - &ErrorMsg: if the specialization failed
-     */
-    fn validateOfSliceAllocInnerExplicit (self, dmut context : &Validator, alls : [&Expression], slc : &SliceAllocatorExpr, types : [&Type])-> (&TemplateMapper, usize)
-        throws &ErrorMsg
-    {
-        let type = types [0];
-
-        // This verification is close to slices, but with the verification of the size of the alloc that must be known at compile time
-        match type {
-            arr : &ArrayType => {
-                let dmut retMapper = TemplateMapper::new (score-> TemplateScore::VAR * 2u32);
-                let (typeMapper, _) = self.validateOfVarExprFromExplicit (alias context, alls, slc.getValue (), arr.getInners ());
-                retMapper:.merge (typeMapper);
-
-                match slc.getSize () {
-                    v : &VarExpr => {
-                        let expr = self.findExpression (v.getLoc ().str (), alls);
-                        if !expr.isOf!{&EmptyExpression} () {
-                            let (valMapper, _) = self.validateParamTemplateFromExplicit (alias context, alls, expr, [cast!(&Generator) (makeIntValue (arr.getLoc (), arr.getLen ()))]);
-                            retMapper:.merge (valMapper);
-                        }
-                    }
-                }
-
-                let finalType = self.performTemplateRewrite (slc, retMapper);
-                let ofType = context:.validateType (finalType);
-                context:.verifyCompatibleType (slc.getLoc (), type.getLoc (), ofType, type);
-
-                return (retMapper, 1us);
-            }
-            arr : &SliceType => {
-                if (!arr.getSize ().isOf!{&NoneValue} ()) {
-                    let dmut retMapper = TemplateMapper::new (score-> TemplateScore::VAR * 2u32);
-                    let (typeMapper, _) = self.validateOfVarExprFromExplicit (alias context, alls, slc.getValue (), arr.getInners ());
-                    retMapper:.merge (typeMapper);
-
-                    match slc.getSize () {
-                        v : &VarExpr => {
-                            let expr = self.findExpression (v.getLoc ().str (), alls);
-                            if !expr.isOf!{&EmptyExpression} () {
-                                let (valMapper, _) = self.validateParamTemplateFromExplicit (alias context, alls, expr, [cast!(&Generator) (arr.getSize ())]);
-                                retMapper:.merge (valMapper);
-                            }
-                        }
-                    }
-
-                    let finalType = self.performTemplateRewrite (slc, retMapper);
-                    let ofType = context:.validateType (finalType);
-                    context:.verifyCompatibleType (slc.getLoc (), type.getLoc (), ofType, type);
-
-                    return (retMapper, 1us);
-                }
-            }
-        }
-
-
-        throw ErrorMsg::fatal (type.getLoc (), format (ValidateErrorMessage::NOT_AN_ARRAY, type),
-                               notes-> [ErrorMsg::note (slc.getLoc (), ""s8)]);
-    }
-    
     /**
      * ================================================================================
      * ================================================================================
@@ -1681,12 +1800,7 @@ pub class TemplateSolver {
             syntTemplate = rewriter.replaceSyntaxTempl (syntTemplate);
         }
 
-        let param = rewriter.rewrite (tmp.getLeft ());
-        let (mapper, _) = self.validateTypeFromImplicit (alias context, syntTemplate, param, [types [0]]);
-
-        retMapper:.merge (mapper);
         return (retMapper, 1u32);
-
     }
 
     /**
