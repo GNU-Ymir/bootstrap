@@ -579,33 +579,29 @@ pub class ForLoopValidator {
     fn validateComputeNbIterations (self, loc : &Word, dmut context : &Validator, fst : &Value, scd : &Value, step : &Value, contains : &Value)-> &Value
         throws &ErrorMsg
     {
+        let sizeType = IntType::new (loc, size-> 0u16, signed-> false);
+        let max = context.getCompileTimeInterpreter ().createIntMaxValue (sizeType);
+
         match (fst, scd, step, contains) {
             (fstI : &IntValue, scdI : &IntValue, stepI : &IntValue, containsB : &BoolValue) =>
             {
-                let sizeType = IntType::new (loc, size-> 0u16, signed-> false);
-                let max = context.getCompileTimeInterpreter ().createIntMaxValue (sizeType);
-                IntValue::new (loc, sizeType, self.validateCteComputeNbIterations (fstI.getValue (), scdI.getValue (), stepI.getValue (), max, containsB.isTrue ()))
+                return IntValue::new (loc, sizeType, self.validateCteComputeNbIterations (fstI.getValue (), scdI.getValue (), stepI.getValue (), max, containsB.isTrue ()));
             }
             _ => {
-                let syntVar = context.createSyntaxVarFromPath (loc, [CoreNames::CORE_MODULE, CoreNames::RANGE_MODULE, CoreNames::COUNT_NB_ITERATIONS]);
-                let rights = [ValueWrapperExpr::new (loc, fst),
-                              ValueWrapperExpr::new (loc, scd),
-                              ValueWrapperExpr::new (loc, step),
-                              ValueWrapperExpr::new (loc, contains)];
+                let val = if (step.isOf!{&IntValue} () && contains.isOf!{&BoolValue} ()) {
+                    // Almost cte, we can infer some things as step and contains are known
+                    self.validateAlmostCteComputeNbIterations (loc, fst, scd, step.asOf!{&IntValue} ().getValue (), max, contains.asOf!{&BoolValue} ().isTrue ())
+                } else {
+                    self.validateNonCteComputeNbIterations (loc, fst, scd, step, max, contains)
+                };
 
-                let callExpr = MultOperatorExpr::new (Word::new (Tokens::LPAR, loc),
-                                                      Word::new (Tokens::RPAR, loc),
-                                                      left-> syntVar,
-                                                      rights-> rights, canBeDotCall-> false);
-
-
-                return context:.validateValue (callExpr);
+                return context.getCompileTimeInterpreter ().reduce (val);
             }
         }
     }
 
     /**
-     * Cte version of compute the number of iterations of a range
+     * Cte version of fun to compute the number of iterations of a range
      * @params:
      *     - fst: the cte fst value of the range
      *     - scd: the cte scd value of the range
@@ -616,13 +612,13 @@ pub class ForLoopValidator {
      * */
     fn validateCteComputeNbIterations (self, fst : &BigInt, scd : &BigInt, step : &BigInt, max : &BigInt, contains : bool)-> &BigInt {
         let stepU = if (step < 0) { 0 - step } else { step };
-        let (fstU, scdU, mut subU) = if (fst > scd) {
+        if (stepU == 0) return BigInt::new (0);
+
+        let (fstU, scdU, subU) = if (fst > scd) {
             (scd, fst, fst - scd)
         } else {
             (fst, scd, scd - fst)
         };
-
-        if (stepU == 0) return BigInt::new (0);
 
         let nbAll = subU / stepU;
 
@@ -637,6 +633,108 @@ pub class ForLoopValidator {
     } catch {
         _ => __pragma!panic (); // stepU == 0
     }
+
+    /**
+     * Almost cte version of the function used to compute the number of iteration in a range
+     * Almost because fst and scd are not cte, but step and contains are (it can happen a lot actually, ex: for i in 0 .. a.len, with a : [T])
+     * @params:
+     *     - fst: the fst value of the range
+     *     - scd: the scd value of the range
+     *     - step: the cte step value of the range
+     *     - max: the maximal int value reprensentable in the target language
+     *     - contains: the cte contains value of the range
+     * @returns: an expression used to compute the number of iteration in the range
+     * */
+    fn validateAlmostCteComputeNbIterations (self, loc : &Word, fst : &Value, scd : &Value, step : &BigInt, max : &BigInt, contains : bool)-> &Value {
+        let stepU = if (step < 0) { 0 - step } else { step };
+        if (stepU == 0) return makeIntValue (0us);
+
+        let rngType = fst.getType ().asOf!{&IntType} ();
+        let (fstU, scdU, mut subU) = if (step < 0) {
+            (scd, fst, BinaryMathIntOperatorValue::new (loc, rngType, BinaryOperators::MINUS, fst, scd))
+        } else {
+            (fst, scd, BinaryMathIntOperatorValue::new (loc, rngType, BinaryOperators::MINUS, scd, fst))
+        };
+
+        let stepI = IntValue::new (loc, rngType, stepU);
+        let maxI = IntValue::new (loc, rngType, max);
+        let nbAll = BinaryMathIntOperatorValue::new (loc, rngType, BinaryOperators::DIV, subU, stepI);
+        let nbAllP1 = BinaryMathIntOperatorValue::new (loc, rngType, BinaryOperators::PLUS, nbAll, IntValue::new (loc, rngType, 1us));
+
+        if (contains) {
+            let cmp = CmpIntOperatorValue::new (loc, BinaryOperators::DEQUAL, nbAll, maxI);
+            return ConditionalValue::new (loc, rngType, cmp, nbAll, nbAllP1); // if contains { return if (nbAll == max) { nbAll } else { nbAll + 1 } }
+        }
+
+        let mulNbAll = BinaryMathIntOperatorValue::new (loc, rngType, BinaryOperators::STAR, nbAll, stepI);
+        let last = BinaryMathIntOperatorValue::new (loc, rngType, BinaryOperators::PLUS, mulNbAll, fstU);
+
+        let cmp = CmpIntOperatorValue::new (loc, BinaryOperators::NOT_EQUAL, last, scdU);
+        return ConditionalValue::new (loc, rngType, cmp, nbAllP1, nbAll); // return if (last == scdU) { nbAll } else { nbAll + 1 };
+    }
+
+
+    /**
+     * Completely non cte version of the function used to compute the number of iteration in a range
+     * * @params:
+     *     - fst: the fst value of the range
+     *     - scd: the scd value of the range
+     *     - step: the step value of the range
+     *     - max: the maximal int value reprensentable in the target language
+     *     - contains: the contains value of the range
+     * @returns: an expression used to compute the number of iteration in the range
+     * */
+    fn validateNonCteComputeNbIterations (self, loc : &Word, fstV : &Value, scdV : &Value, stepV : &Value, max : &BigInt, contains : &Value)-> &Value {
+        let dmut lst = Vec!{&Value}::new ();
+
+        let rngTuType = TupleType::new (loc, [fstV.getType (), scdV.getType (), stepV.getType ()]);
+        let vdecl = VarDeclValue::new (Word::new ("#_range"s8, loc), rngTuType, TupleValue::new (loc, rngTuType, [fstV, scdV, stepV]), isMutable-> false, isPure-> false);
+        let vref = VarRefValue::new (vdecl.getLoc (), loc, rngTuType, vdecl.getUniqId (), isSelf-> false, canCte-> true);
+
+        lst:.push (vdecl);
+
+        let fst = TupleFieldAccessValue::new (loc, rngTuType.getInners ()[0], vref, 0us);
+        let scd = TupleFieldAccessValue::new (loc, rngTuType.getInners ()[1], vref, 1us);
+        let step = TupleFieldAccessValue::new (loc, rngTuType.getInners ()[2], vref, 2us);
+
+        let rngType = fst.getType ().asOf!{&IntType} ();
+        let stepCmp = CmpIntOperatorValue::new (loc, BinaryOperators::INF, step, IntValue::new (loc, step.getType ().asOf!{&IntType} (), 0us));
+
+        let tuType = TupleType::new (loc, [rngType, rngType, rngType, rngType]);
+        let valNeg = TupleValue::new (loc, tuType, [UnaryIntOperatorValue::new (loc, step.getType ().asOf!{&IntType} (), UnaryOperators::MINUS, step), scd, fst, BinaryMathIntOperatorValue::new (loc, rngType, BinaryOperators::MINUS, fst, scd)]);
+        let valPos = TupleValue::new (loc, tuType, [step, fst, scd, BinaryMathIntOperatorValue::new (loc, rngType, BinaryOperators::MINUS, scd, fst)]);
+
+        let valDecl = VarDeclValue::new (Word::new ("#_val"s8, loc), tuType, ConditionalValue::new (loc, tuType, stepCmp, valNeg, valPos), isMutable-> false, isPure-> false);
+        let val = VarRefValue::new (valDecl.getLoc (), loc, tuType, valDecl.getUniqId (), isSelf-> false, canCte-> true);
+        lst:.push (valDecl);
+
+        let maxI = IntValue::new (loc, rngType, max);
+        let stepU = TupleFieldAccessValue::new (loc, rngType, val, 0us);
+        let fstU = TupleFieldAccessValue::new (loc, rngType, val, 1us);
+        let scdU = TupleFieldAccessValue::new (loc, rngType, val, 2us);
+        let subU = TupleFieldAccessValue::new (loc, rngType, val, 3us);
+
+        let nbAllDecl = VarDeclValue::new (Word::new ("#_nbAll"s8, loc), rngType, BinaryMathIntOperatorValue::new (loc, rngType, BinaryOperators::DIV, subU, stepU), isMutable-> false, isPure-> false);
+        let nbAll = VarRefValue::new (nbAllDecl.getLoc (), loc, rngType, nbAllDecl.getUniqId (), isSelf-> false, canCte-> true);
+        lst:.push (nbAllDecl);
+
+        let valIfNoMax = {
+            let mulNbAll = BinaryMathIntOperatorValue::new (loc, rngType, BinaryOperators::STAR, nbAll, stepU);
+            let last = BinaryMathIntOperatorValue::new (loc, rngType, BinaryOperators::PLUS, mulNbAll, fstU);
+
+            let nbAllP1 = BinaryMathIntOperatorValue::new (loc, rngType, BinaryOperators::PLUS, nbAll, IntValue::new (loc, rngType, 1us));
+            let cmp = LogicalBinBoolOperatorValue::new (loc, BinaryOperators::DPIPE, CmpIntOperatorValue::new (loc, BinaryOperators::NOT_EQUAL, last, scdU), contains);
+            ConditionalValue::new (loc, rngType, cmp, nbAllP1, nbAll)
+        };
+
+        // if (nbAll == max) { nbAll } else { let last = (nbAll * stepU) + fstU; if (last != scdU || contains) { nbAll + 1 } else { nbAll } };
+        let cmp = CmpIntOperatorValue::new (loc, BinaryOperators::DEQUAL, nbAll, maxI);
+        let cnd = ConditionalValue::new (loc, rngType, cmp, nbAll, valIfNoMax);
+        lst:.push (cnd);
+
+        return BlockValue::new (loc, rngType, lst[]);
+    }
+
 
     /**
      * ================================================================================
