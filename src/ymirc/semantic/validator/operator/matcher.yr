@@ -41,7 +41,7 @@ pub class MatcherValidator {
     pub fn validate (self, dmut context : &Validator, m : &MatcherExpr)-> &Value
         throws &ErrorMsg
     {
-        let mValue = context:.validateValue (m.getContent ());
+        let mValue = context:.getValueValidator ().validate (alias context, m.getContent (), canBeRef-> true);
         let matchers = m.getMatchers ();
         let (conds, values, errors, type, complete) = self.validateMatchers (alias context, m.getLoc (), mValue, matchers);
 
@@ -96,12 +96,15 @@ pub class MatcherValidator {
                     throw ErrorMsg::fatal (mtch.0.getLoc (), ValidateErrorMessage::UNREACHABLE_MATCHER);
                 }
 
-                let cond = self.validateMatcher (alias context, value, mtch.0);
+                let dmut vars = Vec!{&Value}::new ();
+                let cond = self.validateMatcher (alias context, value, mtch.0, alias vars);
                 conds:.push (cond);
 
                 let mut val = context:.validateValue (mtch.1);
                 let (t, v) = context:.inferTypeBranchingWithValue (finType.getLoc (), finType, val);
-                values:.push (v);
+                vars:.push (v);
+
+                values:.push (BlockValue::new (mtch.1.getLoc (), v.getType (), vars[]));
                 finType = t;
 
                 currentTautCond = match currentTautCond {
@@ -166,21 +169,21 @@ pub class MatcherValidator {
      *   - mtch: the matcher expression
      * @returns: the condition to evaluate at runtime
      * */
-    fn validateMatcher (self, dmut context : &Validator, value : &Value, mtch : &Expression)-> &Value
+    fn validateMatcher (self, dmut context : &Validator, value : &Value, mtch : &Expression, dmut vars : &Vec!{&Value})-> &Value
         throws &ErrorMsg
     {
         return match mtch {
             v : &VarDeclExpr => {
-                self.validateVarDeclMatcher (alias context, value, v)
+                self.validateVarDeclMatcher (alias context, value, v, alias vars)
             }
             m : &MultOperatorExpr => {
-                self.validateCallOpMatcher (alias context, value, m)
+                self.validateCallOpMatcher (alias context, value, m, alias vars)
             }
             l : &ListExpr => {
                 if (l.getLoc () == Tokens::LPAR) {
-                    self.validateTupleMatcher (alias context, value, l)
+                    self.validateTupleMatcher (alias context, value, l, alias vars)
                 } else {
-                    self.validateArrayMatcher (alias context, value, l)
+                    self.validateArrayMatcher (alias context, value, l, alias vars)
                 }
             }
             _ => {
@@ -197,35 +200,71 @@ pub class MatcherValidator {
      *    - vdecl: the variable declaration
      * @returns: the condition to evaluate at runtime
      * */
-    fn validateVarDeclMatcher (self, dmut context : &Validator, value : &Value, vdecl : &VarDeclExpr)-> &Value
+    fn validateVarDeclMatcher (self, dmut context : &Validator, value : &Value, vdecl : &VarDeclExpr, dmut vars : &Vec!{&Value})-> &Value
         throws &ErrorMsg
     {
-        context;
-        value;
-        vdecl;
-        __pragma!fake_throw (&ErrorMsg);
-        __pragma!panic ();
+        if (vdecl.getLoc () != Keys::UNDER) context:.verifyShadow (vdecl.getLoc ()); // variable declaration, so no shadows are allowed
 
-        // let dmut errors = Vec!{&ErrorMsg}::new ();
-        // if (vdecl.getLoc () != Keys::UNDER) context:.verifyShadow (vdecl.getLoc ());
+        let isPure = context.findDecos (vdecl.getDecos (), [Decorators::PURE]);
+        let isRef = context.findDecos (vdecl.getDecos (), [Decorators::REF]);
+        let isMutable = context.findDecos (vdecl.getDecos (), [Decorators::MUT, Decorators::DMUT]);
 
-        // let isPure = context.findDecos (v.getDecos (), [Decorators::PURE]);
-        // let isRef = context.findDecos (v.getDecos (), [Decorators::REF]);
-        // let isMutable = context.findDecos (v.getDecos (), [Decorators::MUT, Decorators::DMUT]);
+        let (typeCond, finalType) = if (!vdecl.getType ().isOf!{&EmptyExpression} ()) { // not '_'
+            let (_, t) = context:.validateType (vdecl.getType (), decos-> vdecl.getDecos (), canBeRef-> isRef);
+            let type = if (isPure) { t.clone (0u32) } else { t };
 
-        // let typeCond = if (!vdecl.getType ().isOf!{&EmptyExpression} ()) { // not '_'
-        //     let (_, t) = context:.validateType (vdecl.getType (), decos-> vdecl.getDecos (), canBeRef-> isRef);
-        //     let type = if (isPure) { t.clone (0u32) } else { t };
+            let typeTest = match (value.getType (), type) {
+                (ClassPtrType (), inner : &ClassPtrType) => { // a class reverse casting: Base -> Derived can only be known at cte (
+                                                              // unless it is a Derived -> Base, but that is already managed by the binary operator validator
+                    context:.getBinOpValidator ().validateClassTypeTestOp (alias context, vdecl.getType ().getLoc (), BinaryOperators::OF, value, inner.getInner ())
+                }
+                _ => { // Any other type test is cte evaluated
+                    context.verifyCompatibleType (value.getLoc (), type.getLoc (), value.getType (), type);
+                    cast!{&Value} (BoolValue::new (vdecl.getType ().getLoc (), true))
+                }
+            };
 
-        //     if (type.isCompatible (value.getType ())) {
-        //         BoolValue::new (t.getLoc (), true)
-        //     } else {
-        //         if (context.isAncestor (value.getType (), type)) {
+            (typeTest, t)
+        } else { // create a type for mutability checking
+            let (_, t) = context:.validateType (TypeWrapperExpr::new (value.getLoc (), value.getType ()), decos-> vdecl.getDecos (), canBeRef-> isRef);
+            (cast!{&Value} (BoolValue::new (vdecl.getLoc (), true)), t) // type test is always true
+        };
 
-        //         }
-        //     }
-        // }
+        match finalType { // only values with a real type can be used to create a variable
+            NoneType () => throw ErrorMsg::fatal (vdecl.getLoc (), format (ValidateErrorMessage::DECLARE_VOID_VAR, finalType));
+            VoidType () => throw ErrorMsg::fatal (vdecl.getLoc (), format (ValidateErrorMessage::DECLARE_VOID_VAR, finalType));
+            o : &OptionType => {
+                if (o.getInners ()[0].isOf!{&NoneType} ()) {
+                    throw ErrorMsg::fatal (vdecl.getLoc (), format (ValidateErrorMessage::DECLARE_VOID_VAR, finalType));
+                }
+            }
+        }
 
+        let valueCond = if (!vdecl.getValue ().isOf!{&EmptyExpression} ()) { // not x : T =>
+            self.validateMatcher (alias context, value, vdecl.getValue (), alias vars) // inner pattern matching
+        } else {
+            cast!{&Value} (BoolValue::new (vdecl.getLoc (), true)) // necessarily pass
+        };
+
+        // reduce non refrence value
+        let mut finVal = if (!isRef) { context:.getCompileTimeInterpreter ().reduce (value) } else { value };
+        finVal = if (isRef && !finVal.isOf!{&ReferencerValue} () && !finalType.isMutable () && finVal.isLvalue ()) {
+            ReferencerValue::new (finVal.getLoc (), finVal.getType (), finVal, isMutable-> false) // if it is passed by const ref we need to transform the lvalue to an implicit ref lvalue
+        } else {
+            finVal
+        };
+
+        context:.verifyMemoryOwner (vdecl.getLoc (), finalType, finVal, construct-> true, byReference-> isRef);
+
+        if (vdecl.getLoc () != Keys::UNDER) { // if the variable is not '_' we insert it in the current block
+            let var = VarDeclValue::new (vdecl.getLoc (), finalType, finVal, isReference-> isRef, isMutable-> isMutable, isPure-> isPure);
+            context:.insertLocal (vdecl.getLoc ().str (), var);
+
+            vars:.push (var); // add the declaration in the pattern matching success block
+        }
+
+        // test type && test value to be a successful pattern matcher
+        LogicalBinBoolOperatorValue::new (vdecl.getLoc (), BinaryOperators::DAND, typeCond, valueCond)
     }
 
     /**
@@ -236,12 +275,13 @@ pub class MatcherValidator {
      *    - cl: the call operator
      * @returns: the condition to evaluate at runtime
      * */
-    fn validateCallOpMatcher (self, dmut context : &Validator, value : &Value, cl : &MultOperatorExpr)-> &Value
+    fn validateCallOpMatcher (self, dmut context : &Validator, value : &Value, cl : &MultOperatorExpr, dmut vars : &Vec!{&Value})-> &Value
         throws &ErrorMsg
     {
         context;
         value;
         cl;
+        vars;
         __pragma!fake_throw (&ErrorMsg);
         __pragma!panic ();
     }
@@ -254,12 +294,13 @@ pub class MatcherValidator {
      *    - tu: the tuple list
      * @returns: the condition to evaluate at runtime
      * */
-    fn validateTupleMatcher (self, dmut context : &Validator, value : &Value, tu : &ListExpr)-> &Value
+    fn validateTupleMatcher (self, dmut context : &Validator, value : &Value, tu : &ListExpr, dmut vars : &Vec!{&Value})-> &Value
         throws &ErrorMsg
     {
         context;
         value;
         tu;
+        vars;
         __pragma!fake_throw (&ErrorMsg);
         __pragma!panic ();
     }
@@ -272,12 +313,13 @@ pub class MatcherValidator {
      *    - arr: the array list
      * @returns: the condition to evaluate at runtime
      * */
-    fn validateArrayMatcher (self, dmut context : &Validator, value : &Value, arr : &ListExpr)-> &Value
+    fn validateArrayMatcher (self, dmut context : &Validator, value : &Value, arr : &ListExpr, dmut vars : &Vec!{&Value})-> &Value
         throws &ErrorMsg
     {
         context;
         value;
         arr;
+        vars;
         __pragma!fake_throw (&ErrorMsg);
         __pragma!panic ();
     }
