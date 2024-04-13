@@ -212,25 +212,29 @@ pub class MatcherValidator {
         let isRef = context.findDecos (vdecl.getDecos (), [Decorators::REF]);
         let isMutable = context.findDecos (vdecl.getDecos (), [Decorators::MUT, Decorators::DMUT]);
 
-        let (typeCond, finalType) = if (!vdecl.getType ().isOf!{&EmptyExpression} ()) { // not '_'
+        let (typeCond, finalType, castedValue) = if (!vdecl.getType ().isOf!{&EmptyExpression} ()) { // not '_'
             let (_, t) = context:.validateType (vdecl.getType (), decos-> vdecl.getDecos (), canBeRef-> isRef);
             let type = if (isPure) { t.clone (0u32) } else { t };
 
-            let typeTest = match (value.getType (), type) {
+            let (typeTest, castedValue) = match (value.getType (), type) {
                 (ClassPtrType (), inner : &ClassPtrType) => { // a class reverse casting: Base -> Derived can only be known at cte (
                                                               // unless it is a Derived -> Base, but that is already managed by the binary operator validator
-                    context:.getBinOpValidator ().validateClassTypeTestOp (alias context, vdecl.getType ().getLoc (), BinaryOperators::OF, value, inner.getInner ())
+                    let typeTest = context:.getBinOpValidator ().validateClassTypeTestOp (alias context, vdecl.getType ().getLoc (), BinaryOperators::OF, value, inner.getInner ());
+
+                    // we clone the derived type to match the base type mutability
+                    let resType = type.clone (pattern-> value.getType ());
+                    (typeTest, cast!{&Value} (CastValue::new (type.getLoc (), resType, value, isLvalue-> value.isLvalue ()))) // transform the value into the derived type
                 }
                 _ => { // Any other type test is cte evaluated
                     context.verifyCompatibleType (value.getLoc (), type.getLoc (), value.getType (), type);
-                    cast!{&Value} (BoolValue::new (vdecl.getType ().getLoc (), true))
+                    (cast!{&Value} (BoolValue::new (vdecl.getType ().getLoc (), true)), value)
                 }
             };
 
-            (typeTest, t)
+            (typeTest, t, castedValue)
         } else { // create a type for mutability checking
             let (_, t) = context:.validateType (TypeWrapperExpr::new (value.getLoc (), value.getType ()), decos-> vdecl.getDecos (), canBeRef-> isRef);
-            (cast!{&Value} (BoolValue::new (vdecl.getLoc (), true)), t) // type test is always true
+            (cast!{&Value} (BoolValue::new (vdecl.getLoc (), true)), t, value) // type test is always true
         };
 
         match finalType { // only values with a real type can be used to create a variable
@@ -243,8 +247,9 @@ pub class MatcherValidator {
             }
         }
 
-        let valueCond = if (!vdecl.getValue ().isOf!{&EmptyExpression} ()) { // not x : T =>
-            self.validateMatcher (alias context, value, vdecl.getValue (), alias vars) // inner pattern matching
+        let valueCond = if (!vdecl.getValue ().isOf!{&EmptyExpression} ()) { // x : T = V =>
+            // inner pattern matching on V using /cast!T (value)/ (since the type test was true)
+            self.validateMatcher (alias context, castedValue, vdecl.getValue (), alias vars)
         } else {
             cast!{&Value} (BoolValue::new (vdecl.getLoc (), true)) // necessarily pass
         };
@@ -288,30 +293,47 @@ pub class MatcherValidator {
             _ => { true }
         };
 
-        let typeCond = if (validateL) {
+        let (typeCond, castedValue) = if (validateL) {
             let type = context:.validateType (cl.getLeft ());
-            let typeTest = match (value.getType (), type) {
+            let (typeTest, castedValue) = match (value.getType (), type) {
                 (ClassPtrType (), inner : &ClassPtrType) => { // a class reverse casting: Base -> Derived can only be known at cte (
                                                               // unless it is a Derived -> Base, but that is already managed by the binary operator validator
-                    context:.getBinOpValidator ().validateClassTypeTestOp (alias context, type.getLoc (), BinaryOperators::OF, value, inner.getInner ())
+                    let typeTest = context:.getBinOpValidator ().validateClassTypeTestOp (alias context, type.getLoc (), BinaryOperators::OF, value, inner.getInner ());
+
+                    // we clone the derived type to match the base type mutability
+                    let resType = type.clone (pattern-> value.getType ());
+                    (typeTest, cast!{&Value} (CastValue::new (type.getLoc (), resType, value, isLvalue-> value.isLvalue ()))) // transform the value into the derived type
                 }
                 (ClassPtrType (), inner : &ClassRefType) => { // Same as class ptr, but in MultOp a class ref can be used directly (Derived () => ) to match &Base
-                    context:.getBinOpValidator ().validateClassTypeTestOp (alias context, type.getLoc (), BinaryOperators::OF, value, inner)
+                    let typeTest = context:.getBinOpValidator ().validateClassTypeTestOp (alias context, type.getLoc (), BinaryOperators::OF, value, inner);
+
+                    // we clone the derived type to match the base type mutability
+                    let resType = ClassPtrType::new (type.getLoc (), inner).clone (pattern-> value.getType ());
+                    (typeTest, cast!{&Value} (CastValue::new (type.getLoc (), resType, value, isLvalue-> value.isLvalue ())))
                 }
                 _ => { // Any other type test is cte evaluated
                     context.verifyCompatibleType (value.getLoc (), type.getLoc (), value.getType (), type);
-                    cast!{&Value} (BoolValue::new (type.getLoc (), true))
+                    (cast!{&Value} (BoolValue::new (type.getLoc (), true)), value)
                 }
             };
 
-            typeTest
+            (typeTest, castedValue)
         } else {
-            cast!{&Value} (BoolValue::new (cl.getLeft ().getLoc (), true))
+            (cast!{&Value} (BoolValue::new (cl.getLeft ().getLoc (), true)), value)
         };
 
-        vars;
+        let mut curValueTest : &Value = BoolValue::new (cl.getLoc (), true);
+        for p in cl.getRights () match p {
+            n : &NamedExpr => {
+                let val = context:.getBinOpValidator ().validateFieldOperation (alias context, n.getLoc (), BinaryOperators::DOT, castedValue, VarExpr::new (n.getLoc ()));
+                let innerTest = self.validateMatcher (alias context, val, n.getContent (), alias vars);
 
-        typeCond
+                curValueTest = LogicalBinBoolOperatorValue::new (n.getLoc (), BinaryOperators::DAND, curValueTest, innerTest);
+            }
+            _ => __pragma!panic ();
+        }
+
+        LogicalBinBoolOperatorValue::new (cl.getLoc (), BinaryOperators::DAND, typeCond, curValueTest)
     }
 
     /**
