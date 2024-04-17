@@ -48,7 +48,12 @@ pub class MatcherValidator {
             _ => { (false, mValue) }
         };
 
-        let (conds, values, errors, type, complete) = self.validateMatchers (alias context, m.getLoc (), fVal, matchers, canInnerMutRef);
+        let (conds, values, errors, type, complete, innerUse) = self.validateMatchers (alias context, m.getLoc (), fVal, matchers, canInnerMutRef);
+        if (!innerUse && canInnerMutRef) {
+            throw ErrorMsg::fatal (mValue.getLoc (), ValidateErrorMessage::UNECESSARY_REFERENCE,
+                                   notes-> [ErrorMsg::note (m.getLoc (), ValidateErrorMessage::NO_REFERENCE_PATTERN)]);
+        }
+
 
         if (errors.len != 0us) {
             throw ErrorMsg::fatal (m.getLoc (), format (ValidateErrorMessage::MATCH_VALIDATION, fVal, mValue.getType ()), notes-> errors);
@@ -84,7 +89,7 @@ pub class MatcherValidator {
      *    - .3: the type result of the matcher (@warning: before checking completness)
      *    - .4: true if the matcher is complete
      * */
-    fn validateMatchers (self, dmut context : &Validator, loc : &Word, value : &Value, matchers : [(&Expression, &Expression)], canInnerMutRef : bool)-> ([&Value], [&Value], [&ErrorMsg], &Type, bool) {
+    fn validateMatchers (self, dmut context : &Validator, loc : &Word, value : &Value, matchers : [(&Expression, &Expression)], canInnerMutRef : bool)-> ([&Value], [&Value], [&ErrorMsg], &Type, bool, bool) {
         let mut finType : &Type = NoneType::new (loc);
         let mut complete = false;
         let mut currentTautCond : &Value = UNIT_VALUE;
@@ -92,6 +97,7 @@ pub class MatcherValidator {
         let dmut conds = Vec!{&Value}::new ();
         let dmut values = Vec!{&Value}::new ();
         let dmut errors = Vec!{&ErrorMsg}::new ();
+        let mut innerUse = false;
 
         for mtch in matchers {
             let mut succeed = true;
@@ -102,8 +108,10 @@ pub class MatcherValidator {
                 }
 
                 let dmut vars = Vec!{&Value}::new ();
-                let cond = self.validateMatcher (alias context, value, mtch.0, alias vars, canInnerMutRef);
+                let (cond, innerUse_) = self.validateMatcher (alias context, value, mtch.0, alias vars, canInnerMutRef);
                 conds:.push (cond);
+
+                innerUse = innerUse || innerUse_;
 
                 let mut val = context:.validateValue (mtch.1);
                 let (t, v) = context:.inferTypeBranchingWithValue (finType.getLoc (), finType, val);
@@ -134,7 +142,7 @@ pub class MatcherValidator {
             }
         }
 
-        (conds[], values[], errors[], finType, complete)
+        (conds[], values[], errors[], finType, complete, innerUse)
     }
 
 
@@ -174,7 +182,7 @@ pub class MatcherValidator {
      *   - mtch: the matcher expression
      * @returns: the condition to evaluate at runtime
      * */
-    pub fn validateMatcher (self, dmut context : &Validator, value : &Value, mtch : &Expression, dmut vars : &Vec!{&Value}, canInnerMutRef : bool)-> &Value
+    pub fn validateMatcher (self, dmut context : &Validator, value : &Value, mtch : &Expression, dmut vars : &Vec!{&Value}, canInnerMutRef : bool)-> (&Value, bool)
         throws &ErrorMsg
     {
         return match mtch {
@@ -195,7 +203,7 @@ pub class MatcherValidator {
                 }
             }
             _ => {
-                self.validateValueEqualMatcher (alias context, value, mtch)
+                (self.validateValueEqualMatcher (alias context, value, mtch), false)
             }
         };
     }
@@ -208,7 +216,7 @@ pub class MatcherValidator {
      *    - vdecl: the variable declaration
      * @returns: the condition to evaluate at runtime
      * */
-    fn validateVarDeclMatcher (self, dmut context : &Validator, value : &Value, vdecl : &VarDeclExpr, dmut vars : &Vec!{&Value}, canInnerMutRef : bool)-> &Value
+    fn validateVarDeclMatcher (self, dmut context : &Validator, value : &Value, vdecl : &VarDeclExpr, dmut vars : &Vec!{&Value}, canInnerMutRef : bool)-> (&Value, bool)
         throws &ErrorMsg
     {
         if (vdecl.getLoc () != Keys::UNDER) context:.verifyShadow (vdecl.getLoc ()); // variable declaration, so no shadows are allowed
@@ -252,19 +260,20 @@ pub class MatcherValidator {
             }
         }
 
-        let valueCond = if (!vdecl.getValue ().isOf!{&EmptyExpression} ()) { // x : T = V =>
+        let (valueCond, innerUse) = if (!vdecl.getValue ().isOf!{&EmptyExpression} ()) { // x : T = V =>
             // inner pattern matching on V using /cast!T (value)/ (since the type test was true)
             self.validateMatcher (alias context, castedValue, vdecl.getValue (), alias vars, canInnerMutRef && isRef)
         } else {
-            cast!{&Value} (BoolValue::new (vdecl.getLoc (), true)) // necessarily pass
+            (cast!{&Value} (BoolValue::new (vdecl.getLoc (), true)), false) // necessarily pass
         };
 
         // reduce non reference value
-        let mut finVal = if (!isRef) { context:.getCompileTimeInterpreter ().reduce (value) } else { value };
-        finVal = if (isRef && finVal.isLvalue ()) {
-            ReferencerValue::new (finVal.getLoc (), finVal.getType (), finVal, isMutable-> (canInnerMutRef && finalType.isMutable ())) // if it is passed by const ref we need to transform the lvalue to an implicit ref lvalue
+        let finVal_ = if (!isRef) { context:.getCompileTimeInterpreter ().reduce (value) } else { value };
+        let (finVal, useRef) = if (isRef && finVal_.isLvalue ()) {
+            let isMut = (canInnerMutRef && finalType.isMutable ());
+            (cast!{&Value} (ReferencerValue::new (finVal_.getLoc (), finVal_.getType (), finVal_, isMutable-> isMut)), isMut) // if it is passed by const ref we need to transform the lvalue to an implicit ref lvalue
         } else {
-            finVal
+            (finVal_, false)
         };
 
         context:.verifyMemoryOwner (vdecl.getLoc (), finalType, finVal, construct-> true, byReference-> isRef);
@@ -276,7 +285,7 @@ pub class MatcherValidator {
         }
 
         // test type && test value to be a successful pattern matcher
-        LogicalBinBoolOperatorValue::new (vdecl.getLoc (), BinaryOperators::DAND, typeCond, valueCond)
+        (LogicalBinBoolOperatorValue::new (vdecl.getLoc (), BinaryOperators::DAND, typeCond, valueCond), useRef || innerUse)
     }
 
     /**
@@ -287,7 +296,7 @@ pub class MatcherValidator {
      *    - cl: the call operator
      * @returns: the condition to evaluate at runtime
      * */
-    fn validateCallOpMatcher (self, dmut context : &Validator, value : &Value, cl : &MultOperatorExpr, dmut vars : &Vec!{&Value}, canInnerMutRef : bool)-> &Value
+    fn validateCallOpMatcher (self, dmut context : &Validator, value : &Value, cl : &MultOperatorExpr, dmut vars : &Vec!{&Value}, canInnerMutRef : bool)-> (&Value, bool)
         throws &ErrorMsg
     {
         let validateL = match cl.getLeft () { // don't validate _ ()
@@ -327,17 +336,19 @@ pub class MatcherValidator {
         };
 
         let mut curValueTest : &Value = BoolValue::new (cl.getLoc (), true);
+        let mut innerUse = false;
         for p in cl.getRights () match p {
             n : &NamedExpr => {
                 let val = context:.getBinOpValidator ().validateFieldOperation (alias context, n.getLoc (), BinaryOperators::DOT, castedValue, VarExpr::new (n.getLoc ()));
-                let innerTest = self.validateMatcher (alias context, val, n.getContent (), alias vars, canInnerMutRef);
+                let (innerTest, innerUse_) = self.validateMatcher (alias context, val, n.getContent (), alias vars, canInnerMutRef);
 
                 curValueTest = LogicalBinBoolOperatorValue::new (n.getLoc (), BinaryOperators::DAND, curValueTest, innerTest);
+                innerUse = innerUse_ || innerUse;
             }
             _ => __pragma!panic ();
         }
 
-        LogicalBinBoolOperatorValue::new (cl.getLoc (), BinaryOperators::DAND, typeCond, curValueTest)
+        (LogicalBinBoolOperatorValue::new (cl.getLoc (), BinaryOperators::DAND, typeCond, curValueTest), innerUse)
     }
 
     /**
@@ -348,7 +359,7 @@ pub class MatcherValidator {
      *     - opt: the option matcher to validate
      *     - vars:
      * */
-    fn validateOptionMatcher (self, dmut context : &Validator, value : &Value, opt : &OptionMatcherExpr, dmut vars : &Vec!{&Value}, canInnerMutRef : bool)-> &Value
+    fn validateOptionMatcher (self, dmut context : &Validator, value : &Value, opt : &OptionMatcherExpr, dmut vars : &Vec!{&Value}, canInnerMutRef : bool)-> (&Value, bool)
         throws &ErrorMsg
     {
         let loc = opt.getLoc ();
@@ -359,16 +370,16 @@ pub class MatcherValidator {
         let optType = value.getType ().asOf!{&OptionType} ();
         let isSet = StructFieldAccessValue::new (loc, BoolType::new (loc), value, OptionKeys::SET);
         if (loc == OptionKeys::MATCH_SOME) match opt.getInner () {
-            EmptyExpression () => return isSet;
+            EmptyExpression () => return (isSet, false);
             exp : &Expression => {
                 let innerVal = OptionFieldAccessValue::new (loc, optType.getInners ()[0], value, OptionKeys::VALUE);
-                let innerTest = self.validateMatcher (alias context, innerVal, exp, alias vars, canInnerMutRef);
+                let (innerTest, innerUse) = self.validateMatcher (alias context, innerVal, exp, alias vars, canInnerMutRef);
 
-                return LogicalBinBoolOperatorValue::new (loc, BinaryOperators::DAND, isSet, innerTest);
+                return (LogicalBinBoolOperatorValue::new (loc, BinaryOperators::DAND, isSet, innerTest), innerUse);
             }
         } else match opt.getInner () {
             EmptyExpression () => {
-                return UnaryBoolOperatorValue::new (loc, UnaryOperators::NOT, isSet);
+                return (UnaryBoolOperatorValue::new (loc, UnaryOperators::NOT, isSet), false);
             }
             exp : &Expression => {
                 let ptrType = PointerType::new (loc, VoidType::new (loc));
@@ -380,9 +391,9 @@ pub class MatcherValidator {
                 let finTest = LogicalBinBoolOperatorValue::new (loc, BinaryOperators::DAND, notSet, hasError);
                 let innerType = context:.getExceptionType (loc-> loc);
                 let err = OptionFieldAccessValue::new (loc, innerType, value, OptionKeys::ERROR);
-                let innerTest = self.validateMatcher (alias context, err, exp, alias vars, canInnerMutRef);
+                let (innerTest, innerUse) = self.validateMatcher (alias context, err, exp, alias vars, canInnerMutRef);
 
-                return LogicalBinBoolOperatorValue::new (loc, BinaryOperators::DAND, finTest, innerTest);
+                return (LogicalBinBoolOperatorValue::new (loc, BinaryOperators::DAND, finTest, innerTest), innerUse);
             }
         }
     }
@@ -395,7 +406,7 @@ pub class MatcherValidator {
      *    - tu: the tuple list
      * @returns: the condition to evaluate at runtime
      * */
-    fn validateTupleMatcher (self, dmut context : &Validator, value : &Value, tu : &ListMatcherExpr, dmut vars : &Vec!{&Value}, canInnerMutRef : bool)-> &Value
+    fn validateTupleMatcher (self, dmut context : &Validator, value : &Value, tu : &ListMatcherExpr, dmut vars : &Vec!{&Value}, canInnerMutRef : bool)-> (&Value, bool)
         throws &ErrorMsg
     {
         let loc = tu.getLoc ();
@@ -408,6 +419,7 @@ pub class MatcherValidator {
 
         // pattern match inner values
         let mut curValueTest : &Value = BoolValue::new (loc, true);
+        let mut innerUse = false;
         for i, p in tu.getParameters () {
             let assocValue : &Value = if (i != tu.getParameters ().len - 1us || !tu.isVariadic ()) {
                 values [i]
@@ -422,11 +434,12 @@ pub class MatcherValidator {
                 cast!{&Value} (TupleValue::new (value.getLoc (), tupleType, rest))
             };
 
-            let innerTest = self.validateMatcher (alias context, assocValue, p, alias vars, canInnerMutRef);
+            let (innerTest, innerUse_) = self.validateMatcher (alias context, assocValue, p, alias vars, canInnerMutRef);
             curValueTest = LogicalBinBoolOperatorValue::new (loc, BinaryOperators::DAND, curValueTest, innerTest);
+            innerUse = innerUse || innerUse_;
         }
 
-        curValueTest
+        (curValueTest, innerUse)
     }
 
     /**
@@ -460,7 +473,7 @@ pub class MatcherValidator {
      *    - arr: the array list
      * @returns: the condition to evaluate at runtime
      * */
-    fn validateArrayMatcher (self, dmut context : &Validator, value : &Value, arr : &ListMatcherExpr, dmut vars : &Vec!{&Value}, canInnerMutRef : bool)-> &Value
+    fn validateArrayMatcher (self, dmut context : &Validator, value : &Value, arr : &ListMatcherExpr, dmut vars : &Vec!{&Value}, canInnerMutRef : bool)-> (&Value, bool)
         throws &ErrorMsg
     {
         context;
