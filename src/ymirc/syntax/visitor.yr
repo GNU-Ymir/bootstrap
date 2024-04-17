@@ -2014,7 +2014,7 @@ pub class SyntaxVisitor {
      *                    | (Decorator)* Keys::SELF
      * ==================
      */
-    fn readSingleVarDeclaration (mut self, mandType : bool = false, withValue : bool = true, isClass : bool = false, level : usize = 0us)-> &VarDeclExpr
+    fn readSingleVarDeclaration (mut self, mandType : bool = false, withValue : bool = true, mandValue : bool = false, isClass : bool = false, level : usize = 0us)-> &VarDeclExpr
         throws &ErrorMsg
     {
         let decos = self:.readDecorators ();
@@ -2037,8 +2037,11 @@ pub class SyntaxVisitor {
                     self:.readExpression (level-> self._specials.binaryOperators.len)
                 } else { cast!{&Expression} (EmptyExpression::new ()) }
 
-                let value = if (withValue) {
-                    if (!(self:.readIf (Tokens::EQUAL)._0).isEof ()) {
+                let value = if (withValue || mandValue) {
+                    if (mandValue) {
+                        self:.readTokens (Tokens::EQUAL);
+                        self:.readExpression (level-> level)
+                    } else if (!(self:.readIf (Tokens::EQUAL)._0).isEof ()) {
                         self:.readExpression (level-> level)
                     } else { cast!{&Expression} (EmptyExpression::new ()) }
                 } else { cast!{&Expression} (EmptyExpression::new ()) }
@@ -2047,39 +2050,6 @@ pub class SyntaxVisitor {
             }
         }
     }
-
-    /**
-     * Read a destruct var declaration
-     * @verbatim:
-     * ===============================
-     * destruct_decl := Keys::LET Tokens::LPAR (single_var_decl (Tokens::COMA single_var_decl)* Tokens::RPAR Tokens::EQUAL expression:(0)
-     * ===============================
-     */
-    fn readDestructVarDecl (mut self, loc : &Word)-> &Expression
-        throws &ErrorMsg
-    {
-        let dmut vars = Vec!{&Expression}::new ();
-        let mut isVariadic = false;
-        loop {
-            vars:.push (self:.readSingleVarDeclaration (mandType-> false, withValue-> false, isClass-> false));
-            let (n, _) = if (vars.len () == 1us) {
-                self:.readTokens (Tokens::COMA, Tokens::RPAR)
-            } else {
-                let (a, _) = self:.readTokens (Tokens::COMA, Tokens::RPAR, Tokens::TDOT);
-                if (a == Tokens::TDOT) {
-                    isVariadic = true;
-                    self:.readTokens (Tokens::RPAR)
-                } else { (a, ""s8) }
-            }
-
-            if (n == Tokens::RPAR) break {}
-        }
-
-        self:.readTokens (Tokens::EQUAL);
-
-        DestructVarDeclExpr::new (loc, vars[], self:.readExpression (), isVariadic-> isVariadic)
-    }
-
 
     /**
      * Read a list of decorators
@@ -2443,28 +2413,53 @@ pub class SyntaxVisitor {
      * Read a var declaration
      * @verbatim:
      * ========================
-     * var_decl :=   Keys::LET (single_var_decl) (Tokens::COMA (single_var_decl))*
-     *             | Keys::LET destruct_decl
+     * var_decl :=   Keys::LET (single_var_decl Tokens::EQUAL value) (Tokens::COMA (single_var_decl Tokens::EQUAL value))*
+     *             | Keys::LET pattern Tokens::EQUAL value
      * ========================
      */
     fn readVarDeclaration (mut self, loc : &Word)-> &Expression
         throws &ErrorMsg
     {
-        let dmut decls = Vec!{&Expression}::new ();
-        loop {
-            let (tok, _) = self:.readIf (Tokens::LPAR);
-            if (!tok.isEof ()) {
-                decls:.push (self:.readDestructVarDecl (tok));
-                break {}
-            } else {
-                decls:.push (self:.readSingleVarDeclaration (mandType-> false, isClass-> false, withValue-> true));
-                if ((self:.readIf (Tokens::COMA)._0).isEof ()) break {}
+        let t = self._lex.getCounter ();
+        let mut succeed = false;
+        let (tok, _) = self:.readIf (Tokens::LPAR, Tokens::LCRO);
+        if (tok == Tokens::LPAR || tok == Tokens::LCRO) {
+            let pattern = self:.readParMatch (tok, rootVars-> true, endTok-> if (tok == Tokens::LPAR) { Tokens::RPAR } else { Tokens::RCRO });
+            self:.readTokens (Tokens::EQUAL);
+            let value = self:.readExpression ();
+
+            return PatternVarDeclExpr::new (loc, pattern, value);
+        } else {
+            {
+                let dmut decls = Vec!{&Expression}::new ();
+                loop {
+                    decls:.push (self:.readSingleVarDeclaration (mandType-> false, isClass-> false, mandValue-> true));
+                    succeed = true; // read at least one
+                    if ((self:.readIf (Tokens::COMA)._0).isEof ()) break {}
+                }
+
+                return if (decls.len () == 1us)
+                    __pragma!trusted (decls [0us])
+                else cast!{&Expression} (SetExpr::new (loc, decls[]))
+
+            } catch {
+                err : &ErrorMsg => {
+                    if (succeed) throw err; // pattern var decl cannot be grouped with other kind of declarations
+                    {
+                        self._lex:.rewindTo (nb-> t);
+                        let pattern = self:.readMatchExpression ();
+                        self:.readTokens (Tokens::EQUAL);
+                        let value = self:.readExpression ();
+
+                        return PatternVarDeclExpr::new (loc, pattern, value);
+                    } catch {
+                        subErr : &ErrorMsg => {
+                            throw err.withNote ([ErrorMsg::note (loc, oneLine-> true, SyntaxErrorMessage::READING_PATTERN_DECLARATION, notes-> [subErr])]);
+                        }
+                    }
+                }
             }
         }
-
-        if (decls.len () == 1us)
-            __pragma!trusted (decls [0us])
-        else cast!{&Expression} (SetExpr::new (loc, decls[]))
     }
 
 
@@ -2946,12 +2941,14 @@ pub class SyntaxVisitor {
 
     /**
      * Read a single var declaration for a pattern matcher
+     * @params:
+     *   - empty: allows for var to have no type nor value
      * @verbatim:
      * ========================
      * single_var_decl_match := (Decorator)* (Identifier | Keys::UNDER) Tokens::COLON (Keys::UNDER | expression:(10))  (Tokens::EQUAL inner_matcher_expr)?
      * ========================
      */
-    fn readSingleVarDeclarationForMatch (mut self)-> &Expression
+    fn readSingleVarDeclarationForMatch (mut self, empty : bool = false)-> &Expression
         throws &ErrorMsg
     {
         let decos = self:.readDecorators ();
@@ -2961,7 +2958,12 @@ pub class SyntaxVisitor {
         } else { self:.readIdentifier ()._0 }
 
         if (name == Keys::SELF) throw ErrorMsg::fatal (name, format (SyntaxErrorMessage::USED_AS_IDENTIFIER, name.str ()));
-        let (tok, _) = self:.readTokens (Tokens::COLON, Tokens::EQUAL);
+        let (tok, _) = if (empty) {
+            self:.readIf (Tokens::COLON, Tokens::EQUAL)
+        } else {
+            self:.readTokens (Tokens::COLON, Tokens::EQUAL)
+        };
+
         if (tok == Tokens::COLON) { // _ : _ =
             let type = if ((self:.readIf (Keys::UNDER)._0).isEof ()) {
                 self:.readExpression (level-> self._specials.binaryOperators.len)
@@ -2972,8 +2974,10 @@ pub class SyntaxVisitor {
             } else { cast!{&Expression} (EmptyExpression::new ()) }
 
             VarDeclExpr::new (name, name, decos-> decos, value-> value, type-> type)
-        } else { // _ =
+        } else if (tok == Tokens::EQUAL) { // _ =
             VarDeclExpr::new (name, name, decos-> decos, value-> self:.readMatchExpression (), type-> EmptyExpression::new ())
+        } else {
+            VarDeclExpr::new (name, name, decos-> decos, value-> EmptyExpression::new (), type-> EmptyExpression::new ())
         }
     }
 
@@ -3057,28 +3061,42 @@ pub class SyntaxVisitor {
      * Read a list in match expression
      * @verbatim:
      * ===============================
-     * par_match :=   Tokens::LPAR (inner_matcher_expr (Tokens::COMA inner_matcher_expr)*)? Tokens::RPAR
+     * par_match :=   Tokens::LPAR (inner_matcher_expr (Tokens::COMA inner_matcher_expr )* (Tokens::COMA inner_matcher_expr Tokens::TDOT))? Tokens::RPAR
+     *              | Tokens::LPAR (inner_matcher_expr (Tokens::TDOT)? Tokens::COMA) Tokens::RPAR
      *              | Tokens::LCRO (inner_matcher_expr (Tokens::COMA inner_matcher_expr)*)? Tokens::RCRO
      * ===============================
      */
-    fn readParMatch (mut self, loc : &Word, endTok : [c8] = Tokens::RPAR)-> &Expression
+    fn readParMatch (mut self, loc : &Word, endTok : [c8] = Tokens::RPAR, rootVars : bool = false)-> &Expression
         throws &ErrorMsg
     {
         let dmut params = Vec!{&Expression}::new ();
         let mut e = self:.readIf (endTok)._0;
         while e != Tokens::RPAR {
-            params:.push (self:.readMatchExpression ());
-            e = self:.readTokens (Tokens::COMA, endTok)._0;
+            if (rootVars) {
+                params:.push (self:.readSingleVarDeclarationForMatch (empty-> true));
+            } else {
+                params:.push (self:.readMatchExpression ());
+            };
+
+            e = self:.readTokens (Tokens::COMA, endTok, Tokens::TDOT)._0;
+            if (e == Tokens::TDOT) {
+                if (endTok == Tokens::RPAR && params.len () == 1us) {
+                    self:.readTokens (Tokens::COMA);
+                }
+                e = self:.readTokens (endTok)._0;
+                return ListMatcherExpr::new (loc, e, params[], true);
+            }
+
             if (params.len () == 1us) {
                 if (e == Tokens::COMA && endTok == Tokens::RPAR && !self:.readIf (Tokens::RPAR)._0.isEof ()) { // (x,) is a tuple
-                    return ListExpr::new (loc, e, params[]);
+                    return ListMatcherExpr::new (loc, e, params[], false);
                 }
             }
         }
 
         // (x) is not a tuple, just x, but () is a tuple
         if (endTok == Tokens::RPAR && params.len () == 1us) return params [0us];
-        ListExpr::new (loc, e, params[])
+        ListMatcherExpr::new (loc, e, params[], false)
     }
 
 
@@ -3762,7 +3780,7 @@ pub class SyntaxVisitor {
                     }
                 }
             }
-            v : &DestructVarDeclExpr => {
+            v : &PatternVarDeclExpr => {
                 match v.getValue () {
                     EmptyExpression () => { true }
                     _ => {
