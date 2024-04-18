@@ -164,6 +164,46 @@ pub class MatcherValidator {
         ConditionalValue::new (cond.getLoc (), type, cond, val, elsev-> else_, isComplete-> isComplete)
     }
 
+    /**
+     * ================================================================================
+     * ================================================================================
+     * ==========================         ERROR DECL         ==========================
+     * ================================================================================
+     * ================================================================================
+     */
+
+    /**
+     * Declare the variables with error type
+     * @throws: if there are shadowing variable found
+     * */
+    pub fn declareErrorVariables (self, dmut context : &Validator, mtch : &Expression)
+        throws &ErrorMsg
+    {
+        match mtch {
+            vdecl : &VarDeclExpr => {
+                if (vdecl.getLoc () != Keys::UNDER) {
+                    context:.verifyShadow (vdecl.getLoc ());
+                    let var = VarDeclValue::new (vdecl.getLoc (), ErrorType::new (vdecl.getLoc ()), UNIT_VALUE, isMutable-> false, isPure-> false);
+                    context:.insertLocal (vdecl.getLoc ().str (), var);
+                }
+
+                self.declareErrorVariables (alias context, vdecl.getValue ());
+            }
+            o : &OptionMatcherExpr => {
+                self.declareErrorVariables (alias context, o.getInner ());
+            }
+            cl : &MultOperatorExpr => {
+                for m in cl.getRights () {
+                    self.declareErrorVariables (alias context, m);
+                }
+            }
+            l : &ListMatcherExpr => {
+                for m in l.getParameters () {
+                    self.declareErrorVariables (alias context, m);
+                }
+            }
+        }
+    }
 
     /**
      * ================================================================================
@@ -225,68 +265,119 @@ pub class MatcherValidator {
         let isRef = context.findDecos (vdecl.getDecos (), [Decorators::REF]);
         let isMutable = context.findDecos (vdecl.getDecos (), [Decorators::MUT, Decorators::DMUT]);
 
-        let (typeCond, finalType, castedValue) = if (!vdecl.getType ().isOf!{&EmptyExpression} ()) { // not '_'
+        let finVal_ = if (!isRef) { context:.getCompileTimeInterpreter ().reduce (value) } else { value };
+        let (finVal, useRef) = if (isRef && finVal_.isLvalue ()) {
+            let isMut = (canInnerMutRef && isMutable);
+            (cast!{&Value} (ReferencerValue::new (finVal_.getLoc (), finVal_.getType (), finVal_, isMutable-> isMut)), isMut) // if it is passed by const ref we need to transform the lvalue to an implicit ref lvalue
+        } else {
+            (finVal_, false)
+        };
+
+        {
+            let (typeCond, finalType, castedValue) = self.validateVarDeclMatcherValue (alias context, finVal, vdecl, isRef, isPure, isMutable, useRef);
+            match finalType { // only values with a real type can be used to create a variable
+                NoneType () => throw ErrorMsg::fatal (vdecl.getLoc (), format (ValidateErrorMessage::DECLARE_VOID_VAR, finalType));
+                VoidType () => throw ErrorMsg::fatal (vdecl.getLoc (), format (ValidateErrorMessage::DECLARE_VOID_VAR, finalType));
+                o : &OptionType => {
+                    if (o.getInners ()[0].isOf!{&NoneType} ()) {
+                        throw ErrorMsg::fatal (vdecl.getLoc (), format (ValidateErrorMessage::DECLARE_VOID_VAR, finalType));
+                    }
+                }
+            }
+
+            let (valueCond, innerUse) = if (!vdecl.getValue ().isOf!{&EmptyExpression} ()) { // x : T = V =>
+                let (canInnerInnerMutRef, fVal) = match castedValue {
+                    r : &ReferencerValue => { (r.isMutable () && canInnerMutRef, r.getValue ()) }
+                    _ => { (false, castedValue) }
+                };
+
+                // inner pattern matching on V using /cast!T (value)/ (since the type test was true)
+                self.validateMatcher (alias context, fVal, vdecl.getValue (), alias vars, canInnerInnerMutRef && isRef)
+            } else {
+                (cast!{&Value} (BoolValue::new (vdecl.getLoc (), true)), false) // necessarily pass
+            };
+
+            let var = VarDeclValue::new (vdecl.getLoc (), finalType, castedValue, isReference-> isRef, isMutable-> isMutable, isPure-> isPure);
+            vars:.push (var); // add the declaration in the pattern matching success block
+
+            if (vdecl.getLoc () != Keys::UNDER) { // if the variable is not '_' we insert it in the current block
+                context:.insertLocal (vdecl.getLoc ().str (), var);
+            }
+
+            // test type && test value to be a successful pattern matcher
+            (LogicalBinBoolOperatorValue::new (vdecl.getLoc (), BinaryOperators::DAND, typeCond, valueCond), useRef || innerUse)
+        } catch {
+            err : &ErrorMsg => { // insert error variable to avoid undefined symbol errors
+                if (vdecl.getLoc () != Keys::UNDER) {
+                    let var = VarDeclValue::new (vdecl.getLoc (), ErrorType::new (vdecl.getLoc ()), UNIT_VALUE, isReference-> isRef, isMutable-> isMutable, isPure-> isPure);
+                    context:.insertLocal (vdecl.getLoc ().str (), var);
+                }
+
+                throw err;
+            }
+        }
+    }
+
+    /**
+     * Validate the casting of the matching value to the type of the variable
+     * @params:
+     *    - context: the context of the validation
+     *    - value: the value (reference or not)
+     *    - vdecl: the pattern
+     *    - isRef: true if this is a ref (maybe const)
+     *    - useRef: true if using a mutable reference
+     * */
+    fn validateVarDeclMatcherValue (self, dmut context : &Validator, value : &Value, vdecl : &VarDeclExpr, isRef : bool, isPure : bool, _ : bool, useRef : bool)-> (&Value, &Type, &Value)
+        throws &ErrorMsg
+    {
+        if (!vdecl.getType ().isOf!{&EmptyExpression} ()) { // not '_'
             let (_, t) = context:.validateType (vdecl.getType (), decos-> vdecl.getDecos (), canBeRef-> isRef);
             let type = if (isPure) { t.clone (0u32) } else { t };
 
             let (typeTest, castedValue) = match (value.getType (), type) {
-                (ClassPtrType (), inner : &ClassPtrType) => { // a class reverse casting: Base -> Derived can only be known at cte (
-                                                              // unless it is a Derived -> Base, but that is already managed by the binary operator validator
+                (derived : &ClassPtrType, inner : &ClassPtrType) => { // a class reverse casting: Base -> Derived can only be known at cte (
+                    // unless it is a Derived -> Base, but that is already managed by the binary operator validator
+                    if (useRef && context.isAncestor (inner, derived)) { // ref mut x : &Base = ref Derived is not allowed, because x = Base::new () will result in undefined behavior
+                        throw ErrorMsg::fatal (vdecl.getLoc (), end-> value.getLoc (), format (ValidateErrorMessage::CANNOT_CASTTO_BASE_CLASS, derived, inner),
+                                               notes-> [ErrorMsg::note (context.getDecosLoc (vdecl.getDecos (), Decorators::REF), ""s8)]);
+                    }
+
                     let typeTest = context:.getBinOpValidator ().validateClassTypeTestOp (alias context, vdecl.getType ().getLoc (), BinaryOperators::OF, value, inner.getInner ());
 
                     // we clone the derived type to match the base type mutability
                     let resType = type.clone (pattern-> value.getType ());
-                    (typeTest, cast!{&Value} (CastValue::new (type.getLoc (), resType, value, isLvalue-> value.isLvalue ()))) // transform the value into the derived type
+                    let ctdValue = match value {
+                        r : &ReferencerValue => {
+                            ReferencerValue::new (r.getLoc (), resType, CastValue::new (type.getLoc (), resType, r.getValue (), isLvalue-> r.getValue ().isLvalue ()), isMutable-> r.isMutable ())
+                        }
+                        r : _ => {
+                            CastValue::new (type.getLoc (), resType, r, isLvalue-> r.isLvalue ())
+                        }// transform the value into the derived type
+                    }
+
+                    let postCtdValue = context:.verifyCompatibleTypeWithValue (vdecl.getLoc (), type, ctdValue, byReference-> useRef);
+                    context:.verifyMemoryOwner (vdecl.getLoc (), type, postCtdValue, construct-> true, byReference-> isRef);
+
+                    (typeTest, postCtdValue)
                 }
                 _ => { // Any other type test is cte evaluated
-                    context.verifyCompatibleType (value.getLoc (), type.getLoc (), value.getType (), type);
-                    (cast!{&Value} (BoolValue::new (vdecl.getType ().getLoc (), true)), value)
+                    let ctdValue = context:.verifyCompatibleTypeWithValue (vdecl.getLoc (), type, value, byReference-> isRef);
+                    context:.verifyMemoryOwner (vdecl.getLoc (), type, ctdValue, construct-> true, byReference-> isRef);
+
+                    (cast!{&Value} (BoolValue::new (vdecl.getType ().getLoc (), true)), ctdValue)
                 }
             };
 
             (typeTest, t, castedValue)
         } else { // create a type for mutability checking
             let (_, t) = context:.validateType (TypeWrapperExpr::new (value.getLoc (), value.getType ()), decos-> vdecl.getDecos (), canBeRef-> isRef);
-            (cast!{&Value} (BoolValue::new (vdecl.getLoc (), true)), t, value) // type test is always true
-        };
+            let ctdValue = context:.verifyCompatibleTypeWithValue (vdecl.getLoc (), t, value, byReference-> isRef);
+            context:.verifyMemoryOwner (vdecl.getLoc (), t, ctdValue, construct-> true, byReference-> isRef);
 
-        match finalType { // only values with a real type can be used to create a variable
-            NoneType () => throw ErrorMsg::fatal (vdecl.getLoc (), format (ValidateErrorMessage::DECLARE_VOID_VAR, finalType));
-            VoidType () => throw ErrorMsg::fatal (vdecl.getLoc (), format (ValidateErrorMessage::DECLARE_VOID_VAR, finalType));
-            o : &OptionType => {
-                if (o.getInners ()[0].isOf!{&NoneType} ()) {
-                    throw ErrorMsg::fatal (vdecl.getLoc (), format (ValidateErrorMessage::DECLARE_VOID_VAR, finalType));
-                }
-            }
+            (cast!{&Value} (BoolValue::new (vdecl.getLoc (), true)), t, ctdValue) // type test is always true
         }
-
-        let (valueCond, innerUse) = if (!vdecl.getValue ().isOf!{&EmptyExpression} ()) { // x : T = V =>
-            // inner pattern matching on V using /cast!T (value)/ (since the type test was true)
-            self.validateMatcher (alias context, castedValue, vdecl.getValue (), alias vars, canInnerMutRef && isRef)
-        } else {
-            (cast!{&Value} (BoolValue::new (vdecl.getLoc (), true)), false) // necessarily pass
-        };
-
-        // reduce non reference value
-        let finVal_ = if (!isRef) { context:.getCompileTimeInterpreter ().reduce (value) } else { value };
-        let (finVal, useRef) = if (isRef && finVal_.isLvalue ()) {
-            let isMut = (canInnerMutRef && finalType.isMutable ());
-            (cast!{&Value} (ReferencerValue::new (finVal_.getLoc (), finVal_.getType (), finVal_, isMutable-> isMut)), isMut) // if it is passed by const ref we need to transform the lvalue to an implicit ref lvalue
-        } else {
-            (finVal_, false)
-        };
-
-        context:.verifyMemoryOwner (vdecl.getLoc (), finalType, finVal, construct-> true, byReference-> isRef);
-        if (vdecl.getLoc () != Keys::UNDER) { // if the variable is not '_' we insert it in the current block
-            let var = VarDeclValue::new (vdecl.getLoc (), finalType, finVal, isReference-> isRef, isMutable-> isMutable, isPure-> isPure);
-            context:.insertLocal (vdecl.getLoc ().str (), var);
-
-            vars:.push (var); // add the declaration in the pattern matching success block
-        }
-
-        // test type && test value to be a successful pattern matcher
-        (LogicalBinBoolOperatorValue::new (vdecl.getLoc (), BinaryOperators::DAND, typeCond, valueCond), useRef || innerUse)
     }
+
 
     /**
      * Validate a call operator matcher
