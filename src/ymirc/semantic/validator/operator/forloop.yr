@@ -42,16 +42,30 @@ pub class ForLoopValidator {
     pub fn validate (self, dmut context : &Validator, f : &ForLoopExpr) -> &Value
         throws &ErrorMsg
     {
-        let value = context:.validateValue (f.getValue ());
-        match value.getType () {
-            t : &TupleType => { self.validateTupleLoop (alias context, t, value, f) }
-            s : &SliceType => { self.validateSliceLoop (alias context, s, value, f) }
-            a : &ArrayType => { self.validateArrayLoop (alias context, a, value, f) }
-            r : &RangeType => { self.validateRangeLoop (alias context, r, value, f) }
+        let mValue = context:.getValueValidator ().validate (alias context, f.getValue (), canBeRef-> true);
+        let (byMutRef, byAlias, fVal) = match mValue {
+            r : &ReferencerValue => { (r.isMutable (), false, r.getValue ()) }
+            a : &AliaserValue => { (false, true, a.getValue ()) }
+            _ => { (false, false, mValue) }
+        };
+
+        let (value, innerUseRef, innerUseAlias) = match fVal.getType () {
+            t : &TupleType => { self.validateTupleLoop (alias context, t, fVal, f, byMutRef, byAlias) }
+            s : &SliceType => { self.validateSliceLoop (alias context, s, fVal, f, byMutRef, byAlias) }
+            a : &ArrayType => { self.validateArrayLoop (alias context, a, fVal, f, byMutRef, byAlias) }
+            r : &RangeType => { (self.validateRangeLoop (alias context, r, fVal, f), false, false) }
             _ => {
-                throw ErrorMsg::fatal (f.getLoc (), format (ValidateErrorMessage::UNDEF_FOR_LOOP_OPERATOR, f.getVariables ().len, value.getType ()));
+                throw ErrorMsg::fatal (f.getLoc (), format (ValidateErrorMessage::UNDEF_FOR_LOOP_OPERATOR, f.getVariables ().len, fVal.getType ()));
             }
         }
+
+        if (!innerUseRef && byMutRef) {
+            throw ErrorMsg::fatal (mValue.getLoc (), ValidateErrorMessage::UNECESSARY_REFERENCE);
+        } else if (!innerUseAlias && byAlias) {
+            throw ErrorMsg::fatal (mValue.getLoc (), format (ValidateErrorMessage::UNECESSARY_ALIAS, mValue.getType ()));
+        }
+
+        value
     }
 
     /**
@@ -68,7 +82,7 @@ pub class ForLoopValidator {
     {
         let value = context:.validateValue (f.getValue ());
         match value.getType () {
-            t : &TupleType => { self.validateTupleLoop (alias context, t, value, f) }
+            t : &TupleType => { self.validateTupleLoop (alias context, t, value, f, false, false)._0 }
             r : &RangeType => { self.validateCteRangeLoop (alias context, r, value, f) }
             _ => {
                 throw ErrorMsg::fatal (f.getLoc (), format (ValidateErrorMessage::UNDEF_CTE_FOR_LOOP_OPERATOR, f.getVariables ().len, value.getType ()));
@@ -119,16 +133,16 @@ pub class ForLoopValidator {
      *    - &ErrorMsg: if the validation failed
      * @returns: the validated loop
      */
-    fn validateTupleLoop (self, dmut context : &Validator, type : &TupleType, value : &Value, f : &ForLoopExpr)-> &Value
+    fn validateTupleLoop (self, dmut context : &Validator, type : &TupleType, value : &Value, f : &ForLoopExpr, byMutRef : bool, byAlias : bool)-> (&Value, bool, bool)
         throws &ErrorMsg
     {
         let vars = f.getVariables ();
         match vars.len {
             1us => {
-                return self.validateTupleIteration (alias context, type, value, f, vars[0], EmptyExpression::new ());
+                return self.validateTupleIteration (alias context, type, value, f, vars[0], EmptyExpression::new (), byMutRef, byAlias);
             }
             2us => {
-                return self.validateTupleIteration (alias context, type, value, f, vars[0], vars[1]);
+                return self.validateTupleIteration (alias context, type, value, f, vars[0], vars[1], byMutRef, byAlias);
             }
             _ => {
                 throw ErrorMsg::fatal (f.getLoc (), format (ValidateErrorMessage::UNDEF_FOR_LOOP_OPERATOR, vars.len, type));
@@ -149,15 +163,19 @@ pub class ForLoopValidator {
      *     - &ErrorMsg: if the validation failed
      * @returns: the validated loop
      * */
-    fn validateTupleIteration (self, dmut context : &Validator, type : &TupleType, value : &Value, f : &ForLoopExpr, iter1 : &Expression, iter2 : &Expression)-> &Value
+    fn validateTupleIteration (self, dmut context : &Validator, type : &TupleType, value : &Value, f : &ForLoopExpr, iter1 : &Expression, iter2 : &Expression, byMutRef : bool, byAlias : bool)-> (&Value, bool, bool)
         throws &ErrorMsg
     {
+        let mut useRef = false, mut useAlias = false;
         let dmut content = Vec!{&Value}::new ();
         context:.enterLoop (); // Even if it is unwinded at compile time, it should behave like a loop (so we can break in it)
         context:.setCurrentLoopType (VoidType::new (f.getLoc ())); // it has no type, (because there is no else part for the moment ?, in theory it is no necessary if we check that there is at least one value in the tuple?)
         {
             for i in 0us .. type.getInners ().len { // we validate the content of the loop for each type of the tuple
-                content:.push (self.validateTupleInnerLoop (alias context, i, iter1, iter2, type, value, f.getBlock ()));
+                let (value_, useRef_, useAlias_) = self.validateTupleInnerLoop (alias context, i, iter1, iter2, type, value, f.getBlock (), byMutRef, byAlias);
+                content:.push (value_);
+                useAlias = useAlias || useAlias_;
+                useRef = useRef || useRef_;
             }
         } catch {
             err : &ErrorMsg => {
@@ -168,7 +186,7 @@ pub class ForLoopValidator {
 
         context:.quitLoop ();
         let inner = BlockValue::new (f.getLoc (), VoidType::new (f.getLoc ()), content[]);
-        LoopValue::new (f.getLoc (), VoidType::new (f.getLoc ()), UNIT_VALUE, inner, false, isCteFor-> true)
+        (LoopValue::new (f.getLoc (), VoidType::new (f.getLoc ()), UNIT_VALUE, inner, false, isCteFor-> true), useRef, useAlias)
     }
 
     /**
@@ -184,38 +202,38 @@ pub class ForLoopValidator {
      * @throws:
      *    - &ErrorMsg: if the validation failed
      */
-    fn validateTupleInnerLoop (self, dmut context : &Validator, i : usize, iter1 : &Expression, iter2 : &Expression, type : &TupleType, value : &Value, blk : &Expression)-> &Value
+    fn validateTupleInnerLoop (self, dmut context : &Validator, i : usize, iter1 : &Expression, iter2 : &Expression, type : &TupleType, value : &Value, blk : &Expression, byMutRef : bool, byAlias : bool)-> (&Value, bool, bool)
         throws &ErrorMsg
     {
         let dmut errors = Vec!{&ErrorMsg}::new ();        
         context:.enterBlock ();
-        let res = { // Simply validate the content of a single iteration
+        let (res, useRef, useAlias) = { // Simply validate the content of a single iteration
             match (iter1, iter2) {
                 (vdecl : &VarDeclExpr, EmptyExpression ()) => {
-                    let iterValue = context.getCompileTimeInterpreter ().reduce (context:.getBinOpValidator ().createTupleFieldAccess (vdecl.getLoc (), type.getInners ()[i], value, i));
-                    let var = self.validateIterDecl (alias context, value.getLoc (), vdecl, type.getInners ()[i], value-> iterValue, globType-> type, canCte-> true);
+                    let (var, useRef, useAlias) = self.validateTupleIterDecl (alias context, vdecl, type, value, byMutRef, byAlias, i);
                     if (vdecl.getLoc () != Keys::UNDER) context:.insertLocal (vdecl.getLoc ().str (), var); // we declare the variable so we can retreive it inside the loop
 
                     let content = context:.validateValue (blk); // we validate the content of the loop
-                    BlockValue::new (blk.getLoc (), VoidType::new (blk.getLoc ()), [var, content]) // and we return the loop iteration block
+                    (BlockValue::new (blk.getLoc (), VoidType::new (blk.getLoc ()), [var, content]), useRef, useAlias) // and we return the loop iteration block
                 }
                 (idecl : &VarDeclExpr, vdecl : &VarDeclExpr) => {
-                    let iterValue = context.getCompileTimeInterpreter ().reduce (context:.getBinOpValidator ().createTupleFieldAccess (vdecl.getLoc (), type.getInners ()[i], value, i));
-                    let var = self.validateIterDecl (alias context, value.getLoc (), vdecl, type.getInners ()[i], value-> iterValue, globType-> type, canCte-> true);
+                    let (var, useRef, useAlias) = self.validateTupleIterDecl (alias context, vdecl, type, value, byMutRef, byAlias, i);
                     if (vdecl.getLoc () != Keys::UNDER) context:.insertLocal (vdecl.getLoc ().str (), var);
 
-                    let index = self.validateIterDecl (alias context, value.getLoc (), idecl, IntType::new (idecl.getLoc (), size-> 0u16, signed-> false), value-> makeIntValue (idecl.getLoc (), i), globType-> type, canCte-> true);
+                    let indexType = IntType::new (idecl.getLoc (), size-> 0u16, signed-> false);
+                    let indexVal = makeIntValue (idecl.getLoc (), i);
+                    let index = self.validateIndexIterDecl (alias context, value.getLoc (), idecl, indexType, value-> indexVal, globType-> type, canCte-> true);
                     if (idecl.getLoc () != Keys::UNDER) context:.insertLocal (idecl.getLoc ().str (), index);
 
                     let content = context:.validateValue (blk); // we validate the content of the loop
-                    BlockValue::new (blk.getLoc (), VoidType::new (blk.getLoc ()), [var, index, content])
+                    (BlockValue::new (blk.getLoc (), VoidType::new (blk.getLoc ()), [var, index, content]), useRef, useAlias)
                 }
                 _ => __pragma!panic ();
             }
         } catch {
             err: &ErrorMsg => {
                 errors:.push (err);
-                UNIT_VALUE
+                (UNIT_VALUE, false, false)
             }
         }
 
@@ -226,7 +244,62 @@ pub class ForLoopValidator {
         }
 
         if (errors.len () != 0us) throw ErrorMsg::list (errors[]);
-        res
+        (res, useRef, useAlias)
+    }
+
+    /**
+     * Validate the iterator variable of a tuple iteration
+     * @params:
+     *    - context: the context of the validation
+     *    - vdecl: the iterator variable declaration
+     *    - type: the type of the tuple
+     *    - value: the value being iterated
+     *    - byMutRef: true if the value is passed by mutable reference
+     *    - byAlias: true if the value was aliased
+     *    - i: the current index
+     * */
+    fn validateTupleIterDecl (self, dmut context : &Validator, vdecl : &VarDeclExpr, type : &TupleType, value : &Value, byMutRef : bool, byAlias : bool, i : usize)-> (&Value, bool, bool)
+        throws &ErrorMsg
+    {
+        let curTupleType = type.getInners()[i];
+        let isPure = context.findDecos (vdecl.getDecos (), [Decorators::PURE]);
+        let isRef = context.findDecos (vdecl.getDecos (), [Decorators::REF]);
+        let isMutable = context.findDecos (vdecl.getDecos (), [Decorators::MUT, Decorators::DMUT]);
+        let mut useRef = false, mut useAlias = false;
+
+        let vType = if (!vdecl.getType ().isOf!{&EmptyExpression} ()) {
+            let (_, t) = context:.validateType (vdecl.getType (), decos-> vdecl.getDecos (), canBeRef-> isRef);
+            let vtype = if (isPure) { t.clone (0u32) } else { t };
+            context:.verifyCompatibleType (vdecl.getType ().getLoc (), curTupleType.getLoc (), vtype, curTupleType);
+            vtype
+        } else {
+            let (_, t) = context:.validateType (TypeWrapperExpr::new (value.getLoc (), curTupleType), decos-> vdecl.getDecos (), canBeRef-> isRef);
+            let vtype = if (isPure) { t.clone (0u32) } else { t };
+            vtype
+        };
+
+        if (vType.isMutable () && !vType.needExplicitAlias () && !isRef) {
+            throw ErrorMsg::fatal (vdecl.getLoc (), ValidateErrorMessage::MUTABLE_CONST_ITERATOR);
+        }
+
+        let indexValue = context.getCompileTimeInterpreter ().reduce (context:.getBinOpValidator ().createTupleFieldAccess (vdecl.getLoc (), type.getInners ()[i], value, i));
+        let iterValue = context:.verifyCompatibleTypeWithValue (vdecl.getLoc (), vType, indexValue, byReference-> isRef);
+
+        let access = if (byMutRef && isRef && curTupleType.isMutable () && iterValue.isLvalue ()) {
+            useRef = true;
+            cast!{&Value} (ReferencerValue::new (vdecl.getLoc (), iterValue.getType (), iterValue, isMutable-> true))
+        } else if (!isRef && byAlias && curTupleType.isMutable () && vType.needExplicitAlias ()) {
+            useAlias = true;
+            cast!{&Value} (AliaserValue::new (vdecl.getLoc (), iterValue.getType (), iterValue))
+        } else if (isRef && !byMutRef && iterValue.isLvalue ()) {
+            cast!{&Value} (ReferencerValue::new (vdecl.getLoc (), iterValue.getType (), iterValue, isMutable-> false))
+        } else {
+            iterValue
+        };
+
+        context:.verifyMemoryOwner (vdecl.getLoc (), vType, access, construct-> true, byReference-> isRef);
+        let decl = VarDeclValue::new (vdecl.getLoc (), vType, access, isMutable-> isMutable, isPure-> isPure, isReference-> isRef, isIterator-> true);
+        (decl, useRef, useAlias)
     }
 
     /**
@@ -248,18 +321,18 @@ pub class ForLoopValidator {
      * @throws:
      *     - &ErrorMsg: if the validation failed
      * */
-    fn validateArrayLoop (self, dmut context : &Validator, arrType : &ArrayType, value : &Value, content : &ForLoopExpr)-> &Value
+    fn validateArrayLoop (self, dmut context : &Validator, arrType : &ArrayType, value : &Value, content : &ForLoopExpr, byMutRef : bool, byAlias : bool)-> (&Value, bool, bool)
         throws &ErrorMsg
     {
         let vars = content.getVariables ();
-        let uniqV = context.createSliceAliasFromArray (content.getLoc (), arrType, value, mutable-> false);
+        let uniqV = context.createSliceAliasFromArray (content.getLoc (), arrType, value, mutable-> (byMutRef || byAlias) && arrType.isMutable ());
         let slcT = uniqV.getType ().asOf!{&SliceType} ();
 
         match vars.len {
             1us => // only the value of the array
-                return self.validateSliceIteration (alias context, slcT, uniqV, content, vars[0], EmptyExpression::new ());
+                return self.validateSliceIteration (alias context, slcT, uniqV, content, vars[0], EmptyExpression::new (), byMutRef, byAlias);
             2us => // The value of the array and the iterator
-                return self.validateSliceIteration (alias context, slcT, uniqV, content, vars[0], vars[1]);
+                return self.validateSliceIteration (alias context, slcT, uniqV, content, vars[0], vars[1], byMutRef, byAlias);
             _ => { // no iteration is possible with three variables
                 throw ErrorMsg::fatal (content.getLoc (), format (ValidateErrorMessage::UNDEF_FOR_LOOP_OPERATOR, vars.len, arrType));
             }
@@ -282,15 +355,15 @@ pub class ForLoopValidator {
      *     - value: the value that is iterated
      *     - content: the content of the iteration to validate
      */
-    fn validateSliceLoop (self, dmut context : &Validator, slcType : &SliceType, value : &Value, content : &ForLoopExpr)-> &Value
+    fn validateSliceLoop (self, dmut context : &Validator, slcType : &SliceType, value : &Value, content : &ForLoopExpr, byMutRef : bool, byAlias : bool)-> (&Value, bool, bool)
         throws &ErrorMsg
     {
         let vars = content.getVariables ();
         match vars.len {
             1us => // only the value of the array
-                return self.validateSliceIteration (alias context, slcType, value, content, vars[0], EmptyExpression::new ());
+                return self.validateSliceIteration (alias context, slcType, value, content, vars[0], EmptyExpression::new (), byMutRef, byAlias);
             2us => // The value of the array and the iterator
-                return self.validateSliceIteration (alias context, slcType, value, content, vars[0], vars[1]);
+                return self.validateSliceIteration (alias context, slcType, value, content, vars[0], vars[1], byMutRef, byAlias);
             _ => { // no iteration is possible with three variables
                 throw ErrorMsg::fatal (content.getLoc (), format (ValidateErrorMessage::UNDEF_FOR_LOOP_OPERATOR, vars.len, slcType));
             }
@@ -310,7 +383,7 @@ pub class ForLoopValidator {
      * @throws:
      *    - &ErrorMsg: if the iteration cannot be validated
      */
-    fn validateSliceIteration (self, dmut context : &Validator, slcType : &SliceType, sliceValue : &Value, content : &ForLoopExpr, iter1 : &Expression, iter2 : &Expression)-> &Value
+    fn validateSliceIteration (self, dmut context : &Validator, slcType : &SliceType, sliceValue : &Value, content : &ForLoopExpr, iter1 : &Expression, iter2 : &Expression, byMutRef : bool, byAlias : bool)-> (&Value, bool, bool)
         throws &ErrorMsg
     {
         let dmut errors = Vec!{&ErrorMsg}::new ();
@@ -318,31 +391,44 @@ pub class ForLoopValidator {
         let dmut values = Vec!{&Value}::new ();
         let loc = content.getLoc ();
         let mut test : &Value = UNIT_VALUE;
+        let mut useRef = false, mut useAlias = false;
+
+        // => for index, value in S
+        // ==
+        // let array = S;
+        // let index = 0;
+        // while index < array.len {
+        //    let value = array [index];
+        //    {  } // content
+        //    index += 1;
+        // }
 
         context:.enterBlock ();
         {
-            // First we create the iteration variables, that will store the value at the current array index, and the value of the index
-            let vars = self.validateSliceIteratorVars (alias context, sliceValue.getLoc (), slcType, iter1, iter2);
-            let sliceDecl = VarDeclValue::new (Word::new ("#_value"s8, sliceValue.getLoc ()), slcType, sliceValue, isMutable-> false, isPure-> false);
+            let sliceDecl = VarDeclValue::new (Word::new ("#_value"s8, sliceValue.getLoc ()), slcType, sliceValue, isMutable-> (byMutRef || byAlias) && slcType.isMutable (), isPure-> false);
             let sliceRef = VarRefValue::new (sliceDecl.getLoc (), sliceDecl.getLoc (), slcType, sliceDecl.getUniqId (), isSelf-> false, canCte-> false);
-
-            let array = vars._0; // the value inside the array
-            let iter = vars._1; // the value of the current index
             values:.push (sliceDecl);
-            values:.push (vars._2);
-            values:.push (vars._3);
-            
+
+            // First we create the iteration variables, that will store the value at the current array index, and the value of the index
+            let vars = self.validateSliceIteratorVars (alias context, sliceValue.getLoc (), slcType, sliceRef, iter1, iter2, byMutRef, byAlias);
+            let iter = vars._0; // the value of the current index
+
+            values:.push (vars._1); // declare index iterator outside the content of the loop
+
+            useRef = vars._3;
+            useAlias = vars._4;
+
             let one = makeIntValue (loc, 1us); // used to increment the iterator
             let len = StructFieldAccessValue::new (loc, one.getType (), sliceRef, SliceKeys::LEN); // access the size of the array to verify test when to exit the loop
-            
+
             test = CmpIntOperatorValue::new (loc, BinaryOperators::INF, iter, len); // if the iterator is greater than the value of the array the loop is stopped
-            let affect = AffectValue::new (loc, array.getType (), array, SliceAccessValue::new (loc, array.getType (), sliceRef, iter)); // affect the current value of the array to the index
             let increment = AffectValue::new (loc, iter.getType (), iter, BinaryMathIntOperatorValue::new (loc, iter.getType (), BinaryOperators::PLUS, iter, one)); // increment the iterator for the next iteration
 
-            // the loop has three steps: 
-            innerValues:.push (affect); // 1. get the current value of the array
+            // the loop has three steps: value iterator declarations, content, increment
+            innerValues:.push (vars._2);
             innerValues:.push (context:.validateValue (content.getBlock ())); // execute the content of the loop
-            innerValues:.push (increment); // go to the next iteration
+            innerValues:.push (increment);
+            // go to the next iteration
         } catch {
             err : &ErrorMsg => { errors:.push (err); } // we catch everything because we need to exit the block
         }
@@ -358,7 +444,7 @@ pub class ForLoopValidator {
         }
 
         if (errors.len () != 0us) throw ErrorMsg::list (errors[]);
-        BlockValue::new (loc, VoidType::new (loc), values[])
+        (BlockValue::new (loc, VoidType::new (loc), values[]), useRef, useAlias)
     }
 
     /**
@@ -370,44 +456,96 @@ pub class ForLoopValidator {
      *    - iter1: the iterator (value if iter2 is empty, index otherwise)
      *    - iter2: value if not empty
      * @returns:
-     *    - .0: the ref to the value variable 
-     *    - .1: the ref to the index variable (even if iter2 is empty)
+     *    - .0: the ref to the index variable (even if iter2 is empty)
+     *    - .1: the vardecl of the index variable (even if iter1 is empty)
      *    - .2: the vardecl of the value variable
-     *    - .3: the vardecl of the index variable (even if iter1 is empty)
      * @throws:
      *    - &ErrorMsg: if the variables are uncorrectly defined
      */
-    fn validateSliceIteratorVars (self, dmut context : &Validator, loc : &Word, slcType : &SliceType, iter1 : &Expression, iter2 : &Expression)-> (&Value, &Value, &Value, &Value)
+    fn validateSliceIteratorVars (self, dmut context : &Validator, loc : &Word, slcType : &SliceType, sliceRef : &Value, iter1 : &Expression, iter2 : &Expression, byMutRef : bool, byAlias : bool)-> (&Value, &Value, &Value, bool, bool)
         throws &ErrorMsg
     {
         // This function can seem a bit complex but isn't
         match (iter1, iter2) { // we have two cases, (with one variable, or with two)            
             (v : &VarDeclExpr, EmptyExpression ()) => { // 1. with one
-                let array = self.validateIterDecl (alias context, loc, v, slcType.getInners ()[0].clone (0u32), slcType, canCte-> false);
-
                 // And the variable for the iterator, with an name that cannot be taken elsewhere, but this is not important
                 let iter = VarDeclValue::new (Word::new ("#_iter"s8, v.getLoc ()), IntType::new (v.getLoc (), size-> 0u16, signed-> false), makeIntValue (v.getLoc (), 0us), isMutable-> false, isPure-> false);
-                if (v.getLoc () != Keys::UNDER) context:.insertLocal (v.getLoc ().str (), array); // The variable must be retreivable, so we insert it inside the context, (but not the iterator that is hidden)               
-
-                let vrefArray = VarRefValue::new (v.getLoc (), array.getLoc (), array.getVarType (), array.getUniqId (), isSelf-> false, canCte-> false);
                 let vrefIter = VarRefValue::new (iter.getLoc (), iter.getLoc (), iter.getVarType (), iter.getUniqId (), isSelf-> false, canCte-> false);
-                
-                return (vrefArray, vrefIter, array, iter); // we return the variable for the loop validation
+
+                let (array, useRef, useAlias) = self.validateSliceIterDecl (alias context, v, slcType, sliceRef, vrefIter, byMutRef, byAlias);
+                if (v.getLoc () != Keys::UNDER) context:.insertLocal (v.getLoc ().str (), array); // The variable must be retreivable, so we insert it inside the context, (but not the iterator that is hidden)
+
+                return (vrefIter, iter, array, useRef, useAlias); // we return the variable for the loop validation
             }
             (i : &VarDeclExpr, v : &VarDeclExpr) => {
-                let array = self.validateIterDecl (alias context, loc, v, slcType.getInners ()[0].clone (0u32), slcType, canCte-> false);
-                let iter = self.validateIterDecl (alias context, loc, i, IntType::new (i.getLoc (), size-> 0u16, signed-> false), value-> makeIntValue (i.getLoc (), 0us), slcType, canCte-> false);
+                let iter = self.validateIndexIterDecl (alias context, loc, i, IntType::new (i.getLoc (), size-> 0u16, signed-> false), value-> makeIntValue (i.getLoc (), 0us), slcType, canCte-> false);
+                let vrefIter = VarRefValue::new (iter.getLoc (), iter.getLoc (), iter.getVarType (), iter.getUniqId (), isSelf-> false, canCte-> false);
+
+                let (array, useRef, useAlias) = self.validateSliceIterDecl (alias context, v, slcType, sliceRef, vrefIter, byMutRef, byAlias);
 
                 if (v.getLoc () != Keys::UNDER) context:.insertLocal (v.getLoc ().str (), array); // insert them, so we can retreive them
                 if (i.getLoc () != Keys::UNDER) context:.insertLocal (i.getLoc ().str (), iter);
 
-                let vrefArray = VarRefValue::new (v.getLoc (), array.getLoc (), array.getVarType (), array.getUniqId (), isSelf-> false, canCte-> false);
-                let vrefIter = VarRefValue::new (iter.getLoc (), iter.getLoc (), iter.getVarType (), iter.getUniqId (), isSelf-> false, canCte-> false);
-                
-                return (vrefArray, vrefIter, array, iter); // and we return them for the loop valiation
+                return (vrefIter, iter, array, useRef, useAlias); // and we return them for the loop valiation
             }
             _ => __pragma!panic (); // panic if we get something else
         }
+    }
+
+    /**
+     * Validate the iterator variable of a slice iteration
+     * @params:
+     *    - context: the context of the validation
+     *    - vdecl: the iterator variable declaration
+     *    - type: the type of the slice
+     *    - value: the value being iterated
+     *    - index: the variable reference to the index value
+     *    - byMutRef: true if the value is passed by mutable reference
+     *    - byAlias: true if the value was aliased
+     * */
+    fn validateSliceIterDecl (self, dmut context : &Validator, vdecl : &VarDeclExpr, type : &SliceType, sliceValue : &Value, index : &Value, byMutRef : bool, byAlias : bool)-> (&Value, bool, bool)
+        throws &ErrorMsg
+    {
+        let innerType = type.getInners ()[0];
+        let isPure = context.findDecos (vdecl.getDecos (), [Decorators::PURE]);
+        let isRef = context.findDecos (vdecl.getDecos (), [Decorators::REF]);
+        let isMutable = context.findDecos (vdecl.getDecos (), [Decorators::MUT, Decorators::DMUT]);
+
+        let mut useRef = false, mut useAlias = false;
+
+        let vType = if (!vdecl.getType ().isOf!{&EmptyExpression} ()) {
+            let (_, t) = context:.validateType (vdecl.getType (), decos-> vdecl.getDecos (), canBeRef-> isRef);
+            let vtype = if (isPure) { t.clone (0u32) } else { t };
+            context:.verifyCompatibleType (vdecl.getType ().getLoc (), innerType.getLoc (), vtype, innerType);
+            vtype
+        } else {
+            let (_, t) = context:.validateType (TypeWrapperExpr::new (sliceValue.getLoc (), innerType), decos-> vdecl.getDecos (), canBeRef-> isRef);
+            let vtype = if (isPure) { t.clone (0u32) } else { t };
+            vtype
+        };
+
+        if (vType.isMutable () && !vType.needExplicitAlias () && !isRef) {
+            throw ErrorMsg::fatal (vdecl.getLoc (), ValidateErrorMessage::MUTABLE_CONST_ITERATOR);
+        }
+
+        let reducedValue = context.getCompileTimeInterpreter ().reduce (SliceAccessValue::new (sliceValue.getLoc (), innerType, sliceValue, index));
+        let iterValue = context:.verifyCompatibleTypeWithValue (vdecl.getLoc (), vType, reducedValue, byReference-> isRef);
+
+        let access = if (byMutRef && isRef && innerType.isMutable () && iterValue.isLvalue ()) {
+            useRef = true;
+            cast!{&Value} (ReferencerValue::new (vdecl.getLoc (), iterValue.getType (), iterValue, isMutable-> true))
+        } else if (!isRef && byAlias && innerType.isMutable () && vType.needExplicitAlias ()) {
+            useAlias = true;
+            cast!{&Value} (AliaserValue::new (vdecl.getLoc (), iterValue.getType (), iterValue))
+        } else if (isRef && !byMutRef && iterValue.isLvalue ()) {
+            cast!{&Value} (ReferencerValue::new (vdecl.getLoc (), iterValue.getType (), iterValue, isMutable-> false))
+        } else {
+            iterValue
+        };
+
+        context:.verifyMemoryOwner (vdecl.getLoc (), vType, access, construct-> true, byReference-> isRef);
+        let decl = VarDeclValue::new (vdecl.getLoc (), vType, access, isMutable-> isMutable, isPure-> isPure, isReference-> isRef, isIterator-> true);
+        (decl, useRef, useAlias)
     }
 
     /**
@@ -535,7 +673,7 @@ pub class ForLoopValidator {
             v : &VarDeclExpr => {
                 // We create the variable for the iterator
                 let iterType = rngType.getInners ()[0].clone (0u32);
-                let iterValue = self.validateIterDecl (alias context, loc, v, iterType, rngType, canCte-> false);
+                let iterValue = self.validateIndexIterDecl (alias context, loc, v, iterType, rngType, canCte-> false);
                 if (v.getLoc () != Keys::UNDER) context:.insertLocal (v.getLoc ().str (), iterValue);
 
                 // And the variable ref so we can use it
@@ -920,29 +1058,24 @@ pub class ForLoopValidator {
      *     - withDeco: true if the variable can have decorators
      * @returns: a vardecl value
      * */
-    fn validateIterDecl (self, dmut context : &Validator, loc : &Word, vdecl : &VarDeclExpr, type : &Type, value : &Value = UNIT_VALUE, globType : &Type, withDeco : bool = false, canCte : bool = true)-> &VarDeclValue
+    fn validateIndexIterDecl (self, dmut context : &Validator, loc : &Word, vdecl : &VarDeclExpr, type : &Type, value : &Value = UNIT_VALUE, globType : &Type, canCte : bool = true)-> &VarDeclValue
         throws &ErrorMsg
     {
-        if (!withDeco) {
-            if (context.findDecos (vdecl.getDecos (), Decorators::__members__)) {
-                throw ErrorMsg::fatal (vdecl.getDecos ()[0].loc, end-> loc, format (ValidateErrorMessage::FORBID_DECO_FOR_LOOP, globType));
-            }
+        if (context.findDecos (vdecl.getDecos (), Decorators::__members__)) {
+            throw ErrorMsg::fatal (vdecl.getDecos ()[0].loc, end-> loc, format (ValidateErrorMessage::FORBID_DECO_FOR_LOOP, globType));
         }
 
-        let isPure = context.findDecos (vdecl.getDecos (), [Decorators::PURE]);
-        let isMutable = context.findDecos (vdecl.getDecos (), [Decorators::MUT, Decorators::DMUT]);
-
         let vType = if (!vdecl.getType ().isOf!{&EmptyExpression} ()) {
-            let vtype = context:.validateType (vdecl.getType (), decos-> vdecl.getDecos (), canBeRef-> false)._1;
+            let vtype = context:.validateType (vdecl.getType (), decos-> [], canBeRef-> false)._1;
             context:.verifyCompatibleType (vdecl.getType ().getLoc (), loc, vtype, type);
             vtype
         } else {
-            type
+            let (_, t) = context:.validateType (TypeWrapperExpr::new (value.getLoc (), type), decos-> [], canBeRef-> false);
+            t
         }
 
         if (vdecl.getLoc () != Keys::UNDER) context:.verifyShadow (vdecl.getLoc ());
-
-        VarDeclValue::new (vdecl.getLoc (), vType, value, isMutable-> isMutable, isPure-> isPure, isCte-> canCte)
+        VarDeclValue::new (vdecl.getLoc (), vType, value, isMutable-> false, isPure-> false, isCte-> canCte)
     }
 
     /**
