@@ -584,7 +584,7 @@ pub class ForLoopValidator {
 
         let fst  = interpret.reduce (StructFieldAccessValue::new (loc, rngType.getInners ()[0], value, RangeKeys::FST));
         let scd  = interpret.reduce (StructFieldAccessValue::new (loc, rngType.getInners ()[0], value, RangeKeys::SCD));
-        let step = interpret.reduce (StructFieldAccessValue::new (loc, rngType.getInners ()[1], value, RangeKeys::STEP))
+        let step = interpret.reduce (StructFieldAccessValue::new (loc, rngType.getInners ()[1], value, RangeKeys::STEP));
         let contains = interpret.reduce (StructFieldAccessValue::new (loc, BoolType::new (loc), value, RangeKeys::CONTAIN));
 
         let iterDecl = VarDeclValue::new (Word::new ("#_iter"s8, loc), IntType::new (loc, signed-> false, size-> 0u16), makeIntValue (loc, 0us), isMutable-> true, isPure-> false);
@@ -962,16 +962,155 @@ pub class ForLoopValidator {
      * @throws:
      *   - &ErrorMsg: if the validation failes
      * */
-    fn validateComprRange (self, dmut context : &Validator, ra : &RangeType, iter : &Value, all : &SliceForAllocatorExpr, canDynamic : bool)-> &Value
+    fn validateComprRange (self, dmut context : &Validator, rngType : &RangeType, value : &Value, all : &SliceForAllocatorExpr, canDynamic : bool)-> &Value
         throws &ErrorMsg
     {
-        context;
-        ra;
-        iter;
-        all;
-        canDynamic;
-        __pragma!fake_throw (&ErrorMsg);
-        __pragma!panic ();
+        let vars = all.getVariables ();
+
+        if (vars.len != 1us) throw ErrorMsg::fatal (all.getLoc (), format (ValidateErrorMessage::UNDEF_FOR_LOOP_OPERATOR, vars.len, rngType));
+
+        let loc = all.getLoc ();
+        let dmut values = Vec!{&Value}::new ();
+        let interpret = context.getCompileTimeInterpreter ();
+
+        let fst  = interpret.reduce (StructFieldAccessValue::new (loc, rngType.getInners ()[0], value, RangeKeys::FST));
+        let scd  = interpret.reduce (StructFieldAccessValue::new (loc, rngType.getInners ()[0], value, RangeKeys::SCD));
+        let step = interpret.reduce (StructFieldAccessValue::new (loc, rngType.getInners ()[1], value, RangeKeys::STEP));
+        let contains = interpret.reduce (StructFieldAccessValue::new (loc, BoolType::new (loc), value, RangeKeys::CONTAIN));
+
+        let iterDecl = VarDeclValue::new (Word::new ("#_iter"s8, loc), IntType::new (loc, signed-> false, size-> 0u16), makeIntValue (loc, 0us), isMutable-> true, isPure-> false);
+        let mut iterRef = VarRefValue::new (iterDecl.getLoc (), loc, iterDecl.getVarType (), iterDecl.getUniqId (), isSelf-> false, canCte-> false);
+        values:.push (iterDecl);
+
+        let nbIterRef = if (!interpret.isCte (fst) || !interpret.isCte (scd) || !interpret.isCte (step) || !interpret.isCte (contains)) {
+            let nbIteration = self.validateComputeNbIterations (loc, alias context, fst, scd, step, contains);
+            let nbIterDecl = VarDeclValue::new (Word::new ("#_nb_iter"s8, loc), IntType::new (loc, signed-> false, size-> 0u16), nbIteration, isMutable-> true, isPure-> false);
+            let mut nbIterRef = VarRefValue::new (nbIterDecl.getLoc (), loc, nbIterDecl.getVarType (), nbIterDecl.getUniqId (), isSelf-> false, canCte-> false);
+
+            values:.push (nbIterDecl);
+            nbIterRef
+        } else {
+            context:.getCompileTimeInterpreter ().reduce (self.validateComputeNbIterations (loc, alias context, fst, scd, step, contains))
+        };
+
+        let dmut errors = Vec!{&ErrorMsg}::new ();
+
+        context:.enterBlock ();
+        let retValue = {
+            let (lp, slcValueRef, slcValueDecl, sliceType) = self.validateComprRangeInnerLoop (alias context, rngType, all, vars [0], iterRef, nbIterRef, fst, step, canDynamic);
+
+            // Declare the value
+            values:.push (slcValueDecl);
+            values:.push (lp); // iterate to fill its content
+            values:.push (slcValueRef); // return the generated value
+
+            // Put inside a copier, because it is already allocated, so first level copy should not be done again
+            CopierValue::new (loc, sliceType, isDone-> true, BlockValue::new (loc, sliceType, values[]))
+        } catch {
+            err : &ErrorMsg => {
+                errors:.push (err);
+                cast!{&Value} (UNIT_VALUE)
+            }
+        };
+
+        {
+            context:.quitBlock (warnUnused-> errors.len () == 0us);
+        } catch {
+            err : &ErrorMsg => errors:.push (err);
+        }
+
+        if (errors.len () != 0us) throw ErrorMsg::list (errors[]);
+        retValue
+    }
+
+    /**
+     * Validate the inner value of a list comprehension iterating over a range value
+     * @params:
+     *    - context: the context of the validation
+     *    - rngType: the type of the iterated value
+     *    - all: the slice for allocator
+     *    - var: the value iterator (not yet validated)
+     *    - iterRef: the reference to the index iterator
+     *    - nbIterRef: the value containing the number of iteration to perform
+     *    - fst: the first value of the range
+     *    - step: the step of the range
+     *    - canDynamic: true if the result is a slice, false if the result is an array
+     * @returns:
+     *    - .0: the loop filling the result value
+     *    - .1: the refrence to the created value
+     *    - .2: the declaration of the created value
+     *    - .3: the type of the created value
+     * @throws:
+     *    - &ErrorMsg: if the validation failed
+     * */
+    fn validateComprRangeInnerLoop (self, dmut context : &Validator, rngType : &RangeType, all : &SliceForAllocatorExpr, var : &Expression, iterRef : &Value, nbIterRef : &Value, fst : &Value, step : &Value, canDynamic : bool)-> (&Value, &Value, &Value, &Type)
+        throws &ErrorMsg
+    {
+        let loc = all.getLoc ();
+        let dmut innerLoopValues = Vec!{&Value}::new ();
+
+        let (varRef, varDecl) = self.validateRangeIteratorVar (alias context, loc, rngType, var); // validate the value iterator
+        let innerValue = context:.validateValue (all.getValue ()); // Validate the value using the declared iterator
+        let mut innerType = innerValue.getType (); // use the validated value to infer the type of the created slice
+        if (!innerType.isMutable ()) innerType = innerType.clone (1u32); // same as slice simple alloc, inner values are always 1 level mutable
+
+        { // if the inner value is more deeply mutable we need to check for implicit alias and stuff
+            context:.verifyMemoryOwner (loc, innerType, innerValue, byReference-> false)
+        } catch {
+            _ => {
+                innerType = innerType.clone (1u32); // it is more deeply mutable, but does not allow mutable memory borrowing
+            }
+        }
+
+        let (sliceType, sliceInitValue) = if (canDynamic) {
+            let type = SliceType::new (all.getLoc (), innerType, isMutable-> true);
+            (type, ArrayAllocValue::dyn (loc, type, UNIT_VALUE, nbIterRef)) // allocate a slice to be filled
+        } else {
+            let size = {
+                context:.getCompileTimeInterpreter ().computeInt (nbIterRef, signed-> false)
+            } catch {
+                _ => throw ErrorMsg::fatal (all.getIter ().getLoc (), format (ValidateErrorMessage::LIST_COMPR_SIZE_CTE, rngType));
+            };
+
+            let tabSize = {
+                size.to!usize ()
+            } catch {
+                _ => throw ErrorMsg::fatal (loc, format (ValidateErrorMessage::OVERFLOW_CAPACITY, IntType::new (loc, size-> 0u16, signed-> false), size, u64::max));
+            };
+
+            if (tabSize > 1048576us) { // 1MB
+                throw ErrorMsg::fatal (loc, format (ValidateErrorMessage::OVERFLOW_CAPACITY_ARRAY, tabSize, 1048576us));
+            }
+
+            let type = ArrayType::new (all.getLoc (), innerType, tabSize, isMutable-> true);
+            (type, UNIT_VALUE) // no need to allocate, the variable declaration will be enough
+        };
+
+        // Declaration of the variable that will store the result of the list comprehension
+        let slcValueDecl = VarDeclValue::new (Word::new ("#_value"s8, loc), sliceType, sliceInitValue, isMutable-> true, isPure-> false);
+        let slcValueRef = VarRefValue::new (slcValueDecl.getLoc (), loc, slcValueDecl.getVarType (), slcValueDecl.getUniqId (), isSelf-> false, canCte-> false);
+
+        let slcIndex = if (canDynamic) { // affecting at each index
+            SliceAccessValue::new (loc, innerType, slcValueRef, iterRef)
+        } else {
+            ArrayAccessValue::new (loc, innerType, slcValueRef, iterRef)
+        };
+
+        // Loop incrementation
+        let (increment, setIndex, test) = self.validateRangeIteratorIncrement (alias context, loc, iterRef, nbIterRef, varRef, fst, step);
+        if (varRef.getLoc () != Keys::UNDER) {
+            innerLoopValues:.push (varDecl);
+            innerLoopValues:.push (setIndex);
+        }
+
+        // Content of the loop
+        innerLoopValues:.push (AffectValue::new (loc, innerType, slcIndex, innerValue));
+        innerLoopValues:.push (increment);
+
+        let blkContent = BlockValue::new (loc, VoidType::new (loc), innerLoopValues[]);
+        let lp = LoopValue::new (loc, VoidType::new (loc), test-> test, blkContent, isDo-> false);
+
+        (lp, slcValueRef, slcValueDecl, sliceType)
     }
 
     /**
