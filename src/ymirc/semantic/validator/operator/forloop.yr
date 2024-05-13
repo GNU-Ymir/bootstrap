@@ -117,7 +117,7 @@ pub class ForLoopValidator {
         }
 
         match value.getType () {
-            t : &TupleType => { self.validateComprTuple (alias context, t, value, all, dynamic) }
+            t : &TupleType => { self.validateComprTuple (alias context, t, value, all) }
             s : &SliceType => { self.validateComprSlice (alias context, s, value, all, dynamic) }
             a : &ArrayType => { self.validateComprArray (alias context, a, value, all, dynamic) }
             r : &RangeType => { self.validateComprRange (alias context, r, value, all, dynamic) }
@@ -215,19 +215,19 @@ pub class ForLoopValidator {
      * @throws:
      *    - &ErrorMsg: if the validation failed
      */
-    fn validateTupleInnerLoop (self, dmut context : &Validator, i : usize, iter1 : &Expression, iter2 : &Expression, type : &TupleType, value : &Value, blk : &Expression, byMutRef : bool, byAlias : bool)-> (&Value, bool, bool)
+    fn validateTupleInnerLoop (self, dmut context : &Validator, i : usize, iter1 : &Expression, iter2 : &Expression, type : &TupleType, value : &Value, blk : &Expression, byMutRef : bool, byAlias : bool, forLstCompr : bool = false)-> (&Value, bool, bool)
         throws &ErrorMsg
     {
         let dmut errors = Vec!{&ErrorMsg}::new ();        
         context:.enterBlock ();
-        let (res, useRef, useAlias) = { // Simply validate the content of a single iteration
+        let (pre, res, useRef, useAlias) = { // Simply validate the content of a single iteration
             match (iter1, iter2) {
                 (vdecl : &VarDeclExpr, EmptyExpression ()) => {
                     let (var, useRef, useAlias) = self.validateTupleIterDecl (alias context, vdecl, type, value, byMutRef, byAlias, i);
                     if (vdecl.getLoc () != Keys::UNDER) context:.insertLocal (vdecl.getLoc ().str (), var); // we declare the variable so we can retreive it inside the loop
 
                     let content = context:.validateValue (blk); // we validate the content of the loop
-                    (BlockValue::new (blk.getLoc (), VoidType::new (blk.getLoc ()), [var, content]), useRef, useAlias) // and we return the loop iteration block
+                    ([var], content, useRef, useAlias) // and we return the loop iteration block
                 }
                 (idecl : &VarDeclExpr, vdecl : &VarDeclExpr) => {
                     let (var, useRef, useAlias) = self.validateTupleIterDecl (alias context, vdecl, type, value, byMutRef, byAlias, i);
@@ -239,14 +239,14 @@ pub class ForLoopValidator {
                     if (idecl.getLoc () != Keys::UNDER) context:.insertLocal (idecl.getLoc ().str (), index);
 
                     let content = context:.validateValue (blk); // we validate the content of the loop
-                    (BlockValue::new (blk.getLoc (), VoidType::new (blk.getLoc ()), [var, index, content]), useRef, useAlias)
+                    ([var, index], content, useRef, useAlias)
                 }
                 _ => __pragma!panic ();
             }
         } catch {
             err: &ErrorMsg => {
                 errors:.push (err);
-                (UNIT_VALUE, false, false)
+                ([], UNIT_VALUE, false, false)
             }
         }
 
@@ -256,8 +256,24 @@ pub class ForLoopValidator {
             err : &ErrorMsg => errors:.push (err); 
         }
 
+        let blkRes = if (forLstCompr) {
+            let mut innerType = res.getType ();
+            if (!innerType.isMutable ()) innerType = innerType.clone (1u32);
+            {
+                context:.verifyMemoryOwner (blk.getLoc (), innerType, res, byReference-> false);
+            } catch {
+                _ => {
+                    innerType = innerType.clone (1u32);
+                }
+            };
+
+            BlockValue::new (blk.getLoc (), innerType, pre ~ [res])
+        } else {
+            BlockValue::new (blk.getLoc (), VoidType::new (blk.getLoc ()), pre ~ [res])
+        };
+
         if (errors.len () != 0us) throw ErrorMsg::list (errors[]);
-        (res, useRef, useAlias)
+        (blkRes, useRef, useAlias)
     }
 
     /**
@@ -434,7 +450,7 @@ pub class ForLoopValidator {
 
             let one = makeIntValue (loc, 1us); // used to increment the iterator
             // Compute the len from the initial value, because the generator #_value may lose the cte len (e.g. a [0 .. 2], [1, 2, 3], ...)
-            let len = StructFieldAccessValue::new (loc, one.getType (), sliceValue, SliceKeys::LEN); // access the size of the array to verify test when to exit the loop
+            let len = context:.getCompileTimeInterpreter ().reduce (StructFieldAccessValue::new (loc, one.getType (), sliceValue, SliceKeys::LEN)); // access the size of the array to verify test when to exit the loop
 
             test = CmpIntOperatorValue::new (loc, BinaryOperators::INF, iter, len); // if the iterator is greater than the value of the array the loop is stopped
             let increment = AffectValue::new (loc, iter.getType (), iter, BinaryMathIntOperatorValue::new (loc, iter.getType (), BinaryOperators::PLUS, iter, one)); // increment the iterator for the next iteration
@@ -983,7 +999,7 @@ pub class ForLoopValidator {
         let sliceRef = VarRefValue::new (sliceDecl.getLoc (), sliceDecl.getLoc (), slcType, sliceDecl.getUniqId (), isSelf-> false, canCte-> false);
 
         // Compute the len from the initial value, because the generator #_value may lose the cte len (e.g. a [0 .. 2], [1, 2, 3], ...)
-        let len = StructFieldAccessValue::new (loc, IntType::new (loc, size-> 0u16, signed-> false), value, SliceKeys::LEN);
+        let len = context:.getCompileTimeInterpreter ().reduce (StructFieldAccessValue::new (loc, IntType::new (loc, size-> 0u16, signed-> false), value, SliceKeys::LEN));
         values:.push (sliceDecl); // insert the slice above the loop
 
         let retValue = if (all.isTuple ()) { // tuple iteration is unfolded, so need to be cte
@@ -1218,19 +1234,58 @@ pub class ForLoopValidator {
      * @throws:
      *   - &ErrorMsg: if the validation failes
      * */
-    fn validateComprTuple (self, dmut context : &Validator, tu : &TupleType, iter : &Value, all : &SliceForAllocatorExpr, canDynamic : bool)-> &Value
+    fn validateComprTuple (self, dmut context : &Validator, type : &TupleType, value : &Value, all : &SliceForAllocatorExpr)-> &Value
         throws &ErrorMsg
     {
-        context;
-        tu;
-        iter;
-        all;
-        canDynamic;
-        __pragma!fake_throw (&ErrorMsg);
-        __pragma!panic ();
+        let vars = all.getVariables ();
+        match vars.len {
+            1us => {
+                return self.validateComprTupleIteration (alias context, type, value, all, vars[0], EmptyExpression::new ());
+            }
+            2us => {
+                return self.validateComprTupleIteration (alias context, type, value, all, vars[0], vars[1]);
+            }
+            _ => {
+                throw ErrorMsg::fatal (all.getLoc (), format (ValidateErrorMessage::UNDEF_FOR_LOOP_OPERATOR, vars.len, type));
+            }
+        }
     }
 
+    /**
+     * Validate the list comprehension from a tuple value
+     * @params:
+     *    - context: the context of the validation
+     *    - type: the type of the tuple being iterated
+     *    - value: the
+     * */
+    fn validateComprTupleIteration (self, dmut context : &Validator, type : &TupleType, value : &Value, all : &SliceForAllocatorExpr, iter1 : &Expression, iter2 : &Expression)-> &Value
+        throws &ErrorMsg
+    {
+        let dmut content = Vec!{&Value}::new ();
+        let mut arrType : &Type = NoneType::new (all.getLoc ());
+        let dmut tuTypes = Vec!{&Type}::new ();
 
+
+        for i in 0us .. type.getInners ().len { // we validate the content of the loop for each type of the tuple
+            let (value_, _, _) = self.validateTupleInnerLoop (alias context, i, iter1, iter2, type, value, all.getValue (), false, false, forLstCompr-> true);
+            if (all.isTuple ()) {
+                context:.getValueValidator ().addTupleType (alias context, value_, alias content, alias tuTypes);
+            } else {
+                arrType = context:.getValueValidator ().addArrayType (alias context, value_, alias content, arrType);
+            }
+        }
+
+        if (all.isTuple ()) {
+            let tu = TupleType::new (all.getLoc (), tuTypes[], isMutable-> true);
+            cast!{&Value} (TupleValue::new (all.getLoc (), tu, content[]))
+        } else {
+            if (content.len () == 0us && arrType.isOf!{&NoneType} ()) arrType = VoidType::new (all.getLoc ());
+            if (!arrType.isMutable ()) arrType = arrType.clone (1u32);
+
+            let finType = ArrayType::new (all.getLoc (), arrType, content.len (), isMutable-> true);
+            cast!{&Value} (ArrayValue::new (all.getLoc (), finType, content[]))
+        }
+    }
 
     /**
      * ================================================================================
