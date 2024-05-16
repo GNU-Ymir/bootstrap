@@ -141,21 +141,23 @@ pub class ValueValidator {
         }
 
         let loc = if (!valueLoc.isEof ()) { valueLoc } else { b.getLoc () };
-        let retBlock = BlockValue::new (loc, type, values, breakLoc-> brLoc, returnLoc-> rtLoc);
-        let (_, _, _) = if (errors.len () != 0us) {
-            self.validateCatcher (alias context, b.getCatcher (), type, retBlock.getThrowers (), alias errors)
-        } else {
-            let a : &Value = UNIT_VALUE;
-            (a, a, a)
+        let mut retBlock : &Value = BlockValue::new (loc, type, values, breakLoc-> brLoc, returnLoc-> rtLoc);
+
+        if (errors.len () == 0us && !b.getCatcher ().isOf!{&EmptyExpression} ()) {
+            __pragma!panic ();
+            // let (ctVar, ctInfo, catcher) = self.validateCatcher (alias context, b.getCatcher (), type, retBlock.getThrowers (), alias errors);
+            // retBlock = TryCatchValue::new (loc, type, retBlock, ctVar, ctInfo, catcher);
         }
 
-        // let (onExit, onSuccess, onFailure) = self.validateScopes ();
-        
+        if (errors.len () == 0us && b.getGuards ().len != 0us) {
+            let (onExit, failVar) = self.validateScopeGuards (alias context, b.getLoc (), b.getGuards (), retBlock.getThrowers ().len != 0us, alias errors);
+            retBlock = TryFinallyValue::new (loc, type, retBlock, onExit, failVar-> failVar);
+        }
+
         if (errors.len () != 0us) {
             throw ErrorMsg::list (errors[]);
         }
-        
-        
+
         retBlock
     }
 
@@ -284,24 +286,95 @@ pub class ValueValidator {
      *   - .2: the content of the catcher
      */
     fn validateCatcher (self, dmut context : &Validator, catcher : &Expression, type : &Type, throwers : [(&Word, &Type)], dmut errors : &Vec!{&ErrorMsg})-> (&Value, &Value, &Value) {
-        match catcher {
-            EmptyExpression () => {
-                let a : &Value = UNIT_VALUE;
-                return (a, a, a);
-            }
-            _ => {
-                if (throwers.len == 0us) errors:.push (ErrorMsg::fatal (catcher.getLoc (), ValidateErrorMessage::NOTHING_TO_CATCH));
-            }
-        }
-        
+        if (throwers.len == 0us) errors:.push (ErrorMsg::fatal (catcher.getLoc (), ValidateErrorMessage::NOTHING_TO_CATCH));
+
         context;
         catcher;
         errors;
         type;
-        // Need pattern matching
         __pragma!panic ();
     }
 
+    /**
+     * Validate the scope guards of a block expression
+     * @params:
+     *    - context: the context of the validation
+     *    - guards: the scope guards to validate
+     *    - throwers: the list of throwers from the guarded scope
+     * @returns:
+     *    - errors: filled with errors if some occured
+     *    - .0: the content of the validated scope guard
+     *    - .1: the variable to declare in case of failure/success guards (might be UNIT_VALUE)
+     * */
+    fn validateScopeGuards (self, dmut context : &Validator, loc : &Word, guards : [&ScopeGuardExpr], canThrow : bool, dmut errors : &Vec!{&ErrorMsg})-> (&Value, &Value) {
+        let mut exit : &Value = UNIT_VALUE;
+        let mut fail : &Value = UNIT_VALUE;
+        let mut succ : &Value = UNIT_VALUE;
+
+        // already inside a scope guard, scope within another scope
+        let inScope = context:.getInScopeGuard ();
+        for gu in guards {
+            match gu.getKind () {
+                ScopeGuardType::FAILURE | ScopeGuardType::SUCCESS => {
+                    if !canThrow {
+                        errors:.push (ErrorMsg::fatal (gu.getLoc (), format (ValidateErrorMessage::EXIT_SCOPE_NO_THROW, gu.getLoc ().str ())));
+                    }
+                }
+            }
+
+            let mut failed = false;
+            context:.enterBlock ();
+            if (inScope.isEof ()) context:.enterScopeGuard (gu.getLoc ());
+
+            let value = {
+                context:.validateValue (gu.getContent ())
+            } catch {
+                err : &ErrorMsg => {
+                    errors:.push (err);
+                    failed = true;
+                    UNIT_VALUE
+                }
+            };
+
+            for i in value.getThrowers () { // cannot throw error in a scope guard
+                errors:.push (ErrorMsg::fatal (i.0, end-> gu.getLoc (), format (ValidateErrorMessage::THROW_SCOPE_GUARD_RETHROW, i._1)));
+            }
+
+            {
+                if (inScope.isEof ()) context:.exitScopeGuard ();
+                context:.quitBlock (warnUnused-> !failed)
+            } catch {
+                err : &ErrorMsg => { errors:.push (err); }
+            }
+
+            if (!value.getType ().isOf!{&VoidType} () && !value.getType ().isOf!{&NoneType} ()) {
+                errors:.push (ErrorMsg::fatal (gu.getContent ().getLoc (), format (ValidateErrorMessage::EXIT_SCOPE_VALUE_TYPE, gu.getLoc ().str (), value.getType ())));
+            }
+
+            match gu.getKind () {
+                ScopeGuardType::SUCCESS => { succ = value; }
+                ScopeGuardType::FAILURE => { fail = value; }
+                _ => { exit = value; }
+            }
+        }
+
+        if (!fail.isOf!{&UnitValue} () || !succ.isOf!{&UnitValue} ()) {
+            let var = VarDeclValue::new (Word::new ("#_failed"s8, loc), BoolType::new (loc), BoolValue::new (loc, true), isMutable-> true, isPure-> false);
+            let vref = VarRefValue::new (var.getLoc (), var.getLoc (), var.getVarType (), var.getUniqId (), isSelf-> false, canCte-> false);
+
+            let cnd = ConditionalValue::new (loc, VoidType::new (loc), vref, fail, succ);
+            let finValue = if (exit.isOf!{&UnitValue} ()) {
+                cnd
+            } else {
+                BlockValue::new (loc, cnd.getType (), [cnd, exit])
+            };
+
+
+            (finValue, var)
+        } else {
+            (exit, UNIT_VALUE)
+        }
+    }
 
     /*!
      * ================================================================================
@@ -1454,6 +1527,8 @@ pub class ValueValidator {
         throws &ErrorMsg
     {        
         if (!context.isInLoop ()) throw ErrorMsg::fatal (b.getLoc (), ValidateErrorMessage::BREAK_NO_LOOP);
+        let inScope = context.getInScopeGuard ();
+        if (!inScope.isEof ()) throw ErrorMsg::fatal (b.getLoc (), end-> inScope, format (ValidateErrorMessage::BREAK_SCOPE_GUARD));
 
         // Break can have a value in 'loop' loops
         let val = match b.getValue () {
@@ -1490,6 +1565,8 @@ pub class ValueValidator {
         throws &ErrorMsg
     {
         if (!context.isInFunctionBody ()) throw ErrorMsg::fatal (r.getLoc (), ValidateErrorMessage::RETURN_NO_FUNCTION);
+        let inScope = context.getInScopeGuard ();
+        if (!inScope.isEof ()) throw ErrorMsg::fatal (r.getLoc (), end-> inScope, format (ValidateErrorMessage::RETURN_SCOPE_GUARD));
 
         // The function type is set once at the beginning of a function validation, or by return statement in case of lambda validation
         let fnType = context.getFunctionReturn ();
@@ -1539,6 +1616,10 @@ pub class ValueValidator {
     fn validateThrow (self, dmut context : &Validator, t : &ThrowExpr)-> &Value
         throws &ErrorMsg
     {
+        if (!context.isInFunctionBody ()) throw ErrorMsg::fatal (t.getLoc (), ValidateErrorMessage::THROW_NO_FUNCTION);
+        let inScope = context.getInScopeGuard ();
+        if (!inScope.isEof ()) throw ErrorMsg::fatal (t.getLoc (), end-> inScope, format (ValidateErrorMessage::THROW_SCOPE_GUARD));
+
         let inner = context:.validateValue (t.getValue ());
         let type = inner.getType ();
 
