@@ -53,7 +53,7 @@ pub class ValueValidator {
             v : &VarDeclExpr         => return self.validateVarDecl (alias context, v);
             p : &PatternVarDeclExpr  => return self.validatePatternVarDecl (alias context, p);
             s : &SetExpr             => return self.validateSet (alias context, s);
-            d : &DecoratedExpr       => return self.validateDecoExpr (alias context, d, canValidateRef-> canBeRef, canBeLazy-> canBeLazy);
+            d : &DecoratedExpr       => return self.validateDecoExpr (alias context, d);
             c : &ConditionalExpr     => return self.validateConditional (alias context, c);
             f : &ForLoopExpr         => return self.validateForLoop (alias context, f);
             w : &WhileLoopExpr       => return self.validateWhileLoop (alias context, w);
@@ -70,7 +70,7 @@ pub class ValueValidator {
             a : &AtomicExpr          => return self.validateAtomic (alias context, a);
             c : &CastExpr            => return self.validateCast (alias context, c);
             l : &ListExpr            => return self.validateList (alias context, l);
-            i : &IntrinsicExpr       => return self.validateIntrinsics (alias context, i);
+            i : &IntrinsicExpr       => return self.validateIntrinsics (alias context, i, canValidateRef-> canBeRef, canBeLazy-> canBeLazy);
             n : &NamedExpr           => return self.validateNamedExpr (alias context, n);
             t : &TemplateCallExpr    => return self.validateTemplateCall (alias context, t);
             t : &TemplateCheckerExpr => return self.validateTemplateChecker (alias context, t);
@@ -852,7 +852,10 @@ pub class ValueValidator {
 
             self.validateVarDeclNoValue (alias context, v)
         } else {
-            let rewrite = VarDeclExpr::new (v.getLoc (), v.getName (), value-> EmptyExpression::new (), type-> v.getType (), decos-> v.getDecos ());
+            let rewrite = VarDeclExpr::new (v.getLoc (), v.getName (), value-> EmptyExpression::new (), type-> v.getType (),
+                                            isLazyPureOrRef-> v.getLazyPureOrRefLocation (),
+                                            isMutOrDmut-> v.getMutOrDmutLocation ());
+
             let fin = self.validatePatternVarDecl (alias context, PatternVarDeclExpr::new (v.getLoc (), rewrite, v.getValue ()));
             match fin {
                 z : &VarDeclValue => {
@@ -879,19 +882,13 @@ pub class ValueValidator {
     {
         let dmut errors = Vec!{&ErrorMsg}::new ();
         if (v.getLoc () != Keys::UNDER) context:.verifyShadow (v.getLoc ());
-        let isPure = context.findDecos (v.getDecos (), [Decorators::PURE]);
-        let isLazy = context.findDecos (v.getDecos (), [Decorators::LAZY]);
-        let isMutable = context.findDecos (v.getDecos (), [Decorators::MUT, Decorators::DMUT]);
 
-        let (isRef, type) = {
-            let (isRef, t) = context:.validateType (v.getType (), decos-> v.getDecos (), canBeRef-> true, canBeLazy-> true);
-            if (isPure) {
-                (isRef, t.clone (0u32))
-            } else { (isRef, t) }
+        let type = {
+            context:.validateTypeForVarDecl (v.getType (), v, canBeRef-> true, canBeLazy-> true)
         }  catch {
             err : &ErrorMsg => { // error when validating the type of the variable, so it has an error type, no matter the value
                 errors:.push (err);
-                (false, cast!{&Type} (ErrorType::new (v.getLoc ())))
+                cast!{&Type} (ErrorType::new (v.getLoc ()))
             }
         };
 
@@ -911,7 +908,7 @@ pub class ValueValidator {
             type
         };
 
-        let ret = VarDeclValue::new (v.getLoc (), finalType, UNIT_VALUE, isReference-> isRef, isLazy-> isLazy, isMutable-> isMutable, isPure-> isPure);
+        let ret = VarDeclValue::new (v.getLoc (), finalType, UNIT_VALUE, isReference-> v.isRef (), isLazy-> v.isLazy (), isMutable-> type.isMutable (), isPure-> v.isPure ());
         if (v.getLoc () != Keys::UNDER) context:.insertLocal (v.getLoc ().str (), ret);
 
         return ret;
@@ -930,7 +927,7 @@ pub class ValueValidator {
         throws &ErrorMsg
     {
         let dmut blk = Vec!{&Value}::new ();
-        let (mValue, cond, vars, error) = context:.getMatcherValidator ().validateMatcher (alias context, p.getValue (), p.getPattern ());
+        let (mValue, cond, vars, error) = context:.getMatcherValidator ().validateMatcher (alias context, p.getValue (), p.getPattern (), canBeLazy-> true);
         for v in vars { // insert the declared variables
             if (v.0 != Keys::UNDER) {
                 context:.insertLocal (v.0, v.1);
@@ -990,188 +987,16 @@ pub class ValueValidator {
      * ================================================================================
      */
 
-
     /**
-     * Validate a decorated expression
-     * @params: 
-     *   - context: the context of the validation
-     *   - d: the decorated expression to validate
-     * @returns: the validated value
-     * @throws:
-     *   - &ErrorMsg: if the validation fails
-     */    
-    fn validateDecoExpr (self, dmut context : &Validator, d : &DecoratedExpr, canValidateRef : bool, canBeLazy : bool)-> &Value
-        throws &ErrorMsg
-    {
-        let decos = d.getDecorators ();
-        let dmut found = HashMap!{Decorators, &Word}::new ();
-        let dmut antiAffs = hmap #[
-            Decorators::CTE => hset #{Decorators::CONST, Decorators::REF, Decorators::PURE, Decorators::LAZY},
-            Decorators::CONST  => hset #{Decorators::PURE, Decorators::CTE, Decorators::REF, Decorators::LAZY},
-            Decorators::REF => hset #{Decorators::PURE, Decorators::CTE, Decorators::CONST, Decorators::LAZY},
-            Decorators::PURE => hset #{Decorators::REF, Decorators::CONST, Decorators::LAZY},
-            Decorators::LAZY => hset#{Decorators::REF, Decorators::CONST, Decorators::PURE, Decorators::CTE}
-        ];
-
-        for i in decos {
-            match found.find (i.deco) {
-                Ok (l : _) => throw ErrorMsg::warn (i.loc, format (ValidateErrorMessage::MULTIPLE_DECORATORS, i.deco), notes-> [ErrorMsg::note (l, ""s8)]);
-            }
-            
-            match antiAffs.find (i.deco) {
-                Ok (an : _) => {
-                    for j in an {
-                        match found.find (j) {
-                            Ok (l : _) => throw ErrorMsg::fatal (i.loc, format (ValidateErrorMessage::CONFLIT_DECORATORS, j, i.deco), notes-> [ErrorMsg::note (l, ""s8)]);
-                        }
-                    }
-                }
-                Err () => {
-                    throw ErrorMsg::fatal (i.loc, format (ValidateErrorMessage::UNDEF_DECORATOR_VALUE, i.deco));
-                }
-            }
-                
-            found:.insert (i.deco, i.loc);        
-        }
-
-
-        if (Decorators::CTE in found) {
-            return self.validateCteExpr (alias context, d.getContent ());            
-        }
-
-        let mut ret = context:.validateValue (d.getContent ());
-
-        if (Decorators::CONST in found) {
-            ret = CastValue::new (d.getLoc (), ret.getType ().clone (0u32), ret);
-        } else if (Decorators::REF in found) {
-            match found.find (Decorators::REF) {
-                Ok (refLoc : &Word) => {
-                    if (!ret.isLvalue () || context.isSelf (ret)) { // only lvalue can be used as left operand, and not self
-                        throw ErrorMsg::fatal (refLoc, end-> ret.getLoc (), ValidateErrorMessage::NOT_A_LVALUE);
-                    } else if (context.isParameter (ret) && !context.isReference (ret)) {
-                        throw ErrorMsg::fatal (refLoc, end-> ret.getLoc (), format (ValidateErrorMessage::NOT_A_LVALUE_PARAM, ret));
-                    }
-
-                    if (!ret.getType ().isMutable ()) { // only mutable element can be used as left operand
-                        throw ErrorMsg::fatal (refLoc, end-> ret.getLoc (), format (ValidateErrorMessage::IMMUTABLE_LVALUE, ret.getType ()));
-                    }
-
-                    if (!canValidateRef) {
-                        throw ErrorMsg::fatal (refLoc, end-> ret.getLoc (), ValidateErrorMessage::UNECESSARY_REFERENCE);
-                    }
-                }
-            }
-
-            return ReferencerValue::new (d.getLoc (), ret.getType (), ret, isMutable-> true);
-        } else if (Decorators::LAZY in found) {
-            match found.find (Decorators::LAZY) {
-                Ok (refLoc : &Word) => {
-                    if (!canBeLazy) throw ErrorMsg::fatal (refLoc, end-> ret.getLoc (), format (ValidateErrorMessage::UNECESSARY_LAZY));
-                }
-            }
-
-            return LazyValue::new (d.getLoc (), ret.getType ().clone (0u32), ret);
-        }
-       
-        ret
-    }
-
-    /**
-     * Validate an expression that has been marked as "cte"
-     * @params: 
-     *   - context: the context of the validation
-     *   - expr: the expression to validate
-     * @returns: the validated expression
-     * @throws:
-     *   - &ErrorMsg: if the validation fails
-     */
-    fn validateCteExpr (self, dmut context : &Validator, expr : &Expression)-> &Value
-        throws &ErrorMsg
-    {
-        match expr {
-            c : &ConditionalExpr => { // Conditionals have a different treatment for ctes
-                return self.validateCteConditionalExpr (alias context, c);
-            }
-            f : &ForLoopExpr => { // Same for "for" loops
-                return self.validateCteForLoopExpr (alias context, f);
-            }
-            a : &AssertExpr => {
-                return self.validateCteAssertExpr (alias context, a);
-            }
-            _ => { // Otherwise we just try to get the value at compilation time
-                let resExpr = context:.validateValue (expr);
-                if (!context.getCompileTimeInterpreter ().isCte (resExpr)) {
-                    throw ErrorMsg::fatal (resExpr.getLoc (), format (ValidateErrorMessage::UNKNOWN_AT_COMPILE_TIME, resExpr.getType ()));
-                }
-
-                return resExpr;
-            }
-        }
-    }
-
-    /**
-     * Validate a conditional expression whose test must be evaluated at compilation time
-     * @params: 
-     *    - context: the context of the validation
-     *    - expr: the expression to validate
-     * @returns: the result content of the if expression (or its else value if the test did not pass)
-     * @throws:
-     *     - &ErrorMsg: if the validation fails or the test value cannot be known at compile time
-     */
-    fn validateCteConditionalExpr (self, dmut context : &Validator, expr : &ConditionalExpr)-> &Value
-        throws &ErrorMsg
-    {
-        let test = context:.validateValue (expr.getTest ()); // First we need to validate the expression of the test of the conditional
-        let value = context:.getCompileTimeInterpreter ().computeBool (test); // And try to retreive its real value at compilation time
-        if (value) {
-            context:.validateValue (expr.getContent ())
-        } else { // otherwise only the else part is validated
-            context:.validateValue (expr.getElse ())
-        }
-    }
-
-    /**
-     * Validate a for loop that is marked cte
-     * @params: 
-     *    - context: the context of the validation
-     *    - expr: the for loop to validate
-     * @returns: the content of the for loop, unrolled at compile time
-     * @throws:
-     *    - &ErrorMsg: if the for loop cannot be executed at compile time, or there is an error in the validation (iterator, or for loop content)
-     */
-    fn validateCteForLoopExpr (self, dmut context : &Validator, expr : &ForLoopExpr)-> &Value
-        throws &ErrorMsg
-    {
-        context:.getForLoopValidator ():.validateCteForLoop (alias context, expr)
-    }
-
-    /**
-     * Validate an assert expression whose test is made at compilation time
+     * Validate a decorated expression as a value
      * @params:
-     *     - context: the context of the validation
-     *     - a: the expression to validate
-     * @returns: a unit expr
-     * @throws:
-     *   - &ErrorMsg: if the assert expression failed to be validated, or is test is false
+     *    - context: the context of the validation
+     *    - i: the decorated expression
      * */
-    fn validateCteAssertExpr (self, dmut context : &Validator, a : &AssertExpr)-> &Value
+    fn validateDecoExpr (self, dmut _ : &Validator, d : &DecoratedExpr)-> &Value
         throws &ErrorMsg
     {
-        let test = context:.validateValue (a.getTest ());
-        let value = context:.getCompileTimeInterpreter ().computeBool (test);
-        if (!value) {
-            match a.getMessage () {
-                EmptyExpression () => {
-                    throw ErrorMsg::fatal (a.getLoc (), ValidateErrorMessage::CTE_ASSERT_NO_MSG);
-                }
-                msg : _ => {
-                    let m = context:.validateValue (msg);
-                    throw ErrorMsg::fatal (a.getLoc (), format (ValidateErrorMessage::CTE_ASSERT_WITH_MSG, m));
-                }
-            }
-        }
-
-        UNIT_VALUE
+        throw ErrorMsg::fatal (d.getLoc (), format (ValidateErrorMessage::UNDEF_DECORATOR_VALUE, d.getDecorator ().str ()));
     }
 
     /**
@@ -1181,7 +1006,7 @@ pub class ValueValidator {
      *   - i: the intrinsic expression to validate
      * @returns: the validated value
      */
-    fn validateIntrinsics (self, dmut context : &Validator, i : &IntrinsicExpr)-> &Value
+    fn validateIntrinsics (self, dmut context : &Validator, i : &IntrinsicExpr, canValidateRef : bool = false, canBeLazy : bool = false)-> &Value
         throws &ErrorMsg
     {
         match i.getType () {
@@ -1207,6 +1032,15 @@ pub class ValueValidator {
             }
             IntrinsicKeys::DCOPY => {
                 return context:.getCopyValidator ().validateDeepCopy (alias context, i);
+            }
+            IntrinsicKeys::CTE => {
+                return self.validateCteExpr (alias context, i.getContent ());
+            }
+            IntrinsicKeys::REF => {
+                return self.validateRefExpr (alias context, i, i.getContent (), canValidateRef-> canValidateRef);
+            }
+            IntrinsicKeys::LAZY => {
+                return self.validateLazy (alias context, i, i.getContent (), canBeLazy-> canBeLazy);
             }
         }
 
@@ -1319,7 +1153,160 @@ pub class ValueValidator {
         return context:.getSizeofValidator ():.validate (alias context, i);
     }
 
-    
+    /**
+     * Validate a reference expression
+     * @params:
+     *    - context: the context of the validation
+     *    - i: the intrinsic expression containing the ref
+     *    - expr: the content of the ref
+     *    - canValidateRef: true iif a ref can be constructed here
+     * @returns: the ref value
+     * @throws:
+     *   - &ErrorMsg: if the validation fails
+     * */
+    fn validateRefExpr (self, dmut context : &Validator, i : &IntrinsicExpr, expr : &Expression, canValidateRef : bool)-> &Value
+        throws &ErrorMsg
+    {
+
+        let ret = context:.validateValue (expr);
+        if (!ret.isLvalue () || context.isSelf (ret)) { // only lvalue can be used as left operand, and not self
+            throw ErrorMsg::fatal (i.getLoc (), end-> ret.getLoc (), ValidateErrorMessage::NOT_A_LVALUE);
+        } else if (context.isParameter (ret) && !context.isReference (ret)) {
+            throw ErrorMsg::fatal (i.getLoc (), end-> ret.getLoc (), format (ValidateErrorMessage::NOT_A_LVALUE_PARAM, ret));
+        }
+
+        if (!ret.getType ().isMutable ()) { // only mutable element can be used as left operand
+            throw ErrorMsg::fatal (i.getLoc (), end-> ret.getLoc (), format (ValidateErrorMessage::IMMUTABLE_LVALUE, ret.getType ()));
+        }
+
+        if (!canValidateRef) {
+            throw ErrorMsg::fatal (i.getLoc (), end-> ret.getLoc (), ValidateErrorMessage::UNECESSARY_REFERENCE);
+        }
+
+        return ReferencerValue::new (i.getLoc (), ret.getType (), ret, isMutable-> true);
+    }
+
+    /**
+     * Validate a lazy intrinsic expression
+     * @params:
+     *    - context: the context of the validation
+     *    - i: the intrinsic expression containing the lazy
+     *    - expr: the content of the lazy
+     *    - canBeLazy: true iif a lazy can be constructed here
+     * @returns: the lazy value
+     * @throws:
+     *   - &ErrorMsg: if the validation fails
+     * */
+    fn validateLazy (self, dmut context : &Validator, i : &IntrinsicExpr, expr : &Expression, canBeLazy : bool)-> &Value
+        throws &ErrorMsg
+    {
+        if (!canBeLazy) throw ErrorMsg::fatal (i.getLoc (), format (ValidateErrorMessage::UNECESSARY_LAZY));
+
+        context;
+        expr;
+
+        __pragma!fake_throw (&ErrorMsg);
+        __pragma!panic ();
+    }
+
+    /**
+     * Validate an expression that has been marked as "cte"
+     * @params:
+     *   - context: the context of the validation
+     *   - expr: the expression to validate
+     * @returns: the validated expression
+     * @throws:
+     *   - &ErrorMsg: if the validation fails
+     */
+    fn validateCteExpr (self, dmut context : &Validator, expr : &Expression)-> &Value
+        throws &ErrorMsg
+    {
+        match expr {
+            c : &ConditionalExpr => { // Conditionals have a different treatment for ctes
+                return self.validateCteConditionalExpr (alias context, c);
+            }
+            f : &ForLoopExpr => { // Same for "for" loops
+                return self.validateCteForLoopExpr (alias context, f);
+            }
+            a : &AssertExpr => {
+                return self.validateCteAssertExpr (alias context, a);
+            }
+            _ => { // Otherwise we just try to get the value at compilation time
+                let resExpr = context:.validateValue (expr);
+                if (!context.getCompileTimeInterpreter ().isCte (resExpr)) {
+                    throw ErrorMsg::fatal (resExpr.getLoc (), format (ValidateErrorMessage::UNKNOWN_AT_COMPILE_TIME, resExpr.getType ()));
+                }
+
+                return resExpr;
+            }
+        }
+    }
+
+    /**
+     * Validate a conditional expression whose test must be evaluated at compilation time
+     * @params:
+     *    - context: the context of the validation
+     *    - expr: the expression to validate
+     * @returns: the result content of the if expression (or its else value if the test did not pass)
+     * @throws:
+     *     - &ErrorMsg: if the validation fails or the test value cannot be known at compile time
+     */
+    fn validateCteConditionalExpr (self, dmut context : &Validator, expr : &ConditionalExpr)-> &Value
+        throws &ErrorMsg
+    {
+        let test = context:.validateValue (expr.getTest ()); // First we need to validate the expression of the test of the conditional
+        let value = context:.getCompileTimeInterpreter ().computeBool (test); // And try to retreive its real value at compilation time
+        if (value) {
+            context:.validateValue (expr.getContent ())
+        } else { // otherwise only the else part is validated
+            context:.validateValue (expr.getElse ())
+        }
+    }
+
+    /**
+     * Validate a for loop that is marked cte
+     * @params:
+     *    - context: the context of the validation
+     *    - expr: the for loop to validate
+     * @returns: the content of the for loop, unrolled at compile time
+     * @throws:
+     *    - &ErrorMsg: if the for loop cannot be executed at compile time, or there is an error in the validation (iterator, or for loop content)
+     */
+    fn validateCteForLoopExpr (self, dmut context : &Validator, expr : &ForLoopExpr)-> &Value
+        throws &ErrorMsg
+    {
+        context:.getForLoopValidator ():.validateCteForLoop (alias context, expr)
+    }
+
+    /**
+     * Validate an assert expression whose test is made at compilation time
+     * @params:
+     *     - context: the context of the validation
+     *     - a: the expression to validate
+     * @returns: a unit expr
+     * @throws:
+     *   - &ErrorMsg: if the assert expression failed to be validated, or is test is false
+     * */
+    fn validateCteAssertExpr (self, dmut context : &Validator, a : &AssertExpr)-> &Value
+        throws &ErrorMsg
+    {
+        let test = context:.validateValue (a.getTest ());
+        let value = context:.getCompileTimeInterpreter ().computeBool (test);
+        if (!value) {
+            match a.getMessage () {
+                EmptyExpression () => {
+                    throw ErrorMsg::fatal (a.getLoc (), ValidateErrorMessage::CTE_ASSERT_NO_MSG);
+                }
+                msg : _ => {
+                    let m = context:.validateValue (msg);
+                    throw ErrorMsg::fatal (a.getLoc (), format (ValidateErrorMessage::CTE_ASSERT_WITH_MSG, m));
+                }
+            }
+        }
+
+        UNIT_VALUE
+    }
+
     /*!
      * ================================================================================
      * ================================================================================
@@ -1386,7 +1373,9 @@ pub class ValueValidator {
         let mut error = ((&ErrorMsg)?)::__err__, mut hasErrors = false;
         let (pattern, value) = match c.getTest () {
             v : &VarDeclExpr => {
-                let rewrite = VarDeclExpr::new (v.getLoc (), v.getName (), value-> EmptyExpression::new (), type-> v.getType (), decos-> v.getDecos ());
+                let rewrite = VarDeclExpr::new (v.getLoc (), v.getName (), value-> EmptyExpression::new (), type-> v.getType (),
+                                                isLazyPureOrRef-> v.getLazyPureOrRefLocation (),
+                                                isMutOrDmut-> v.getMutOrDmutLocation ());
                 (rewrite, v.getValue ())
             }
             p : &PatternVarDeclExpr => (p.getPattern (), p.getValue ())

@@ -469,48 +469,25 @@ pub class TemplateSolver {
     {
         let type = types [0];
 
-        let mut hasMut = EOF_WORD, mut hasDmut = EOF_WORD, mut hasConst = EOF_WORD;
-        for d in deco.getDecorators () { // Deco in template specialization can only be mut, dmut and const (not ref, cte, static, pure )
-            if (d.deco == Decorators::MUT) { hasMut = d.loc; }
-            else if (d.deco == Decorators::DMUT) { hasDmut = d.loc; }
-            else if (d.deco == Decorators::CONST) { hasConst = d.loc; }
-            else { // other decorators cannot be used for template specialization
-                throw ErrorMsg::fatal (d.loc, format (ValidateErrorMessage::UNDEF_DECORATOR_TEMPLATE, d.deco));
-            }
-        }
-
-        if (!hasDmut.isEof () && !hasMut.isEof ()) { // MUT and DMUT cannot appear at the same time
-            throw ErrorMsg::fatal (hasMut, format (ValidateErrorMessage::MULTIPLE_DECORATORS, hasMut.str ()),
-                                   notes-> [ErrorMsg::note (hasDmut, ValidateErrorMessage::DECLARED_HERE)]);
-        }
-
-        if ((!hasMut.isEof () || !hasDmut.isEof ()) && !hasConst.isEof ()) { // Same for CONST and DMUT or MUT
-            let other = if hasMut.isEof () { hasDmut } else { hasMut };
-            throw ErrorMsg::fatal (hasConst, format (ValidateErrorMessage::CONFLIT_DECORATORS, hasConst.str (), other.str ()),
-                                   notes-> [ErrorMsg::note (other, ValidateErrorMessage::DECLARED_HERE)]);
-        }
+        let hasMut = deco.isMutable (), hasDmut = deco.isDeeplyMutable ();
 
         // Validate the type inside the template specialization
         // final template type won't have the mutability lvl, this is just a checking to see wether the decorator was used in the template call
         // For example MyTemplate!{dmut [i32]}, MyTemplate!{mut [i32]}, ...
         let (mapper, _) = self.validateOfVarExprFromExplicit (alias context, alls, deco.getContent (), [type]);
-        if (!hasDmut.isEof ()) {
+        if (hasDmut) {
             if (!type.isDeeplyMutable ()) { // if it was deeply mutable, it should have the same lvl as the same type but deeply mutable
-                throw ErrorMsg::fatal (hasDmut, ValidateErrorMessage::DISCARD_CONST);
+                throw ErrorMsg::fatal (deco.getDecorator (), ValidateErrorMessage::DISCARD_CONST);
             }
-        } else if (!hasMut.isEof ()) {
+        } else if (hasMut) {
             if (!type.isMutable ()) { // If the mut decorator is used the type has to be mutable
-                throw ErrorMsg::fatal (hasMut, ValidateErrorMessage::DISCARD_CONST);
-            }
-        } else if (!hasConst.isEof ()) {
-            if (type.isMutable ()) { // If the const decorator is used the type has to be const
-                throw ErrorMsg::fatal (hasMut, ValidateErrorMessage::DISCARD_CONST);
+                throw ErrorMsg::fatal (deco.getDecorator (), ValidateErrorMessage::DISCARD_CONST);
             }
         }
 
         let dmut retMapper = TemplateMapper::new (score-> TemplateScore::VAR * 2us);
         retMapper:.merge (mapper);
-        retMapper:.insert (varName, self.createTypeWrapper (deco.getLoc (), type), mutable-> !hasMut.isEof (), deeplyMut-> !hasDmut.isEof ());
+        retMapper:.insert (varName, self.createTypeWrapper (deco.getLoc (), type), mutable-> hasMut, deeplyMut-> hasDmut);
 
         return (retMapper, 1us); // return the mapper containing the sub specialization
     }
@@ -1064,16 +1041,21 @@ pub class TemplateSolver {
         let mut syntTemplate = alls;
 
         for i in 0us .. fptr.getParameters ().len {
-            let currentParam = rewriter.rewrite (fptr.getParameters ()[i]);
-            let rest = params.len - consumed;
-            let syntaxRest = (fptr.getParameters ().len - i) - 1us;
-            let consomableTypes = params[consumed .. consumed + (rest - syntaxRest)];
+            match fptr.getParameters ()[i] {
+                v : &VarDeclExpr => {
+                    let currentParam = rewriter.rewrite (v.getType ());
+                    let rest = params.len - consumed;
+                    let syntaxRest = (fptr.getParameters ().len - i) - 1us;
+                    let consomableTypes = params[consumed .. consumed + (rest - syntaxRest)];
 
-            let (tiMapper, localConsumed) = self.validateOfVarExprFromExplicit (alias context, syntTemplate, currentParam, consomableTypes);
+                    let (tiMapper, localConsumed) = self.validateOfVarExprFromExplicit (alias context, syntTemplate, currentParam, consomableTypes);
 
-            retMapper:.merge (tiMapper);
-            consumed += cast!usize (localConsumed);
-            syntTemplate = rewriter.replaceSyntaxTempl (syntTemplate);
+                    retMapper:.merge (tiMapper);
+                    consumed += cast!usize (localConsumed);
+                    syntTemplate = rewriter.replaceSyntaxTempl (syntTemplate);
+                }
+                _ => __pragma!panic ();
+            }
         }
 
         let retParam = rewriter.rewrite (fptr.getReturn ());
@@ -1572,12 +1554,17 @@ pub class TemplateSolver {
 
         for i, ti in fptrType.getParameters () match lmbdValue.getParameters ()[i] {
             v : &ProtoVarValue => { // lambda has a type to validate
-                let tiExpr = rewriter.rewrite (ti);
-                let (tiMapper, _) = self.validateOfVarExprFromExplicit (alias context, alls, tiExpr, [v.getType ()]);
-                retMapper:.merge (tiMapper);
+                match ti {
+                    vd : &VarDeclExpr => {
+                        let tiExpr = rewriter.rewrite (vd.getType ());
+                        let (tiMapper, _) = self.validateOfVarExprFromExplicit (alias context, alls, tiExpr, [v.getType ()]);
+                        retMapper:.merge (tiMapper);
 
-                let finalExpr = rewriter.rewrite (ti);
-                paramTypes:.push (context:.validateType (finalExpr));
+                        let finalExpr = rewriter.rewrite (vd.getType ());
+                        paramTypes:.push (context:.validateType (finalExpr));
+                    }
+                    _ => __pragma!panic ();
+                }
             }
             _ => { paramTypes:.push (NONE_TYPE); }
         }
@@ -1585,11 +1572,16 @@ pub class TemplateSolver {
         for i, ti in fptrType.getParameters () match lmbdValue.getParameters ()[i] {
             ProtoVarValue () => {}
             _ => {
-                let tiExpr = rewriter.rewrite (ti);
-                {
-                    (alias paramTypes) [i] = context:.validateType (tiExpr);
-                } catch {
-                    _ => { uncomplete = true; }
+                match ti {
+                    v : &VarDeclExpr => {
+                        let tiExpr = rewriter.rewrite (v.getType ());
+                        {
+                            (alias paramTypes) [i] = context:.validateType (tiExpr);
+                        } catch {
+                            _ => { uncomplete = true; }
+                        }
+                    }
+                    _ => __pragma!panic ();
                 }
             }
         }
@@ -1614,6 +1606,12 @@ pub class TemplateSolver {
         context:.getLambdaValidator ():.insertGenerator (alias context, frame);
         retMapper:.merge (retTypeMapper);
         retMapper:.insert (loc.str (), ValueWrapperExpr::new (loc, proto));
+
+        let rewriter = TemplateRewriter::new (retMapper);
+        let fptrFinal = rewriter.rewrite (fptrType);
+        let ofType = context:.validateType (fptrFinal);
+
+        context:.verifyCompatibleType (fptrType.getLoc (), lmbdValue.getLoc (), ofType, proto.getType ());
     }
 
     /*!
@@ -2132,16 +2130,21 @@ pub class TemplateSolver {
             let mut syntTemplate = templates;
 
             for i in 0us .. fptrType.getParameters ().len {
-                let currentParam = rewriter.rewrite (fptrType.getParameters ()[i]);
-                let rest = params.len - consumed;
-                let syntaxRest = (fptrType.getParameters ().len - i) - 1us;
+                match fptrType.getParameters ()[i] {
+                    v : &VarDeclExpr => {
+                        let currentParam = rewriter.rewrite (v.getType ());
+                        let rest = params.len - consumed;
+                        let syntaxRest = (fptrType.getParameters ().len - i) - 1us;
 
-                let consomableTypes = params [consumed .. consumed + (rest - syntaxRest)];
-                let (tiMapper, localConsumed) = self.validateTypeFromImplicit (alias context, syntTemplate, currentParam, consomableTypes);
+                        let consomableTypes = params [consumed .. consumed + (rest - syntaxRest)];
+                        let (tiMapper, localConsumed) = self.validateTypeFromImplicit (alias context, syntTemplate, currentParam, consomableTypes);
 
-                retMapper:.merge (tiMapper);
-                consumed += cast!usize (localConsumed);
-                syntTemplate = rewriter.replaceSyntaxTempl (syntTemplate);
+                        retMapper:.merge (tiMapper);
+                        consumed += cast!usize (localConsumed);
+                        syntTemplate = rewriter.replaceSyntaxTempl (syntTemplate);
+                    }
+                    _ => __pragma!panic ();
+                }
             }
 
             let retParam = rewriter.rewrite (fptrType.getReturn ());
@@ -2179,10 +2182,15 @@ pub class TemplateSolver {
         let rewriter = TemplateRewriter::new (retMapper);
 
         for i in 0us .. fptrType.getParameters ().len {
-            let currentParam = rewriter.rewrite (fptrType.getParameters ()[i]);
-            if (!params [i].isOf!{&NoneType} ()) {
-                let (mapper, _) = self.validateTypeFromImplicit (alias context, templates, currentParam, [params [i]]);
-                retMapper:.merge (mapper);
+            match fptrType.getParameters ()[i] {
+                v : &VarDeclExpr => {
+                    let currentParam = rewriter.rewrite (v.getType ());
+                    if (!params [i].isOf!{&NoneType} ()) {
+                        let (mapper, _) = self.validateTypeFromImplicit (alias context, templates, currentParam, [params [i]]);
+                        retMapper:.merge (mapper);
+                    }
+                }
+                _ => __pragma!panic ();
             }
         }
 
