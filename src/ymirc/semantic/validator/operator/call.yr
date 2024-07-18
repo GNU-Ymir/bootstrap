@@ -288,8 +288,9 @@ pub class CallOpValidator {
     {
         let prettyName = self.prettyName (left);
         let (nonTemplates, templates) = self.divideByPriority (left.getValues ()); // non template values have higher priorities than template ones, so if there can be called then no need to validate template ones
-        let (call, res, score) = {
-            self.validateValueList (alias context, loc, prettyName, nonTemplates, rights)
+        let (call, res, rewrite, score) = {
+            let (call, res, score) = self.validateValueList (alias context, loc, prettyName, nonTemplates, rights);
+            (call, res, [], score)
         } catch { // there is no need to worry of empty list, it is managed in validateValueList
             err : &ErrorMsg => { // there is no value in non template values that works with rigths
                 if (templates.len != 0us) {
@@ -299,7 +300,7 @@ pub class CallOpValidator {
                             self.finalizeImplicitTemplateDeclaration (alias context, loc, rewrite [0us], call [0us]);
                         }
                         
-                        (call, res, score)
+                        (call, res, rewrite, score)
                     } catch { // there is no need to worry of empty list here either, it is managed in validateValueList
                         templateError : &ErrorMsg => { // Does not work with both template and non templates
                             if (nonTemplates.len != 0us) {
@@ -316,7 +317,14 @@ pub class CallOpValidator {
             // This error is not managed in validateValueList, because we don't want to validate templates when it occurs
             let dmut errors = Vec!{&ErrorMsg}::new ();
             for i in 0us .. call.len {
-                errors:.push (ErrorMsg::note (call[i].getLoc (), format (ValidateErrorMessage::CANDIDATE_ARE, self.prettyName (call[i])), oneLine-> true, withLoc-> true));
+                let notes = if (rewrite.len > i) {
+                    [ErrorMsg::note (call [i].getLoc (), format (ValidateErrorMessage::TEMPLATE_SPE, rewrite [i]), oneLine-> true)]
+                } else { [] };
+
+                let msg = ErrorMsg::note (call [i].getLoc (), format (ValidateErrorMessage::CANDIDATE_ARE, self.prettyName (call [i])), oneLine-> true, withLoc-> true,
+                                          notes-> notes);
+
+                errors:.push (msg);
             }        
             
             throw ErrorMsg::fatal (loc, format (ValidateErrorMessage::WORKS_WITH_BOTH, prettyName, rights), notes-> errors[]);
@@ -451,6 +459,9 @@ pub class CallOpValidator {
             m : &MethodDelegateTemplateValue => {
                 context:.getTemplateDeclarator ():.declare (alias context, loc, rewriter, m.getPrototype ());
             }
+            c : &CtorDelegateTemplateValue => {
+                context:.getTemplateDeclarator ():.declare (alias context, loc, rewriter, c.getPrototype ());
+            }
             x : &TemplateRefValue => {
                 context:.getTemplateDeclarator ():.declare (alias context, loc, rewriter, x);
             }
@@ -532,6 +543,7 @@ pub class CallOpValidator {
         for i in list match i {
             t : &TemplateRefValue => { right:.push (t); }
             m : &MethodDelegateTemplateValue => { right:.push (m); }
+            c : &CtorDelegateTemplateValue => { right:.push (c); }
             _ => { left:.push (i); }
         }
 
@@ -943,7 +955,7 @@ pub class CallOpValidator {
                     context:.verifyUnsafeContext (ctor.getPrototype ().getLoc (), msg-> ValidateErrorMessage::UNSAFE_CALL);
                 }
 
-                (CtorCallValue::new (c.getLoc (), ctor.getType (), ctor, c.getParameters (), addParams-> c.getAddParameters ()), score + ctor.getPrototype ().getTemplateScore ()) // replace the prototype by the delegate
+                (CtorCallValue::new (c.getLoc (), ctor.getInstanceType (), ctor, c.getParameters (), addParams-> c.getAddParameters ()), score + ctor.getPrototype ().getTemplateScore ()) // replace the prototype by the delegate
             }
             _ => { __pragma!panic (); }
         }
@@ -978,6 +990,9 @@ pub class CallOpValidator {
         match left {
             m : &MethodDelegateTemplateValue => {
                 return self.validateTemplateCallMethod (alias context, loc, m, rights, candidate-> candidate);
+            }
+            c : &CtorDelegateTemplateValue => {
+                return self.validateTemplateCallCtor (alias context, loc, c, rights, candidate-> candidate);
             }
             t : &TemplateRefValue => match t.getSymbol ().getContent ().getContent () {
                 f : &FunctionDecl => {
@@ -1113,6 +1128,68 @@ pub class CallOpValidator {
         }
     }
 
+
+    /**
+     * Validate the call to a template constructor
+     * @params:
+     *    - context: the context of the validation
+     *    - loc: the location of the call
+     *    - left: the ctor being called
+     *    - rights: the list of parameters passed to the call
+     * @returns:
+     *    - .0: the call value
+     *    - .1: the symbol that was created by the template validation
+     *    - .2: the score of the call
+     * @throws:
+     *    - &ErrorMsg: if the call failed (from template solving, declaration, or simply cannot be called with the parameters)
+     * */
+    fn validateTemplateCallCtor (self, dmut context : &Validator, loc : &Word, left : &CtorDelegateTemplateValue, rights : [&Value], candidate : bool = false)-> (&Value, &TemplateRewriter, u32)
+        throws &ErrorMsg
+    {
+        {
+            let func = left.getPrototype ().getCtor ();
+
+            // the function is not validated thus we don't have real prototype to use, so we transform the informations we have into something usable
+            let argList = self.createTemplatePrototypeValues (alias context, left.getPrototype (), func.getFunctionProtoDecl ().getParameters ());
+            let (params, rest) = self.validateParameterList (argList, rights); // we use the fake prototype to sort the parameters, at least we have the names
+
+                        // Perform the template specialization, and get the rewritter, and the finalParameters (in the correct order, and tupled if needed)
+            let (rewriter, finalParams) = context:.getTemplateSolver ().validateImplicitValue (alias context, loc, left.getPrototype (), params ~ rest, forMethod-> true);
+
+            {
+                // Validate the rewrite of the prototype (only the prototype, in order to get the score)
+                let (proto, hasTest) = context:.getTemplateDeclarator ():.finalizeCtorPrototype (alias context, loc, left.getPrototype (), rewriter, func);
+
+                // Verify that the template specialization effectively worked as expected and formatted the parameters
+                if (proto.getParameters ().len != finalParams.len) {
+                    throw ErrorMsg::fatal (loc, self.formatTooFew (finalParams.len, proto.getParameters ().len));
+                }
+
+                // Normal call can be performed now
+                let (_, n_params, score) = self.validateTypeParameterList (alias context, loc, proto.getParameters (), finalParams, verifType-> true, verifMemory-> true, isLambda-> false);
+                if (proto.isUnsafe ()) {
+                    context:.verifyUnsafeContext (proto.getLoc (), msg-> ValidateErrorMessage::UNSAFE_CALL);
+                }
+
+                let dgV = CtorDelegateValue::new (loc, left.getInstanceType (), proto.asOf!{&CtorPrototypeValue} (), instance-> left.getInstance ());
+
+                // We have a call, a rewriter and a score to return
+                (CtorCallValue::new (loc, dgV.getInstanceType (), dgV, n_params), rewriter, score + rewriter.getScore () + if (hasTest) { 1u32 } else { 0u32 })
+            } catch {
+                err : &ErrorMsg => {
+                    let nErr = err.withNote ([ErrorMsg::note (loc, format (ValidateErrorMessage::TEMPLATE_SPE, rewriter), oneLine-> true)]);
+                    throw nErr;
+                }
+            }
+        } catch {
+            err : &ErrorMsg => {
+                if (!candidate) throw err; // as for normal call, template call might be in multsymbol, so we don't add candidate error
+                throw ErrorMsg::note (left.getLoc (), format (ValidateErrorMessage::CANDIDATE_ARE, self.prettyName (left)), notes-> [err], oneLine-> true, withLoc-> true); // alone call, add the candidate are error
+            }
+        }
+    }
+
+    
     /**
      * Create a list of prototype value from an unvalidated function
      * @params: 
