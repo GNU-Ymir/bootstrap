@@ -895,7 +895,7 @@ pub class FunctionValidator {
         let throwers = self.validateThrowers (alias context, func.getThrowerLoc (), func.getThrowers ());
         self.verifyUndefAttributes (func.getAttributes ());
 
-        let (selfParam, parameters, body) = {
+        let (selfParam, parameters, body, hasRedirect) = {
             context:.enterBlock ();
             // We need a class ptr for the self parameter
             let clPtr = clRef.createInstance (true, true);
@@ -914,18 +914,18 @@ pub class FunctionValidator {
             };
 
 
-            let body = if (validateBody) { // We validate the body
+            let (body, hasRedirect) = if (validateBody) { // We validate the body
                 self.validateCtorBody (alias context, sym, func, clPtr.getInner (), selfParam, throwers)
             } else { // we validate only the prototype
-                cast!{&Value} (UNIT_VALUE)
+                (cast!{&Value} (UNIT_VALUE), false)
             }
 
 
-            (selfParam, parameters, body) // don't add the self parameter in the prototype, we don't have it when calling the prototype
+            (selfParam, parameters, body, hasRedirect) // don't add the self parameter in the prototype, we don't have it when calling the prototype
         } catch {
             err : &ErrorMsg => {
                 errors:.push (err);
-                (cast!{&Value} (UNIT_VALUE), [], cast!{&Value} (UNIT_VALUE))
+                (cast!{&Value} (UNIT_VALUE), [], cast!{&Value} (UNIT_VALUE), false)
             }
         } exit {
             {
@@ -958,7 +958,10 @@ pub class FunctionValidator {
                 }
 
                 if (validateBody) { // If not validate body the prototype might be uncomplete
-                    sym:.setFrameProto (gen);
+                    sym:.setFrameProto (gen, body, hasRedirect);
+                    if (hasRedirect) {
+                        context:.verifyInfiniteCtorRecursion (gen);
+                    }
                 }
                 
                 gen
@@ -980,7 +983,7 @@ pub class FunctionValidator {
      * @throws:
      *    - &ErrorMsg: if there was an error in the validation     
      */
-    fn validateCtorBody (self, dmut context : &Validator, sym : &ConstructorSymbol, ctor : &ConstructorDecl, clRef : &ClassRefType, selfParam : &Value, throwers : [(&Word, &Type)])-> &Value
+    fn validateCtorBody (self, dmut context : &Validator, sym : &ConstructorSymbol, ctor : &ConstructorDecl, clRef : &ClassRefType, selfParam : &Value, throwers : [(&Word, &Type)])-> (&Value, bool)
         throws &ErrorMsg
     {
         //
@@ -992,7 +995,8 @@ pub class FunctionValidator {
         let selfValue = VarRefValue::new (selfParam.getLoc (), selfParam.getLoc (), selfParam.getType (), selfParam.getUniqId (), isSelf-> true);
         
         // Validate the pre construction of the constructor (construction of fields, and ancestor)
-        let preConstruct = self.validatePreConstructor (alias context, sym, ctor, clRef, selfValue);
+        let (preConstruct, hasRedirect) = self.validatePreConstructor (alias context, ctor, clRef, selfValue);
+
 
         // From this point, return is allowed
         context:.enterFunctionBody ();
@@ -1009,7 +1013,7 @@ pub class FunctionValidator {
             _ => { [preConstruct, body] }
         };
 
-        BlockValue::new (ctor.getLoc (), VoidType::new (sym.getLoc ()), finalBody)
+        (BlockValue::new (ctor.getLoc (), VoidType::new (sym.getLoc ()), finalBody), hasRedirect)
     }       
         
     /**
@@ -1024,11 +1028,11 @@ pub class FunctionValidator {
      * @throws: 
      *    - &ErrorMsg: if there was an error in the validation
      */
-    fn validatePreConstructor (self, dmut context : &Validator, sym : &ConstructorSymbol, func : &ConstructorDecl, clRef : &ClassRefType, selfParam : &Value)-> &Value
+    fn validatePreConstructor (self, dmut context : &Validator, func : &ConstructorDecl, clRef : &ClassRefType, selfParam : &Value)-> (&Value, bool)
         throws &ErrorMsg
     {
         if (func.getExplicitCstrsCall () == Keys::SELF) { // There is a redirection of construction
-            return self.validateRedirectCtor (alias context, sym, func, clRef, selfParam);
+            return (self.validateRedirectCtor (alias context, func, clRef, selfParam), true);
         }
 
         let dmut block = Vec!{&Value}::new (); // list of instructions        
@@ -1048,12 +1052,14 @@ pub class FunctionValidator {
             }
         }
 
-        if (block.len () != 0us) {
+        let finVal = if (block.len () != 0us) {
             // We create the block of instruction, containing super call, and field ctors
             BlockValue::new (func.getLoc (), VoidType::new (func.getLoc ()), block[])
         } else {
             UnitValue::new (loc-> func.getLoc ())
-        }
+        };
+
+        (finVal, false)
     }
 
     /**
@@ -1067,7 +1073,7 @@ pub class FunctionValidator {
      * @throws: 
      *    - &ErrorMsg: if there is an error in the validation
      */
-    fn validateRedirectCtor (self, dmut context : &Validator, sym : &ConstructorSymbol, func : &ConstructorDecl, clRef : &ClassRefType, selfParam : &Value)-> &Value
+    fn validateRedirectCtor (self, dmut context : &Validator, func : &ConstructorDecl, clRef : &ClassRefType, selfParam : &Value)-> &Value
         throws &ErrorMsg
     {
         let dmut errors = Vec!{&ErrorMsg}::new ();
@@ -1080,11 +1086,11 @@ pub class FunctionValidator {
         
         let ret = {
             // Ignore the current constructor, it cannot be called by redirection
-            let ctors = self.createCtorDelegate (alias context, selfLoc, clRef, selfParam, renameLoc-> func.getExplicitSuperName (), ignore-> sym, templateParams-> func.getSuperTemplateParams ());
+            let ctors = self.createCtorDelegate (alias context, selfLoc, clRef, selfParam, renameLoc-> func.getExplicitSuperName (), templateParams-> func.getSuperTemplateParams ());
             context:.getCallOpValidator ().validate (alias context, selfLoc, ctors, rights[])
         } catch { 
             err : &ErrorMsg => { // None succeeded (TODO print private candidates)
-                errors:.push (ErrorMsg::fatal (selfLoc, format (ValidateErrorMessage::UNDEFINED_SUPER_CALL_CTOR, rights[]), notes-> [err]));
+                errors:.push (ErrorMsg::fatal (selfLoc, format (ValidateErrorMessage::UNDEFINED_REDIRECT_CALL_CTOR, rights[]), notes-> [err]));
                 cast!{&Value} (UnitValue::new (loc-> selfLoc))
             }
         }
@@ -1150,14 +1156,13 @@ pub class FunctionValidator {
      *    - selfParam: the instance for self
      *    - withPrivate: include PRV_PARENT constructors ?
      *    - prettyStr: the name of the call
-     *    - ignore: the ctor to ignore (for self redirection only)
      * @returns: a MultSymValue with all the available ctors (can be of len == 0us)
      */
-    fn createCtorDelegate (self, dmut context : &Validator, loc : &Word, clRef : &ClassRefType, selfParam : &Value, renameLoc : &Word, templateParams : &Expression, ignore : &Symbol = EMPTY_SYMBOL)-> &Value
+    fn createCtorDelegate (self, dmut context : &Validator, loc : &Word, clRef : &ClassRefType, selfParam : &Value, renameLoc : &Word, templateParams : &Expression)-> &Value
         throws &ErrorMsg
     {
         let rename = if (renameLoc.isEof ()) { ""s8 } else { renameLoc.str () };
-        let ctors = context:.getSubTypeValidator ().validateClassCtors (alias context, loc, clRef, name-> rename, selfParam-> selfParam, ignore-> ignore);
+        let ctors = context:.getSubTypeValidator ().validateClassCtors (alias context, loc, clRef, name-> rename, selfParam-> selfParam);
 
         match templateParams {
             EmptyExpression () => { ctors }
