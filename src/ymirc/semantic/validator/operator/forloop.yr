@@ -917,15 +917,15 @@ pub class ForLoopValidator {
     fn validateClassLoop (self, dmut context : &Validator, cptr : &ClassPtrType, value : &Value, f : &ForLoopExpr, byAlias : bool, aliasLoc : &Word)-> &Value
         throws &ErrorMsg
     {
+        let loc = f.getLoc ();
         let (useAlias, beginMeth, endMeth) = {
-            let (beginMeth, useAliasBeg) = self.createIterOverCptrCall (alias context, f.getLoc (), cptr, value, byAlias, OpOverrideNames::BEGIN_OP_OVERRIDE);
-            let (endMeth, useAliasEnd) = self.createIterOverCptrCall (alias context, f.getLoc (), cptr, value, byAlias, OpOverrideNames::END_OP_OVERRIDE);
+            let inst = if (byAlias) { ClassAliaserValue::new (loc, cptr, value) } else { value };
+            let (beginMeth, useAliasBeg) = self.createIterOverCptrCall (alias context, loc, cptr, inst, OpOverrideNames::BEGIN_OP_OVERRIDE);
+            let (endMeth, useAliasEnd) = self.createIterOverCptrCall (alias context, loc, cptr, inst, OpOverrideNames::END_OP_OVERRIDE);
             (useAliasEnd || useAliasBeg, beginMeth, endMeth)
         } catch {
-            err : &ErrorMsg => throw ErrorMsg::fatal (f.getLoc (), format (ValidateErrorMessage::FOR_LOOP_CPTR, cptr), notes-> [err]);
+            err : &ErrorMsg => throw ErrorMsg::fatal (loc, format (ValidateErrorMessage::FOR_LOOP_CPTR, cptr), notes-> [err]);
         };
-
-        let loc = f.getLoc ();
 
         let dmut outerLoop = Vec!{&Value}::new ();
         let dmut innerLoop = Vec!{&Value}::new ();
@@ -933,16 +933,14 @@ pub class ForLoopValidator {
 
         context:.enterBlock ();
         let _loop = {
-            let iteratorDecl = VarDeclValue::new (Word::new ("#_iter"s8, beginMeth.getLoc ()), beginMeth.getType (), beginMeth, isMutable-> true);
+            let iteratorDecl = VarDeclValue::new (Word::new ("#_iter"s8, beginMeth.getLoc ()), beginMeth.getType ().toDeeplyMutable (), beginMeth, isMutable-> true);
             let endDecl = VarDeclValue::new (Word::new ("#_end"s8, endMeth.getLoc ()), endMeth.getType ().clone (0u32), endMeth, isMutable-> false);
             let iteratorType = iteratorDecl.getVarType ();
+            self.verifyCptrBeginIsValid (alias context, loc, cptr, iteratorDecl, beginMeth);
 
             let iteratorRef = VarRefValue::new (iteratorDecl.getLoc (), iteratorDecl.getLoc (), iteratorType, iteratorDecl.getUniqId (), isSelf-> false, canCte-> false);
             let endRef = VarRefValue::new (endDecl.getLoc (), endDecl.getLoc (), endDecl.getVarType (), endDecl.getUniqId (), isSelf-> false, canCte-> false);
-
-            let aliasRef = if (iteratorType.needExplicitAlias ()) {
-                AliaserValue::new (iteratorDecl.getLoc (), iteratorType, iteratorRef)
-            } else { iteratorRef };
+            let aliasRef = ClassAliaserValue::new (iteratorDecl.getLoc (), iteratorType.asOf!{&ClassPtrType} (), iteratorRef);
 
             let test = context:.getBinOpValidator ().validateComparisonOperation (alias context, loc, BinaryOperators::NOT_EQUAL, iteratorRef, endRef);
             outerLoop:.push (iteratorDecl);
@@ -959,7 +957,7 @@ pub class ForLoopValidator {
                 _ => __pragma!panic ();
             }
 
-            let increment = self.validateCptrIncrement (alias context, loc, iteratorType, aliasRef, iteratorRef);
+            let increment = self.validateCptrIncrement (alias context, loc, iteratorType, aliasRef);
 
             innerLoop:.push (context:.validateValue (f.getBlock ()));
             innerLoop:.push (increment);
@@ -994,28 +992,22 @@ pub class ForLoopValidator {
      *   - context: the context of the validation
      *   - cptr: the type of the class begin iterated
      *   - value: the instance being iterated
-     *   - byAlias: true if the instance is passed by alias
      *   - name: the name of the meth to call
      *   - mustBeMutable: true iif the return type of the call has to be mutable
      * */
-    fn createIterOverCptrCall (self, dmut context : &Validator, loc : &Word, cptr : &ClassPtrType, value : &Value, byAlias : bool, name : [c8])-> (&Value, bool)
+    fn createIterOverCptrCall (self, dmut context : &Validator, loc : &Word, cptr : &ClassPtrType, value : &Value, name : [c8])-> (&Value, bool)
         throws &ErrorMsg
     {
-        let (meth, useAlias) = {
-            if (byAlias) {
-                (context:.constructObjectMethodAcc (loc, cptr, AliaserValue::new (loc, cptr, value), name), true)
-            } else {
-                (context:.constructObjectMethodAcc (loc, cptr, value, name), false)
-            }
-        } catch {
-            err : &ErrorMsg => {
-                if (!byAlias) throw err;
+        let meth = context:.constructObjectMethodAcc (loc, cptr, value, name, allowImmut-> true);
+        let cl = context:.getCallOpValidator ().validate (alias context, loc, meth, []);
 
-                (context:.constructObjectMethodAcc (loc, cptr, value, name), false)
+        let useAlias = match cl {
+            c : &MethodCallValue => {
+                c.getMethod ().getPrototype ().isMutable ()
             }
+            _ => { false }
         };
 
-        let cl = context:.getCallOpValidator ().validate (alias context, loc, meth, []);
         (cl, useAlias)
     }
 
@@ -1033,21 +1025,11 @@ pub class ForLoopValidator {
         throws &ErrorMsg
     {
         // let x = iter.get!{0, N} ();
-        // or, let x = get!{0, N} (iter);
-        //
-        let getVal = {
-            self.validateCptrIterCallGet (alias context, loc, iteratorType, iterRef, index, nbVars)
-        } catch {
-            err : &ErrorMsg => {
-                let note = ErrorMsg::note (loc, format (ValidateErrorMessage::CALL_GET_OP_ONE_LINE, vdecl.getLoc ().str (), iterRef, index, nbVars), oneLine-> true);
-                throw ErrorMsg::fatal (vdecl.getLoc (), format (ValidateErrorMessage::CALL_GET_OP_ITERATOR, iteratorType, index, nbVars),
-                                       notes-> [note, err]);
-            }
-        }
-
+        let getVal = self.validateCptrIterCallGet (alias context, vdecl.getLoc (), iteratorType, iterRef, index, nbVars)
         let (protoLoc, protoMsg) = match getVal {
-            c : &CallValue => { (c.getPrototype ().getLoc (), format ("%", c.getPrototype ())) }
-            c : &MethodCallValue => { (c.getMethod ().getPrototype ().getLoc (), format ("%", c.getMethod ().getPrototype ())) }
+            c : &MethodCallValue => { (c.getMethod ().getPrototype ().getLoc (),
+                                       format ("%", c.getMethod ().getPrototype (), withTags-> ["withParams"s8]))
+            }
             _ => { (loc, format ("%", getVal)) }
         };
 
@@ -1055,7 +1037,6 @@ pub class ForLoopValidator {
             return self.validateCptrIterValidateVDecl (alias context, vdecl, getVal);
         } catch {
             err : &ErrorMsg => {
-
                 let note = ErrorMsg::note (loc, format (ValidateErrorMessage::CALL_GET_OP_ONE_LINE, vdecl.getLoc ().str (), iterRef, index, nbVars), oneLine-> true);
                 let protoNote = ErrorMsg::note (protoLoc, format (ValidateErrorMessage::CALL_PROTO, protoMsg));
                 throw ErrorMsg::fatal (vdecl.getLoc (), format (ValidateErrorMessage::USE_GET_OP_ITERATOR, protoMsg, iteratorType),
@@ -1089,49 +1070,70 @@ pub class ForLoopValidator {
             throw ErrorMsg::fatal (vdecl.getMutOrDmutLocation (), ValidateErrorMessage::MUTABLE_CONST_ITERATOR);
         }
 
+        let retTypeLoc = match val {
+            c : &MethodCallValue => { c.getMethod ().getPrototype ().getRetType ().getLoc () }
+            _ => { val.getLoc () }
+        };
 
-        context:.verifyMemoryOwner (vdecl.getLoc (), vType, val, construct-> true, byReference-> false);
+        context:.verifyMemoryOwner (retTypeLoc, vType, val, construct-> true, byReference-> false);
         let decl = VarDeclValue::new (vdecl.getLoc (), vType, val, isMutable-> (vdecl.isMutable () || vdecl.isDeeplyMutable ()), isReference-> false, isIterator-> true);
         decl
     }
 
     /**
-     *
+     * Validate the call to the method "get" of the iterator value
+     * @warning: assumes that the iterator type is a class or a struct
+     * @params:
+     *    - context: the context of the validation
+     *    - loc: the location of variable to declare
+     *    - iteratorType: the type of the iterator
+     *    - iterRef: the reference (class aliaser) of the iterator
+     *    - index: the index of the variable to create
+     *    - nbVars: the number of variables iterating the class
      * */
     fn validateCptrIterCallGet (self, dmut context : &Validator, loc : &Word, iteratorType : &Type, iterRef : &Value, index : usize, nbVars : usize)-> &Value
         throws &ErrorMsg
     {
-        match iteratorType {
-            cptr : &ClassPtrType => {
-                let meth = context:.constructObjectMethodAcc (loc, cptr, iterRef, OpOverrideNames::GET_ITER_OVERRIDE);
-                let templ = context:.getValueValidator ().validateTemplateCall (alias context, loc, meth, [makeIntValue (loc, index), makeIntValue (loc, nbVars)]);
-                context:.getCallOpValidator ().validate (alias context, loc, templ, [])
+        {
+            match iteratorType {
+                cptr : &ClassPtrType => {
+                    let meth = context:.constructObjectMethodAcc (loc, cptr, iterRef, OpOverrideNames::GET_ITER_OVERRIDE, allowImmut-> true);
+                    let templ = context:.getValueValidator ().validateTemplateCall (alias context, loc, meth, [makeIntValue (loc, index), makeIntValue (loc, nbVars)]);
+                    return context:.getCallOpValidator ().validate (alias context, loc, templ, []);
+                }
+                _ => {
+                    __pragma!panic ();
+                }
             }
-            _ => {
-                let syntVar = VarExpr::new (Word::new (OpOverrideNames::GET_ITER_OVERRIDE, loc));
-                let func = context:.validateValue (syntVar);
-                let templ = context:.getValueValidator ().validateTemplateCall (alias context, loc, func, [makeIntValue (loc, index), makeIntValue (loc, nbVars)]);
-                context:.getCallOpValidator ().validate (alias context, loc, templ, [iterRef])
+        } catch {
+            err : &ErrorMsg => {
+                let note = ErrorMsg::note (loc, format (ValidateErrorMessage::CALL_GET_OP_ONE_LINE, loc.str (), iterRef, index, nbVars), oneLine-> true);
+                throw ErrorMsg::fatal (loc, format (ValidateErrorMessage::CALL_GET_OP_ITERATOR, iteratorType, index, nbVars),
+                                       notes-> [note, err]);
             }
         }
     }
 
     /**
-     * Validate the increment on a iterator for a class ptr iteration
-     * */
-    fn validateCptrIncrement (self, dmut context : &Validator, loc : &Word, iteratorType : &Type, iterRef : &Value, lvalue : &Value)-> &Value
+     * Validate the increment on a iterator for a class ptr iteration, i.e., call to the "next" method
+     * @warning: assumes that the iterator type is a class or a struct
+     * @params:
+     *    - context: the context of the validation
+     *    - loc: the location of the for loop
+     *    - iteratorType : the type of the iterator
+     *    - iterRef: the reference to the iterator value (in a class aliaser)
+     * * */
+    fn validateCptrIncrement (self, dmut context : &Validator, loc : &Word, iteratorType : &Type, iterRef : &Value)-> &Value
         throws &ErrorMsg
     {
-        let val = {
+        {
             match iteratorType {
-                cptr : &ClassPtrType => { // #_iter.next ()
+                cptr : &ClassPtrType => {
                     let meth = context:.constructObjectMethodAcc (loc, cptr, iterRef, OpOverrideNames::NEXT_OP_OVERRIDE);
-                    context:.getCallOpValidator ().validate (alias context, loc, meth, [])
+                    return context:.getCallOpValidator ().validate (alias context, loc, meth, []);
                 }
-                _ => { // next (#_iter);
-                    let syntVar = VarExpr::new (Word::new (OpOverrideNames::NEXT_OP_OVERRIDE, loc));
-                    let func = context:.validateValue (syntVar);
-                    context:.getCallOpValidator ().validate (alias context, loc, func, [iterRef])
+                _ => {
+                    __pragma!panic ();
                 }
             }
         } catch {
@@ -1140,23 +1142,38 @@ pub class ForLoopValidator {
                 throw ErrorMsg::fatal (loc, format (ValidateErrorMessage::CALL_NEXT_OP_ITERATOR, iteratorType), notes-> [note, err]);
             }
         }
+    }
+
+    /**
+     * Verify that the begin method returns a valid iterator, and that the iterator is deeply mutable
+     * @params:
+     *    - context: the context of the validation
+     *    - loc : the location of the for loop
+     *    - cptr: the type being iterated
+     *    - iteratorDecl: the declaration of the iterator variable
+     *    - beginMeth: the call to the begin method
+     * */
+    fn verifyCptrBeginIsValid (self, dmut context : &Validator, loc : &Word, cptr : &ClassPtrType, iteratorDecl : &VarDeclValue, beginMeth : &Value)
+        throws &ErrorMsg
+    {
+        let (protoLocBeg, retTypeProtoLog, protoMsg) = match beginMeth {
+            c : &MethodCallValue => { (c.getMethod ().getPrototype ().getLoc (),
+                                       c.getMethod ().getPrototype ().getRetType ().getLoc (),
+                                       format ("%", c.getMethod ().getPrototype (), withTags-> ["withParams"s8]))
+            }
+            _ => { (loc, loc, format ("%", beginMeth)) }
+        };
 
         {
-            // #_iter = #_iter.next ();
-            let finVal = context:.verifyCompatibleTypeWithValue (val.getLoc (), lvalue.getType (), val, byReference-> false);
-            AffectValue::new (loc, lvalue.getType (), lvalue, finVal)
+            let iteratorTrait = context:.validateIteratorTrait (loc);
+            context:.verifyImplement (retTypeProtoLog, beginMeth.getType (), iteratorTrait);
+            context:.verifyMemoryOwner (retTypeProtoLog, iteratorDecl.getVarType (), beginMeth, byReference-> false, construct-> true, byLazy-> false);
         } catch {
             err : &ErrorMsg => {
-                let (protoLoc, protoMsg) = match val {
-                    c : &CallValue => { (c.getPrototype ().getLoc (), format ("%", c.getPrototype ())) }
-                    c : &MethodCallValue => { (c.getMethod ().getPrototype ().getLoc (), format ("%", c.getMethod ().getPrototype ())) }
-                    _ => { (loc, format ("%", val)) }
-                };
-
-                let note = ErrorMsg::note (loc, format (ValidateErrorMessage::CALL_NEXT_OP_ONE_LINE, iterRef, iterRef), oneLine-> true);
-                let protoNote = ErrorMsg::note (protoLoc, format (ValidateErrorMessage::CALL_PROTO, protoMsg));
-                throw ErrorMsg::fatal (loc, format (ValidateErrorMessage::AFFECT_NEXT_OP_ITERATOR, iteratorType),
-                                       notes-> [note, err.withNote ([protoNote])]);
+                println (format ("%", err));
+                let noteBeg = ErrorMsg::note (protoLocBeg, format (ValidateErrorMessage::CALL_PROTO, protoMsg));
+                let rewriteNote = ErrorMsg::note (loc, format (ValidateErrorMessage::CALL_BEGIN_ONE_LINE, cptr), oneLine-> true);
+                throw ErrorMsg::list ([rewriteNote, noteBeg, err]);
             }
         }
     }
@@ -1179,14 +1196,16 @@ pub class ForLoopValidator {
     {
         if (!useAlias && byAlias) {
             let (protoLocBeg, _) = match beginMeth {
-                c : &CallValue => { (c.getPrototype ().getLoc (), format ("%", c.getPrototype ())) }
-                c : &MethodCallValue => { (c.getMethod ().getPrototype ().getLoc (), format ("%", c.getMethod ().getPrototype ())) }
+                c : &MethodCallValue => { (c.getMethod ().getPrototype ().getLoc (),
+                                           format ("%", c.getMethod ().getPrototype (), withTags-> ["withParams"s8]))
+                }
                 _ => { (loc, format ("%", beginMeth)) }
             };
 
             let (protoLocEnd, _) = match endMeth {
-                c : &CallValue => { (c.getPrototype ().getLoc (), format ("%", c.getPrototype ())) }
-                c : &MethodCallValue => { (c.getMethod ().getPrototype ().getLoc (), format ("%", c.getMethod ().getPrototype ())) }
+                c : &MethodCallValue => { (c.getMethod ().getPrototype ().getLoc (),
+                                           format ("%", c.getMethod ().getPrototype (), withTags-> ["withParams"s8]))
+                }
                 _ => { (loc, format ("%", endMeth)) }
             };
 
