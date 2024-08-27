@@ -454,6 +454,15 @@ pub class CastValidator {
             ErrOptionValue () => {
                 return ErrOptionValue::new (loc, type-> o.toDeeplyMutable ().asOf!{&OptionType} ());
             }
+            ov : &OptionValue => {
+                {
+                    let innerV = self.validateImplicit (alias context, loc, ov.getValue (), o.getInners ()[0]);
+                    let optType = OptionType::new (loc, innerV.getType ()).clone (ov.getType ());
+                    return OptionValue::new (loc, optType, innerV);
+                } catch {
+                    _ => {}
+                }
+            }
         }
 
         throw ErrorMsg::fatal (loc, format (ValidateErrorMessage::UNDEFINED_CAST_OP, value.getType (), o));
@@ -567,11 +576,20 @@ pub class CastValidator {
      * @throws:
      *    - &ErrorMsg: if the cast is not allowed
      * */
-    fn validateImplicitOption (self, dmut _ : &Validator, loc : &Word, o : &OptionType, v : &Value, error : &ErrorMsg)-> &Value
+    fn validateImplicitOption (self, dmut context : &Validator, loc : &Word, o : &OptionType, v : &Value, error : &ErrorMsg)-> &Value
         throws &ErrorMsg
     {
         match v {
             ErrOptionValue () => return ErrOptionValue::new (loc, type-> o);
+            ov : &OptionValue => {
+                {
+                    let innerV = self.validateImplicit (alias context, loc, ov.getValue (), o.getInners ()[0]);
+                    let optType = OptionType::new (loc, innerV.getType ()).clone (ov.getType ());
+                    return OptionValue::new (loc, optType, innerV);
+                } catch {
+                    _ => {}
+                }
+            }
         }
 
         throw error;
@@ -752,6 +770,8 @@ pub class CastValidator {
     {
         if (!av.isDynamic ()) {
             {
+                if (av.getType ().asOf!{&ArrayType} ().getLen () != a.getLen ()) throw error;
+
                 let innerV = self.validateImplicit (alias context, loc, av.getValue (), a.getInners ()[0]);
                 let arrType = ArrayType::new (loc, innerV.getType (), av.getType ().asOf!{&ArrayType} ().getLen (), isMutable-> true);
 
@@ -761,7 +781,6 @@ pub class CastValidator {
             }
         } else throw error;
     }
-
 
     /*!
      * ================================================================================
@@ -809,6 +828,10 @@ pub class CastValidator {
 
                 if (c.getValue ().isOf!{&SliceCtorValue} ()) {
                     return self.validateImplicitSliceFromLit (alias context, loc, s, c.getValue ().asOf!{&SliceCtorValue} (), c.isDeep (), error);
+                }
+
+                if (c.getValue ().isOf!{&ListComprValue} ()) {
+                    return self.validateImplicitSliceFromLstCompr (alias context, loc, s.getInners ()[0], c.getValue ().asOf!{&ListComprValue} (), error);
                 }
             }
             (a : &ArrayAllocValue, sr : &SliceType) => {
@@ -923,6 +946,104 @@ pub class CastValidator {
         } catch {
             innerErr : &ErrorMsg =>  throw error.withNote ([innerErr], alone-> true);
         }
+    }
+
+    /**
+     * Validate an implicit cast from a list comprehension
+     * */
+    fn validateImplicitSliceFromLstCompr (self, dmut context : &Validator, loc : &Word, inner : &Type, lst : &ListComprValue, error : &ErrorMsg)-> &Value
+        throws &ErrorMsg
+    {
+        match lst.getType () {
+            SliceType () => {}
+            _ => throw error;
+        }
+
+        if (lst.getContent ().getValues ().len < 3us) throw error;
+
+        // last is the ref to the value
+        // before that we have the loop
+        // and before that we have the slice decl
+        let (aff, lpInner, oldLp) = match lst.getContent ().getValues ()[$ - 2us] {
+            l : &LoopValue => {
+                match l.getValue () {
+                    b : &BlockValue => {
+                        if (b.getValues ().len >= 2us && b.getValues ()[$ - 2us].isOf!{&AffectValue} ()) {
+                            (b.getValues ()[$ - 2us].asOf!{&AffectValue} (), b, l)
+                        } else {
+                            throw error;
+                        }
+                    }
+                    _ => throw error;
+                }
+            }
+            _ => throw error;
+        };
+
+        let iterRef = match aff.getLeft () {
+            s : &SliceAccessValue => { s.getIndex () }
+            _ => throw error;
+        };
+
+        let len = match lst.getContent ().getValues () [$ - 3us] {
+            s : &VarDeclValue => {
+                if (s.getValue ().isOf!{&ArrayAllocValue} ()) { s.getValue ().asOf!{&ArrayAllocValue} ().getLen () }
+                else throw error;
+            }
+            _ => throw error;
+        };
+
+        {
+            self.rewriteListComprSlice (alias context, loc, inner, lst, aff, lpInner, oldLp, iterRef, len)
+        } catch {
+            _ => {
+                throw error;
+            }
+        }
+    }
+
+    /**
+     * Rewrite the content of a list comprehension that generates a slice value
+     * */
+    fn rewriteListComprSlice (self, dmut context : &Validator, loc : &Word, inner : &Type, lst : &ListComprValue, aff : &AffectValue, lpInner : &BlockValue, oldLp : &LoopValue, iterRef : &Value, len : &Value)-> &Value
+        throws &ErrorMsg
+    {
+        let innerV = self.validateImplicit (alias context, loc, aff.getRight (), inner);
+        let mut innerType = innerV.getType ();
+        if (!innerType.isMutable ()) innerType = innerType.cloneMutableTilBorrow ();
+        else {
+            context:.verifyMemoryOwner (loc, innerType, innerV, byReference-> false);
+        } catch {
+            _ => {
+                innerType = innerType.cloneMutableTilBorrow (); // it is more deeply mutable, but does not allow mutable memory borrowing
+            }
+        }
+
+        let (slcValueDecl, slcValueRef, slcIndex, sliceType) = context:.getForLoopValidator ().validateComprSliceValueDecl (alias context, loc, VoidType::new (loc), innerType, iterRef, len, true);
+
+        let dmut finalValues = Vec!{&Value}::new ();
+        let dmut loopValues = Vec!{&Value}::new ();
+        for it in lst.getContent ().getValues () [0us .. $ - 3us] {
+            finalValues:.push (it);
+        }
+
+        for it in lpInner.getValues ()[0us .. $ - 2us] {
+            loopValues:.push (it);
+        }
+
+        loopValues:.push (AffectValue::new (aff.getLoc (), VoidType::new (aff.getLoc ()), slcIndex, innerV));
+        loopValues:.push (lpInner.getValues ()[$ - 1us]);
+
+
+        let blkContent = BlockValue::new (loc, VoidType::new (loc), loopValues[]);
+        finalValues:.push (slcValueDecl);
+        finalValues:.push (LoopValue::new (oldLp.getLoc (), VoidType::new (oldLp.getLoc ()), test-> oldLp.getTest (), blkContent, isDo-> false));
+        finalValues:.push (slcValueRef);
+
+
+
+        CopierValue::new (loc, sliceType, isDone-> true,
+                          ListComprValue::new (loc, sliceType, BlockValue::new (loc, sliceType, finalValues[])))
     }
 
     /**
