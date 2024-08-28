@@ -42,22 +42,24 @@ pub class LiteralValidator {
      * @throws: &ErrorMsg, if the validation failed
      * @returns: a value
      */
-    pub fn validate (self, dmut context : &Validator, lit : &LiteralExpr)-> &Value
+    pub fn validate (self, dmut context : &Validator, lit : &Expression)-> &Value
         throws &ErrorMsg
     {
         match lit {
-            b : &BoolExpr => return self.validateBool (alias context, b);
-            n : &NullExpr => return self.validateNull (alias context, n);
-            n : &NoneExpr => return self.validateNone (alias context, n);
-            d : &DollarExpr => return self.validateDollar (alias context, d);
-            i : &IgnoreExpr => return self.validateIgnore (alias context, i);
-            u : &UnitExpr => return self.validateUnit (alias context, u);
-            f : &FixedExpr => return self.validateInt (alias context, f);
-            f : &FloatExpr => return self.validateFloat (alias context, f);
-            c : &CharExpr => return self.validateChar (alias context, c);
-            s : &StringExpr => return self.validateString (alias context, s);
-            v : &VarExpr => return self.validateVar (alias context, v);
-            RangeTypeExpr () => {
+            b : &BoolExpr           => return self.validateBool (alias context, b);
+            n : &NullExpr           => return self.validateNull (alias context, n);
+            n : &NoneExpr           => return self.validateNone (alias context, n);
+            d : &DollarExpr         => return self.validateDollar (alias context, d);
+            i : &IgnoreExpr         => return self.validateIgnore (alias context, i);
+            u : &UnitExpr           => return self.validateUnit (alias context, u);
+            f : &FixedExpr          => return self.validateInt (alias context, f);
+            f : &FloatExpr          => return self.validateFloat (alias context, f);
+            c : &CharExpr           => return self.validateChar (alias context, c);
+            s : &StringExpr         => return self.validateString (alias context, s);
+            v : &VarExpr            => return self.validateVar (alias context, v);
+            l : &ListExpr           => return self.validateList (alias context, l);
+            s : &SliceAllocatorExpr => return self.validateSliceAllocator (alias context, s);
+            RangeTypeExpr ()        => {
                 throw ErrorMsg::fatal (lit.getLoc (), format (ValidateErrorMessage::USE_AS_VALUE));
             }
             _ => {
@@ -265,7 +267,7 @@ pub class LiteralValidator {
         if (f.getSuffix () == FloatSuffixes::F32) {
             FloatValue::new (f.getLoc (),
                              FloatType::new (f.getLoc (), size-> 32u16),
-                              val * exp)
+                             val * exp)
         } else if (f.getSuffix () == FloatSuffixes::F64 || f.getSuffix ().isEof ()){
             FloatValue::new  (f.getLoc (),
                               FloatType::new (f.getLoc (), size-> 64u16),
@@ -485,7 +487,345 @@ pub class LiteralValidator {
             }
         };
     }
-        
+
+
+    /*!
+     * ================================================================================
+     * ================================================================================
+     * ======================            SLICE/ARRAYS             =====================
+     * ================================================================================
+     * ================================================================================
+     */
+
+    /**
+     * Validate a list expression
+     * @params:
+     *   - context: the context of the validation
+     *   - l: the list expression to validate
+     *   - type: the type to force (if different to NONE_TYPE) and only applicable to ListArray
+     * @returns: the validated value
+     */
+    pub fn validateList (self, dmut context : &Validator, l : &ListExpr)-> &Value
+        throws &ErrorMsg
+    {
+        if (l.isArray ()) {
+            if (context.isDynamic (l)) {
+                self.validateListSlice (alias context, l)
+            } else {
+                self.validateListStaticArray (alias context, l)
+            }
+        } else {
+            self.validateListTuple (alias context, l)
+        }
+    }
+
+    /**
+     * Validate a list expression containing an array literal
+     * @params:
+     *   - context: the context of the validation
+     *   - l: the list to validate
+     * @returns: the validated value
+     */
+    fn validateListStaticArray (self, dmut context : &Validator, l : &ListExpr)-> &Value
+        throws &ErrorMsg
+    {
+        let dmut parameters = Vec!{&Value}::new ();
+        let mut inner : &Type = NoneType::new (l.getLoc ());
+
+        for it in l.getParameters () {
+            let val = context:.validateValue (it);
+            match val {
+                e : &ExpandValue => {
+                    for g_it in e.getInnerValues () {
+                        inner = self.addArrayType (alias context, g_it, alias parameters, inner);
+                    }
+                }
+                g_it : _ => {
+                    inner = self.addArrayType (alias context, g_it, alias parameters, inner);
+                }
+            }
+        }
+
+        // If there is no value in the slice (i.e. []), its values is [void]
+        if (parameters.len () == 0us) inner = VoidType::new (l.getLoc ());
+
+        let arrType = ArrayType::new (l.getLoc (), inner, parameters.len (), isMutable-> true);
+        ArrayValue::new (l.getLoc (), arrType, parameters [])
+    }
+
+    /**
+     * Validate a list expression containing a slice literal (same as array literal but within a copy or dcopy context)
+     * @params:
+     *    - context: the context of the validation
+     *    - l: the list to validate
+     * @returns: the validated value
+     * */
+    fn validateListSlice (self, dmut context : &Validator, l : &ListExpr)-> &Value
+        throws &ErrorMsg
+    {
+        let content = self.validateListStaticArray (alias context, l);
+        let arrType = content.getType ().asOf!{&ArrayType} ();
+        let inner = arrType.getInners ()[0];
+
+        let slcType = SliceType::new (l.getLoc (), inner, isMutable-> true);
+        if (arrType.getLen () == 0us) {
+            return SliceCtorValue::new (l.getLoc (), slcType, NullValue::new (l.getLoc ()), makeIntValue (l.getLoc (), 0us), isImplicitAlias-> true);
+        } else {
+            let addr = AddressValue::new (l.getLoc (), PointerType::new (l.getLoc (), inner), content);
+            let ctor = SliceCtorValue::new (l.getLoc (), slcType, addr, makeIntValue (l.getLoc (), arrType.getLen ()), isImplicitAlias-> true);
+
+            match context.getDynamicExpr () {
+                i : &IntrinsicExpr => {
+                    return CopierValue::new (i.getLoc (), slcType, ctor, isDeep-> i.getType () == IntrinsicKeys::DCOPY);
+                }
+                _ => __pragma!panic ();
+            }
+        }
+    }
+
+    /**
+     * Add a parameter to an list of array parameters
+     * @params:
+     *   - context: the context of the validation
+     *   - val: the value to add
+     *   - parameters: the list of parameters inside the array literal
+     *   - innerType: the current type of the inner values of the array
+     */
+    pub fn addArrayType (self, dmut context : &Validator, val : &Value, dmut parameters : &Vec!{&Value}, innerType : &Type)-> &Type
+        throws &ErrorMsg
+    {
+        if (val.getType ().isOf!{&NoneType} () || val.getType ().isOf!{&VoidType} ()) {
+            throw ErrorMsg::fatal (val.getLoc (), ValidateErrorMessage::VOID_VALUE);
+        }
+
+        let (t, v) = context:.inferTypeBranchingWithValue (innerType.getLoc (), innerType, val);
+        parameters:.push (v);
+        t
+    }
+
+    /*!
+     * ================================================================================
+     * ================================================================================
+     * =========================            TUPLES             ========================
+     * ================================================================================
+     * ================================================================================
+     */
+
+    /**
+     * Validate a list expression containing a tuple literal
+     * @params:
+     *   - context: the context of the validation
+     *   - l: the list to validate
+     * @returns: the validated value
+     */
+    fn validateListTuple (self, dmut context : &Validator, l : &ListExpr)-> &Value
+        throws &ErrorMsg
+    {
+        let dmut parameters = Vec!{&Value}::new ();
+        let dmut types = Vec!{&Type}::new ();
+        for it in l.getParameters () {
+            let val = context:.validateValue (it);
+            match val {
+                e : &ExpandValue => {
+                    for g_it in e.getInnerValues () {
+                        self.addTupleType (alias context, g_it, alias parameters, alias types);
+                    }
+                }
+                g_it : _ => {
+                    self.addTupleType (alias context, g_it, alias parameters, alias types);
+                }
+            }
+        }
+
+        let type = TupleType::new (l.getLoc (), types[], isMutable-> true);
+        TupleValue::new (l.getLoc (), type, parameters[])
+    }
+
+    /**
+     * Add an element at the end of a list of tuple parameters and types
+     * @params:
+     *   - context: the context of the validation
+     *   - val: the value to add
+     *   - params: the list of parameters
+     *   - types: the list of types
+     */
+    pub fn addTupleType (self, dmut context : &Validator, val : &Value, dmut params : &Vec!{&Value}, dmut types : &Vec!{&Type})
+        throws &ErrorMsg
+    {
+        if (val.getType ().isOf!{&NoneType} () || val.getType ().isOf!{&VoidType} ()) {
+            throw ErrorMsg::fatal (val.getLoc (), ValidateErrorMessage::VOID_VALUE);
+        }
+
+        let type = context:.inferTypeImplicitMutability (val);
+
+        params:.push (val);
+        types:.push (type);
+    }
+
+    
+    /*!
+     * ================================================================================
+     * ================================================================================
+     * ===================            ALLOC SLICE/ARRAYS             ==================
+     * ================================================================================
+     * ================================================================================
+     */
+
+    /**
+     * Validate a slice allocator expression
+     * @params:
+     *     - context: the context of the validation
+     *     - alloc: the allocation to validate
+     *  @throws: &ErrorMsg: if the expression is not valid
+     *  @returns: the value containing the allocation
+     */
+    pub fn validateSliceAllocator (self, dmut context : &Validator, alloc : &SliceAllocatorExpr)-> &Value
+        throws &ErrorMsg
+    {
+        if (context.isDynamic (alloc)) {
+            self.validateDynamicSliceAllocator (alias context, alloc)
+        } else {
+            self.validateStaticSliceAllocator (alias context, alloc)
+        }
+    }
+
+    /**
+     * Validate a slice allocator whose size might not be cte
+     * @params:
+     *    - context: the context of the validation
+     *    - allooc: the allocator to validate
+     * */
+    fn validateDynamicSliceAllocator (self, dmut context : &Validator, alloc : &SliceAllocatorExpr)-> &Value
+        throws &ErrorMsg
+    {
+        let size = context:.implicitEnumUnwrap (context:.validateValue (alloc.getSize ()));
+        match size.getType () {
+            IntType () => {}
+            _ => {
+                let iType = IntType::new (alloc.getSize ().getLoc (), size-> 0u16, signed-> false);
+                throw ErrorMsg::fatal (alloc.getSize ().getLoc (),
+                                       format (ValidateErrorMessage::INCOMPATIBLE_TYPE,
+                                               size.getType (), iType));
+            }
+        };
+
+        let value = context:.validateValue (alloc.getValue ());
+        self.validateDynamicSliceAllocator (alias context, alloc.getLoc (), value, size)
+    }
+
+
+    /**
+     * Validate a array allocator that creates a slice (whose size does not need to be cte)
+     * The returned value is a copier, or a dynamic array allocator.
+     * @params:
+     *    - context: the context of the validation
+     *    - loc: the location of the allocation
+     *    - value: the value to put in the slice
+     *    - size: the size of the slice to allocate (can be cte, but is not mandatory)
+     * @returns: the allocator (or copier)
+     * @throws:
+     *    - &ErrorMsg: if the validation failed
+     * */
+    pub fn validateDynamicSliceAllocator (self, dmut context : &Validator, loc : &Word, value : &Value, size : &Value)-> &Value
+        throws &ErrorMsg
+    {
+        let innerType = context:.inferTypeImplicitMutability (value);
+        context.verifyCompleteType (value.getLoc (), innerType, false);
+        if (innerType.isOf!{&NoneType} () || innerType.isOf!{&VoidType} ()) {
+            throw ErrorMsg::fatal (value.getLoc (), format (ValidateErrorMessage::EMPTY_ARRAY_INNER, innerType));
+        }
+
+        if (size.isOf!{&IntValue} ()) {
+            let tabSize = {
+                size.asOf!{&IntValue} ().getValue ().to!usize ()
+            } catch {
+                _ => throw ErrorMsg::fatal (size.getLoc (), format (ValidateErrorMessage::OVERFLOW_CAPACITY, IntType::new (size.getLoc (), size-> 0u16, signed-> false), size, u64::max));
+            };
+
+            if (tabSize <= 255us) { // then alloc from copy is faster (memset is slower than memcpy)
+                let valSize = makeIntValue (size.getLoc (), tabSize);
+                let type = ArrayType::new (loc, innerType, tabSize, isMutable-> true);
+                let slcType = SliceType::new (loc, innerType, isMutable-> true);
+                let content = AddressValue::new (loc, PointerType::new (loc, innerType),
+                                                 ArrayAllocValue::stat (loc, type, value, valSize));
+
+                let ctor = SliceCtorValue::new (loc, slcType, content, valSize, isImplicitAlias-> true);
+                match context.getDynamicExpr () { // We can make a dynamic alloc only if we are inside a copy
+                    i : &IntrinsicExpr => {
+                        return CopierValue::new (i.getLoc (), slcType, ctor, isDeep-> i.getType () == IntrinsicKeys::DCOPY);
+                    }
+                    _ => __pragma!panic (); // thus should not be there
+                }
+            }
+        }
+
+        // Size is unknown, we cannot make an array in the stack to copy from
+        let type = SliceType::new (loc, innerType, isMutable-> true);
+        ArrayAllocValue::dyn (loc, type, value, size)
+    }
+
+
+    /**
+     * Validate an array allocator, thus whose size is cte
+     * @params:
+     *    - context: the context of the validaton
+     *    - alloc: the allocator to validate
+     * */
+    fn validateStaticSliceAllocator (self, dmut context : &Validator, alloc : &SliceAllocatorExpr)-> &Value
+        throws &ErrorMsg
+    {
+        let sizeVal = context:.implicitEnumUnwrap (context:.validateValue (alloc.getSize ()));
+        let value = context:.validateValue (alloc.getValue ());
+
+        {
+            context:.getCompileTimeInterpreter ().computeInt (sizeVal);
+        } catch {
+            err : &ErrorMsg => {
+                throw err.withNote ([ErrorMsg::note (alloc.getLoc (), format (ValidateErrorMessage::ENCLOSE_COPY_CLASS_CTOR))]);
+            }
+        }
+
+        self.validateStaticSliceAllocator (alias context, alloc.getLoc (), value, sizeVal)
+    }
+
+    /**
+     * Validate a static array allocation, form an inner value, and a already validate size
+     * @params:
+     *    - context: the context of the validation
+     *    - loc: the location of the allocator
+     *    - value: the inner value to put in the array
+     *    - sizeVal: the value containing the size of the array (should be cte)
+     * @returns: the array allocator
+     * @throws:
+     *     - &ErrorMsg: if the allocation is not valid
+     * */
+    pub fn validateStaticSliceAllocator (self, dmut context : &Validator, loc : &Word, value : &Value, sizeVal : &Value)-> &Value
+        throws &ErrorMsg
+    {
+        let size = context:.getCompileTimeInterpreter ().computeInt (sizeVal);
+        let innerType = context:.inferTypeImplicitMutability (value);
+
+        context.verifyCompleteType (value.getLoc (), innerType, false);
+        if (innerType.isOf!{&NoneType} () || innerType.isOf!{&VoidType} ()) {
+            throw ErrorMsg::fatal (value.getLoc (), format (ValidateErrorMessage::EMPTY_ARRAY_INNER, innerType));
+        }
+
+        let tabSize = {
+            size.to!usize ()
+        } catch {
+            _ => throw ErrorMsg::fatal (sizeVal.getLoc (), format (ValidateErrorMessage::OVERFLOW_CAPACITY, IntType::new (sizeVal.getLoc (), size-> 0u16, signed-> false), size, u64::max));
+        };
+
+        if (tabSize > 1048576us) { // 1MB
+            throw ErrorMsg::fatal (sizeVal.getLoc (), format (ValidateErrorMessage::OVERFLOW_CAPACITY_ARRAY, tabSize, 1048576us));
+        }
+
+        let valSize = makeIntValue (sizeVal.getLoc (), tabSize);
+        let type = ArrayType::new (loc, innerType, tabSize, isMutable-> true);
+        ArrayAllocValue::stat (loc, type, value, valSize)
+    }
+
+
     /*!
      * ================================================================================
      * ================================================================================
@@ -537,7 +877,7 @@ pub class LiteralValidator {
             }
         }
     } 
-     
+
     
     /**
      * Validate a var reference that was not found locally, and then must be searched in global symbols

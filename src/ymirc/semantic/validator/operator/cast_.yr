@@ -747,7 +747,7 @@ pub class CastValidator {
                     {
                         for i in 0us .. x {
                             let innerV = self.validateImplicit (alias context, loc, av.getValues ()[i], t2);
-                            inner = context:.getValueValidator ().addArrayType (alias context, innerV, alias params, inner);
+                            inner = context:.getLiteralValidator ().addArrayType (alias context, innerV, alias params, inner);
                         }
                     } catch {
                         innerErr : &ErrorMsg => throw error.withNote ([innerErr], alone-> true);
@@ -886,13 +886,15 @@ pub class CastValidator {
     fn validateImplicitSliceFromArray (self, dmut context : &Validator, loc : &Word, s : &SliceType, array : &ArrayValue, error : &ErrorMsg)-> &Value
         throws &ErrorMsg
     {
+        // an array value is a list of values of the same type
+        // we try to implicitely cast every one of them
         let dmut params = Vec!{&Value}::new ();
         let mut inner : &Type = NoneType::new (loc);
         {
             let len = array.getValues ().len;
             for i in 0us .. len {
                 let innerV = self.validateImplicit (alias context, loc, array.getValues ()[i], s.getInners ()[0]);
-                inner = context:.getValueValidator ().addArrayType (alias context, innerV, alias params, inner);
+                inner = context:.getLiteralValidator ().addArrayType (alias context, innerV, alias params, inner);
             }
         } catch {
             innerErr : &ErrorMsg => throw error.withNote ([innerErr], alone-> true);
@@ -900,6 +902,8 @@ pub class CastValidator {
 
         if (params.len () != 0us) {
             let arrType = ArrayType::new (loc, inner, params.len (), isMutable-> true);
+
+            // We create a new array value from the casted types
             let arrValue = ArrayValue::new (loc, arrType, params[]);
             let slcType = SliceType::new (loc, inner, withSize-> makeIntValue (loc, params.len ()), isMutable-> true);
 
@@ -919,13 +923,22 @@ pub class CastValidator {
         throws &ErrorMsg
     {
         {
+            // array alloc stat is a memcpy of an array on the stack
+            // let x = [old_value ; #_len];
+            // copy {.len = #_len, .ptr = &x}
             let innerV = self.validateImplicit (alias context, loc, ctor.getValue (), inner);
-            let arrType = ArrayType::new (loc, innerV.getType (), ctor.getType ().asOf!{&ArrayType} ().getLen (), isMutable-> true);
-            let slcType = SliceType::new (loc, innerV.getType (), withSize-> ctor.getLen (), isMutable-> true);
+            let innerType = context:.inferTypeImplicitMutability (innerV);
 
-            let content = AddressValue::new (ctor.getLoc (), PointerType::new (ctor.getLoc (), innerV.getType ()),
+            let arrType = ArrayType::new (loc, innerType, ctor.getType ().asOf!{&ArrayType} ().getLen (), isMutable-> true);
+            let slcType = SliceType::new (loc, innerType, withSize-> ctor.getLen (), isMutable-> true);
+
+            // We rewritte the stack part
+            // let x = [new_value ; #_len]
+            let content = AddressValue::new (ctor.getLoc (), PointerType::new (ctor.getLoc (), innerType),
                                              ArrayAllocValue::stat (loc, arrType, innerV, ctor.getLen ()));
 
+            // And the copy part
+            // copy {.len = #_len, .ptr = &x}
             let finalCtor = SliceCtorValue::new (ctor.getLoc (), slcType, content, ctor.getLen (), isImplicitAlias-> true);
             CopierValue::new (ctor.getLoc (), slcType, finalCtor, isDeep-> isDeep)
         } catch {
@@ -940,8 +953,13 @@ pub class CastValidator {
         throws &ErrorMsg
     {
         {
+            // An array alloc is simple,
+            // copy [old_value ; #_len]
             let innerV = self.validateImplicit (alias context, loc, ctor.getValue (), inner);
             let slcType = SliceType::new (loc, innerV.getType (), withSize-> ctor.getLen (), isMutable-> true);
+
+            // Create a new array alloc
+            // copy [new_value ; #_len]
             ArrayAllocValue::dyn (loc, slcType, innerV, ctor.getLen ())
         } catch {
             innerErr : &ErrorMsg =>  throw error.withNote ([innerErr], alone-> true);
@@ -959,19 +977,26 @@ pub class CastValidator {
             _ => throw error;
         }
 
-        if (lst.getContent ().getValues ().len < 3us) throw error;
+        // a list compr that is castable is simple, and made of three elements
+        // 1. let mut #_iter = 0;
+        // 2. let #_value : [oldType] = copy [<unit-value> ; #_len]
+        // 3. while  #_iter < #_len {
+        // 4.    let i = #_iter;
+        // 5.    #_value [i] = oldValue; <= the castable value
+        // 6.    #_iter += 1;
+        //    }
+        // 7. #_value <= return the created slice
 
-        // last is the ref to the value
-        // before that we have the loop
-        // and before that we have the slice decl
+        if (lst.getContent ().getValues ().len < 3us) throw error; // iter, loop, value_ref
         let (aff, lpInner, oldLp) = match lst.getContent ().getValues ()[$ - 2us] {
             l : &LoopValue => {
                 match l.getValue () {
                     b : &BlockValue => {
                         if (b.getValues ().len >= 2us && b.getValues ()[$ - 2us].isOf!{&AffectValue} ()) {
+                             // thus we extract the affect part, that contains the old value as right operand
                             (b.getValues ()[$ - 2us].asOf!{&AffectValue} (), b, l)
                         } else {
-                            throw error;
+                            throw error; // everything else is not castable
                         }
                     }
                     _ => throw error;
@@ -980,11 +1005,13 @@ pub class CastValidator {
             _ => throw error;
         };
 
+        // we need the iterator index used in the affectation, i.e. '#_iter' from => #_value [#_iter] = oldValue;
         let iterRef = match aff.getLeft () {
             s : &SliceAccessValue => { s.getIndex () }
             _ => throw error;
         };
 
+        // We also need the size of the slice that was created, i.e. '#_len' from => let #_value = copy [<unit-value> ; #_len]
         let len = match lst.getContent ().getValues () [$ - 3us] {
             s : &VarDeclValue => {
                 if (s.getValue ().isOf!{&ArrayAllocValue} ()) { s.getValue ().asOf!{&ArrayAllocValue} ().getLen () }
@@ -1008,43 +1035,62 @@ pub class CastValidator {
     fn rewriteListComprSlice (self, dmut context : &Validator, loc : &Word, inner : &Type, lst : &ListComprValue, aff : &AffectValue, lpInner : &BlockValue, oldLp : &LoopValue, iterRef : &Value, len : &Value)-> &Value
         throws &ErrorMsg
     {
+         // implicit cast the value that was used at each index of the list comprehension
         let innerV = self.validateImplicit (alias context, loc, aff.getRight (), inner);
-        let mut innerType = innerV.getType ();
-        if (!innerType.isMutable ()) innerType = innerType.cloneMutableTilBorrow ();
-        else {
-            context:.verifyMemoryOwner (loc, innerType, innerV, byReference-> false);
-        } catch {
-            _ => {
-                innerType = innerType.cloneMutableTilBorrow (); // it is more deeply mutable, but does not allow mutable memory borrowing
-            }
-        }
+        let innerType = context:.inferTypeImplicitMutability (innerV);
 
+        // Because the inner value can be implicitely casted, then the list compr can be fully rewritten with new type
         let (slcValueDecl, slcValueRef, slcIndex, sliceType) = context:.getForLoopValidator ().validateComprSliceValueDecl (alias context, loc, VoidType::new (loc), innerType, iterRef, len, true);
 
         let dmut finalValues = Vec!{&Value}::new ();
         let dmut loopValues = Vec!{&Value}::new ();
+
+        // insert old initial variable declarations
+        // 1. let mut #_iter = 0;
         for it in lst.getContent ().getValues () [0us .. $ - 3us] {
             finalValues:.push (it);
         }
 
+        // insert iterator declarations
+        // 4. let i = #_iter;
         for it in lpInner.getValues ()[0us .. $ - 2us] {
             loopValues:.push (it);
         }
 
+        // rewrite the affectation part
+        // 5. #_value [i] = rewritten_value;
         loopValues:.push (AffectValue::new (aff.getLoc (), VoidType::new (aff.getLoc ()), slcIndex, innerV));
+
+        // insert the iterator increment
+        // 6. #_iter += 1;
         loopValues:.push (lpInner.getValues ()[$ - 1us]);
 
 
         let blkContent = BlockValue::new (loc, VoidType::new (loc), loopValues[]);
+        // new slice value
+        // 2. let #_value : [new_type] = copy [<unit-value> ; #_len];
         finalValues:.push (slcValueDecl);
-        finalValues:.push (LoopValue::new (oldLp.getLoc (), VoidType::new (oldLp.getLoc ()), test-> oldLp.getTest (), blkContent, isDo-> false));
+
+        // new loop value
+        // 3. while #_iter < #_len { ... }
+        finalValues:.push (LoopValue::new (oldLp.getLoc (), VoidType::new (oldLp.getLoc ()), test-> oldLp.getTest (), blkContent, isDo-> false)); // new loop
+
+        // new slice reference
+        // 7. #_value
         finalValues:.push (slcValueRef);
 
-
-
+        // it creates a slice so it is an implicit copy
         CopierValue::new (loc, sliceType, isDone-> true,
                           ListComprValue::new (loc, sliceType, BlockValue::new (loc, sliceType, finalValues[])))
     }
+
+    /*!
+     * ================================================================================
+     * ================================================================================
+     * ====================            IMPLICIT TUPLE             =====================
+     * ================================================================================
+     * ================================================================================
+     */
 
     /**
      * Implicit cast a value to a tuple type
@@ -1072,7 +1118,7 @@ pub class CastValidator {
                 {
                     for i in 0us .. tv.getArity () {
                         let innerV = self.validateImplicit (alias context, loc, tv.getValues ()[i], t.getInners ()[i]);
-                        context:.getValueValidator ().addTupleType (alias context, innerV, alias params, alias types);
+                        context:.getLiteralValidator ().addTupleType (alias context, innerV, alias params, alias types);
                     }
                 } catch {
                     innerErr : &ErrorMsg => throw error.withNote ([innerErr], alone-> true);
@@ -1085,6 +1131,14 @@ pub class CastValidator {
 
         throw error;
     }
+
+    /*!
+     * ================================================================================
+     * ================================================================================
+     * ====================            IMPLICIT FPTR             ======================
+     * ================================================================================
+     * ================================================================================
+     */
 
     /**
      * Implicit cast a value to a funcptr type
@@ -1112,6 +1166,14 @@ pub class CastValidator {
 
         throw error;
     }
+
+    /*!
+     * ================================================================================
+     * ================================================================================
+     * ==================            IMPLICIT DELEGATE             ====================
+     * ================================================================================
+     * ================================================================================
+     */
 
     /**
      * Implicit cast a value to a delegate type
