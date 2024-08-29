@@ -196,7 +196,7 @@ pub class TemplateSolver {
      * @throws:
      *    - &ErrorMsg: if the specialization fails
      */
-    fn validateFromImplicit (self, dmut context : &Validator, loc : &Word, templates : [&Expression], parameters : [&Expression], rights : [&Value])-> (&TemplateRewriter, [&Value])
+    fn validateFromImplicit (self, dmut context : &Validator, loc : &Word, templates : [&Expression], parameters : [&VarDeclExpr], rights : [&Value])-> (&TemplateRewriter, [&Value])
         throws &ErrorMsg
     {
         let types = self.createTypesFromRights (alias context, rights);
@@ -212,7 +212,7 @@ pub class TemplateSolver {
 
         for it in 0us .. parameters.len {
             // Rewritte the current parameter that will be specialized to remove any template that was already validated
-            let currentParam = rewriter.rewrite (parameters[it]);
+            let currentParam = rewriter.rewriteVarDecl (parameters[it]);
             let rest = types.len - consumed; // number of types that still can be consumed (Note that there can be more types than parameters in case of variadics)
             let syntaxRest = (parameters.len - it) - 1us; // The number of parameters that where not validated yet, minus the current one
             let consomableTypes = types [consumed .. consumed + (rest - syntaxRest)]; // The list of types that can be associated to the current parameter (can be more than 1 in case of variadics)
@@ -369,6 +369,10 @@ pub class TemplateSolver {
                     }
                 }
             }
+            t : &TemplateAndExpr => {
+                println (format ("TODO %", t));
+                __pragma!panic ();
+            }
             t : &TemplateVarExpr => {
                 return self.validateTemplateVarExprFromExplicit (alias context, syntaxTemplate, t, values);
             }
@@ -378,12 +382,8 @@ pub class TemplateSolver {
             v : &VarDeclExpr => {
                 return self.validateVarDeclExprFromExplicit (alias context, syntaxTemplate, v, values);
             }
-            expr : &Expression => {
+            expr : _ => {
                 return self.validateValueExpressionFromExplicit (alias context, expr, values);
-            }
-            _ => {
-                println (format ("TODO %", current), " ", current::typeinfo.name);
-                __pragma!panic ();
             }
         }
     }    
@@ -1103,21 +1103,18 @@ pub class TemplateSolver {
         let mut syntTemplate = alls;
 
         for i in 0us .. fptr.getParameters ().len {
-            match fptr.getParameters ()[i] {
-                v : &VarDeclExpr => {
-                    let currentParam = rewriter.rewrite (v.getType ());
-                    let rest = params.len - consumed;
-                    let syntaxRest = (fptr.getParameters ().len - i) - 1us;
-                    let consomableTypes = params[consumed .. consumed + (rest - syntaxRest)];
+            let v = fptr.getParameters ()[i];
 
-                    let (tiMapper, localConsumed) = self.validateOfVarExprFromExplicit (alias context, syntTemplate, currentParam, consomableTypes);
+            let currentParam = rewriter.rewrite (v.getType ());
+            let rest = params.len - consumed;
+            let syntaxRest = (fptr.getParameters ().len - i) - 1us;
+            let consomableTypes = params[consumed .. consumed + (rest - syntaxRest)];
 
-                    retMapper:.merge (tiMapper);
-                    consumed += cast!usize (localConsumed);
-                    syntTemplate = rewriter.replaceSyntaxTempl (syntTemplate);
-                }
-                _ => __pragma!panic ();
-            }
+            let (tiMapper, localConsumed) = self.validateOfVarExprFromExplicit (alias context, syntTemplate, currentParam, consomableTypes);
+
+            retMapper:.merge (tiMapper);
+            consumed += cast!usize (localConsumed);
+            syntTemplate = rewriter.replaceSyntaxTempl (syntTemplate);
         }
 
         let retParam = rewriter.rewrite (fptr.getReturn ());
@@ -1156,12 +1153,73 @@ pub class TemplateSolver {
     fn validateOverVarExprFromExplicit (self, dmut context : &Validator, alls : [&Expression], v : &TemplateOfVarExpr, values : [&Generator])-> (&TemplateMapper, usize)
         throws &ErrorMsg
     {
-        context;
-        alls;
-        v;
-        values;        
-        __pragma!fake_throw (&ErrorMsg);
-        __pragma!panic ();
+        match values [0] {
+            t : &Type => {
+                match context:.implicitEnumUnwrap (t) {
+                    c : &ClassPtrType => {
+                        if (!c.isStruct ()) { // record and entity does not override super classes
+                            let mapper = self.validateOverClassFromExplicit (alias context, alls, v, c);
+                            let dmut retMapper = TemplateMapper::new (score-> TemplateScore::VAR);
+                            retMapper:.merge (mapper);
+                            retMapper:.insert (v.getLoc ().str (), self.createTypeWrapper (c.getLoc (), c));
+
+                            return (retMapper, 1us);
+                        }
+                    }
+                }
+            }
+        }
+
+        throw ErrorMsg::fatal (values [0].getLoc (), format (ValidateErrorMessage::NOT_A_CLASS, values [0]),
+                               notes-> [ErrorMsg::note (v.getLoc (), ""s8)]);
+    }
+
+    /**
+     * Validate an explicit template specialization wheer template parameter is an over var, and type used for specialization is a class type
+     * @params:
+     *     - context: the context of the validation
+     *     - alls: the list of template parameters to validate
+     *     - v: the over expr to validation
+     *     - type: the class type used for validation
+     * @assume: type is not a struct type
+     * @returns: the template parameters specialization
+     * @throws:
+     *    - &ErrorMsg: if the specialization is impossible
+     * */
+    fn validateOverClassFromExplicit (self, dmut context : &Validator, alls : [&Expression], v : &TemplateOfVarExpr, type : &ClassPtrType)-> &TemplateMapper
+        throws &ErrorMsg
+    {
+        let inner = type.getInner ().asOf!{&ClassRefType} ();
+        let dmut errors = Vec!{&ErrorMsg}::new ();
+        let dmut retMapper = TemplateMapper::new (score-> TemplateScore::TYPE);
+        let dmut ancestors = Vec!{&Type}::new ();
+
+        let mut ancestor = inner.getAncestor ();
+        loop {
+            match ancestor {
+                c : &ClassRefType => {
+                    ancestors:.push (c.createInstance (loc-> v.getLoc (), isMutable-> false, isInnerMutable-> false));
+                    ancestor = c.getAncestor ();
+                }
+                _ => break {}
+            }
+        }
+
+        for anc in ancestors [] {
+            {
+                let (mapper, _) = self.validateOfVarExprFromExplicit (alias context, alls, v.getSpecialization (), [anc]);
+                let finalType = self.performTemplateRewrite (v.getSpecialization (), mapper);
+                let ofType = context:.validateType (finalType);
+                context:.verifyCompatibleType (type.getLoc (), ofType.getLoc (), anc, ofType);
+
+                retMapper:.merge (mapper);
+                return retMapper;
+            } catch {
+                err : &ErrorMsg => errors:.push (err);
+            }
+        }
+
+        throw ErrorMsg::fatal (v.getLoc (), format (ValidateErrorMessage::NOT_ANCESTOR, v.getSpecialization (), type), notes-> errors[]);
     }
     
     /*!
@@ -1644,36 +1702,26 @@ pub class TemplateSolver {
             return (retMapper, true, []);
         }
 
-        for i, ti in fptrType.getParameters () match lmbdValue.getParameters ()[i] {
+        for i, vd in fptrType.getParameters () match lmbdValue.getParameters ()[i] {
             v : &ProtoVarValue => { // lambda has a type to validate
-                match ti {
-                    vd : &VarDeclExpr => {
-                        let tiExpr = rewriter.rewrite (vd.getType ());
-                        let (tiMapper, _) = self.validateOfVarExprFromExplicit (alias context, alls, tiExpr, [v.getType ()]);
-                        retMapper:.merge (tiMapper);
+                let tiExpr = rewriter.rewrite (vd.getType ());
+                let (tiMapper, _) = self.validateOfVarExprFromExplicit (alias context, alls, tiExpr, [v.getType ()]);
+                retMapper:.merge (tiMapper);
 
-                        let finalExpr = rewriter.rewrite (vd.getType ());
-                        paramTypes:.push (context:.validateType (finalExpr));
-                    }
-                    _ => __pragma!panic ();
-                }
+                let finalExpr = rewriter.rewrite (vd.getType ());
+                paramTypes:.push (context:.validateType (finalExpr));
             }
             _ => { paramTypes:.push (NONE_TYPE); }
         }
 
-        for i, ti in fptrType.getParameters () match lmbdValue.getParameters ()[i] {
+        for i, v in fptrType.getParameters () match lmbdValue.getParameters ()[i] {
             ProtoVarValue () => {}
             _ => {
-                match ti {
-                    v : &VarDeclExpr => {
-                        let tiExpr = rewriter.rewrite (v.getType ());
-                        {
-                            (alias paramTypes) [i] = context:.validateType (tiExpr);
-                        } catch {
-                            _ => { uncomplete = true; }
-                        }
-                    }
-                    _ => __pragma!panic ();
+                let tiExpr = rewriter.rewrite (v.getType ());
+                {
+                    (alias paramTypes) [i] = context:.validateType (tiExpr);
+                } catch {
+                    _ => { uncomplete = true; }
                 }
             }
         }
@@ -1727,31 +1775,26 @@ pub class TemplateSolver {
      * @throws:
      *    - &ErrorMsg: if the specialization failed
      */
-    fn validateParamTemplateFromImplicit (self, dmut context : &Validator, templates : [&Expression], param : &Expression, types : [&Type])-> (&TemplateMapper, usize)
+    fn validateParamTemplateFromImplicit (self, dmut context : &Validator, templates : [&Expression], param : &VarDeclExpr, types : [&Type])-> (&TemplateMapper, usize)
         throws &ErrorMsg
     {
-        match param {
-            x : &VarDeclExpr => {
-                match x.getType () { // we want to transform its type from implicit specialization
-                    EmptyExpression () => { // It has no type
-                        (TemplateMapper::new (), 0us)
-                    }
-                    UnitExpr () => { // Also no type, 
-                        (TemplateMapper::new (), 0us) // we return an empty template mapper, because the specialization works, it just gives no information
-                    }
-                    type : _ => { // There is possible information, if the type contains templates, so we validate it
-                        {
-                            self.validateTypeFromImplicit (alias context, templates, type, types)
-                        } catch {
-                            err : &ErrorMsg => {
-                                throw err;
-                                // throw ErrorMsg::fatal (param.getLoc (), format (ValidateErrorMessage::PARAMETER_NAME, x.getName ()), notes-> [err]);
-                            }
-                        }
+        match param.getType () { // we want to transform its type from implicit specialization
+            EmptyExpression () => { // It has no type
+                (TemplateMapper::new (), 0us)
+            }
+            UnitExpr () => { // Also no type,
+                (TemplateMapper::new (), 0us) // we return an empty template mapper, because the specialization works, it just gives no information
+            }
+            type : _ => { // There is possible information, if the type contains templates, so we validate it
+                {
+                    self.validateTypeFromImplicit (alias context, templates, type, types)
+                } catch {
+                    err : &ErrorMsg => {
+                        throw err;
+                        // throw ErrorMsg::fatal (param.getLoc (), format (ValidateErrorMessage::PARAMETER_NAME, x.getName ()), notes-> [err]);
                     }
                 }
             }
-            _ => __pragma!panic ();  // necessarily a vardecl, implicit specialization are for function proto, ctor, and structs, so always vardecls are usable, we can't make an implicit specialization without them that is the premise
         }
     }
 
@@ -1949,6 +1992,14 @@ pub class TemplateSolver {
             }
             cl : &ClassRefType => {
                 match cl.getTemplateMapper () {
+                    Ok (clTmps : _) => {
+                        clTmps
+                    }
+                    _ => { return (false, []); }
+                }
+            }
+            t : &TraitRefType => {
+                match t.getTemplateMapper () {
                     Ok (clTmps : _) => {
                         clTmps
                     }
@@ -2258,21 +2309,17 @@ pub class TemplateSolver {
             let mut syntTemplate = templates;
 
             for i in 0us .. fptrType.getParameters ().len {
-                match fptrType.getParameters ()[i] {
-                    v : &VarDeclExpr => {
-                        let currentParam = rewriter.rewrite (v.getType ());
-                        let rest = params.len - consumed;
-                        let syntaxRest = (fptrType.getParameters ().len - i) - 1us;
+                let v = fptrType.getParameters ()[i];
+                let currentParam = rewriter.rewrite (v.getType ());
+                let rest = params.len - consumed;
+                let syntaxRest = (fptrType.getParameters ().len - i) - 1us;
 
-                        let consomableTypes = params [consumed .. consumed + (rest - syntaxRest)];
-                        let (tiMapper, localConsumed) = self.validateTypeFromImplicit (alias context, syntTemplate, currentParam, consomableTypes);
+                let consomableTypes = params [consumed .. consumed + (rest - syntaxRest)];
+                let (tiMapper, localConsumed) = self.validateTypeFromImplicit (alias context, syntTemplate, currentParam, consomableTypes);
 
-                        retMapper:.merge (tiMapper);
-                        consumed += cast!usize (localConsumed);
-                        syntTemplate = rewriter.replaceSyntaxTempl (syntTemplate);
-                    }
-                    _ => __pragma!panic ();
-                }
+                retMapper:.merge (tiMapper);
+                consumed += cast!usize (localConsumed);
+                syntTemplate = rewriter.replaceSyntaxTempl (syntTemplate);
             }
 
             let retParam = rewriter.rewrite (fptrType.getReturn ());
@@ -2310,15 +2357,11 @@ pub class TemplateSolver {
         let rewriter = TemplateRewriter::new (retMapper);
 
         for i in 0us .. fptrType.getParameters ().len {
-            match fptrType.getParameters ()[i] {
-                v : &VarDeclExpr => {
-                    let currentParam = rewriter.rewrite (v.getType ());
-                    if (!params [i].isOf!{&NoneType} ()) {
-                        let (mapper, _) = self.validateTypeFromImplicit (alias context, templates, currentParam, [params [i]]);
-                        retMapper:.merge (mapper);
-                    }
-                }
-                _ => __pragma!panic ();
+            let v = fptrType.getParameters ()[i];
+            let currentParam = rewriter.rewrite (v.getType ());
+            if (!params [i].isOf!{&NoneType} ()) {
+                let (mapper, _) = self.validateTypeFromImplicit (alias context, templates, currentParam, [params [i]]);
+                retMapper:.merge (mapper);
             }
         }
 
@@ -2366,6 +2409,11 @@ pub class TemplateSolver {
                 }
             }
             v : &TemplateOfVarExpr => {
+                if v.getLoc ().str () == name {
+                    return v;
+                }
+            }
+            v : &TemplateAndExpr => {
                 if v.getLoc ().str () == name {
                     return v;
                 }
