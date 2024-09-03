@@ -1,5 +1,8 @@
 mod ymirc::semantic::validator::macro_::solver;
 
+import ymirc::semantic::validator::macro_::mapper;
+
+import ymirc::semantic::validator::utf;
 import ymirc::semantic::validator::visitor;
 import ymirc::semantic::validator::errors;
 import ymirc::semantic::validator::scores;
@@ -44,10 +47,814 @@ pub class MacroSolver {
     pub fn validate (self, dmut context : &Validator, m : &MacroCallExpr)-> &Value
         throws &ErrorMsg
     {
-        context;
-        m;
+        let left = context:.validateValue (m.getMacro ());
+        let value : &MultSymValue = match left {
+            mu : &MultSymValue => { mu }
+            tmp : _ => { MultSymValue::new (tmp.getLoc (), [tmp], prettyStr-> format ("%", tmp)) }
+        };
+
+        self.validateMultSym (alias context, m.getLoc (), value, m)
+    }
+
+
+    /**
+     * Validate a macro call expression
+     * @params:
+     *    - context: the context of the validation
+     *    - loc: the location of the call
+     *    - value: the multsym containing the symbol referenced by 'm.getLeft ()'
+     *    - m: the call expression to validate
+     * @returns: the validated value
+     * @throws:
+     *    - &ErrorMsg: if the validation failed
+     * */
+    fn validateMultSym (self, dmut context : &Validator, loc : &Word, value : &MultSymValue, m : &MacroCallExpr)-> &Value
+        throws &ErrorMsg
+    {
+        let dmut results = Vec!{[c8]}::new (); // list of generated macro contents
+        let dmut lefts = Vec!{&MacroRefValue}::new (); // list of macros used to generate values
+        let dmut errors = Vec!{&ErrorMsg}::new ();
+
+        for it in value.getValues () {
+            {
+                match it {
+                    mac : &MacroRefValue => {
+                        let gen = self.validateCall (alias context, loc, mac, m.getContent ());
+                        results:.push (gen);
+                        lefts:.push (mac);
+                    }
+                    _ => {
+                        let prettyName = context:.getCallOpValidator ().prettyName (it);
+                        throw ErrorMsg::fatal (loc, format (ValidateErrorMessage::UNDEFINED_MACRO_CALL, prettyName));
+                    }
+                }
+            } catch {
+                err : &ErrorMsg => { // either not a macro, or call failed
+                    errors:.push (err);
+                }
+            }
+        }
+
+        if (results.len () == 0us) { // no candidates succeeded
+            throw ErrorMsg::fatal (loc, format (ValidateErrorMessage::MACRO_CALL_VALIDATION_FAILED),
+                                   notes-> errors[]);
+        }
+        else if (results.len () != 1us) { // multiple candidates succeeded to the macro call
+            let dmut candidates = Vec!{&ErrorMsg}::new ();
+            for i in lefts {
+                candidates:.push (ErrorMsg::note (i.getLoc (), format (ValidateErrorMessage::CANDIDATE_ARE, i)));
+            }
+
+            throw ErrorMsg::fatal (loc, format (ValidateErrorMessage::WORKS_WITH_BOTH), notes-> candidates[]);
+        }
+
+        // only one success
+        self.finalizeMacro (alias context, lefts [0], results[0])
+    }
+
+    /*!
+     * ================================================================================
+     * ================================================================================
+     * =====================            MACRO CALL CTOR            ====================
+     * ================================================================================
+     * ================================================================================
+     */
+
+    /**
+     * Validate a call to a macro using a macro call expression
+     * @params:
+     *    - context: the context of the validation
+     *    - loc: the location of the call
+     *    - value: the macro value being called
+     *    - str: the string used to call the macro
+     * @returns: the validated value (transformation of the macro content)
+     * @throws:
+     *    - &ErrorMsg: if the call failed, or the validation of the content failed
+     * */
+    fn validateCall (self, dmut context : &Validator, loc : &Word, value : &MacroRefValue, str : [c8])-> [c8]
+        throws &ErrorMsg
+    {
+        let dmut errors = Vec!{&ErrorMsg}::new ();
+        let dmut lefts = Vec!{&MacroConstructorSymbol}::new ();
+        let dmut values = Vec!{[c8]}::new ();
+
+        for it in value.getSymbol ().getAllLocalSymbols (protection-> Protection::PRIVATE) match it {
+            mct : &MacroConstructorSymbol => {
+                {
+                    values:.push (self.validateCallCtor (alias context, loc, value, mct, str));
+                    lefts:.push (mct);
+                } catch {
+                    err : &ErrorMsg => errors:.push (err);
+                }
+            }
+        }
+
+        if values.len () == 0us {
+            if (errors.len () == 0us) {
+                throw ErrorMsg::fatal (loc, format (ValidateErrorMessage::UNDEFINED_CTOR_MACRO, value));
+            } else {
+                throw ErrorMsg::list (errors[]);
+            }
+        } else if (values.len () != 1us) {
+            let dmut candidates = Vec!{&ErrorMsg}::new ();
+            for i in lefts {
+                candidates:.push (ErrorMsg::note (i.getLoc (), format (ValidateErrorMessage::CANDIDATE_ARE, i.getPath ())));
+            }
+
+            throw ErrorMsg::fatal (loc, format (ValidateErrorMessage::WORKS_WITH_BOTH), notes-> candidates[]);
+        }
+
+        values [0]
+    }
+
+    /**
+     * Validate the call to a macro constructor
+     * @params:
+     *   - context: the context of the validation
+     *   - loc: the location of the call
+     *   - msym: the macro symbol being called
+     *   - ctor: the ctor to call
+     *   - str: the string being used to call the ctor
+     * @returns: the rewritten content of the ctor
+     * @throws:
+     *   - &ErrorMsg: if the call failed
+     * */
+    fn validateCallCtor (self, dmut context : &Validator, loc : &Word, msym : &MacroRefValue, ctor : &MacroConstructorSymbol, str : [c8])-> [c8]
+        throws &ErrorMsg
+    {
+        let mult = ctor.getContent ().getRule ();
+        let skips = self.validateSkips (alias context, ctor.getContent ().getSkips ());
+        {
+            let (retMapper, rest) = self.validateMacroMult (alias context, loc, msym, mult, str, skips, str);
+
+            if (rest.len != 0us) {
+                let realLoc = self.computeLoc (loc, str, rest);
+                throw ErrorMsg::fatal (ctor.getLoc (), end-> realLoc, format (ValidateErrorMessage::MACRO_REST, rest));
+            }
+
+            self.rewriteMapper (loc, ctor.getContent ().getContent (), retMapper)
+        } catch {
+            err : &ErrorMsg => {
+                throw ErrorMsg::note (loc, end-> ctor.getLoc (), format (ValidateErrorMessage::MACRO_IN_CTOR), notes-> [err]);
+            }
+        }
+    }
+
+    /**
+     * Validate the call to a macro rule
+     * @params:
+     *   - context: the context of the validation
+     *   - loc: the location of the call
+     *   - msym: the macro symbol being called
+     *   - ctor: the ctor to call
+     *   - str: the string being used to call the ctor
+     * @returns: the rewritten content of the ctor
+     * @throws:
+     *   - &ErrorMsg: if the call failed
+     * */
+    fn validateCallRule (self, dmut context : &Validator, loc : &Word, msym : &MacroRefValue, rule : &MacroRuleSymbol, str : [c8], full : [c8])-> (&MacroMapper, [c8])
+        throws &ErrorMsg
+    {
+        let mult = rule.getContent ().getRule ();
+        let skips = self.validateSkips (alias context, rule.getContent ().getSkips ());
+
+        {
+            let (retMapper, rest) = self.validateMacroMult (alias context, loc, msym, mult, str, skips, full);
+            let content = self.rewriteMapper (loc, rule.getContent ().getContent (), retMapper);
+
+            (MacroMapper::new (content), rest)
+        } catch {
+            err : &ErrorMsg => {
+                let eLoc = self.computeLoc (loc, str, full);
+                throw ErrorMsg::note (eLoc, end-> rule.getLoc (), format (ValidateErrorMessage::MACRO_IN_RULE, rule.getLoc ().str ())
+                                      , notes-> [err]);
+            }
+        }
+    }
+
+    /*!
+     * ================================================================================
+     * ================================================================================
+     * =======================            MULTIPLIERS            ======================
+     * ================================================================================
+     * ================================================================================
+     */
+
+    /**
+     * Validate a macro mult expression
+     * @params:
+     *    - context: the context of the validation
+     *    - loc: the location of the call
+     *    - msym: the macro symbol being called
+     *    - mult: the mult expression being extracted
+     *    - str: the string used to validate the mult expression
+     *    - skips: the expression used to remove skip tokens
+     * @returns:
+     *    - .0: the macro mapper generated from that validation
+     *    - .1: the rest of the string that does not work with the macro mult
+     * @throws:
+     *    - &ErrorMsg: if the validation failed
+     * */
+    fn validateMacroMult (self, dmut context : &Validator, loc : &Word, msym : &MacroRefValue, mult : &MacroMultExpr, str : [c8], skips : &Expression, full : [c8])-> (&MacroMapper, [c8])
+        throws &ErrorMsg
+    {
+        if mult.getMultiplier ().isEof () {
+            return self.validateMacroList (alias context, loc, msym, mult, str, skips, full);
+        }
+
+        match mult.getMultiplier ().str () {
+            Tokens::INTEG => { self.validateMacroOneOrNone (alias context, loc, msym, mult, str, skips, full) }
+            Tokens::STAR => {
+                let (vecs, rest) = self.validateMacroRepeat (alias context, loc, msym, mult, str, skips, full);
+                let dmut result = StringStream::new ();
+                for i in vecs { result:.write (i.getValue ()); }
+
+                return (MacroMapper::new (result[]), rest);
+            }
+            Tokens::PLUS => {
+                let (vecs, rest) = self.validateMacroOneOrMore (alias context, loc, msym, mult, str, skips, full);
+                let dmut result = StringStream::new ();
+                for i in vecs { result:.write (i.getValue ()); }
+
+                return (MacroMapper::new (result[]), rest);
+            }
+            _ => { self.validateMacroList (alias context, loc, msym, mult, str, skips, full) }
+        }
+    }
+
+    /**
+     * Validate a macro mult that is composed of a list without repetition
+     * @params:
+     *    - context: the context of the validation
+     *    - loc: the location of the call
+     *    - msym: the macro symbol being called
+     *    - mult: the mult expression being extracted
+     *    - str: the string used to validate the mult expression
+     *    - skips: the expression used to remove skip tokens
+     * @returns:
+     *    - .0: the macro mapper generated from that validation
+     *    - .1: the rest of the string that does not work with the macro mult
+     * @throws:
+     *    - &ErrorMsg: if the validation failed
+     * */
+    fn validateMacroList (self, dmut context : &Validator, loc : &Word, msym : &MacroRefValue, mult : &MacroMultExpr, str : [c8], skips : &Expression, full : [c8])-> (&MacroMapper, [c8])
+        throws &ErrorMsg
+    {
+        let dmut retMapper = MacroMapper::new (""s8);
+        let mut rest = str;
+
+        for rule in mult.getContent () {
+            match skips {
+                sk : &MacroMultExpr => {
+                    let (_, postSkip) = self.validateMacroRepeat (alias context, loc, msym, sk, rest, EMPTY_EXPR, full);
+                    rest = postSkip;
+                }
+            }
+
+            let (localMapper, postRule) = self.validateMacroRuleExpr (alias context, loc, msym, rule, rest, skips, full);
+
+            retMapper:.merge (localMapper);
+            rest = postRule;
+        }
+
+        (retMapper, rest)
+    }
+
+    /**
+     * Validate a macro mult that is composed of a list with one or no repetition
+     * @params:
+     *    - context: the context of the validation
+     *    - loc: the location of the call
+     *    - msym: the macro symbol being called
+     *    - mult: the mult expression being extracted
+     *    - str: the string used to validate the mult expression
+     *    - skips: the expression used to remove skip tokens
+     * @returns:
+     *    - .0: the macro mapper generated from that validation
+     *    - .1: the rest of the string that does not work with the macro mult
+     * @throws:
+     *    - &ErrorMsg: if the validation failed
+     * */
+    fn validateMacroOneOrNone (self, dmut context : &Validator, loc : &Word, msym : &MacroRefValue, mult : &MacroMultExpr, str : [c8], skips : &Expression, full : [c8])-> (&MacroMapper, [c8]) {
+        {
+            return self.validateMacroList (alias context, loc, msym, mult, str, skips, full);
+        } catch { // One or none, thus no problem if fail
+            _ => {}
+        }
+
+        (MacroMapper::new (""s8), str)
+    }
+
+    /**
+     * Validate a macro mult that is composed of a list with none, one or more repetitions
+     * @params:
+     *    - context: the context of the validation
+     *    - loc: the location of the call
+     *    - msym: the macro symbol being called
+     *    - mult: the mult expression being extracted
+     *    - str: the string used to validate the mult expression
+     *    - skips: the expression used to remove skip tokens
+     * @returns:
+     *    - .0: the macro mapper generated from that validation
+     *    - .1: the rest of the string that does not work with the macro mult
+     * @throws:
+     *    - &ErrorMsg: if the validation failed
+     * */
+    fn validateMacroRepeat (self, dmut context : &Validator, loc : &Word, msym : &MacroRefValue, mult : &MacroMultExpr, str : [c8], skips : &Expression, full : [c8])-> ([&MacroMapper], [c8]) {
+        let dmut res = Vec!{&MacroMapper}::new ();
+        let mut rest = str;
+        loop {
+            {
+                let (localMap, postRead) = self.validateMacroList (alias context, loc, msym, mult, rest, skips, full);
+                res:.push (localMap);
+                rest = postRead;
+            } catch { // repeat is not necessary, thus an error is not a real problem
+                _ => { break {} }
+            }
+        }
+
+        (res[], rest)
+    }
+
+    /**
+     * Validate a macro mult that is composed of a list with at least one repetition
+     * @params:
+     *    - context: the context of the validation
+     *    - loc: the location of the call
+     *    - msym: the macro symbol being called
+     *    - mult: the mult expression being extracted
+     *    - str: the string used to validate the mult expression
+     *    - skips: the expression used to remove skip tokens
+     * @returns:
+     *    - .0: the macro mapper generated from that validation
+     *    - .1: the rest of the string that does not work with the macro mult
+     * @throws:
+     *    - &ErrorMsg: if the validation failed
+     * */
+    fn validateMacroOneOrMore (self, dmut context : &Validator, loc : &Word, msym : &MacroRefValue, mult : &MacroMultExpr, str : [c8], skips : &Expression, full : [c8])-> ([&MacroMapper], [c8])
+        throws &ErrorMsg
+    {
+        let dmut res = Vec!{&MacroMapper}::new ();
+        let mut rest = str;
+        let mut error = ((&ErrorMsg)?)::__err__;
+        loop {
+            {
+                let (localMap, postRead) = self.validateMacroList (alias context, loc, msym, mult, rest, skips, full);
+                res:.push (localMap);
+                rest = postRead;
+            } catch { // repeat is not necessary, thus an error is not a real problem
+                err : &ErrorMsg => { error = err?; break {} }
+            }
+        }
+
+        if (res.len () == 0us) {
+            let eLoc = self.computeLoc (loc, full, rest);
+            match error {
+                Ok (x : _) => throw ErrorMsg::fatal (eLoc,
+                                                     end-> mult.getLoc (),
+                                                     format (ValidateErrorMessage::MACRO_DOES_NOT_MATCH, self.shorten (rest), mult),
+                                                     notes-> [x]);
+            }
+
+            throw ErrorMsg::fatal (eLoc,
+                                   end-> mult.getLoc (),
+                                   format (ValidateErrorMessage::MACRO_DOES_NOT_MATCH, self.shorten (rest), mult));
+        }
+
+        (res[], rest)
+    }
+
+    /**
+     * Validate a macro rule
+     * @params:
+     *    - context: the context of the validation
+     *    - loc: the location of the call
+     *    - msym: the macro symbol being called
+     *    - expr: the or expression being extracted
+     *    - str: the string used to validate the mult expression
+     *    - skips: the expression used to remove skip tokens
+     * @returns:
+     *    - .0: the macro mapper generated from that validation
+     *    - .1: the rest of the string that does not work with the macro mult
+     * @throws:
+     *    - &ErrorMsg: if the validation failed
+     * */
+    fn validateMacroRuleExpr (self, dmut context : &Validator, loc : &Word, msym : &MacroRefValue, expr : &MacroRuleExpression, str : [c8], skips : &Expression, full : [c8])-> (&MacroMapper, [c8])
+        throws &ErrorMsg
+    {
+        match expr {
+            mlt : &MacroMultExpr => { self.validateMacroMult (alias context, loc, msym, mlt, str, skips, full) }
+            mor : &MacroOrExpr => { self.validateMacroOr (alias context, loc, msym, mor, str, skips, full) }
+            mva : &MacroVarExpr => { self.validateMacroVar (alias context, loc, msym, mva, str, skips, full) }
+            mto : &MacroTokenExpr => { self.validateMacroToken (alias context, loc, msym, mto, str, skips, full) }
+            mid : &MacroIdentExpr => { self.validateMacroIdent (alias context, loc, msym, mid, str, skips, full) }
+            rule : _ => {
+                println ("??", rule::typeinfo.name);
+                __pragma!panic ();
+            }
+        }
+    }
+
+    /**
+     * Validate a macro or
+     * @params:
+     *    - context: the context of the validation
+     *    - loc: the location of the call
+     *    - msym: the macro symbol being called
+     *    - or: the or expression being extracted
+     *    - str: the string used to validate the mult expression
+     *    - skips: the expression used to remove skip tokens
+     * @returns:
+     *    - .0: the macro mapper generated from that validation
+     *    - .1: the rest of the string that does not work with the macro mult
+     * @throws:
+     *    - &ErrorMsg: if the validation failed
+     * */
+    fn validateMacroOr (self, dmut context : &Validator, loc : &Word, msym : &MacroRefValue, mor : &MacroOrExpr, str : [c8], skips : &Expression, full : [c8])-> (&MacroMapper, [c8])
+        throws &ErrorMsg
+    {
+        let dmut errors = Vec!{&ErrorMsg}::new ();
+        {
+            return self.validateMacroRuleExpr (alias context, loc, msym, mor.getLeft (), str, skips, full);
+        } catch {
+            err : &ErrorMsg => { errors:.push (err); }
+        }
+
+        {
+            return self.validateMacroRuleExpr (alias context, loc, msym, mor.getRight (), str, skips, full);
+        } catch {
+            err : &ErrorMsg => { errors:.push (err); }
+        }
+
+        let eLoc = self.computeLoc (loc, full, str);
+        throw ErrorMsg::fatal (eLoc, end-> mor.getLoc (),
+                               format (ValidateErrorMessage::MACRO_DOES_NOT_MATCH, self.shorten (str), mor),
+                               notes-> errors[]);
+    }
+
+    /**
+     * Validate a macro var expr
+     * @params:
+     *    - context: the context of the validation
+     *    - loc: the location of the call
+     *    - msym: the macro symbol being called
+     *    - or: the or expression being extracted
+     *    - str: the string used to validate the mult expression
+     *    - skips: the expression used to remove skip tokens
+     * @returns:
+     *    - .0: the macro mapper generated from that validation
+     *    - .1: the rest of the string that does not work with the macro mult
+     * @throws:
+     *    - &ErrorMsg: if the validation failed
+     * */
+    fn validateMacroVar (self, dmut context : &Validator, loc : &Word, msym : &MacroRefValue, mva : &MacroVarExpr, str : [c8], skips : &Expression, full : [c8])-> (&MacroMapper, [c8])
+        throws &ErrorMsg
+    {
+        let (vec, rest) = match mva.getContent () {
+            mlt : &MacroMultExpr => {
+                if (mlt.getMultiplier () == Tokens::STAR) {
+                    self.validateMacroRepeat (alias context, loc, msym, mlt, str, skips, full)
+                } else if (mlt.getMultiplier () == Tokens::PLUS) {
+                    self.validateMacroOneOrMore (alias context, loc, msym, mlt, str, skips, full)
+                } else {
+                    let (localMap, rest) = self.validateMacroMult (alias context, loc, msym, mlt, str, skips, full);
+                    ([localMap], rest)
+                }
+            }
+            rule : _ => {
+                let (localMapper, rest) = self.validateMacroRuleExpr (alias context, loc, msym, rule, str, skips, full);
+                ([localMapper], rest)
+            }
+        };
+
+        let dmut stream = StringStream::new ();
+        for i in vec { stream:.write (i.getValue ()); }
+
+        let dmut res = MacroMapper::new (stream[]);
+        res:.insert (mva.getLoc ().str (), vec);
+
+        (res, rest)
+    }
+
+    /**
+     * Validate a macro token
+     * @params:
+     *    - context: the context of the validation
+     *    - loc: the location of the call
+     *    - msym: the macro symbol being called
+     *    - or: the or expression being extracted
+     *    - str: the string used to validate the mult expression
+     *    - skips: the expression used to remove skip tokens
+     * @returns:
+     *    - .0: the macro mapper generated from that validation
+     *    - .1: the rest of the string that does not work with the macro mult
+     * @throws:
+     *    - &ErrorMsg: if the validation failed
+     * */
+    fn validateMacroToken (self, dmut context : &Validator, loc : &Word, _ : &MacroRefValue, mtok : &MacroTokenExpr, str : [c8], _ : &Expression, full : [c8])-> (&MacroMapper, [c8])
+        throws &ErrorMsg
+    {
+        let (size, strV) = context:.getCompileTimeInterpreter ().computeString (context:.validateValue (mtok.getContent ()));
+        let strCont = utf::instance ().decode (size, strV);
+
+        if (strCont.len > str.len) {
+            let eLoc = self.computeLoc (loc, full, str);
+            throw ErrorMsg::fatal (eLoc, end-> mtok.getLoc (), format (ValidateErrorMessage::MACRO_DOES_NOT_MATCH, self.shorten (str), mtok));
+        }
+
+        for i in 0us .. strCont.len {
+            if strCont [i] != str [i] {
+                let eLoc = self.computeLoc (loc, full, str [i .. $]);
+                throw ErrorMsg::fatal (eLoc, end-> mtok.getLoc (), format (ValidateErrorMessage::MACRO_DOES_NOT_MATCH, self.shorten (str [i .. $]), mtok));
+            }
+        }
+
+        let rest = str [strCont.len .. $];
+        (MacroMapper::new (strCont), rest)
+    }
+
+    /**
+     * Validate a macro identifier rule
+     * @params:
+     *    - context: the context of the validation
+     *    - loc: the location of the call
+     *    - msym: the macro symbol being called
+     *    - or: the or expression being extracted
+     *    - str: the string used to validate the mult expression
+     *    - skips: the expression used to remove skip tokens
+     * @returns:
+     *    - .0: the macro mapper generated from that validation
+     *    - .1: the rest of the string that does not work with the macro mult
+     * @throws:
+     *    - &ErrorMsg: if the validation failed
+     * */
+    fn validateMacroIdent (self, dmut context : &Validator, loc : &Word, msym : &MacroRefValue, mid : &MacroIdentExpr, str : [c8], _ : &Expression, full : [c8])-> (&MacroMapper, [c8])
+        throws &ErrorMsg
+    {
+        let dmut values = Vec!{&MacroMapper}::new ();
+        let dmut lefts = Vec!{&MacroRuleSymbol}::new ();
+        let dmut rests = Vec!{[c8]}::new ();
+        let dmut errors = Vec!{&ErrorMsg}::new ();
+
+        for it in msym.getSymbol ().getAllLocalSymbols (protection-> Protection::PRIVATE) match it {
+            mct : &MacroRuleSymbol => {
+                if (mct.getPath ().file () == mid.getLoc ().str ()) {
+                    {
+                        let (localMapper, rest) = self.validateCallRule (alias context, loc, msym, mct, str, full);
+                        values:.push (localMapper);
+                        rests:.push (rest);
+                        lefts:.push (mct);
+                    }
+                } catch {
+                    err : &ErrorMsg => errors:.push (err);
+                }
+            }
+        }
+
+
+        if (values.len () == 0us) {
+            if (errors.len () == 0us) return self.validateMacroKnwonIdent (alias context, loc, msym, mid, str, full);
+            else {
+                throw ErrorMsg::list (errors[]);
+            }
+        } else if (values.len () != 1us) {
+            let dmut candidates = Vec!{&ErrorMsg}::new ();
+            for i in lefts {
+                candidates:.push (ErrorMsg::note (i.getLoc (), format (ValidateErrorMessage::CANDIDATE_ARE, i.getPath ())));
+            }
+
+            let eLoc = self.computeLoc (loc, full, str);
+            throw ErrorMsg::fatal (eLoc, end-> mid.getLoc (), format (ValidateErrorMessage::WORKS_WITH_BOTH), notes-> candidates[]);
+        }
+
+        (values [0], rests [0])
+    }
+
+    /**
+     * Validate a pre constructed macro identifier rule
+     * @params:
+     *    - context: the context of the validation
+     *    - loc: the location of the call
+     *    - msym: the macro symbol being called
+     *    - or: the or expression being extracted
+     *    - str: the string used to validate the mult expression
+     *    - skips: the expression used to remove skip tokens
+     * @returns:
+     *    - .0: the macro mapper generated from that validation
+     *    - .1: the rest of the string that does not work with the macro mult
+     * @throws:
+     *    - &ErrorMsg: if the validation failed
+     * */
+    fn validateMacroKnwonIdent (self, dmut context : &Validator, loc : &Word, msym : &MacroRefValue, mid : &MacroIdentExpr, str : [c8], full : [c8])-> (&MacroMapper, [c8])
+        throws &ErrorMsg
+    {
+        let ident = context:.getSubTypeValidator ().removeUnders (mid.getLoc ().str ());
+        match ident {
+            MacroKnownRuleKeys::ANY => {
+                return self.validateMacroIdentAny (alias context, loc, msym, mid, str, full);
+            }
+            MacroKnownRuleKeys::CHAR => {
+                return self.validateMacroIdentChar (alias context, loc, msym, mid, str, full);
+            }
+        }
+
+        let mut found = false;
+        for f in MacroKnownRuleKeys::__members__ {
+            if (f == ident) { found = true; break {} }
+        }
+
+        if (!found) {
+            let eLoc = self.computeLoc (loc, full, str);
+            throw ErrorMsg::fatal (eLoc, end-> mid.getLoc (),
+                                   format (ValidateErrorMessage::UNDEFINED_RULE_MACRO, msym, mid.getLoc ().str ()));
+        }
+
+        __pragma!panic ();
+    }
+
+
+    /**
+     * Validate a pre constructed macro identifier rule that read a char
+     * @params:
+     *    - context: the context of the validation
+     *    - loc: the location of the call
+     *    - msym: the macro symbol being called
+     *    - or: the or expression being extracted
+     *    - str: the string used to validate the mult expression
+     *    - skips: the expression used to remove skip tokens
+     * @returns:
+     *    - .0: the macro mapper generated from that validation
+     *    - .1: the rest of the string that does not work with the macro mult
+     * @throws:
+     *    - &ErrorMsg: if the validation failed
+     * */
+    fn validateMacroIdentChar (self, dmut _ : &Validator, loc : &Word, _ : &MacroRefValue, mid : &MacroIdentExpr, str : [c8], full : [c8])-> (&MacroMapper, [c8])
+        throws &ErrorMsg
+    {
+        if (str.len == 0us) {
+            let eLoc = self.computeLoc (loc, full, str);
+            throw ErrorMsg::fatal (eLoc, end-> mid.getLoc (), format (ValidateErrorMessage::MACRO_DOES_NOT_MATCH, str, MacroKnownRuleKeys::ANY));
+        }
+
+        let ch = str [0];
+        let res = if (ch == '\"'c8) { "\\\""s8 }
+        else if ch == '\''c8 { "\\\'"s8 }
+        else { [ch] };
+
+        (MacroMapper::new (res), str [1us .. $])
+    }
+
+    /**
+     * Validate a pre constructed macro identifier rule that read anything
+     * @params:
+     *    - context: the context of the validation
+     *    - loc: the location of the call
+     *    - msym: the macro symbol being called
+     *    - or: the or expression being extracted
+     *    - str: the string used to validate the mult expression
+     *    - skips: the expression used to remove skip tokens
+     * @returns:
+     *    - .0: the macro mapper generated from that validation
+     *    - .1: the rest of the string that does not work with the macro mult
+     * @throws:
+     *    - &ErrorMsg: if the validation failed
+     * */
+    fn validateMacroIdentAny (self, dmut _ : &Validator, loc : &Word, _ : &MacroRefValue, mid : &MacroIdentExpr, str : [c8], full : [c8])-> (&MacroMapper, [c8])
+        throws &ErrorMsg
+    {
+        if (str.len == 0us) {
+            let eLoc = self.computeLoc (loc, full, str);
+            throw ErrorMsg::fatal (eLoc, end-> mid.getLoc (), format (ValidateErrorMessage::MACRO_DOES_NOT_MATCH, str, MacroKnownRuleKeys::ANY));
+        }
+
+        (MacroMapper::new (str [0 .. 1]), str [1us .. $])
+    }
+
+    /**
+     * Transform a list of string into a macro mult expression
+     * @params:
+     *    - context: the context of the validation
+     *    - skips: the list of skip tokens
+     * @returns: a macro mult expression (or empty if no skips)
+     * @throws:
+     *    - &ErrorMsg: if the skip tokens are invalid
+     * */
+    fn validateSkips (self, dmut context : &Validator, skips : [&Expression])-> &Expression
+        throws &ErrorMsg
+    {
+        let mut next : &Expression = EMPTY_EXPR;
+        for i, it in skips {
+            if i == 0us { next = it; }
+            else {
+                match (next, it) {
+                    (n : &MacroRuleExpression, p : &MacroTokenExpr) => {
+                        context:.validateValue (p.getContent ());
+                        next = MacroOrExpr::new (it.getLoc (), n, p);
+                    }
+                    _ => __pragma!panic ();
+                }
+            }
+        }
+
+        match next {
+            n : &MacroRuleExpression => {
+                cast!{&Expression} (MacroMultExpr::new (n.getLoc (), end-> n.getLoc (),
+                                                        [n], mult-> Word::new (Tokens::STAR, next.getLoc ())))
+            }
+            _ => next
+        }
+    }
+
+    /*!
+     * ================================================================================
+     * ================================================================================
+     * =======================            REWRITTING            =======================
+     * ================================================================================
+     * ================================================================================
+     */
+
+    /**
+     * Rewrite the content of a macro using a mapper and return it
+     * @params:
+     *    - loc: the location of the call
+     *    - content: the content of the macro to rewrite
+     *    - mapper: the mapper used to rewrite
+     * */
+    fn rewriteMapper (self, loc : &Word, content : [c8], mapper : &MacroMapper)-> [c8]
+        throws &ErrorMsg
+    {
+        loc;
+        content;
+        mapper;
         __pragma!fake_throw (&ErrorMsg);
         __pragma!panic ();
     }
+
+    /**
+     * Compute the location of the end of content, where loc is located at the beginning of it
+     * */
+    fn computeLoc (self, loc : &Word, content : [c8], end : [c8])-> &Word {
+        let mut line = 0u64, mut col = 0u64;
+        for i in 0us .. content.len {
+            if (content [i] == '\n'c8) {
+                line += 1u64;
+                col = 0u64;
+            } else col += 1u64;
+        }
+
+        Word::new (end, loc, addLine-> line, addCol-> col)
+    }
+
+    /**
+     * Shorten the text used to
+     * */
+    fn shorten (self, str : [c8])-> [c8] {
+        let maxLen = 10us, mut curr = 0us;
+        for i in 0us .. str.len {
+            let br = if (i >= maxLen) { true }
+            else if str [i] == '\n'c8 { true }
+            else { false };
+
+            if (br) {
+                curr = i;
+                break {}
+            }
+        }
+
+        if (curr != str.len - 1us) {
+            str [0us .. curr] ~ " ..."s8
+        } else {
+            str
+        }
+    }
+
+    /*!
+     * ================================================================================
+     * ================================================================================
+     * ======================            FINALIZATION            ======================
+     * ================================================================================
+     * ================================================================================
+     */
+
+
+    /**
+     * Finalize a macro content syntax, and validate it into a value
+     * @params:
+     *   - context: the context of the validation
+     *   - content: the string ymir code to validate
+     * @returns: the validated value
+     * @throws:
+     *    - &ErrorMsg: if the validation failed
+     * */
+    fn finalizeMacro (self, dmut context : &Validator, macVal : &MacroRefValue, content : [c8])-> &Value
+        throws &ErrorMsg
+    {
+        context;
+        macVal;
+        content;
+        __pragma!fake_throw (&ErrorMsg);
+        __pragma!panic ();
+    }
+
 
 }
