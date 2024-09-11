@@ -1,0 +1,419 @@
+mod ymirc::semantic::validator::macro_::rewrite;
+
+import ymirc::semantic::validator::macro_::mapper;
+
+import ymirc::lexing::word;
+import ymirc::lexing::tokens;
+import ymirc::lexing::lexer;
+
+import ymirc::errors::_;
+import ymirc::utils::format;
+
+import ymirc::syntax::keys;
+import ymirc::syntax::declaration::_;
+import ymirc::syntax::expression::_;
+
+import std::collection::vec;
+import std::fs::path;
+import std::io;
+
+import ymirc::syntax::visitor;
+import ymirc::syntax::errors;
+import ymirc::semantic::validator::errors;
+
+
+pub enum : [c8]
+| MACRO_ACC = Tokens::MACRO_ACC
+| MACRO_CRO = Tokens::MACRO_CRO
+| MACRO_PAR = Tokens::MACRO_PAR
+| LACC      = Tokens::LACC
+| LCRO      = Tokens::LCRO
+| DCOLON      = Tokens::DCOLON
+| RACC      = Tokens::RACC
+| RCRO      = Tokens::RCRO
+| RPAR      = Tokens::RPAR
+| DOLLAR    = Tokens::DOLLAR
+| MINUS     = Tokens::MINUS
+| SPACE     = SkipTokens::SPACE
+| RETURN    = SkipTokens::RETURN
+| RRETURN   = SkipTokens::RRETURN
+| TAB       = SkipTokens::TAB
+ -> MacroPatternTokens;
+
+
+static mut __ID__ = 0us;
+pub fn generateUniqID ()-> usize {
+    __ID__ += 1us;
+    __ID__
+}
+
+pub class MacroRewriter {
+
+    // The mapper used in the rewriting
+    let _mapper : &MacroMapper;
+
+    // The index of the rewritten rule
+    let _ruleIndex : usize;
+
+    // The uniq id of the rewritting
+    let _uid : usize;
+
+    /**
+     * @params:
+     *    - mapper: the mapper used to rewrite the content of the macro
+     * */
+    pub self (mapper : &MacroMapper, ruleIndex : usize)
+        with _mapper = mapper
+        , _ruleIndex = ruleIndex
+        , _uid = generateUniqID ()
+    {}
+
+    /**
+     * Rewrite the content of a macro
+     * @params:
+     *    - loc: the location of the content of the rule to rewrite
+     *    - content: the content to rewrite
+     * @returns: the rewriten content of the macro, where patterns are replaced according to the mapper
+     * */
+    pub fn rewrite (self, content : [c8])-> [c8]
+        throws &ErrorMsg
+    {
+        let dmut lex = Lexer::new (MacroKeys::FILEI,
+                                   content,
+                                   tokens-> MacroPatternTokens::__members__); // macro content has its own dedicated syntax system                                   );
+
+        let dmut result = StringStream::new ();
+        loop {
+            let next = lex:.directNext (); // we don't skip spaces, we want to write them in the result string
+            if (next.isEof ()) break {}
+            match next.str () {
+                MacroPatternTokens::MACRO_ACC |
+                MacroPatternTokens::MACRO_PAR |
+                MacroPatternTokens::MACRO_CRO => {
+                    self.rewriteRule (alias result, alias lex, closing-> next.str ());
+                }
+                _ => {
+                    result:.write (next.str ());
+                }
+            }
+        }
+
+        result[]
+    }
+
+    /**
+     * Read a macro mapper rule, and use it to rewrite according to the mapper
+     * */
+    fn rewriteRule (self, dmut result : &StringStream, dmut lexer : &Lexer, closing : [c8])
+        throws &ErrorMsg
+    {
+        let inner = self.readIf (alias lexer, Keys::FOR); // skips are activated in here
+        if (inner.str () == Keys::FOR) {
+            self.rewriteMacroFor (alias result, alias lexer, closing);
+        } else {
+            self.rewriteMacroEval (alias result, alias lexer, closing);
+        }
+    }
+
+    /**
+     * Rewrite a macro for loop
+     * @params:
+     *    - lexer: the lexer in which the for loop is written
+     * @returns: the
+     * */
+    fn rewriteMacroFor (self, dmut stream : &StringStream, dmut lexer : &Lexer, closing : [c8])
+        throws &ErrorMsg
+    {
+        let ident = self.readIdentifier (alias lexer);
+        self.readToken (alias lexer, Keys::IN);
+
+        let mappers = self.readMacroEval (alias lexer);
+        match closing {
+            MacroPatternTokens::MACRO_CRO => { self.readToken (alias lexer, MacroPatternTokens::RCRO); }
+            MacroPatternTokens::MACRO_PAR => { self.readToken (alias lexer, MacroPatternTokens::RPAR); }
+            MacroPatternTokens::MACRO_ACC => { self.readToken (alias lexer, MacroPatternTokens::RACC); }
+            _ => __pragma!panic ();
+        }
+
+        self.readToken (alias lexer, Tokens::LACC);
+
+        let dmut block = StringStream::new ();
+        let mut nbOpen = 1us;
+        loop {
+            let n = lexer:.directNext ();
+            if (n.str () == Tokens::LACC) nbOpen += 1us;
+            else if (n.str () == Tokens::MACRO_ACC) nbOpen += 1us;
+            else if (n.str () == Tokens::RACC) nbOpen -= 1us;
+
+            if (nbOpen == 0us) break {}
+            block:.write (n.str ());
+        }
+
+        for m in mappers {
+            let dmut nMapper = MacroMapper::new (m.getValue ());
+            nMapper:.insert (ident.str (), m);
+
+            let nRewritter = MacroRewriter::new (nMapper, self._ruleIndex);
+            let nContent = nRewritter.rewrite (block[]);
+
+            stream:.write (nContent);
+        }
+    }
+
+    /**
+     * Rewrite a macro evaluation
+     * @params:
+     *    - lexer: the lexer reading the content to rewrite
+     *    - closing: the token that opened the macro evaluation, (i.e. /#[/, /#(/ or /#{/) that defines how the evaluation must be closed
+     * @returns:
+     *    - stream: the stream in which the rewritten content is output
+     * @throws:
+     *    - &ErrorMsg: if the content read in the lexer is invalid
+     * */
+    fn rewriteMacroEval (self, dmut stream : &StringStream, dmut lexer : &Lexer, closing : [c8])
+        throws &ErrorMsg
+    {
+        let mappers = self.readMacroEval (alias lexer);
+        match closing {
+            MacroPatternTokens::MACRO_CRO => { self.readToken (alias lexer, MacroPatternTokens::RCRO); }
+            MacroPatternTokens::MACRO_PAR => { self.readToken (alias lexer, MacroPatternTokens::RPAR); }
+            MacroPatternTokens::MACRO_ACC => { self.readToken (alias lexer, MacroPatternTokens::RACC); }
+            _ => __pragma!panic ();
+        }
+
+        for i in mappers {
+            stream:.write (i.getValue ());
+        }
+    }
+
+    /**
+     * Read a macro evaluation content
+     * @params:
+     *    - lexer: the lexer in which the read is performed
+     * @returns: the list of macro mappers, associated to the macro evaluation
+     * */
+    fn readMacroEval (self, dmut lexer : &Lexer)-> [&MacroMapper]
+        throws &ErrorMsg
+    {
+        let ident = self.readIdentifier (alias lexer);
+        let mut current = match self._mapper.find (ident.str ()) {
+            Ok (vals : _) => { vals[] }
+            _ => {
+                let nUnder = self.removeUnders (ident.str ());
+                match nUnder {
+                    MacroKeys::INDEX => { return [MacroMapper::new (format ("%", self._ruleIndex))]; }
+                    MacroKeys::UID => { return [MacroMapper::new (format ("%", self._uid))]; }
+                }
+
+                throw ErrorMsg::fatal (ident, format (ValidateErrorMessage::UNDEF_VAR, ident.str ()));
+            }
+        };
+
+        loop {
+            let next = self.readIf (alias lexer, [MacroPatternTokens::LCRO, MacroPatternTokens::DCOLON]);
+            match next {
+                MacroPatternTokens::LCRO => {
+                    let index = self.readNumeric (alias lexer, current.len);
+                    self.readToken (alias lexer, MacroPatternTokens::RCRO);
+                    if (current.len > index) {
+                        current = [current [index]];
+                    } else {
+                        throw ErrorMsg::fatal (next, format (ValidateErrorMessage::ARRAY_OVERFLOW, current.len, index));
+                    }
+                }
+                MacroPatternTokens::DCOLON => {
+                    let nIdent = self.readIdentifier (alias lexer);
+                    if (current.len == 1us) {
+                        current = match current [0].find (nIdent.str ()) {
+                            Ok (vals : _) => { vals[] }
+                            _ => {
+                                if (self.removeUnders (nIdent.str ()) == SliceKeys::LEN) {
+                                    return [MacroMapper::new (format ("%", current.len))];
+                                }
+
+                                throw ErrorMsg::fatal (ident, format (ValidateErrorMessage::UNDEF_VAR, ident.str ()));
+                            }
+                        };
+                    } else if (self.removeUnders (nIdent.str ()) == SliceKeys::LEN) {
+                        return [MacroMapper::new (format ("%", current.len))];
+                    }
+                }
+                _ => { break {} }
+            }
+        }
+
+        current
+    }
+
+    /**
+     * @returns: the next token ensuring it can be used as an identifier
+     * @throws:
+     *    - &ErrorMsg: if the next token is not an identifier
+     * */
+    fn readIdentifier (self, dmut lexer : &Lexer)-> &Word
+        throws &ErrorMsg
+    {
+        let (ident, _) = lexer:.next ();
+        if (!self.isIdentifier (ident.str ())) {
+            throw ErrorMsg::fatal (ident, format (SyntaxErrorMessage::USED_AS_IDENTIFIER, ident.str ()));
+        }
+
+        ident
+    }
+
+    /**
+     * Read a numeric expression (a simple one, 1, 2, 3.. etc.)
+     * */
+    fn readNumeric (self, dmut lexer : &Lexer, len : usize)-> usize
+        throws &ErrorMsg
+    {
+        import std::conv;
+
+        let (x, _) = lexer:.next ();
+        if (x.isEof ()) throw ErrorMsg::fatal (x, format (SyntaxErrorMessage::UNEXPECTED, x.str ()));
+
+        let (withDollar, value) = if (x.str () == Tokens::DOLLAR) {
+            self.readToken (alias lexer, Tokens::MINUS);
+            let (postX, _) = lexer:.next ();
+            if (postX.isEof ()) throw ErrorMsg::fatal (postX, format (SyntaxErrorMessage::UNEXPECTED, postX.str ()));
+
+            (true, postX.str ())
+        } else {
+            (false, x.str ())
+        };
+
+        for i in 0us .. value.len {
+            if ((value [i] < '0'c8 || value [i] > '9'c8) && value [i] != Keys::UNDER [0]) {
+                throw ErrorMsg::fatal (x, format (SyntaxErrorMessage::UNEXPECTED, x.str ()));
+            }
+        }
+
+
+        let postVal = {
+            value.to!{usize} ()
+        } catch {
+            _ : &CastFailure => {
+                throw ErrorMsg::fatal (x, format (ValidateErrorMessage::MALFORMED_INT_LITERAL, value));
+            }
+        };
+
+        if (withDollar) {
+            if (len < postVal) throw ErrorMsg::fatal (x, format (ValidateErrorMessage::ARRAY_OVERFLOW, len, postVal));
+            len - postVal
+        } else {
+            postVal
+        }
+    }
+
+    /**
+     * Read and return the next token if it found in 'lst'
+     * @returns: the next token, or EOF_WORD iif not found in "lst"
+     * */
+    fn readIf (self, dmut lexer : &Lexer, lst : [[c8]])-> &Word {
+        let (x, _) = lexer:.next ();
+        if (x.isEof ()) return x;
+        for z in lst {
+            if x.str () == z { return x; }
+        }
+
+        lexer:.rewind ();
+        EOF_WORD
+    }
+
+    /**
+     * Read and return the next token if it equals to 'lst'
+     * @returns: the next token, or EOF_WORD iif not equal to "lst"
+     * */
+    fn readToken (self, dmut lexer : &Lexer, lst : [c8])-> &Word
+        throws &ErrorMsg
+    {
+        let (x, _) = lexer:.next ();
+        if (x.isEof ()) return x;
+        if (x.str () == lst) return x;
+
+        throw ErrorMsg::fatal (x, format (SyntaxErrorMessage::UNEXPECTED_BUT_LST, [lst]));
+    }
+
+    /**
+     * Read and return the next token if it equals to 'lst'
+     * @returns: the next token, or EOF_WORD iif not equal to "lst"
+     * */
+    fn readIf (self, dmut lexer : &Lexer, lst : [c8])-> &Word {
+        let (x, _) = lexer:.next ();
+        if (x.isEof ()) return x;
+        if (x.str () == lst) return x;
+
+        lexer:.rewind ();
+        EOF_WORD
+    }
+
+    /**
+     * @returns: true iif "str" can be used as an identifier
+     * */
+    fn isIdentifier (self, str : [c8])-> bool {
+        if (str == Keys::FOR) {
+            return false;
+        }
+
+        let mut i = 0u64;
+        let mut found = false;
+        for j in str { // must start by a letter, but can be preceded by as many _ as wanted
+            if (j >= 'a'c8 && j <= 'z'c8) || (j >= 'A'c8 && j <= 'Z'c8) {
+                found = true;
+                break {}
+            } else if (j != '_'c8) {
+                return false;
+            }
+            i += 1u64;
+        }
+
+        i += 1u64;
+        if (i < str.len) { // the rest of the identifier must be composed of letters, numbers, or _
+            for j in str [cast!usize (i) .. $] {
+                if (j < 'a'c8 || j > 'z'c8) && (j < 'A'c8 || j > 'Z'c8) && (j != '_'c8) && (j < '0'c8 || j > '9'c8) {
+                    return false;
+                }
+            }
+        } else {
+            return found;
+        }
+
+        true
+    }
+
+    /**
+     * Remove the underscores around a name
+     * @params:
+     *    - name: the name that will be transformed
+     * @returns: the same name but stripped from '_' on left and right sides
+     * @example:
+     * =======================
+     * let x = "___test__"s8;
+     * assert (self.removeUnders (x) == "test"s8);
+     *
+     * let y = "___test_2__"s8;
+     * assert (self.removeUnders (y) == "test_2"s8);
+     * =======================
+     */
+    pub fn removeUnders (self, name : [c8])-> [c8] {
+        let dmut result = StringStream::new ();
+        let mut started = false, mut nb = 0us;
+        for i in name {
+            if (i == '_'c8) {
+                nb += 1us;
+            } else {
+                if (started) {
+                    for _ in 0us .. nb {
+                        result:.write ('_'c8);
+                    }
+                }
+                result:.write (i);
+                started = true;
+                nb = 0us;
+            }
+        }
+
+        result[]
+    }
+    
+}
