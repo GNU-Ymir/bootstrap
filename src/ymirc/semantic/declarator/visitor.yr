@@ -91,12 +91,17 @@ pub class Declarator {
      * Compute the list of use decl to implicitely insert during module declaration
      * This list is the list of core modules computed from the core module tree
      * */
-    pub fn computeCoreUseDecls (mut self) {
+    pub fn computeCoreUseDecls (mut self)
+        throws &ErrorMsg
+    {
         let dmut coreMod = (alias (self._foreignRoot:.getLocalSymbols (CoreNames::CORE_MODULE, protection-> Protection::PUBLIC)))[];
         for c in 0us .. coreMod.len {
             match ref coreMod[c] {
                 dmut m : &ModuleSymbol => {
                     self:.computeCoreUseDecls (alias self._coreModules, root-> alias m);
+                }
+                dmut l : &LazyModuleSymbol => {
+                    self:.computeCoreUseDecls (alias self._coreModules, root-> self:.finalizeImportDecl (alias l))
                 }
             }
         }
@@ -189,7 +194,7 @@ pub class Declarator {
      *   - parent: the parent symbol that is declaring the module
      * @info: self._imported is updated if the module is global, as well a self._root
      */
-    fn declareModule (mut self, module : &ModuleDecl, dmut parent : &Symbol, protection : Protection = Protection::PRIVATE, importLoc : &Word = EOF_WORD)-> dmut &Symbol
+    fn declareModule (mut self, module : &ModuleDecl, dmut parent : &Symbol, protection : Protection = Protection::PRIVATE, importLoc : &Word = EOF_WORD)-> dmut &ModuleSymbol
         throws &ErrorMsg
     {
         let name = if (module.isGlobal ()) {
@@ -270,47 +275,142 @@ pub class Declarator {
         throws &ErrorMsg
     {
         let packageLoc = self._currentPackDir [$ - 1us];
+        let name = im.getModuleName ().str ();
         let child = packageLoc.push (parent.getPath ().asStdPath ()).push (im.getModuleName ().str ()).addExtension (CommonVars::YMIR_EXTENSION);
         let sibling = packageLoc.push (parent.getPath ().asStdPath ().parent ()).push (im.getModuleName ().str ()).addExtension (CommonVars::YMIR_EXTENSION);
 
-        let dmut referent = alias parent;
         if (fs::sys::isFile (sibling) && fs::sys::isFile (child)) {
             throw ErrorMsg::fatal (im.getModuleName (), format (DeclareErrorMessage::CONFLICT_MODULES, child.toStr (sep-> "/"s8), sibling.toStr (sep-> "/"s8)));
         } else if (!fs::sys::isFile (sibling) && !fs::sys::isFile (child)) {
             throw ErrorMsg::fatal (im.getModuleName (), format (DeclareErrorMessage::NO_SUCH_FILE, child.toStr (sep-> "/"s8), sibling.toStr (sep-> "/"s8)));
         }
 
-        let decl = {
-            if (fs::sys::isFile (sibling)) {
-                referent = alias parent:.getReferent ();
-                SyntaxVisitor::new (sibling):.read ()
-            } else {
-                SyntaxVisitor::new (child):.read ()
-            }
-        } catch {
-            err : &ErrorMsg => {
-                throw err.withNote ([ErrorMsg::note (im.getModuleName (), format (DeclareErrorMessage::IN_IMPORT, im.getModuleName ().str ()))]);
-            }
-            _ => {
-                throw ErrorMsg::fatal (im.getModuleName (), format (DeclareErrorMessage::NO_SUCH_FILE, child.toStr (sep-> "::"s8), sibling.toStr (sep-> "::"s8)),
-                                       notes-> [ErrorMsg::note (im.getModuleName (), format (DeclareErrorMessage::IN_IMPORT, im.getModuleName ().str ()))]);
+        let (importPath, isSibling) = if fs::sys::isFile (sibling) {
+            (sibling, true)
+        } else { (child, false) };
+
+        // Check wether the module is already imported within the current package
+        let already = parent.getLocalSymbols (name, protection-> Protection::PRIVATE);
+        let importLoc = im.getModuleName ();
+        for a in already[] {
+            match a {
+                m : &ModuleSymbol => { // a module with the same name is already present in the referent
+                    let dmut notes = Vec!{&ErrorMsg}::new ();
+                    if (!importLoc.isEof ()) {
+                        notes:.push (ErrorMsg::note (importLoc, format (DeclareErrorMessage::IN_IMPORT, importLoc.str ())));
+                    }
+
+                    if (!m.getImportLoc ().isEof ()) {
+                        notes:.push (ErrorMsg::note (m.getImportLoc (), format (DeclareErrorMessage::IN_IMPORT, m.getImportLoc ().str ())));
+                    } else {
+                        notes:.push (ErrorMsg::note (m.getLoc (), DeclareErrorMessage::DECLARED_HERE));
+                    }
+
+                    throw ErrorMsg::fatal (importLoc, format (DeclareErrorMessage::SHADOWING_DECL, importLoc.str ()), notes-> notes[]);
+                }
+                m : &LazyModuleSymbol => {
+                    let dmut notes = Vec!{&ErrorMsg}::new ();
+                    if (!importLoc.isEof ()) {
+                        notes:.push (ErrorMsg::note (importLoc, format (DeclareErrorMessage::IN_IMPORT, importLoc.str ())));
+                    }
+
+                    if (!m.getImportLoc ().isEof ()) {
+                        notes:.push (ErrorMsg::note (m.getImportLoc (), format (DeclareErrorMessage::IN_IMPORT, m.getImportLoc ().str ())));
+                    } else {
+                        notes:.push (ErrorMsg::note (m.getLoc (), DeclareErrorMessage::DECLARED_HERE));
+                    }
+
+                    throw ErrorMsg::fatal (importLoc, format (DeclareErrorMessage::SHADOWING_DECL, importLoc.str ()), notes-> notes[]);
+                }
             }
         }
 
-        match decl {
-            module : &ModuleDecl => {
-                self:.declareModule (module, alias referent, protection-> protection, importLoc-> im.getModuleName ())
-            }
-            _ => __pragma!panic ();
+        let dmut lazyMod = LazyModuleSymbol::new (name, importLoc, importPath, protection-> protection, packageDir-> packageLoc);
+        if isSibling {
+            parent:.getReferent ():.insert (alias lazyMod, replace-> false);
+        } else {
+            parent:.insert (alias lazyMod, replace-> false);
         }
 
         return EmptySymbol::new ();
     }
 
     /**
+     * Finalize the declaration of a lazy module
+     * @params:
+     *    - parent: the parent module containing the import
+     *    - lazyMod: the module being imported (and addressed)
+     * @returns: an empty symbol
+     * */
+    pub fn finalizeImportDecl (mut self, lazyMod : &LazyModuleSymbol)-> dmut &ModuleSymbol
+        throws &ErrorMsg
+    {
+       match lazyMod.getFinalized () { // already finalized
+            m : &ModuleSymbol => {
+                let dmut ret = self:.getMutableSymbol (m);
+                match ref ret {
+                    dmut mM : &ModuleSymbol => return alias mM;
+                    _ => __pragma!panic ();
+                }
+            }
+        }
+
+        let dmut lM = self:.getMutableSymbol (lazyMod);
+        match ref lM {
+            dmut lazyM : &LazyModuleSymbol => {
+                return alias self:.finalizeImportDecl (alias lazyM);
+            }
+            _ => __pragma!panic ();
+        }
+    }
+
+    /**
+     * Finalize the declaration of a lazy module
+     * @params:
+     *    - parent: the parent module containing the import
+     *    - lazyMod: the module being imported (and addressed)
+     * @returns: an empty symbol
+     * */
+    fn finalizeImportDecl (mut self, dmut lazyMod : &LazyModuleSymbol)-> dmut &ModuleSymbol
+        throws &ErrorMsg
+    {
+        let dmut referent = alias lazyMod:.getReferent ();
+        let decl = {
+            SyntaxVisitor::new (lazyMod.getImportPath ()):.read ()
+        } catch {
+            err : &ErrorMsg => {
+                throw err.withNote ([ErrorMsg::note (lazyMod.getImportLoc (), format (DeclareErrorMessage::IN_IMPORT, lazyMod.getModuleName ()))]);
+            }
+            _ => {
+                throw ErrorMsg::fatal (lazyMod.getImportLoc (), format (DeclareErrorMessage::NO_SUCH_FILE_ONE, lazyMod.getImportPath ().toStr (sep-> "::"s8)),
+                                       notes-> [ErrorMsg::note (lazyMod.getImportLoc (), format (DeclareErrorMessage::IN_IMPORT, lazyMod.getModuleName ()))]);
+            }
+        }
+
+        lazyMod:.getReferent ():.remove (alias lazyMod);
+        match decl {
+            module : &ModuleDecl => {
+                {
+                    self._currentPackDir:.push (lazyMod.getPackageDir ());
+                    let dmut ret = self:.declareModule (module, alias referent, protection-> lazyMod.getProtection (), importLoc-> lazyMod.getImportLoc ());
+                    self:.finalizeDeclaration (alias ret);
+
+                    lazyMod:.setFinalized (ret);
+                    return alias ret;
+                } exit {
+                    self._currentPackDir:.pop (1u64);
+                }
+            }
+            _ => __pragma!panic ();
+        }
+    }
+
+    /**
      * Recursively insert implicit use declaration of the core modules tree
      * */
-    fn computeCoreUseDecls (mut self, dmut mods : &Vec!{dmut &Symbol}, dmut root : &Symbol) {
+    fn computeCoreUseDecls (mut self, dmut mods : &Vec!{dmut &Symbol}, dmut root : &Symbol)
+        throws &ErrorMsg
+    {
         mods:.push (alias root);
         root:.isCoreModule (true);
 
@@ -319,6 +419,9 @@ pub class Declarator {
             match ref list [i] {
                 dmut m : &ModuleSymbol => {
                     self:.computeCoreUseDecls (alias mods, root-> alias m);
+                }
+                dmut l : &LazyModuleSymbol => {
+                    self:.computeCoreUseDecls (alias mods, root-> self:.finalizeImportDecl (alias l));
                 }
             }
         }
@@ -1249,27 +1352,41 @@ pub class Declarator {
             let mut found = false;
             if (i == parts.len - 1us && parts [i] == Keys::UNDER) {
                 let dmut subMods = Vec!{&Symbol}::new ();
-                for r in root match r {
-                    m : &ModuleSymbol => {
-                        let loc = self.getAllLocalFromContext (parent, m);
-                        for s in loc { subMods:.push (s); }
+                for r in root {
+                    let module = match r {
+                        l : &LazyModuleSymbol => { cast!{&Symbol} (self:.finalizeImportDecl (l)) }
+                        m : _ => { m }
+                    };
+
+                    match module {
+                        m : &ModuleSymbol => {
+                            let loc = self.getAllLocalFromContext (parent, m);
+                            for s in loc { subMods:.push (s); }
+                        }
                     }
                 }
 
                 root = subMods[];
                 all = true;
             } else {
-                for r in root match r {
-                    m : &ModuleSymbol => { // there can be only one module with a given name in another module, otherwise error would have been thrown during module declaration
-                        root = self.getLocalFromContext (parts [i], parent, m); // relative access, while ensuring protection access
-                        if (root.len == 0us) { // no module named parts[i] in current module
-                            let errLoc = self.getPathIndexLoc (useP, i);
-                            throw ErrorMsg::fatal (errLoc, format (DeclareErrorMessage::NO_MODULE_NAMED, parts [i], m.getPath ().toStr ()),
-                                                   notes-> self.createLocalAccessError (errLoc, parts[i], m, parent));
-                        }
+                for r in root {
+                    let module = match r {
+                        l : &LazyModuleSymbol => { cast!{&Symbol} (self:.finalizeImportDecl (l)) }
+                        m : _ => { m }
+                    };
 
-                        found = true;
-                        current = m;
+                    match module {
+                        m : &ModuleSymbol => { // there can be only one module with a given name in another module, otherwise error would have been thrown during module declaration
+                            root = self.getLocalFromContext (parts [i], parent, m); // relative access, while ensuring protection access
+                            if (root.len == 0us) { // no module named parts[i] in current module
+                                let errLoc = self.getPathIndexLoc (useP, i);
+                                throw ErrorMsg::fatal (errLoc, format (DeclareErrorMessage::NO_MODULE_NAMED, parts [i], m.getPath ().toStr ()),
+                                                       notes-> self.createLocalAccessError (errLoc, parts[i], m, parent));
+                            }
+
+                            found = true;
+                            current = m;
+                        }
                     }
                 }
 
@@ -1280,15 +1397,22 @@ pub class Declarator {
             }
         }
 
-        for r in root match r {
-            m : &ModuleSymbol => { // use all the module found at the end of the path
-                if (parent is m) {
-                    if (!all && throwSelf) {
-                        throw ErrorMsg::warn (self.getPathIndexLoc (useP, parts.len - 1us), format (DeclareErrorMessage::SELF_USE, m.getPath ().toStr ()));
+        for r in root {
+            let module = match r {
+                l : &LazyModuleSymbol => { cast!{&Symbol} (self:.finalizeImportDecl (l)) }
+                m : _ => { m }
+            };
+
+            match module {
+                m : &ModuleSymbol => { // use all the module found at the end of the path
+                    if (parent is m) {
+                        if (!all && throwSelf) {
+                            throw ErrorMsg::warn (self.getPathIndexLoc (useP, parts.len - 1us), format (DeclareErrorMessage::SELF_USE, m.getPath ().toStr ()));
+                        }
+                    } else {
+                        parent:.useModule (m.getPath ().asStdPath (), alias self:.getMutableSymbol (m));
+                        all = true; // set all to true, because at least one module was found
                     }
-                } else {
-                    parent:.useModule (m.getPath ().asStdPath (), alias self:.getMutableSymbol (m));
-                    all = true; // set all to true, because at least one module was found
                 }
             }
         }
