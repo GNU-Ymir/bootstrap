@@ -42,7 +42,7 @@ pub class ForLoopValidator {
     pub fn validate (self, dmut context : &Validator, f : &ForLoopExpr) -> &Value
         throws &ErrorMsg
     {
-        let mValue = context:.getValueValidator ().validate (alias context, f.getValue (), canBeRef-> true);
+        let mValue = context:.implicitEnumUnwrap (context:.getValueValidator ().validate (alias context, f.getValue (), canBeRef-> true));
         let (byMutRef, byAlias, fVal) = match mValue {
             r : &ReferencerValue => { (r.isMutable (), false, r.getValue ()) }
             a : &AliaserValue => { (false, true, a.getValue ()) }
@@ -116,19 +116,27 @@ pub class ForLoopValidator {
 
         if (byMutRef) { // list comprehension is always const, so not by mut ref, and not by alias
             throw ErrorMsg::fatal (value.getLoc (), ValidateErrorMessage::UNECESSARY_REFERENCE);
-        } else if (byAlias) {
-            throw ErrorMsg::fatal (value.getLoc (), format (ValidateErrorMessage::UNECESSARY_ALIAS, value.getType ()));
         }
 
-        match value.getType () {
-            t : &TupleType => { self.validateComprTuple (alias context, t, value, all) }
-            s : &SliceType => { self.validateComprSlice (alias context, s, value, all, dynamic) }
-            a : &ArrayType => { self.validateComprArray (alias context, a, value, all, dynamic) }
-            r : &RangeType => { self.validateComprRange (alias context, r, value, all, dynamic) }
+        let (res, innerUseAlias) = match value.getType () {
+            t : &TupleType => { (self.validateComprTuple (alias context, t, value, all), false) }
+            s : &SliceType => { (self.validateComprSlice (alias context, s, value, all, dynamic), false) }
+            a : &ArrayType => { (self.validateComprArray (alias context, a, value, all, dynamic), false) }
+            r : &RangeType => { (self.validateComprRange (alias context, r, value, all, dynamic), false) }
+            c : &ClassPtrType => {
+                // by alias error would already be thrown inside the class loop method
+                (self.validateComprClass (alias context, c, value, all, byAlias, value.getLoc (), dynamic), true)
+            }
             _ => {
                 throw ErrorMsg::fatal (all.getForLoc (), format (ValidateErrorMessage::UNDEF_FOR_LOOP_OPERATOR, all.getVariables ().len, value.getType ()));
             }
         }
+
+        if (byAlias && !innerUseAlias) {
+            throw ErrorMsg::fatal (value.getLoc (), format (ValidateErrorMessage::UNECESSARY_ALIAS, value.getType ()));
+        }
+
+        res
     }
 
     /*!
@@ -935,32 +943,7 @@ pub class ForLoopValidator {
 
         context:.enterBlock ();
         let _loop = {
-            let iteratorDecl = VarDeclValue::new (Word::new ("#_iter"s8, beginMeth.getLoc ()), beginMeth.getType ().toDeeplyMutable (), beginMeth, isMutable-> true, isIterator-> true);
-            let endDecl = VarDeclValue::new (Word::new ("#_end"s8, endMeth.getLoc ()), endMeth.getType ().clone (0u32), endMeth, isMutable-> false, isIterator-> false);
-            let iteratorType = iteratorDecl.getVarType ();
-            self.verifyCptrBeginIsValid (alias context, loc, cptr, iteratorDecl, beginMeth);
-
-            let iteratorRef = VarRefValue::new (iteratorDecl.getLoc (), iteratorDecl.getLoc (), iteratorType, iteratorDecl.getUniqId (), isSelf-> false, canCte-> false);
-            let endRef = VarRefValue::new (endDecl.getLoc (), endDecl.getLoc (), endDecl.getVarType (), endDecl.getUniqId (), isSelf-> false, canCte-> false);
-            let aliasRef = ClassAliaserValue::new (iteratorDecl.getLoc (), iteratorType.asOf!{&ClassPtrType} (), iteratorRef);
-
-            let test = context:.getBinOpValidator ().validateComparisonOperation (alias context, loc, BinaryOperators::NOT_EQUAL, iteratorRef, endRef);
-            outerLoop:.push (iteratorDecl);
-            outerLoop:.push (endDecl);
-
-            let nbVars = f.getVariables ().len;
-            for index, it in f.getVariables () match it {
-                v : &VarDeclExpr => {
-                    let iter = self.validateCptrIterDecl (alias context, loc, v, iteratorType, aliasRef, index, nbVars)
-
-                    if (v.getLoc ().str () != Keys::UNDER) context:.insertLocal (v.getLoc ().str (), iter);
-                    innerLoop:.push (iter);
-                }
-                _ => __pragma!panic ();
-            }
-
-            let increment = self.validateCptrIncrement (alias context, loc, iteratorType, aliasRef);
-
+            let (test, increment, _) = self.validateClassLoopIteratorVar (alias context, loc, cptr, beginMeth, endMeth, f.getVariables (), alias innerLoop, alias outerLoop);
             innerLoop:.push (context:.validateValue (f.getBlock ()));
             innerLoop:.push (increment);
 
@@ -974,8 +957,6 @@ pub class ForLoopValidator {
             }
         };
 
-        outerLoop:.push (_loop);
-
         {
             context:.quitBlock (warnUnused-> errors.len () == 0us);
         } catch {
@@ -985,7 +966,77 @@ pub class ForLoopValidator {
         if (errors.len () != 0us) throw ErrorMsg::fatal (f.getLoc (), format (ValidateErrorMessage::FOR_LOOP_CPTR, cptr), notes-> errors[]);
         self.verifyUseAliasCptrIter (loc, aliasLoc, cptr, beginMeth, endMeth, useAlias, byAlias);
 
+        outerLoop:.push (_loop);
         BlockValue::new (loc, VoidType::new (loc), outerLoop[])
+    }
+
+    /**
+     * Validate the iterator vars of a class loop
+     * @params:
+     *    - context: the context of the validation
+     *    - loc : the location of the loop
+     *    - cptr: the class type
+     *    - beginMeth: the call to the begin meth
+     *    - endMeth: the call to the end method
+     *    - len: the len field (can be unit if it does not apply)
+     *    - vars: the list of vars declared by the loop
+     * @returns:
+     *    - innerLoop: add the declaration of the iterators
+     *    - outerLoop: add the declaration of the begin, end values
+     *    - .0: the test that stop the loop
+     *    - .1: the instruction used to increment the iterator to put after the content of the loop
+     *    - .2: the iterator ref or unit value, depending wether lenField is set or not
+     * @throws:
+     *    - &ErrorMsg: if the loop is not valid
+     * */
+    fn validateClassLoopIteratorVar (self, dmut context : &Validator, loc : &Word, cptr : &ClassPtrType, beginMeth : &Value, endMeth : &Value, lenField : &Value = UNIT_VALUE, vars : [&Expression], dmut innerLoop : &Vec!{&Value}, dmut outerLoop : &Vec!{&Value})-> (&Value, &Value, &Value)
+        throws &ErrorMsg
+    {
+        let iteratorDecl = VarDeclValue::new (Word::new ("#_iter"s8, beginMeth.getLoc ()), beginMeth.getType ().toDeeplyMutable (), beginMeth, isMutable-> true, isIterator-> true);
+        let endDecl = VarDeclValue::new (Word::new ("#_end"s8, endMeth.getLoc ()), endMeth.getType ().clone (0u32), endMeth, isMutable-> false, isIterator-> false);
+        let iteratorType = iteratorDecl.getVarType ();
+        self.verifyCptrBeginIsValid (alias context, loc, cptr, iteratorDecl, beginMeth);
+
+        let iteratorRef = VarRefValue::new (iteratorDecl.getLoc (), iteratorDecl.getLoc (), iteratorType, iteratorDecl.getUniqId (), isSelf-> false, canCte-> false);
+        let endRef = VarRefValue::new (endDecl.getLoc (), endDecl.getLoc (), endDecl.getVarType (), endDecl.getUniqId (), isSelf-> false, canCte-> false);
+        let aliasRef = ClassAliaserValue::new (iteratorDecl.getLoc (), iteratorType.asOf!{&ClassPtrType} (), iteratorRef);
+
+        let mut test = context:.getBinOpValidator ().validateComparisonOperation (alias context, loc, BinaryOperators::NOT_EQUAL, iteratorRef, endRef);
+        let mut increment = self.validateCptrIncrement (alias context, loc, iteratorType, aliasRef);
+        let mut iterRef : &Value = UNIT_VALUE;
+
+        match lenField {
+            UnitValue () => {}
+            _ => {
+                let indexDecl = VarDeclValue::new (Word::new ("#_index"s8, lenField.getLoc ()), lenField.getType (), makeIntValue (loc, 0us), isMutable-> true, isIterator-> true);
+                let indexRef = VarRefValue::new (indexDecl.getLoc (), indexDecl.getLoc (), indexDecl.getVarType (), indexDecl.getUniqId (), isSelf-> false, canCte-> false);
+                outerLoop:.push (indexDecl);
+
+                let indexTest = CmpIntOperatorValue::new (loc, BinaryOperators::INF, indexRef, lenField);
+                let indexIncr = AffectValue::new (loc, indexRef.getType (), indexRef, BinaryMathIntOperatorValue::new (loc, indexRef.getType (), BinaryOperators::PLUS, indexRef, makeIntValue (loc, 1us)));
+
+                test = LogicalBinBoolOperatorValue::new (loc, BinaryOperators::DAND, test, indexTest);
+                increment = BlockValue::new (loc, increment.getType (), [increment, indexIncr]);
+
+                iterRef = indexRef;
+            }
+        }
+
+        outerLoop:.push (iteratorDecl);
+        outerLoop:.push (endDecl);
+
+        let nbVars = vars.len;
+        for index, it in vars match it {
+            v : &VarDeclExpr => {
+                let iter = self.validateCptrIterDecl (alias context, loc, v, iteratorType, aliasRef, index, nbVars);
+                if (v.getLoc ().str () != Keys::UNDER) context:.insertLocal (v.getLoc ().str (), iter);
+
+                innerLoop:.push (iter);
+            }
+            _ => __pragma!panic ();
+        }
+
+        (test, increment, iterRef)
     }
 
     /**
@@ -1825,6 +1876,138 @@ pub class ForLoopValidator {
         let lp = LoopValue::new (loc, VoidType::new (loc), test-> test, blkContent, isDo-> false);
 
         (lp, slcValueRef, slcValueDecl, sliceType, false)
+    }
+
+
+    /*!
+     * ================================================================================
+     * ================================================================================
+     * ========================        COMPREHENSION CLASS        =====================
+     * ================================================================================
+     * ================================================================================
+     */
+
+    /**
+     * Validate a list comprehension over a class value
+     * @params:
+     *     - context: the context of the validation
+     *     - cptr: the type being iterated
+     *     - value: the value being iterated
+     *     - all: the for loop
+     *     - canDynamic: if not true, throws an error the len cannot be cte
+     * @throws:
+     *    - &ErrorMsg: if the class is not iterable, or has no len or tries to create a tuple/array
+     * @returns: the generated slice value
+     * */
+    fn validateComprClass (self, dmut context : &Validator, cptr : &ClassPtrType, value : &Value, all : &SliceForAllocatorExpr, byAlias : bool, aliasLoc : &Word, canDynamic : bool)-> &Value
+        throws &ErrorMsg
+    {
+        let loc = all.getLoc ();
+        let (useAlias, beginMeth, endMeth, lenField) = {
+            let inst = if (byAlias) { ClassAliaserValue::new (loc, cptr, value) } else {value};
+            let (beginMeth, useAliasBeg) = self.createIterOverCptrCall (alias context, loc, cptr, inst, OpOverrideNames::BEGIN_OP_OVERRIDE);
+            let (endMeth, useAliasEnd) = self.createIterOverCptrCall (alias context, loc, cptr, inst, OpOverrideNames::END_OP_OVERRIDE);
+            let (lenField, useAliasLen) = self.createLenCptrCall (alias context, loc, cptr, inst);
+            (useAliasEnd || useAliasBeg || useAliasLen, beginMeth, endMeth, lenField)
+        } catch {
+            err : &ErrorMsg => throw ErrorMsg::fatal (loc, format (ValidateErrorMessage::FOR_LOOP_CPTR, cptr), notes-> [err]);
+        };
+
+        if (!canDynamic || all.isTuple ()) {
+            throw ErrorMsg::fatal (all.getIter ().getLoc (), format (ValidateErrorMessage::LIST_COMPR_SIZE_CTE, cptr),
+                                   notes-> [ErrorMsg::note (loc, format (ValidateErrorMessage::ENCLOSE_COPY_LST_COMPR))]);
+        }
+
+        let dmut outerLoop = Vec!{&Value}::new ();
+        let dmut innerLoop = Vec!{&Value}::new ();
+        let dmut errors = Vec!{&ErrorMsg}::new ();
+
+        context:.enterBlock ();
+        let (_loop, slcValueDecl, slcValueRef, slcType, iterRef) = {
+            let (test, increment, iterRef) = self.validateClassLoopIteratorVar (alias context, loc, cptr, beginMeth, endMeth, lenField-> lenField, all.getVariables (), alias innerLoop, alias outerLoop);
+            let innerValue = context:.validateValue (all.getValue ());
+            let innerType = context:.inferTypeImplicitMutability (innerValue);
+            let (slcValueDecl, slcValueRef, slcIndex, sliceType) = self.validateComprSliceValueDecl (alias context, all.getLoc (), cptr, innerType, iterRef, lenField, true);
+
+            innerLoop:.push (AffectValue::new (loc, innerType, slcIndex, innerValue));
+            innerLoop:.push (increment);
+
+            let blkContent = BlockValue::new (loc, VoidType::new (loc), innerLoop[]);
+            let _loop = LoopValue::new (loc, VoidType::new (loc), test-> test, blkContent, isDo-> false);
+            (_loop, slcValueDecl, slcValueRef, sliceType, iterRef)
+        } catch {
+            err : &ErrorMsg => {
+                errors:.push (err);
+                (UNIT_VALUE, UNIT_VALUE, UNIT_VALUE, NONE_TYPE, UNIT_VALUE)
+            }
+        };
+
+        {
+            context:.quitBlock (warnUnused-> errors.len () == 0us);
+        } catch {
+            err : &ErrorMsg => errors:.push (err);
+        }
+
+        if (errors.len () != 0us) throw ErrorMsg::fatal (loc, format (ValidateErrorMessage::FOR_LOOP_CPTR, cptr), notes-> errors[]);
+        self.verifyUseAliasCptrIter (loc, aliasLoc, cptr, beginMeth, endMeth, useAlias, byAlias);
+
+        outerLoop:.push (slcValueDecl);
+        outerLoop:.push (_loop);
+        outerLoop:.push (self.recutSliceClassCompr (alias context, loc, slcType, slcValueRef, iterRef));
+
+        let innerBlock = ListComprValue::new (loc, slcType, BlockValue::new (loc, slcType, outerLoop[]));
+        CopierValue::new (loc, slcType, isDone-> true, innerBlock)
+    }
+
+    /**
+     * Recut the slice to make it the correct size, maybe the indicative len that was return by the field was too big, and the loop stoped early
+     * @params:
+     *    - context: the context of the validation
+     *    - loc: the location of the for loop
+     *    - slcType: the type of the returned slice
+     *    - slcValueRef: the slice value
+     *    - len: the actual number of iteration that were made
+     * @returns: the recutted slice (no realloc)
+     * */
+    fn recutSliceClassCompr (self, dmut _ : &Validator, loc : &Word, slcType : &Type, slcValueRef : &Value, len : &Value)-> &Value {
+        let innerType = slcType.asOf!{&SliceType} ().getInners ()[0];
+        let ptrType = PointerType::new (loc, innerType, isMutable-> innerType.isMutable ());
+        let nPtr = StructFieldAccessValue::new (loc, ptrType, slcValueRef, SliceKeys::PTR);
+
+        SliceCtorValue::new (loc, slcType, nPtr, len, isImplicitAlias-> false)
+    }
+
+    /**
+     * Create the call to the len field for class lst compr
+     * @params:
+     *    - context: the context of the validation
+     *    - loc: the location of the access
+     *    - cptr: the class being accessed
+     *    - value: the value being used
+     * @
+     * */
+    fn createLenCptrCall (self, dmut context : &Validator, loc : &Word, cptr : &ClassPtrType, value : &Value)-> (&Value, bool)
+        throws &ErrorMsg
+    {
+        let fieldAcc = context:.constructObjectMethodAcc (loc, cptr, value, OpOverrideNames::LEN_OP_OVERRIDE, allowImmut-> true);
+        {
+            let lenField = context:.getCallOpValidator ().validate (alias context, loc, fieldAcc, []);
+            let useAlias = match lenField {
+                c : &MethodCallValue => {
+                    c.getMethod ().getPrototype ().isMutable ()
+                }
+                _ => { false }
+            };
+
+            let lenType = IntType::new (loc, size-> 0u16, signed-> false);
+            (context:.getCastValidator ().validateCast (alias context, loc-> lenField.getLoc (), lenField, lenType), useAlias)
+        } catch {
+            err : &ErrorMsg => {
+                let noteBeg = ErrorMsg::note (loc, format (ValidateErrorMessage::CALL_PROTO, fieldAcc, withTags-> ["withParams"s8]), notes-> [err]);
+                let rewriteNote = ErrorMsg::note (loc, format (ValidateErrorMessage::CALL_LEN_ONE_LINE, cptr), oneLine-> true);
+                throw ErrorMsg::list ([rewriteNote, noteBeg]);
+            }
+        }
     }
 
     /*!
