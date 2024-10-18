@@ -74,8 +74,7 @@ pub class ValueExpander {
         let decl = context.getLoopVarRef ();
         if (!decl.isOf!{&YILUnit} ()) {
             let inner = self.finalize (alias context, b.getValue (), alias list);
-            self.removeDestroy (alias context, inner, alias list);
-            list:.append (YILAffect::new (b.getLoc (), decl, inner));
+            self.finalizeAffect (alias context, b.getLoc (), decl, inner, alias list);
         }
 
         list:.append (YILGoto::new (b.getLoc (), endLabel));
@@ -91,7 +90,7 @@ pub class ValueExpander {
      * */
     fn finalizeReturn (self, dmut context : &Expander, r : &ReturnValue, dmut list : &StmtList)-> &YILValue {
         let inner = self.finalize (alias context, r.getValue (), alias list);
-        self.removeDestroy (alias context, inner, alias list);
+        self.removeDestroy (inner, alias list);
         list:.append (YILReturn::new (r.getLoc (), inner));
 
         YIL_UNIT_VALUE
@@ -117,8 +116,8 @@ pub class ValueExpander {
         let funcStrType = funcStr.getType ().asOf!{&YILTuple} ().getInners ()[1];
         let funcStrPtr = funcStr.asOf!{&YILTupleValue} ().getValue ()[1];
 
-        let fileStrPtrU = self.createVarForBlock (alias context, t.getLoc (), fileStrType, alias list, withValue-> fileStrPtr);
-        let funcStrPtrU = self.createVarForBlock (alias context, t.getLoc (), funcStrType, alias list, withValue-> funcStrPtr);
+        let fileStrPtrU = self.createVarForBlock (alias context, t.getLoc (), NONE_TYPE, fileStrType, alias list, withValue-> fileStrPtr);
+        let funcStrPtrU = self.createVarForBlock (alias context, t.getLoc (), NONE_TYPE, funcStrType, alias list, withValue-> funcStrPtr);
 
         let call = YILNameCallValue::new (t.getLoc (), YIL_VOID, CoreNames::YRT_THROW_EXCEPT, [fileStrPtrU, funcStrPtrU, line, inner]);
 
@@ -146,8 +145,8 @@ pub class ValueExpander {
         let funcStrType = funcStr.getType ().asOf!{&YILTuple} ().getInners ()[1];
         let funcStrPtr = funcStr.asOf!{&YILTupleValue} ().getValue ()[1];
 
-        let fileStrPtrU = self.createVarForBlock (alias context, p.getLoc (), fileStrType, alias list, withValue-> fileStrPtr);
-        let funcStrPtrU = self.createVarForBlock (alias context, p.getLoc (), funcStrType, alias list, withValue-> funcStrPtr);
+        let fileStrPtrU = self.createVarForBlock (alias context, p.getLoc (), NONE_TYPE, fileStrType, alias list, withValue-> fileStrPtr);
+        let funcStrPtrU = self.createVarForBlock (alias context, p.getLoc (), NONE_TYPE, funcStrType, alias list, withValue-> funcStrPtr);
 
         let call = YILNameCallValue::new (p.getLoc (), YIL_VOID, CoreNames::YRT_PANIC, [fileStrPtrU, funcStrPtrU, line]);
         list:.append (YILCall::new (p.getLoc (), call));
@@ -169,7 +168,7 @@ pub class ValueExpander {
         let funcStr = self.finalize (alias context, makeStringSliceValue (loc, name), alias list);
         let funcStrPtr = funcStr.asOf!{&YILTupleValue} ().getValue ()[1];
         let funcStrType = funcStr.getType ().asOf!{&YILTuple} ().getInners ()[1];
-        let funcStrPtrU = self.createVarForBlock (alias context, loc, funcStrType, alias list, withValue-> funcStrPtr);
+        let funcStrPtrU = self.createVarForBlock (alias context, loc, NONE_TYPE, funcStrType, alias list, withValue-> funcStrPtr);
 
         let call = YILNameCallValue::new (loc, YIL_VOID, CoreNames::YRT_REGISTER_UNIT_TEST, [funcStrPtrU, funcAddr]);
         list:.append (YILCall::new (EOF_WORD, call));
@@ -195,11 +194,7 @@ pub class ValueExpander {
             let mut varref = YILVar::new (v.getLoc (), v.getLoc ().str (), lazyType, varId);
 
             list:.append (decl);
-
-            if (!inner.isOf!{&YILUnit} ()) {
-                self.removeDestroy (alias context, inner, alias list);
-                list:.append (YILAffect::new (v.getLoc (), varref, inner));
-            }
+            self.finalizeAffect (alias context, v.getLoc (), varref, inner, alias list);
 
             let addr = YILAddrValue::new (v.getLoc (), YILPointer::new (lazyType), varref);
             context:.registerVariable (v.getUniqId (), YILNameCallValue::new (v.getLoc (), YILPointer::new (type), CoreNames::YRT_CALL_LAZY, [addr]));
@@ -213,11 +208,7 @@ pub class ValueExpander {
             let mut varref = YILVar::new (v.getLoc (), v.getLoc ().str (), type, varId);
 
             list:.append (decl);
-
-            if (!inner.isOf!{&YILUnit} ()) {
-                self.removeDestroy (alias context, inner, alias list);
-                list:.append (YILAffect::new (v.getLoc (), varref, inner));
-            }
+            self.finalizeAffect (alias context, v.getLoc (), varref, inner, alias list);
 
             if (v.getVarType ().isMovable () && !v.isReference ()) {
                 self.registerDestroy (alias context, varref, v.getVarType (), alias list, implicit-> false);
@@ -314,7 +305,13 @@ pub class ValueExpander {
         };
 
         let retVal = match sc {
-            b : &BlockValue => { self.finalizeBlock (alias context, b, alias list) }
+            b : &BlockValue => {
+                if (b.isSet ()) {
+                    self.finalizeBlockSet (alias context, b, alias list, asLeft)
+                } else {
+                    self.finalizeBlock (alias context, b, alias list)
+                }
+            }
             c : &ConditionalValue => { self.finalizeCond (alias context, c, alias list) }
             l : &LoopValue => { self.finalizeLoop (alias context, l, alias list) }
             t : &TryFinallyValue => { self.finalizeTryFinally (alias context, t, alias list) }
@@ -326,10 +323,23 @@ pub class ValueExpander {
             }
         }
 
+        retVal
+    }
+
+    /**
+     * Finalize a set
+     * @params:
+     *     - context: the context of the expansion
+     *     - b: the set to finalize
+     *     - list: the list of values to fill
+     *     - asLeft: true if used as lvalue
+     * */
+    fn finalizeBlockSet (self, dmut context : &Expander, b : &BlockValue, dmut list : &StmtList, asLeft : bool)-> &YILValue {
+        let retVal = self.finalizeSet (alias context, b, alias list);
         if (!asLeft) {
-            return self.registerUniqValue (alias context, sc, retVal, alias list);
+            self.registerUniqValue (alias context, b, retVal.getType (), retVal, alias list)
         } else {
-            return retVal;
+            retVal
         }
     }
 
@@ -341,11 +351,14 @@ pub class ValueExpander {
      * @returns: the final value of the block if any
      * */
     fn finalizeBlock (self, dmut context : &Expander, b : &BlockValue, dmut list : &StmtList)-> &YILValue {
-        if (b.isSet ()) return self.finalizeSet (alias context, b, alias list);
         let dmut innerList = StmtList::new ();
+
+        let retType = context:.finalizeType (b.getType ());
+        let resultVar = self.createVarForBlock (alias context, b.getLoc (), b.getType (), retType, alias list);
         context:.enterBlock ();
 
         let retVal = self.finalizeSet (alias context, b, alias innerList);
+        self.finalizeAffect (alias context, b.getLoc (), resultVar, retVal, alias innerList);
 
         context:.exitBlock ();
 
@@ -361,7 +374,7 @@ pub class ValueExpander {
             list:.append (innerList); // BlockValue::new (b.getLoc (), VOID_TYPE, innerList[], noValue-> true));
         }
 
-        retVal
+        resultVar
     }
 
     /**
@@ -394,11 +407,10 @@ pub class ValueExpander {
         };
 
         let type = context:.finalizeType (t.getTryPart ().getType ());
-        let varTry = self.createVarForBlock (alias context, t.getTryPart ().getLoc (), type, alias list);
+        let varTry = self.createVarForBlock (alias context, t.getTryPart ().getLoc (), t.getTryPart ().getType (), type, alias list);
         if (!varTry.isOf!{&YILUnit} ()) {
             context:.registerVariable (t.getTryPart ().getUniqId (), varTry);
-            self.removeDestroy (alias context, tryVal, alias list);
-            tryP:.append (YILAffect::new (t.getTryPart ().getLoc (), varTry, tryVal));
+            self.finalizeAffect (alias context, t.getTryPart ().getLoc (), varTry, tryVal, alias tryP);
         }
 
         if (!isCatch && !vdecl.isOf!{&UnitValue} ()) { // #_failed = false;
@@ -440,12 +452,10 @@ pub class ValueExpander {
         let tryVal = self.finalize (alias context, t.getTryPart (), alias tryP);
 
         let type = context:.finalizeType (t.getTryPart ().getType ());
-
-        let varTry = self.createVarForBlock (alias context, t.getTryPart ().getLoc (), type, alias list);
+        let varTry = self.createVarForBlock (alias context, t.getTryPart ().getLoc (), t.getTryPart ().getType (), type, alias list);
         if (!varTry.isOf!{&YILUnit} ()) {
             context:.registerVariable (t.getTryPart ().getUniqId (), varTry);
-            self.removeDestroy (alias context, tryVal, alias list);
-            tryP:.append (YILAffect::new (t.getTryPart ().getLoc (), varTry, tryVal));
+            self.finalizeAffect (alias context, t.getTryPart ().getLoc (), varTry, tryVal, alias tryP);
         }
 
         if (!aff.isOf!{&UnitValue} ()) {
@@ -463,10 +473,8 @@ pub class ValueExpander {
         catchP:.append (YILAffect::new (t.getCatchVar ().getLoc (), varref, YILBeginCatch::new (t.getLoc (), CoreNames::YRT_BEGIN_CATCH)));
 
         let catchVal = self.finalize (alias context, t.getCatchPart (), alias catchP);
-        if (!varTry.isOf!{&YILUnit} ()) {
-            self.removeDestroy (alias context, catchVal, alias list);
-            catchP:.append (YILAffect::new (t.getCatchPart ().getLoc (), varTry, catchVal));
-        }
+        self.finalizeAffect (alias context, t.getCatchPart ().getLoc (), varTry, catchVal, alias catchP);
+
         context:.exitBlock ();
 
         let ctVarType = context:.finalizeType (ctVarValue.getVarType ());
@@ -502,7 +510,7 @@ pub class ValueExpander {
      * */
     fn finalizeCond (self, dmut context : &Expander, c : &ConditionalValue, dmut list : &StmtList)-> &YILValue {
         let type = context:.finalizeType (c.getType ());
-        let var = self.createVarForBlock (alias context, c.getLoc (), type, alias list);
+        let var = self.createVarForBlock (alias context, c.getLoc (), c.getType (), type, alias list);
 
 
         let dmut ifList = StmtList::new ();
@@ -522,12 +530,10 @@ pub class ValueExpander {
 
         if (!var.isOf!{&YILUnit} ()) {
             if (!ifVal.isOf!{&YILUnit} ()) { // can happen if the if val is returner/breaker
-                self.removeDestroy (alias context, ifVal, alias ifList);
-                ifList:.append (YILAffect::new (c.getLoc (), var, ifVal));
+                self.finalizeAffect (alias context, c.getLoc (), var, ifVal, alias ifList);
             }
             if (!elseVal.isOf!{&YILUnit} ()) { // if the else val is a returner/breaker or just does not have a value
-                self.removeDestroy (alias context, elseVal, alias elseList);
-                elseList:.append (YILAffect::new (c.getLoc (), var, elseVal));
+                self.finalizeAffect (alias context, c.getLoc (), var, elseVal, alias elseList);
             }
         }
 
@@ -589,7 +595,7 @@ pub class ValueExpander {
      * */
     fn finalizeCteForLoop (self, dmut context : &Expander, l : &LoopValue, dmut list : &StmtList)-> &YILValue {
         let type = context:.finalizeType (l.getType ());
-        let var = self.createVarForBlock (alias context, l.getLoc (), type, alias list);
+        let var = self.createVarForBlock (alias context, l.getLoc (), l.getType (), type, alias list);
 
         context:.enterBlock ();
         let endLabel = YILLabel::new (l.getLoc (), "end"s8, context:.generateLblId ());
@@ -598,8 +604,7 @@ pub class ValueExpander {
         let dmut innerList = StmtList::new ();
         let innerValue = self.finalize (alias context, l.getValue (), alias innerList);
         if (!var.isOf!{&YILUnit} () && !l.getValue ().isBreaker ()) {
-            self.removeDestroy (alias context, innerValue, alias innerList);
-            innerList:.append (YILAffect::new (l.getLoc (), var, innerValue));
+            self.finalizeAffect (alias context, l.getLoc (), var, innerValue, alias innerList);
         }
 
         context:.exitLoop ();
@@ -619,7 +624,7 @@ pub class ValueExpander {
      * */
     fn finalizeClassicLoop (self, dmut context : &Expander, l : &LoopValue, dmut list : &StmtList)-> &YILValue {
         let type = context:.finalizeType (l.getType ());
-        let varref = self.createVarForBlock (alias context, l.getLoc (), type, alias list);
+        let varref = self.createVarForBlock (alias context, l.getLoc (), l.getType (), type, alias list);
 
         let dmut testList = StmtList::new ();
         // test is in its own list, because we need to validate it right away
@@ -633,8 +638,7 @@ pub class ValueExpander {
 
         let contentVal = self.finalize (alias context, l.getValue (), alias loopList);
         if (!varref.isOf!{&YILUnit} () && !l.getValue ().isBreaker () && !test.isOf!{&YILUnit} ()) {
-            self.removeDestroy (alias context, contentVal, alias loopList);
-            loopList:.append (YILAffect::new (l.getLoc (), varref, contentVal));
+            self.finalizeAffect (alias context, l.getLoc (), varref, contentVal, alias loopList);
         }
 
         context:.exitLoop ();
@@ -672,7 +676,7 @@ pub class ValueExpander {
      *    - name: the name of the variable (with a possible formatter, its uniq Id)
      * @returns: a varref or unit value, if the type is empty
      * */
-    fn createVarForBlock (self, dmut context : &Expander, loc : &Word, type : &YILType, dmut list : &StmtList, name : [c8] = "YI_%"s8, withValue : &YILValue = YIL_UNIT_VALUE)-> &YILValue {
+    fn createVarForBlock (self, dmut context : &Expander, loc : &Word, genType : &Type, type : &YILType, dmut list : &StmtList, name : [c8] = "YI_%"s8, withValue : &YILValue = YIL_UNIT_VALUE)-> &YILValue {
         match type {
             YILVoid () => { return YIL_UNIT_VALUE; }
             _ => {
@@ -682,11 +686,11 @@ pub class ValueExpander {
                 list:.append (blckVar);
 
                 let var = YILVar::new (loc, fullName, type, varId);
-                if (!withValue.isOf!{&YILUnit} ()) {
-                    self.removeDestroy (alias context, withValue, alias list);
-                    list:.append (YILAffect::new (loc, var, withValue));
-                }
+                if (!withValue.isOf!{&YILUnit} ()) self.finalizeAffect (alias context, loc, var, withValue, alias list);
 
+                if genType.isMovable () {
+                    self.registerDestroy (alias context, var, genType, alias list, implicit-> true);
+                }
                 return var;
             }
         };
@@ -700,11 +704,10 @@ pub class ValueExpander {
         if (!context.isInAFrame ()) return value;
 
         let type = context:.finalizeType (gen.getType ());
-        let varref = self.createVarForBlock (alias context, gen.getLoc (), type, alias list, name-> name);
+        let varref = self.createVarForBlock (alias context, gen.getLoc (), gen.getType (), type, alias list, name-> name);
         if (!varref.isOf!{&YILUnit} ()) {
             context:.registerVariable (gen.getUniqId (), varref);
-            self.removeDestroy (alias context, value, alias list);
-            list:.append (YILAffect::new (gen.getLoc (), varref, value));
+            self.finalizeAffect (alias context, gen.getLoc (), varref, value, alias list);
         }
 
         varref
@@ -717,11 +720,10 @@ pub class ValueExpander {
     fn registerUniqValue (self, dmut context : &Expander, gen : &Value, type : &YILType, value : &YILValue, dmut list : &StmtList, name : [c8] = "YI_%"s8) -> &YILValue {
         if (!context.isInAFrame ()) return value;
 
-        let varref = self.createVarForBlock (alias context, gen.getLoc (), type, alias list, name-> name);
+        let varref = self.createVarForBlock (alias context, gen.getLoc (), gen.getType (), type, alias list, name-> name);
         if (!varref.isOf!{&YILUnit} ()) {
             context:.registerVariable (gen.getUniqId (), varref);
-            self.removeDestroy (alias context, value, alias list);
-            list:.append (YILAffect::new (gen.getLoc (), varref, value));
+            self.finalizeAffect (alias context, gen.getLoc (), varref, value, alias list);
         }
 
         varref
@@ -754,8 +756,7 @@ pub class ValueExpander {
     /**
      * Remove a destroyer (if it was implicit - ctor, or function call)
      * */
-    pub fn removeDestroy (self, dmut context : &Expander, p : &YILValue, dmut list : &StmtList) {
-        context;
+    pub fn removeDestroy (self, p : &YILValue, dmut list : &StmtList) {
         match p {
             v : &YILVar => {
                 list:.removeDestroyNotImplicit (v.getVarId ());
@@ -938,7 +939,7 @@ pub class ValueExpander {
                 let size = YILIntValue::new (a.getLoc (), YIL_UINT_MAX, innerType.getSize ());
 
                 let finalPtr = YILNameCallValue::new (a.getLoc (), YIL_PTR_VOID, CoreNames::YRT_ALLOC_NO_SET_SLICE, [len, size]);
-                let finalPtrU = self.createVarForBlock (alias context, a.getLoc (), finalPtr.getType (), alias list, withValue-> finalPtr);
+                let finalPtrU = self.createVarForBlock (alias context, a.getLoc (), NONE_TYPE, finalPtr.getType (), alias list, withValue-> finalPtr);
 
                 YILTupleValue::new (a.getLoc (), type, [len, finalPtrU], fieldNames-> [SliceKeys::LEN, SliceKeys::PTR])
             } else {
@@ -947,7 +948,7 @@ pub class ValueExpander {
 
                 let valPtr = self.createAddress (alias context, inner, type-> YILPointer::new (innerType), alias list);
                 let finalPtr = YILNameCallValue::new (a.getLoc (), YIL_PTR_VOID, CoreNames::YRT_ALLOC_SET_SLICE, [valPtr, len, size]);
-                let finalPtrU = self.createVarForBlock (alias context, a.getLoc (), finalPtr.getType (), alias list, withValue-> finalPtr);
+                let finalPtrU = self.createVarForBlock (alias context, a.getLoc (), NONE_TYPE, finalPtr.getType (), alias list, withValue-> finalPtr);
 
                 YILTupleValue::new (a.getLoc (), type, [len, finalPtrU], fieldNames-> [SliceKeys::LEN, SliceKeys::PTR])
             }
@@ -1035,9 +1036,20 @@ pub class ValueExpander {
     fn finalizeAffect (self, dmut context : &Expander, a : &AffectValue, dmut list : &StmtList)-> &YILValue {
         let left = self.finalize (alias context, a.getLeft (), alias list, asLeft-> true);
         let right = self.finalize (alias context, a.getRight (), alias list);
-        self.removeDestroy (alias context, right, alias list);
-        list:.append (YILAffect::new (a.getLoc (), left, right));
+
+        self.finalizeAffect (alias context, a.getLoc (), left, right, alias list);
         left
+    }
+
+    /**
+     * Finalize an affection moving value from left to right
+     * */
+    fn finalizeAffect (self, dmut context : &Expander, loc : &Word, left : &YILValue, right : &YILValue, dmut list : &StmtList) {
+        context;
+        if (!left.isOf!{&YILUnit} ()) {
+            self.removeDestroy (right, alias list);
+            list:.append (YILAffect::new (loc, left, right));
+        }
     }
 
     /**
@@ -1087,7 +1099,7 @@ pub class ValueExpander {
         let right = self.finalize (alias context, b.getRight (), alias rightList);
 
         let type = context:.finalizeType (b.getType ());
-        let var = self.createVarForBlock (alias context, b.getLoc (), type, alias list);
+        let var = self.createVarForBlock (alias context, b.getLoc (), b.getType (), type, alias list);
         let dmut ifL = StmtList::new (), dmut ifNL = StmtList::new ();
 
         if (b.getOperator () == BinaryOperators::DAND) { // if (left) { right } else { left }
@@ -1126,11 +1138,11 @@ pub class ValueExpander {
         let rTypeInfo = YILAddrValue::new (c.getLoc (), YIL_PTR_2_VOID, YILVar::new (c.getLoc (), rightTypeInfoName, YIL_PTR_2_VOID, 0us));
 
         let lvtable = YILFieldValue::new (c.getLoc (), YIL_PTR_2_VOID, derefInst, name-> "#_vtable"s8);
-        let vtableAddrU = self.createVarForBlock (alias context, c.getLoc (), YIL_PTR_2_VOID, alias list, withValue-> lvtable);
+        let vtableAddrU = self.createVarForBlock (alias context, c.getLoc (), NONE_TYPE, YIL_PTR_2_VOID, alias list, withValue-> lvtable);
         let call = YILNameCallValue::new (c.getLoc (), YIL_UINT_8, CoreNames::YRT_CMP_CLASS_OF_TYPE, [rTypeInfo, vtableAddrU]);
 
         if (c.getOperator () == BinaryOperators::NOT_OF) {
-            let resCall = self.createVarForBlock (alias context, c.getLoc (), YIL_UINT_8, alias list, withValue-> call);
+            let resCall = self.createVarForBlock (alias context, c.getLoc (), NONE_TYPE, YIL_UINT_8, alias list, withValue-> call);
             YILUnaryValue::new (c.getLoc (), YIL_UINT_8, UnaryOperators::NOT, resCall)
         } else {
             call
@@ -1264,12 +1276,12 @@ pub class ValueExpander {
         let loc = ti.getLoc ();
         let inst = self.finalize (alias context, ti.getClassInstance (), alias list);
 
-        let instU = self.createVarForBlock (alias context, loc, inst.getType (), alias list, withValue-> inst);
+        let instU = self.createVarForBlock (alias context, loc, NONE_TYPE, inst.getType (), alias list, withValue-> inst);
         let derefInst = YILUnrefValue::new (loc, inst.getType ().asOf!{&YILPointer} ().getInner (), instU);
 
         let vtableAddr = YILFieldValue::new (loc, YIL_PTR_2_VOID, derefInst, name-> "#_vtable"s8);
         let typeInfoT = context:.finalizeType (ti.getType ());
-        let vtableAddrU = self.createVarForBlock (alias context, loc, YIL_PTR_2_VOID, alias list, withValue-> vtableAddr); // vtable => [*typeinfo, *dtor, *method1, ..., *methodN]
+        let vtableAddrU = self.createVarForBlock (alias context, loc, NONE_TYPE, YIL_PTR_2_VOID, alias list, withValue-> vtableAddr); // vtable => [*typeinfo, *dtor, *method1, ..., *methodN]
 
         let tiPtr = YILCastValue::new (loc, YILPointer::new (typeInfoT), YILUnrefValue::new (loc, YIL_PTR_VOID, vtableAddrU));
         YILUnrefValue::new (loc, typeInfoT, tiPtr)
@@ -1333,14 +1345,14 @@ pub class ValueExpander {
         let dmut params = Vec!{&YILValue}::new ();
         for i in c.getParameters () {
             let p = self.finalize (alias context, i, alias list);
+            self.removeDestroy (p, alias list);
             params:.push (p);
-            self.removeDestroy (alias context, p, alias list);
         }
 
         for i in c.getAddParameters () {
             let p = self.finalize (alias context, i, alias list);
+            self.removeDestroy (p, alias list);
             params:.push (p);
-            self.removeDestroy (alias context, p, alias list);
         }
 
         let name = context.getMangler ().mangle (c.getPrototype ());
@@ -1360,13 +1372,13 @@ pub class ValueExpander {
         params:.push (inst);
         for pi in c.getParameters () {
             let p = self.finalize (alias context, pi, alias list);
+            self.removeDestroy (p, alias list);
             params:.push (p);
-            self.removeDestroy (alias context, p, alias list);
         }
         for pi in c.getAddParameters () {
             let p = self.finalize (alias context, pi, alias list);
+            self.removeDestroy (p, alias list);
             params:.push (p);
-            self.removeDestroy (alias context, p, alias list);
         }
 
         let name = context.getMangler ().mangle (c.getCtor ().getPrototype ());
@@ -1392,7 +1404,7 @@ pub class ValueExpander {
             return (inner, inner);
         }
 
-        let varref = self.createVarForBlock (alias context, loc, retType, alias list, name-> "__self_%"s8);
+        let varref = self.createVarForBlock (alias context, loc, NONE_TYPE, retType, alias list, name-> "__self_%"s8);
         match clType {
             cptr : &ClassPtrType => {
                 if (cptr.isStruct ()) {
@@ -1432,8 +1444,8 @@ pub class ValueExpander {
         let dmut params = Vec!{&YILValue}::new ();
         for pi in f.getParameters () {
             let p = self.finalize (alias context, pi, alias list);
+            self.removeDestroy (p, alias list);
             params:.push (p);
-            self.removeDestroy (alias context, p, alias list);
         }
 
         match f.getFuncPtr () {
@@ -1469,17 +1481,17 @@ pub class ValueExpander {
         }
 
         params:.push (inst);
-        self.removeDestroy (alias context, inst, alias list);
+        self.removeDestroy (inst, alias list);
         for pi in f.getParameters () {
             let p = self.finalize (alias context, pi, alias list);
+            self.removeDestroy (p, alias list);
             params:.push (p);
-            self.removeDestroy (alias context, p, alias list);
         }
 
         for pi in f.getAddParameters () {
             let p = self.finalize (alias context, pi, alias list);
+            self.removeDestroy (p, alias list);
             params:.push (p);
-            self.removeDestroy (alias context, p, alias list);
         }
 
         if (methProto.isDirect ()) {
@@ -1502,12 +1514,12 @@ pub class ValueExpander {
     fn createVtableAccess (self, dmut context : &Expander, loc : &Word, inst : &YILValue, index : usize, dmut list : &StmtList)-> &YILValue {
         let ptrSize = global::state::instance ().getSizeTypeSize () / 8us;
 
-        let instU = self.createVarForBlock (alias context, loc, inst.getType (), alias list, withValue-> inst);
+        let instU = self.createVarForBlock (alias context, loc, NONE_TYPE, inst.getType (), alias list, withValue-> inst);
         let derefInst = YILUnrefValue::new (loc, inst.getType ().asOf!{&YILPointer} ().getInner (), instU);
 
 
         let vtableAddr = YILFieldValue::new (loc, YIL_PTR_2_VOID, derefInst, name-> "#_vtable"s8);
-        let vtableAddrU = self.createVarForBlock (alias context, loc, YIL_PTR_2_VOID, alias list, withValue-> vtableAddr);
+        let vtableAddrU = self.createVarForBlock (alias context, loc, NONE_TYPE, YIL_PTR_2_VOID, alias list, withValue-> vtableAddr);
 
         // +1us because 0 is the dtor
         let funcInVtableAddr = YILBinaryValue::new (loc,
@@ -1516,7 +1528,7 @@ pub class ValueExpander {
                                                     vtableAddrU,
                                                     YILIntValue::new (loc, YIL_UINT_MAX, (index + 2us) * cast!{usize} (ptrSize))); // [TYPEINFO, DTOR, funcs*]
 
-        let funcInVtableAddrU = self.createVarForBlock (alias context, loc, YIL_PTR_2_VOID, alias list, withValue-> funcInVtableAddr);
+        let funcInVtableAddrU = self.createVarForBlock (alias context, loc, NONE_TYPE, YIL_PTR_2_VOID, alias list, withValue-> funcInVtableAddr);
         YILUnrefValue::new (loc, YIL_PTR_VOID, funcInVtableAddrU)
     }
 
@@ -1603,7 +1615,7 @@ pub class ValueExpander {
         let size = YILIntValue::new (s.getLoc (), YIL_UINT_MAX, resType.getSize ());
 
         let indexV = YILBinaryValue::new (s.getLoc (), YIL_UINT_MAX, BinaryOperators::STAR, size, index);
-        let indexVU = self.createVarForBlock (alias context, s.getLoc (), YIL_UINT_MAX, alias list, withValue-> indexV);
+        let indexVU = self.createVarForBlock (alias context, s.getLoc (), NONE_TYPE, YIL_UINT_MAX, alias list, withValue-> indexV);
         let ptrT = YILPointer::new (resType);
 
         let dataField = YILBinaryValue::new (s.getLoc (),
@@ -1612,7 +1624,7 @@ pub class ValueExpander {
                                               YILFieldValue::new (s.getLoc (), YIL_PTR_VOID, slc, name-> SliceKeys::PTR),
                                               indexVU);
 
-        let dataFieldU = self.createVarForBlock (alias context, s.getLoc (), YIL_UINT_MAX, alias list, withValue-> dataField);
+        let dataFieldU = self.createVarForBlock (alias context, s.getLoc (), NONE_TYPE, YIL_UINT_MAX, alias list, withValue-> dataField);
         let finalPtrV = YILCastValue::new (s.getLoc (), ptrT, dataFieldU);
         YILUnrefValue::new (s.getLoc (),
                             resType,
@@ -1705,7 +1717,7 @@ pub class ValueExpander {
                 return YILAddrValue::new (value.getLoc (), type, f);
             }
             _ => {
-                let var = self.createVarForBlock (alias context, value.getLoc (), value.getType (), alias list);
+                let var = self.createVarForBlock (alias context, value.getLoc (), NONE_TYPE, value.getType (), alias list);
                 list:.append (YILAffect::new (value.getLoc (), var, value));
 
                 return YILAddrValue::new (var.getLoc (), type, var);
@@ -1763,7 +1775,7 @@ pub class ValueExpander {
         let value = self.finalize (alias context, c.getValue (), alias list);
         if (slc.getInners ()[0].isOf!{&VoidType} ()) { return value; } // copy []
 
-        let valueU = self.createVarForBlock (alias context, c.getLoc (), value.getType (), alias list, withValue-> value);
+        let valueU = self.createVarForBlock (alias context, c.getLoc (), c.getValue ().getType (), value.getType (), alias list, withValue-> value);
 
         let retType = context:.finalizeType (c.getType ());
         let innerType = context:.finalizeType (slc.getInners ()[0]);
@@ -1773,7 +1785,7 @@ pub class ValueExpander {
         let ptrU = YILFieldValue::new (c.getLoc (), YIL_UINT_MAX, valueU, name-> SliceKeys::PTR);
 
         let finalPtr = YILNameCallValue::new (c.getLoc (), YIL_PTR_VOID, CoreNames::YRT_DUPLICATE_SLICE, [ptrU, lenU, innerSize]);
-        let finalPtrU = self.createVarForBlock (alias context, c.getLoc (), finalPtr.getType (), alias list, withValue-> finalPtr);
+        let finalPtrU = self.createVarForBlock (alias context, c.getLoc (), NONE_TYPE, finalPtr.getType (), alias list, withValue-> finalPtr);
 
         YILTupleValue::new (c.getLoc (), retType, [lenU, finalPtrU], fieldNames-> [SliceKeys::LEN, SliceKeys::PTR])
     }
@@ -1848,6 +1860,7 @@ pub class ValueExpander {
         let what = self.finalize (alias context, m.getValue (), alias list);
         let result = self.registerUniqValue (alias context, m.getValue (), what, alias list);
         self.finalize (alias context, m.getReset (), alias list);
+        self.registerDestroy (alias context, result.asOf!{&YILVar} (), m.getType (), alias list, implicit-> true);
 
         result
     }
