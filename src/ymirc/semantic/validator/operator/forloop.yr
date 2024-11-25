@@ -50,9 +50,10 @@ pub class ForLoopValidator {
         };
 
         let (value, innerUseRef, innerUseAlias) = match fVal.getType () {
-            t : &TupleType => { self.validateTupleLoop (alias context, t, fVal, f, byMutRef, byAlias) }
-            s : &SliceType => { self.validateSliceLoop (alias context, s, fVal, f, byMutRef, byAlias) }
-            a : &ArrayType => { self.validateArrayLoop (alias context, a, fVal, f, byMutRef, byAlias) }
+            t : &TupleType => { self.validateTupleLoop  (alias context, t, fVal, f, byMutRef, byAlias) }
+            s : &SliceType => { self.validateSliceLoop  (alias context, s, fVal, f, byMutRef, byAlias) }
+            a : &ArrayType => { self.validateArrayLoop  (alias context, a, fVal, f, byMutRef, byAlias) }
+            m : &MapType   => { self.validateMapLoop    (alias context, m, fVal, f, byMutRef, byAlias) }
             r : &RangeType => { (self.validateRangeLoop (alias context, r, fVal, f), false, false) }
             c : &ClassPtrType => {
                 let value = self.validateClassLoop (alias context, c, fVal, f, byAlias, mValue.getLoc ());
@@ -470,7 +471,7 @@ pub class ForLoopValidator {
             err : &ErrorMsg => { errors:.push (err); } // we catch everything because we need to exit the block
         }
     
-        let blkContent = BlockValue::new (loc, VoidType::new (loc), innerValues[]); // create the loop 
+        let blkContent = BlockValue::new (loc, VoidType::new (loc), innerValues[]); // create the loop
         let _loop = LoopValue::new (loc, VoidType::new (loc), test-> test, blkContent, isDo-> false);
         values:.push (_loop);
 
@@ -578,6 +579,157 @@ pub class ForLoopValidator {
         context:.verifyMemoryOwner (vdecl.getLoc (), vType, access, construct-> true, byReference-> vdecl.isRef ());
         let decl = VarDeclValue::new (vdecl.getLoc (), vType, access, isMutable-> (vdecl.isMutable () || vdecl.isDeeplyMutable ()), isReference-> vdecl.isRef (), isIterator-> true);
         (decl, useRef, useAlias)
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ==================================          LOOP ON MAPS          ==================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Validate a for loop on a map value
+     * @params:
+     *    - context: the context of the validation
+     *    - mapType : the type of the map
+     *    - value: the valur to iterate
+     *    - content: the for loop to validate
+     * @returns: the validated loop
+     * @throws:
+     *   - &ErrorMsg: if the validation fails
+     */
+    fn validateMapLoop (self, dmut context : &Validator, mapType : &MapType, value : &Value, content : &ForLoopExpr, byMutRef : bool, byAlias : bool)-> (&Value, bool, bool)
+        throws &ErrorMsg
+    {
+        let vars = content.getVariables ();
+        let (key, val) = match vars.len {
+            1us => {
+                let name = Word::new (Keys::UNDER, content.getLoc ());
+                let valVar = VarDeclExpr::new (content.getLoc (), name, EmptyExpression::new (), EmptyExpression::new ());
+                (vars [0], valVar)
+            }
+            2us => {
+                (vars [0], vars [1])
+            }
+            _ => throw ErrorMsg::fatal (content.getLoc (), format (ValidateErrorMessage::UNDEF_FOR_LOOP_OPERATOR, vars.len, mapType));
+        };
+
+        match (key, val) {
+            (keyIter : &VarDeclExpr, valIter : &VarDeclExpr) => {
+                return self.validateMapIteration (alias context, mapType, value, content, keyIter, valIter, byMutRef, byAlias);
+            }
+            _ => throw ErrorMsg::fatal (content.getLoc (), format (ValidateErrorMessage::UNDEF_FOR_LOOP_OPERATOR, vars.len, mapType));
+        }
+    }
+
+    /**
+     * Validate the iteration over a map
+     * @params:
+     *    - context: the context of the validation
+     *    - mapType: the type of the map being iterated
+     *    - value: the value of the map being iterated
+     *    - content: the content of the for loop
+     *    - iter1: the first iteration variable
+     *    - iter2: the second iteration variable
+     * @returns: the value of the iteration
+     * @throws:
+     *    - &ErrorMsg: if the iteration is malformed
+     * */
+    fn validateMapIteration (self, dmut context : &Validator, mapType : &MapType, value : &Value, content : &ForLoopExpr, keyIter : &VarDeclExpr, valIter : &VarDeclExpr, byMutRef : bool, byAlias : bool)-> (&Value, bool, bool)
+        throws &ErrorMsg
+    {
+        let dmut errors = Vec!{&ErrorMsg}::new ();
+        let dmut innerValues = Vec!{&Value}::new ();
+        let dmut values = Vec!{&Value}::new ();
+        let dmut finalValues = Vec!{&Value}::new ();
+
+        let loc = content.getLoc ();
+        let mut test : &Value = UNIT_VALUE;
+        let mut useRef = false, mut useAlias = false;
+
+        // for key, value in M
+        // ==
+        //  let mp = M;
+        //  let iterator = _yrt_map_begin (mp);
+        //  {
+        //     while (_yrt_map_end (mp, iterator)) {
+        //        let key = _yrt_map_iterator_key (iterator);
+        //        let val = _yrt_map_iterator_value (iterator);
+        //        {  } // content
+        //        _yrt_map_iterator_next (iterator, mp);
+        //     }
+        //  } exit {
+        //     _yrt_map_close (mp, iterator);
+        //  }
+
+        context:.enterBlock ();
+        {
+            let mapDecl = VarDeclValue::new (Word::new ("#_value"s8, value.getLoc ()), mapType, value, isMutable-> (byMutRef || byAlias) && mapType.isMutable ());
+            let mapRef = VarRefValue::new (mapDecl.getLoc (), mapDecl.getLoc (), mapType, mapDecl.getUniqId (), isSelf-> false, canCte-> false);
+            values:.push (mapDecl);
+
+            let vars = self.validateMapIteratorVars (alias context, value.getLoc (), mapType, mapRef, keyIter, valIter,  byMutRef, byAlias, alias values);
+
+            vars;
+        }
+
+        let vdType = VoidType::new (loc);
+        let blkContent = BlockValue::new (loc, vdType, innerValues[]); // create the loop
+        let _loop = LoopValue::new (loc, vdType, test-> test, blkContent, isDo-> false);
+        let finBlk = BlockValue::new (loc, vdType, finalValues[]);
+        let finally = TryFinallyValue::new (loc, vdType, _loop, finBlk, failVar-> UNIT_VALUE);
+
+        values:.push (finally);
+
+        {
+            context:.quitBlock (warnUnused-> errors.len () == 0us); // we only warn if there was no error in the loop content
+        } catch {
+            err : &ErrorMsg => errors:.push (err); // some warn unused
+        }
+
+        if (errors.len () != 0us) throw ErrorMsg::list (errors[]);
+        (BlockValue::new (loc, VoidType::new (loc), values[]), useRef, useAlias)
+    }
+
+    /**
+     * Validate the iterator variables of a map iteration
+     * @params:
+     *    - context: the context of the iteration
+     *    - loc: the location of the iteration
+     *    - mapType: the type of the map being iterated
+     *    - mapRef: the value of the map being iterated
+     *    - keyIter: the key iterator var decl
+     *    - valueIter: the value iterator var decl
+     * */
+    fn validateMapIteratorVars (self, dmut context : &Validator, loc : &Word, mapType : &MapType, mapRef : &Value, keyIter : &VarDeclExpr, valIter : &VarDeclExpr, byMutRef : bool, byAlias : bool, dmut values : &Vec!{&Value})-> (&Value, bool, bool)
+        throws &ErrorMsg
+    {
+        let mapKeyType = mapType.getInners ()[0];
+
+        let mut useRef = false, mut useAlias = false;
+        let kType = if (!keyIter.getType ().isOf!{&EmptyExpression} ()) {
+            let vtype = context:.validateTypeForVarDecl (keyIter.getType (), keyIter, canBeRef-> false);
+            context:.verifyCompatibleType (keyIter.getType ().getLoc (), mapKeyType.getLoc (), vtype, mapKeyType);
+            vtype
+        } else {
+            context:.validateTypeForVarDecl (TypeWrapperExpr::new (keyIter.getLoc (), mapKeyType), keyIter, canBeRef-> false)
+        };
+
+        if (kType.isMutable ()) {
+            throw ErrorMsg::fatal (keyIter.getMutOrDmutLocation (), ValidateErrorMessage::MUTABLE_CONST_ITERATOR);
+        }
+
+        loc;
+        mapRef;
+        valIter;
+        byAlias;
+        byMutRef;
+        values;
+        useRef;
+        useAlias;
+        __pragma!panic ();
     }
 
     /*!
