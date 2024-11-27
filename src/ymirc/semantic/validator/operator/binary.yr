@@ -1785,7 +1785,7 @@ pub class BinaryOpValidator {
         throws &ErrorMsg
     {
         let left = if (op == BinaryOperators::DOT_AND) {
-            context:.getValueValidator ().validateAlias (alias context, bin.getLoc (), bin.getLeft (), isClass-> true)
+            context:.getValueValidator ().validateAlias (alias context, bin.getLoc (), bin.getLeft (), isClass-> true, isField-> true)
         } else {
             context:.implicitEnumUnwrap (context:.validateValue (bin.getLeft ()))
         };
@@ -2274,6 +2274,12 @@ pub class BinaryOpValidator {
                     RangeKeys::STEP_BY => {
                         return self.validateStepByRange (alias context, loc, range, left, right);
                     }
+                    RangeKeys::REVERSE => {
+                        return self.validateReverseRange (alias context, loc, range, left, right);
+                    }
+                    RangeKeys::LEN => {
+                        return self.validateLenRange (alias context, loc, range, left, right);
+                    }
                 }
             }
         }
@@ -2282,7 +2288,7 @@ pub class BinaryOpValidator {
     }
 
     /**
-     * Validate the call to the step by function from a range value
+     * Validate the access to the method 'stepBy' of a range value
      * */
     fn validateStepByRange (self, dmut context : &Validator, loc : &Word, range : &RangeType, left : &Value, right : &Expression)-> &Value
         throws &ErrorMsg
@@ -2297,11 +2303,7 @@ pub class BinaryOpValidator {
 
             match methFunc {
                 n : &PrototypeValue => {
-                    return ProtoDelegateValue::new (loc, n,
-                                                    // We put the range in a ref, because delegate always takes a pointer as a closure (i.e. a encoded (*void, *void))
-                                                    ReferencerValue::new (loc, range, left), [false], [false],
-                                                    [n.getParameters ()[1].getType ()],
-                                                    range); 
+                    return FakeMethodDelegateValue::new (loc, n, left, protoName-> RangeKeys::STEP_BY);
                 }
                 t : _ => {
                     println (t::typeinfo.name);
@@ -2314,6 +2316,37 @@ pub class BinaryOpValidator {
                                        notes-> [err]);
             }
         }
+    }
+
+    /**
+     * Validate the call to the reverse function from a range value
+     * */
+    fn validateReverseRange (self, dmut context : &Validator, loc : &Word, range : &RangeType, left : &Value, right : &Expression)-> &Value
+        throws &ErrorMsg
+    {
+        let methExpr = context.createSyntaxVarFromPath (loc, RangeUtils::REVERSE_FUNC);
+        let methFunc = context:.getValueValidator ().validateTemplateCall (
+            alias context,
+            loc,
+            context:.validateValue (methExpr),
+            [range.getInners ()[0]]);
+
+        return context:.getCallOpValidator ().validate (alias context, right.getLoc (), methFunc, [left]);
+    }
+
+    /**
+     * Compute the length of a range
+     * */
+    fn validateLenRange (self, dmut context : &Validator, loc : &Word, range : &RangeType, left : &Value, _ : &Expression)-> &Value
+        throws &ErrorMsg
+    {
+        let interpret = context.getCompileTimeInterpreter ();
+        let fst  = interpret.reduce (StructFieldAccessValue::new (loc, range.getInners ()[0], left, RangeKeys::FST));
+        let scd  = interpret.reduce (StructFieldAccessValue::new (loc, range.getInners ()[0], left, RangeKeys::SCD));
+        let step = interpret.reduce (StructFieldAccessValue::new (loc, range.getInners ()[1], left, RangeKeys::STEP));
+        let contains = interpret.reduce (StructFieldAccessValue::new (loc, BoolType::new (loc), left, RangeKeys::CONTAINS));
+
+        return context:.getForLoopValidator ().validateComputeNbIterations (loc, alias context, fst, scd, step, contains);
     }
 
     /*!
@@ -2412,22 +2445,74 @@ pub class BinaryOpValidator {
      * @throws:
      *    - &ErrorMsg: if the access is invalid
      * */
-    fn validateMapFieldOperation (self, dmut _ : &Validator, loc : &Word, _ : BinaryOperators, _ : &MapType, left : &Value, right : &Expression)-> &Value
+    fn validateMapFieldOperation (self, dmut context : &Validator, loc : &Word, _ : BinaryOperators, mapType : &MapType, left : &Value, right : &Expression)-> &Value
         throws &ErrorMsg
     {
         match right {
             field : &VarExpr => {
                 match field.getLoc ().str () {
                     MapKeys::LEN => {
+                        if (left.isOf!{&MapAliaserValue} ()) {
+                            throw ErrorMsg::fatal (loc, end-> right.getLoc (), format (ValidateErrorMessage::CLASS_ALIAS_FIELD));
+                        }
+
                         let type = IntType::new (loc, size-> 0u16, signed-> false, isMutable-> false);
                         return StructFieldAccessValue::new (loc, type, left, field.getLoc ().str ());
+                    }
+                    MapKeys::REMOVE => {
+                        if (!left.isOf!{&MapAliaserValue} ()) {
+                            let mut notes = [ErrorMsg::note (left.getLoc (), format (ValidateErrorMessage::IMPLICIT_ALIAS, mapType))];
+                            if (left.isOf!{&AliaserValue} ()) notes = notes ~ [ErrorMsg::note (left.getLoc (), format (ValidateErrorMessage::SIMPLE_ALIAS_NOT_CLASS), oneLine-> true)];
+
+                            throw ErrorMsg::fatal (loc, end-> right.getLoc (), format (ValidateErrorMessage::MUTABLE_METHOD, MapKeys::REMOVE), notes-> notes);
+                        }
+
+                        return self.validateRemoveMap (alias context, loc, mapType, left, right);
                     }
                 }
             }
         }
 
+        if (left.isOf!{&MapAliaserValue} ()) {
+            throw ErrorMsg::fatal (loc, end-> right.getLoc (), format (ValidateErrorMessage::CLASS_ALIAS_FIELD),
+                                   notes-> [ErrorMsg::fatal (right.getLoc (), format (ValidateErrorMessage::TYPE_NO_FIELD, left.getType (), right))]);
+        }
+
         throw ErrorMsg::fatal (right.getLoc (), format (ValidateErrorMessage::TYPE_NO_FIELD, left.getType (), right));
+
     }
+
+
+    /**
+     * Validate the access to the method 'remove' of a map value
+     * */
+    fn validateRemoveMap (self, dmut context : &Validator, loc : &Word, mapType : &MapType, left : &Value, right : &Expression)-> &Value
+        throws &ErrorMsg
+    {
+        let methExpr = context.createSyntaxVarFromPath (loc, MapUtils::REMOVE_FUNC);
+        let methFunc = context:.getValueValidator ().validateTemplateCall (
+            alias context,
+            loc,
+            context:.validateValue (methExpr),
+            [mapType.getInners ()[0], mapType.getInners ()[1]]);
+
+        match methFunc {
+            n : &PrototypeValue => {
+                let closure = ReferencerValue::new (loc, mapType, left, isMutable-> true);
+                return FakeMethodDelegateValue::new (loc, n, closure, protoName-> MapKeys::REMOVE);
+            }
+            t : _ => {
+                println (t::typeinfo.name);
+                __pragma!panic ();
+            }
+        }
+    } catch {
+        err : &ErrorMsg => {
+            throw ErrorMsg::fatal (right.getLoc (), format (ValidateErrorMessage::TYPE_NO_FIELD, left.getType (), right),
+                                   notes-> [err]);
+        }
+    }
+
 
     /*!
      * ====================================================================================================
@@ -2830,7 +2915,7 @@ pub class BinaryOpValidator {
         throws &ErrorMsg
     {
         let leftIndex = if (leftExpr.getLoc () == Tokens::LCRO_AND) {
-            context:.getValueValidator ().validateAlias (alias context, leftExpr.getLoc (), leftExpr.getLeft (), isClass-> true)
+            context:.getValueValidator ().validateAlias (alias context, leftExpr.getLoc (), leftExpr.getLeft (), isClass-> true, isField-> false)
         } else {
             context:.implicitEnumUnwrap (context:.validateValue (leftExpr.getLeft ()))
         };
