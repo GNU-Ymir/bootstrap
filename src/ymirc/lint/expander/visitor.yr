@@ -42,14 +42,11 @@ pub class Expander {
     // The list of generators provided by the previous pass (validation)
     let mut _generators : [&Generator] = [];
 
-    // The list of expanded frames
-    let dmut _expFrames = Vec!{&YILNode}::new ();
+    // The list of symbols created during finalization
+    let dmut _symbols = HashMap!{[c8], &YILSymbol}::new ();
 
-    // The list of expanded constants
-    let dmut _expConsts = Vec!{&YILNode}::new ();
-
-    // The list of expanded global variables
-    let dmut _expVars = Vec!{&YILNode}::new ();
+    // The list of weak symbols created during finalization
+    let dmut _weakSymbols = HashMap!{[c8], &YILSymbol}::new ();
 
     // The stmt list to execute in main function to register unit tests, when the -funittest is activated
     let dmut _expUnitTest = Vec!{(&Word, [c8], [c8])}::new ();
@@ -84,6 +81,9 @@ pub class Expander {
 
     // The name of the frame being validated
     let dmut _frameName = Vec!{[c8]}::new ();
+
+    // The list of symbols touched by the current symbol
+    let dmut _touchings = Vec!{dmut &HashSet!{[c8]}}::new ();
 
     // The current scope variable declarations
     let dmut _variables = Vec!{dmut &HashMap!{usize, &YILValue}}::new ();
@@ -128,7 +128,7 @@ pub class Expander {
     /**
      * Expande a list of generators
      * */
-    pub fn finalize (mut self, generators : [&Generator])-> [&YILNode] {
+    pub fn finalize (mut self, generators : [&Generator])-> [&YILSymbol] {
         self._generators = generators;
         for gen in self._generators {
             self:.finalize (gen);
@@ -138,7 +138,7 @@ pub class Expander {
             self:.finalizeUnitTestCall ();
         }
 
-        self._expConsts[] ~ self._expFrames[] ~ self._expVars []
+        self:.traverseSymbolGraph ()
     }
 
     /**
@@ -167,6 +167,55 @@ pub class Expander {
         }
     }
 
+
+    /**
+     * Traverse the list of finalized symbols and returned the symbols that are either non weak or touched by a non weak symbol
+     * */
+    pub fn traverseSymbolGraph (mut self) -> [&YILSymbol] {
+        import std::algorithm::sorting;
+
+        let dmut consts = Vec!{&YILSymbol}::new ();
+        let dmut vars = Vec!{&YILSymbol}::new ();
+        let dmut frames = Vec!{&YILSymbol}::new ();
+
+        while self._symbols.len () > 0us {
+            let dmut syms = Vec!{&YILSymbol}::new ();
+            for _, j in self._symbols { syms:.push (j); }
+            self._symbols:.clear ();
+
+            for i in syms[] {
+                for t in i.getReferences () match self._weakSymbols.find (t) {
+                    Ok (n : &YILSymbol) => {
+                        self._symbols:.insert (t, n);
+                        self._weakSymbols:.remove (t);
+                    }
+                }
+
+                match i {
+                    YILFrame () => { frames:.push (i); }
+                    YILConstant () => { consts:.push (i); }
+                    YILGlobalVar () => { vars:.push (i); }
+                    _ => __pragma!panic ();
+                }
+            }
+        }
+
+        let csts = sort!{|a, b| => {
+            a.getName () < b.getName ()
+        }} (consts[]);
+
+        let frs = sort!{|a, b| => {
+            a.getName () < b.getName ()
+        }} (frames[]);
+
+        let vrs = sort!{|a, b| => {
+            a.getName () < b.getName ()
+        }} (vars[]);
+
+        csts ~ vrs ~ frs
+    }
+
+
     /*!
      * =====================================================================================
      * =====================================================================================
@@ -183,6 +232,7 @@ pub class Expander {
     pub fn finalizeFrame (mut self, frame : &FrameGenerator) {
         let dmut list = StmtList::new ();
 
+        self:.enterSymbol ();
         self:.enterFrame (frame.getName ().toStr ());
         self:.enterBlock ();
 
@@ -231,6 +281,7 @@ pub class Expander {
 
         self:.exitBlock ();
         self:.exitFrame ();
+        let touching = self:.exitSymbol ();
 
         let name = self._mangler.mangle (frame);
         let final = YILFrame::new (frame.getLoc (),
@@ -238,9 +289,14 @@ pub class Expander {
                                    parameters[],
                                    self:.finalizeType (frame.getReturnType ()),
                                    body-> body,
-                                   isWeak-> frame.isWeak ());
+                                   isWeak-> frame.isWeak (),
+                                   refs-> touching);
 
-        self._expFrames:.push (final);
+        if (frame.isWeak ()) {
+            self._weakSymbols:.insert (name, final);
+        } else {
+            self._symbols:.insert (name, final);
+        }
 
         if (!frame.isWeak () && !state::instance ().isUnittestActive () && frame.getName ().asStdPath ().file () == Keys::MAIN) {
             self:.finalizeMainCall (name, frame.getReturnType ().isOf!{&VoidType} ());
@@ -252,6 +308,8 @@ pub class Expander {
      * */
     fn finalizeMainCall (mut self, name : [c8], isVoid : bool) {
         let dmut list = StmtList::new ();
+
+        self:.enterSymbol ();
         self:.enterFrame (name);
         self:.enterBlock ();
 
@@ -282,17 +340,20 @@ pub class Expander {
             list:.append (YILReturn::new (EOF_WORD, call));
         }
 
+        self:.registerTouchSym (name);
         self:.exitBlock ();
         self:.exitFrame ();
+        let touching = self:.exitSymbol ();
 
         let final = YILFrame::new (EOF_WORD,
                                    Keys::MAIN,
                                    [argcDecl, argvDecl],
                                    YIL_SINT_32,
                                    body-> YILBlock::new (EOF_WORD, list[]),
-                                   isWeak-> false);
+                                   isWeak-> false,
+                                   refs-> touching);
 
-        self._expFrames:.push (final);
+        self._symbols:.insert (Keys::MAIN, final);
     }
 
     /*!
@@ -308,6 +369,7 @@ pub class Expander {
      * */
     fn finalizeUnitTest (mut self, u : &UnitTestGenerator) {
         if (state::instance ().isUnittestActive ()) {
+            self:.enterSymbol ();
             self:.enterFrame (u.getName ().toStr ());
             self:.enterBlock ();
 
@@ -316,6 +378,7 @@ pub class Expander {
 
             self:.exitBlock ();
             self:.exitFrame ();
+            let touchings = self:.exitSymbol ();
 
             let name = self._mangler.mangle (u);
             let final = YILFrame::new (u.getLoc (),
@@ -323,9 +386,10 @@ pub class Expander {
                                        [],
                                        YIL_VOID,
                                        body-> YILBlock::new (u.getLoc (), list[]),
-                                       isWeak-> false);
+                                       isWeak-> false,
+                                       refs-> touchings);
 
-            self._expFrames:.push (final);
+            self._symbols:.insert (name, final);
             self._expUnitTest:.push ((u.getLoc (), u.getName ().toStr (), name));
         }
     }
@@ -336,6 +400,7 @@ pub class Expander {
      * @params:
      * */
     fn finalizeUnitTestCall (mut self) {
+        self:.enterSymbol ();
         self:.enterFrame (""s8);
         self:.enterBlock ();
 
@@ -361,15 +426,17 @@ pub class Expander {
         list:.append (YILReturn::new (EOF_WORD, call));
         self:.exitBlock ();
         self:.exitFrame ();
+        let touchings = self:.exitSymbol ();
 
         let final = YILFrame::new (EOF_WORD,
                                    Keys::MAIN,
                                    [argcDecl, argvDecl],
                                    YIL_SINT_32,
                                    body-> YILBlock::new (EOF_WORD, list[]),
-                                   isWeak-> false);
+                                   isWeak-> false,
+                                   refs-> touchings);
 
-        self._expFrames:.push (final);
+        self._symbols:.insert (Keys::MAIN, final);
     }
 
     /*!
@@ -389,24 +456,43 @@ pub class Expander {
             // abstract because some of their methods are empty
             // and structures because their methods are not virtual
             //
+
+            self:.enterSymbol ();
             let vtableValue = self:.finalizeClassVtable (cl);
             let vtableName = self._mangler.mangleVtable (cl);
+            let touchings = self:.exitSymbol ();
 
             // Const VTABLE
-            self._expConsts:.push (YILConstant::new (cl.getLoc (),
-                                                     vtableName,
-                                                     vtableValue,
-                                                     isWeak-> cl.getSymbol ().isWeak ()));
+            let cst = YILConstant::new (cl.getLoc (),
+                                        vtableName,
+                                        vtableValue,
+                                        isWeak-> cl.getSymbol ().isWeak (),
+                                        refs-> touchings);
+
+            if (cl.getSymbol ().isWeak ()) {
+                self._weakSymbols:.insert (vtableName, cst);
+            } else {
+                self._symbols:.insert (vtableName, cst);
+            }
         }
 
+        self:.enterSymbol ();
         let typeinfoValue = self:.finalizeClassTypeInfo (cl);
         let tiName = self._mangler.mangleTypeInfo (cl);
+        let touchings = self:.exitSymbol ();
 
         // Const TYPEINFO
-        self._expConsts:.push (YILConstant::new (cl.getLoc (),
-                                                 tiName,
-                                                 typeinfoValue,
-                                                 isWeak-> cl.getSymbol ().isWeak ()));
+        let cst = YILConstant::new (cl.getLoc (),
+                                    tiName,
+                                    typeinfoValue,
+                                    isWeak-> cl.getSymbol ().isWeak (),
+                                    refs-> touchings);
+
+        if (cl.getSymbol ().isWeak ()) {
+            self._weakSymbols:.insert (tiName, cst);
+        } else {
+            self._symbols:.insert (tiName, cst);
+        }
     }
 
     /**
@@ -424,6 +510,8 @@ pub class Expander {
         let ancestorSlice = match cl.getAncestor () {
             anc : &ClassRefType => {
                 let ancTIN = self._mangler.mangleTypeInfo (anc);
+                self:.registerTouchSym (ancTIN);
+
                 let ancTIV = YILAddrValue::new (cl.getLoc (), YIL_PTR_VOID,
                                                 YILVar::new (cl.getLoc (), ancTIN, YIL_PTR_VOID, 0us));
 
@@ -460,6 +548,8 @@ pub class Expander {
         let dmut params = Vec!{&YILValue}::new ();
 
         let TIN = self._mangler.mangleTypeInfo (cl);
+        self:.registerTouchSym (TIN);
+
         let TIV = YILAddrValue::new (cl.getLoc (), YIL_PTR_VOID, YILVar::new (cl.getLoc (), TIN, YIL_PTR_VOID, 0us));
         params:.push (TIV);
 
@@ -470,6 +560,8 @@ pub class Expander {
             }
             p : &PrototypeValue => {
                 let name = self._mangler.mangle (p);
+                self:.registerTouchSym (name);
+
                 let addr = YILAddrValue::new (p.getLoc (), YIL_PTR_VOID, YILVar::new (p.getLoc (), name, YIL_VOID, 0us));
                 params:.push (addr);
             }
@@ -478,6 +570,8 @@ pub class Expander {
 
         for mt in cl.getVtable () {
             let name = self._mangler.mangle (mt);
+            self:.registerTouchSym (name);
+
             let addr = YILAddrValue::new (mt.getLoc (), YIL_PTR_VOID, YILVar::new (mt.getLoc (), name, YIL_VOID, 0us));
             params:.push (addr);
         }
@@ -499,10 +593,21 @@ pub class Expander {
      * */
     pub fn finalizeGlobalVar (mut self, gv : &GlobalVarGenerator) {
         let dmut list = StmtList::new ();
+        self:.enterSymbol ();
         let value = self._valueExpander.finalizeLazy (alias self, gv.getValue ().asOf!{&LazyValue} (), alias list);
+        let touchings = self:.exitSymbol ();
 
         let name = self._mangler.mangleGlobalVar (gv);
-        self._expVars:.push (YILGlobalVar::new (gv.getLoc (), name, value, isWeak-> gv.isWeak (), isThreadLocal-> gv.isThreadLocal ()));
+        let glb = YILGlobalVar::new (gv.getLoc (), name, value,
+                                     isWeak-> gv.isWeak (),
+                                     isThreadLocal-> gv.isThreadLocal (),
+                                     touchings);
+
+        if (gv.isWeak ()) {
+            self._weakSymbols:.insert (name, glb);
+        } else {
+            self._symbols:.insert (name, glb);
+        }
     }
 
     /*!
@@ -519,9 +624,16 @@ pub class Expander {
      *    - m: the map info to finalize
      * */
     pub fn finalizeMapInfo (mut self, m : &MapInfoGenerator) {
+        self:.enterSymbol ();
+
+        let cmpName = self._mangler.mangle (m.getCmpFunc ());
+        let hashName = self._mangler.mangle (m.getHashFunc ());
+        self:.registerTouchSym (cmpName);
+        self:.registerTouchSym (hashName);
+
         let name = self._mangler.mangleMapInfo (m.getMapType ());
-        let cmpFunc = YILAddrValue::new (m.getLoc (), YIL_PTR_VOID, YILVar::new (m.getLoc (), self._mangler.mangle (m.getCmpFunc ()), YIL_VOID, 0us));
-        let hashFunc = YILAddrValue::new (m.getLoc (), YIL_PTR_VOID, YILVar::new (m.getLoc (), self._mangler.mangle (m.getHashFunc ()), YIL_VOID, 0us));
+        let cmpFunc = YILAddrValue::new (m.getLoc (), YIL_PTR_VOID, YILVar::new (m.getLoc (), cmpName, YIL_VOID, 0us));
+        let hashFunc = YILAddrValue::new (m.getLoc (), YIL_PTR_VOID, YILVar::new (m.getLoc (), hashName, YIL_VOID, 0us));
         let keyT = self:.finalizeType (m.getMapType ().getInners ()[0]);
         let valT = self:.finalizeType (m.getMapType ().getInners ()[1]);
         let keySize = YILIntValue::new (m.getLoc (), YIL_UINT_MAX, keyT.getSize ());
@@ -530,10 +642,15 @@ pub class Expander {
         let tuType = YILTuple::new ([YIL_PTR_VOID, YIL_PTR_VOID, YIL_UINT_MAX, YIL_UINT_MAX]);
         let tuValue = YILTupleValue::new (m.getLoc (), tuType, [cmpFunc, hashFunc, keySize, valSize]);
 
-        self._expConsts:.push (YILConstant::new (m.getLoc (),
-                                                 name,
-                                                 tuValue,
-                                                 isWeak-> true));
+        let touchings = self:.exitSymbol ();
+
+        let cst = YILConstant::new (m.getLoc (),
+                                    name,
+                                    tuValue,
+                                    isWeak-> true,
+                                    refs-> touchings);
+
+        self._weakSymbols:.insert (name, cst);
     }
 
     /*!
@@ -629,6 +746,31 @@ pub class Expander {
         self._loopLabel:.pop ();
     }  catch {
         _ => __pragma!panic ();
+    }
+
+    /**
+     * Enter a symbol definition
+     * */
+    fn enterSymbol (mut self) {
+        self._touchings:.push (HashSet!{[c8]}::new ());
+    }
+
+    /**
+     * Exit a symbol definitions
+     * @returns: all the foreign symbols touched by it
+     * */
+    fn exitSymbol (mut self)-> &HashSet!{[c8]} {
+        let touchs = self._touchings [$ - 1us];
+        self._touchings:.pop (1u64);
+
+        touchs
+    }
+
+    /**
+     * Register the touch of a foreign symbol
+     * */
+    pub fn registerTouchSym (mut self, name : [c8]) {
+        (alias self._touchings) [$ - 1us]:.insert (name);
     }
 
     /**
