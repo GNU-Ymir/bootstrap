@@ -11,6 +11,7 @@ import ymirc::semantic::generator::_;
 import ymirc::errors::_;
 import ymirc::utils::format;
 import ymirc::lexing::word;
+import ymirc::lexing::tokens;
 
 import std::collection::vec;
 import std::collection::set;
@@ -42,7 +43,7 @@ pub class LambdaValidator {
         throws &ErrorMsg
     {
         let name = format ("_%_%", sym.getLoc ().line (), sym.getLoc ().col ());
-        let frameName = context:.getReferent ().getPath ().push (name)
+        let frameName = context:.getReferent ().getPath ().push (name);
 
         // We start by validating the prototype of the lambda
         // Unlike function prototype it can be uncomplete (missing some var decl type)
@@ -69,6 +70,51 @@ pub class LambdaValidator {
             retProto
         }
     }
+
+    /**
+     * Create a delegate that calls a function pointer to cast a function pointer to a delegate
+     * @params:
+     *    - context: the context of the validation
+     *    - loc: the location of the casting
+     *    - fptrType: the type to cast
+     *    - func: the function to call (assuming its type is 'fptrType')
+     * @returns: the prototype of the delegate
+     * @throws:
+     *    - &ErrorMsg: if the validation failed
+     * */
+    pub fn createDelegateFromFptr (mut self, dmut context : &Validator, loc : &Word, fptrType : &FuncPtrType, func : &Value)-> &Value
+        throws &ErrorMsg
+    {
+        let name = format ("_%_%", loc.line (), loc.col ());
+        let frameName = context:.getReferent ().getPath ().push (name);
+
+        let (paramVars, paramTypes, retType, body) = self.validateLambdaDGFromFptr (alias context, loc, fptrType, func);
+        let index = context:.getCurrentClosingIndex ();
+
+        let closureType = TupleType::new (loc, []);
+        let ptrType = PointerType::new (loc, closureType, isMutable-> false);
+        let closureValue = NullValue::new (loc, ptrType);
+        let fstParam = ProtoVarValue::new (Word::new ("#{CLOSURE-VARREF}"s8, loc), ptrType, refId-> index);
+
+        let frame = FrameGenerator::new (loc, frameName, parameters-> ([fstParam] ~ paramVars), retType, body, FrameKind::LMBD, isWeak-> true);
+        let frameProto = NamePrototypeValue::new (loc, frameName, ([fstParam] ~ paramVars), retType, isLambda-> true);
+        let retProto = NameDelegateValue::new (loc, frameProto, closure-> closureValue,
+                                               fptrType.getReferences (),
+                                               fptrType.getLazys (),
+                                               paramTypes, retType, fromFptr-> true);
+
+        self.insertGenerator (alias context, frame);
+
+        retProto
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ===============================          LAMBDA PARAMETERS          ================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
 
     /**
      * Validate the prototype of a lambda expression
@@ -166,7 +212,14 @@ pub class LambdaValidator {
         context.verifyNonVoidType (vdecl.getType ().getLoc (), type, true);
         (vdecl.isRef (), vdecl.isLazy (), type)
     }
-    
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ==================================          LAMBDA BODY          ===================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
 
     /**
      * Validate the body of a lambda expression, assuming that the lambda is complete
@@ -427,6 +480,95 @@ pub class LambdaValidator {
             (body, closure, retType)
         }
     }
-    
-}
 
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * =================================          LAMBDA CASTING          =================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Validate a lambda prototype and body calling a function pointer to cast a fptr to a dg
+     * @params:
+     *    - context: the context of the validation
+     *    - loc: the location of the casting
+     *    - fptrType: the type to cast
+     *    - func: the function to call (assuming its type is 'fptrType')
+     * @returns:
+     *    - .0: the parameters of the function
+     *    - .1: the types of the parameters
+     *    - .2: the return type of the function
+     *    - .3: the body of the function
+     * @throws:
+     *    - &ErrorMsg: if the validation failed
+     * */
+    fn validateLambdaDGFromFptr (self, dmut context : &Validator, loc : &Word, fptrType : &FuncPtrType, func : &Value)-> ([&ProtoVarValue], [&Type], &Type, &Value) {
+        let dmut parameters = Vec!{&ProtoVarValue}::new ();
+        let dmut usedCall = Vec!{&Value}::new ();
+        let dmut types = Vec!{&Type}::new ();
+
+        context:.enterForeign (isFnBody-> false, clContext-> context:.getCurrentClassContext ());
+        context:.enterBlock ();
+
+        for i in 0us .. fptrType.getParameters ().len {
+            let type = fptrType.getParameters ()[i];
+            let paramGen = ProtoVarValue::new (Word::new (format ("v_%", i), loc),
+                                               type,
+                                               UNIT_VALUE,
+                                               type.isMutable (),
+                                               isSelf-> false,
+                                               isReference-> fptrType.getReferences ()[i],
+                                               isLazy-> fptrType.getLazys ()[i]);
+            parameters:.push (paramGen);
+            types:.push (type);
+            context:.insertLocal (paramGen.getLoc ().str (), paramGen);
+        }
+
+        context:.enterFunctionBody ();
+
+        for i in 0us .. fptrType.getParameters ().len {
+            let pgen = parameters [i];
+            let var : &Value = VarRefValue::new (pgen.getLoc (),
+                                                 pgen.getLoc (),
+                                                 pgen.getType (),
+                                                 pgen.getUniqId (),
+                                                 isSelf-> false,
+                                                 isParam-> true,
+                                                 isReference-> pgen.isReference (),
+                                                 isLazy-> pgen.isLazy ());
+
+            let p = if (pgen.isLazy ()) {
+                cast!{&Value} (LazyValue::new (var.getLoc (),
+                                               var.getType (),
+                                               var,
+                                               UNIT_VALUE,
+                                               byAlias-> false,
+                                               isDone-> true))
+            } else {
+                if (pgen.isReference ()) {
+                    cast!{&Value} (ReferencerValue::new (pgen.getLoc (), var.getType (), var))
+                } else { var }
+            };
+
+            usedCall:.push (p);
+        }
+
+        let r = fptrType.getRetType ();
+        let mut cl : &Value = FuncPtrCallValue::new (loc, r, func, usedCall[]);
+        if (!r.isOf!{&VoidType} () && !r.isOf!{&NoneType} ()) {
+            cl = ReturnValue::new (loc, cl);
+        }
+
+        {
+            context:.quitBlock (warnUnused-> false);
+        } catch { _ => __pragma!panic (); }
+
+        context:.exitForeign ();
+
+        return (parameters[], types[], r, cl);
+    }
+
+}
