@@ -20,6 +20,7 @@ import std::collection::map;
 import std::io, std::fs::path;
 import std::collection::set;
 
+import ymirc::utils::string;
 import std::time::_;
 
 /**
@@ -589,7 +590,7 @@ pub class ClassValidator {
     {
         let proto = context:.getFunctionValidator ():.validateCtorPrototype (alias context, alias ctor, clRef);
         for it in ctorList {
-            if proto.isSimilar (it) {
+            if self.isCtorSimilar (proto, it) {
                 throw ErrorMsg::fatal (proto.getLoc (), end-> it.getLoc (), format (ValidateErrorMessage::COLLIDING_METHOD_DEFINITION, proto, it));
             }
         }
@@ -963,19 +964,17 @@ pub class ClassValidator {
         // Create a delegate type, in order to compare the methods of the vtable
         // The idea behind the following loop is that if a an ancestor has already implemented the trait, we have to replace the implemented methods by this new implementation                
         for it, i in vtable {
-            if (it.getSymbol ().getPath ().file () == meth.getSymbol ().getPath ().file ()) { // we already have a method with the same name
-                if (meth.isSimilar (it)) { // And it is the same method (delta the classreftype of self)
-                    if (it.getTrait () != trRef.getSymbol ()) { // They are not from the same trait, (or not from a trait at all)
-                        throw ErrorMsg::fatal (loc, format (ValidateErrorMessage::IMPLICIT_OVERRIDE_BY_TRAIT, it),
-                                               notes-> [ErrorMsg::note (it.getLoc (), end-> meth.getLoc (), ""s8)]);
-                    } else { // They come from the same trait, then we replace the old version
-                        __pragma!trusted ({
-                            (alias vtable)[i] = meth;
-                            (alias addMethods)[i] = alias func;
-                        });
-                        
-                        return {};
-                    }
+            if (self.isMethSimilar (meth, it)) { // we already have a method with the same name
+                if (it.getTrait () != trRef.getSymbol ()) { // They are not from the same trait, (or not from a trait at all)
+                    throw ErrorMsg::fatal (loc, format (ValidateErrorMessage::IMPLICIT_OVERRIDE_BY_TRAIT, it),
+                                           notes-> [ErrorMsg::note (it.getLoc (), end-> meth.getLoc (), ""s8)]);
+                } else { // They come from the same trait, then we replace the old version
+                    __pragma!trusted ({
+                        (alias vtable)[i] = meth;
+                        (alias addMethods)[i] = alias func;
+                    });
+
+                    return {};
                 }
             }
         } 
@@ -1076,7 +1075,7 @@ pub class ClassValidator {
      * @throws:
      *   - &ErrorMsg: if there is an error in the validation (for example, 'im' does not implement a trait) 
      */
-    fn validateImplVtableMethod (self, dmut context : &Validator, loc : &Word, dmut func : &FunctionSymbol, clRef : &ClassRefType, trRef : &TraitRefType, dmut vtable : &Vec!{&MethodPrototypeValue}, dmut vtableProt : &Vec!{MethodProtection}, dmut addMethods : &Vec!{dmut &Symbol})
+    fn validateImplVtableMethod (self, dmut context : &Validator, _ : &Word, dmut func : &FunctionSymbol, clRef : &ClassRefType, trRef : &TraitRefType, dmut vtable : &Vec!{&MethodPrototypeValue}, dmut vtableProt : &Vec!{MethodProtection}, dmut addMethods : &Vec!{dmut &Symbol})
         throws &ErrorMsg
     {
         let meth = context:.getFunctionValidator ():.validateMethodPrototype (alias context, alias func, clRef, traitRef-> trRef);
@@ -1087,34 +1086,23 @@ pub class ClassValidator {
         };
         
         for it, i in vtable { // traverse the vtable, and verify that there is no collision
-            if (it.getSymbol ().getPath ().file () == meth.getSymbol ().getPath ().file ()) {
-                println (it.getSymbol ().getPath ().file (), " ", meth.isSimilar (it), " ", meth == it);
-                println (format ("% % %", meth.isMutable (), it.isMutable (), meth.getRetType () == it.getRetType ()));
-                println (format ("% %", meth.getParameters (), it.getParameters ()));
-                for u in 0us .. meth.getParameters ().len {
-                    println (format ("% % %", meth.getParameters ()[u], it.getParameters ()[u], meth.getParameters ()[u] == it.getParameters() [u]));
-                    println (format ("%", meth.getParameters ()[u].getType ().sameMutability (it.getParameters() [u].getType ())));
-                    println (format ("% %", meth.getParameters ()[u].isLazy (), it.getParameters() [u].isLazy ()));
-                    println (format ("% %", meth.getParameters ()[u].isReference (), it.getParameters() [u].isReference ()));
-                }
+            if (self.isMethSimilar (meth, it)) { // Verify that there is no collision between the method, and the other method, there can be multiple factors (different protection, missing override, over outside trait, ...)
+                self.verifyCollisionDirectMethod (it, meth, __pragma!trusted (vtableProt [i]), methProt, func.isOver ());
 
-                if (meth.isSimilar (it)) { // Verify that there is no collision between the method, and the other method, there can be multiple factors (different protection, missing override, over outside trait, ...)
-                    self.verifyCollisionDirectMethod (it, meth, __pragma!trusted (vtableProt [i]), methProt, func.isOver ());
-                    
-                    // Thre is a collision, but it is an acceptable one, it is an proper override
-                    __pragma!trusted ({
-                        (alias vtable)[i] = meth; // we update the vtable
-                        (alias addMethods)[i] = alias func; // We add the method to the methods to rewrite      
-                    });
-                    
-                    
-                    return {}
-                }
+                // Thre is a collision, but it is an acceptable one, it is an proper override
+                __pragma!trusted ({
+                    (alias vtable)[i] = meth; // we update the vtable
+                    (alias addMethods)[i] = alias func; // We add the method to the methods to rewrite
+                });
+
+
+                return {}
             }
         }
 
         // There is no method in the trait definition that could be overriden by this method, so it must not be defined inside an impl
-        throw ErrorMsg::fatal (meth.getLoc (), format (ValidateErrorMessage::OVERRIDE_NOTHING, meth), notes-> [ErrorMsg::note (loc, ValidateErrorMessage::VALIDATING)]);
+        let candidates = self.findCandidateOverMethods (meth, vtable[], tr-> trRef.getSymbol ());
+        throw ErrorMsg::fatal (meth.getLoc (), format (ValidateErrorMessage::OVERRIDE_NOTHING, meth), notes-> candidates);
     }   
     
     /**
@@ -1199,23 +1187,25 @@ pub class ClassValidator {
         };
  
         for it, i in vtable { // traverse the vtable, and verify that there is no collision
-            if (it.getSymbol ().getPath ().file () == meth.getSymbol ().getPath ().file ()) {
-                if (meth.isSimilar (it)) { // Verify that there is no collision between the method, and the other method, there can be multiple factors (different protection, missing override, over outside trait, ...)
-                    self.verifyCollisionDirectMethod (it, meth, __pragma!trusted (vtableProt [i]), methProt, func.isOver ());
-                    
-                    // Thre is a collision, but it is an acceptable one, it is an proper override
-                    __pragma!trusted ({
-                        (alias vtable)[i] = meth; // we update the vtable
-                        (alias addMethods)[i] = alias func; // We add the method to the methods to rewrite      
-                    });
-                    
-                    
-                    return {}
-                }
+            if (self.isMethSimilar (meth, it)) { // Verify that there is no collision between the method, and the other method, there can be multiple factors (different protection, missing override, over outside trait, ...)
+                self.verifyCollisionDirectMethod (it, meth, __pragma!trusted (vtableProt [i]), methProt, func.isOver ());
+
+                // Thre is a collision, but it is an acceptable one, it is an proper override
+                __pragma!trusted ({
+                    (alias vtable)[i] = meth; // we update the vtable
+                    (alias addMethods)[i] = alias func; // We add the method to the methods to rewrite
+                });
+
+
+                return {}
             }
         }
 
-        if (func.isOver ()) throw ErrorMsg::fatal (meth.getLoc (), format (ValidateErrorMessage::OVERRIDE_NOTHING, meth));
+        if (func.isOver ()) {
+            let candidates = self.findCandidateOverMethods (meth, vtable[]);
+            throw ErrorMsg::fatal (meth.getLoc (), format (ValidateErrorMessage::OVERRIDE_NOTHING, meth),
+                                   notes-> candidates);
+        }
 
         /// There is no override here, its a new method, we just add it at the end of the vtable
         vtable:.push (meth);
@@ -1509,6 +1499,88 @@ pub class ClassValidator {
             }
             _ => { true }
         }
+    }
+
+    /**
+     * Create the list of notes for an overriding failure
+     * */
+    fn findCandidateOverMethods (self, left : &MethodPrototypeValue, vtable : [&MethodPrototypeValue], tr : &Symbol = EMPTY_SYMBOL)-> [&ErrorMsg] {
+        let dmut notes = Vec!{&ErrorMsg}::new ();
+
+        let name = left.getSymbol ().getPath ().file ();
+        for v in vtable {
+            let iname = v.getSymbol ().getPath ().file ();
+            let sameContext = match tr {
+                TraitSymbol () => { (tr is v.getTrait ()) }
+                _ => match v.getTrait () {
+                    EmptySymbol () => { true }
+                    _ => { false }
+                }
+            };
+
+            if (sameContext) {
+                let add = if (name.len <= 3us) {
+                    name == iname
+                } else {
+                    let levDist = string::levenshteinDistance (name, iname);
+                    levDist <= 3us
+                };
+
+                if (add) {
+                    notes:.push (ErrorMsg::note (v.getLoc (), format (ValidateErrorMessage::CANDIDATE_ARE, v, withTags-> ["withParams"s8]), oneLine-> true, withLoc-> true));
+                }
+            }
+        }
+
+        notes[]
+    }
+
+    
+    /**
+     * @returns: true if left and right have the same prototype (and the same name)
+     * @info: does not check the type of the closure, as it has to be used to find overriding methods
+     * */
+    fn isMethSimilar (self, left : &MethodPrototypeValue, right : &MethodPrototypeValue)-> bool {
+        if (left.getSymbol ().getPath ().file () != right.getSymbol ().getPath ().file ()) return false;
+
+        if (left.isMutable () != right.isMutable ()) { return false; }
+        if (left.getParameters ().len != right.getParameters ().len) { return false; }
+        for i in 0us .. left.getParameters ().len {
+            if (left.getParameters () [i].getType () != right.getParameters () [i].getType ()) {
+                return false;
+            }
+
+            if (!left.getParameters () [i].getType ().sameMutability (right.getParameters () [i].getType ())) {
+                return false;
+            }
+
+            if (left.getParameters () [i].isLazy () != right.getParameters () [i].isLazy ()) {
+                return false;
+            }
+
+            if (left.getParameters () [i].isReference () != right.getParameters () [i].isReference ()) {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    /**
+     * @returns: true if left and right have the same prototype (and the same name)
+     * */
+    fn isCtorSimilar (self, left : &CtorPrototypeValue, right : &CtorPrototypeValue)-> bool {
+        if (left.getRename () != right.getRename ()) return false;
+
+        if (left.getParameters ().len != right.getParameters ().len) return false;
+        for i in 0us .. left.getParameters ().len {
+            if (left.getParameters () [i].getType () != right.getParameters () [i].getType ()) return false;
+            if (!left.getParameters () [i].getType ().sameMutability (right.getParameters () [i].getType ())) return false;
+            if (!left.getParameters () [i].isLazy () != right.getParameters () [i].isLazy ()) return false;
+            if (!left.getParameters () [i].isReference () != right.getParameters () [i].isReference ()) return false;
+        }
+
+        true
     }
 
     /*!
