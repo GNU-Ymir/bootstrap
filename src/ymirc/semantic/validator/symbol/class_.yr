@@ -57,37 +57,47 @@ pub class ClassValidator {
     pub fn validate (mut self, dmut context : &Validator, dmut sym : &ClassSymbol, inModule : bool)-> &ClassRefType
         throws ErrorMsg
     {
-        if (!self.checkValidation (sym)) {
-            context:.pushReferent (alias sym);
-            context:.enterForeign (isFnBody-> false);
+        // We don't validate if we already have an error
+        if (!sym.getErrorGenerator ().hasValue) {
 
-            logging::info ("Validate class layout %", sym.getPath ());
-            self:.validateClassContent (alias context, alias sym); // This cannot throw (cf. the function def)
+            // we revalidate the content if inModule, recursive validation might make the type incomplete (fields, ctors, ...)
+            if (inModule || !self.checkValidation (sym)) {
+                context:.pushReferent (alias sym);
+                context:.enterForeign (isFnBody-> false);
 
-            context:.exitForeign ();
-            context:.popReferent ();
-        }
+                logging::info ("Validate class layout %", sym.getPath ());
 
-        match sym.getClassRef () {
-            r : &ClassRefType => {
+                if !sym.getClassRef ().hasValue {
+                    sym:.setClassRef (copy ClassRefType (sym.getLoc (), sym));
+                }
+
+                self:.validateClassContent (alias context, alias sym, inModule); // This cannot throw (cf. the function def)
+
+                context:.exitForeign ();
+                context:.popReferent ();
+            }
+
+            if let Ok (r) = sym.getClassRef () {
                 if (inModule) { // if we are "in module" we need to validate the symbols of the class (addMethods)
                     logging::info ("Validate class content %", sym.getPath ());
+
                     self:.finalizeClassValidation (alias context, alias sym, r);
                 }
-                
+
                 return r;
             }
-            err : &ErrorGenerator => {
+        }
 
-                // The class was validated by self.validateClassContent, but it failed so the generator is an error
-                // we simply throw it, unfortunately it will leads to printing the same error multiple times, but I don't see any way to avoid that efficiently (while making sure the error is at least printed one time)
-                // Maybe add a uniq identifier to errors, and perform the verification directly in the error printing part
-                throw err.getErrorMessage ();
-            }
-            _ => { 
-                panic;
-            }
-        };
+        // not else, we might set the error within the previous if
+        if let Ok (err) = sym.getErrorGenerator () {
+
+            // The class was validated by self.validateClassContent, but it failed so the generator is an error
+            // we simply throw it, unfortunately it will leads to printing the same error multiple times, but I don't see any way to avoid that efficiently (while making sure the error is at least printed one time)
+            // Maybe add a uniq identifier to errors, and perform the verification directly in the error printing part
+            throw err.getErrorMessage ();
+        }
+
+        panic;
     }
 
     /*!
@@ -137,7 +147,7 @@ pub class ClassValidator {
             let error = copy ErrorMsg::fatal (sym.getLoc (), ValidateErrorMessage::VALIDATING, notes-> errors);
             context:.insertMissingGenerator (error);
             if (sym.isTemplate ()) {
-                sym:.setClassRef (copy ErrorGenerator (sym.getLoc (), error));
+                sym:.setErrorGenerator (copy ErrorGenerator (sym.getLoc (), error));
             }
 
             throw error;
@@ -145,7 +155,7 @@ pub class ClassValidator {
 
         context:.insertGenerator (alias sym, clRef);
     }    
-    
+
     /*!
      * ================================================================================
      * ================================================================================
@@ -162,41 +172,31 @@ pub class ClassValidator {
      *   - sym: the symbol to validate
      *   - inModule: if true, then the methods of the class are validated and inserted in the generators of the context
      */
-    fn validateClassContent (mut self, dmut context : &Validator, dmut sym : &ClassSymbol) {
-        // The assertion are located in the class context
-
-        // The validation of the class is not finished
-        // a recursive reference to itself in ancestor will lead to infinite loop, we want to avoid that
-        sym:.setClassRef (copy ClassRefType (sym.getLoc (), sym, NONE_TYPE));
-
-        // We add the symbol to avoid infinite loops
+    fn validateClassContent (mut self, dmut context : &Validator, dmut sym : &ClassSymbol, inModule : bool) {
         self._validation [sym] = ();
         {            
             // First we need to validate the ancestor of the class, to generate the vtable, the child class vtable being an override of the one of the ancestor
             let ancestor = self.validateAncestor (alias context, alias sym);
-
-            // Now that we have the ancestor, the class is a bit more usable for further validation
-            sym:.setClassRef (copy ClassRefType (sym.getLoc (), sym, ancestor));
 
             // Validate the static assertions of the class definition (@warning: this is only performed if the validation is a root validation-> self._validation.len == 1us, to avoid too deep and unreadable errors)
             self.validateCtes (alias context, alias sym);
 
             // Validate the ctors prototypes of the class
             // Ctors does not need fields to be validated
-            self.validateConstructors (alias context, alias sym);
+            self.validateConstructors (alias context, alias sym, inModule);
 
             // Validate the vtable (without validating the method bodies, just the prototypes)
-            self.validateVtable (alias context, alias sym, ancestor);
+            self.validateVtable (alias context, alias sym, ancestor, inModule);
 
             // Validate the fields of the class
             // But fields might need the ctors of other class to be validated
             self.validateFields (alias context, alias sym, ancestor);
 
             // Validate the default movable ctor if the symbol is an entity
-            self.validateMovableCtors (alias context, alias sym);
+            self.validateMovableCtors (alias context, alias sym, inModule);
 
             // Validate the dtor of the class
-            self.validateDestructor (alias context, alias sym, ancestor);
+            self.validateDestructor (alias context, alias sym, ancestor, inModule);
 
             // Validate the typeinfo of the class
             self.validateTypeInfo (alias context, alias sym);
@@ -206,9 +206,9 @@ pub class ClassValidator {
 
                 // If there is an error in the validation, then write it in the type validation
                 // Then each time a validation is tried, the same error is sent without needing a new validation
-                sym:.setClassRef (copy ErrorGenerator (sym.getLoc (),
-                                                       copy ErrorMsg::fatal (sym.getLoc (), ValidateErrorMessage::VALIDATING,
-                                                                             notes-> copy [err])));
+                sym:.setErrorGenerator (copy ErrorGenerator (sym.getLoc (),
+                                                             copy ErrorMsg::fatal (sym.getLoc (), ValidateErrorMessage::VALIDATING,
+                                                                                   notes-> copy [err])));
             }
         }
 
@@ -232,20 +232,25 @@ pub class ClassValidator {
      * @throws:
      *   - &ErrorMsg: if the validation failed
      */
-    fn validateAncestor (self, dmut context : &Validator, dmut sym : &ClassSymbol)-> &Type
+    fn validateAncestor (self, dmut context : &Validator, dmut sym : &ClassSymbol)-> (&ClassRefType)?
         throws ErrorMsg
     {
         match sym.getAncestor () {
-            EmptyExpression () => { NONE_TYPE } // No ancestor specified
+            EmptyExpression () => {} // No ancestor specified
             ancestor : &Expression => {                                
                 let type = context:.validateType (ancestor);
                 match type {
-                    cr : &ClassRefType => { // The ancestor class must be a class, obviously
-                        if (cr.getSymbol ().isFinal ()) { // and it cannot be final
-                            throw copy ErrorMsg::fatal (ancestor.getLoc (), format (ValidateErrorMessage::INHERIT_FINAL_CLASS, cr));
+                    ancRef : &ClassRefType => { // The ancestor class must be a class, obviously
+                        if (ancRef.getSymbol ().isFinal ()) { // and it cannot be final
+                            throw copy ErrorMsg::fatal (ancestor.getLoc (), format (ValidateErrorMessage::INHERIT_FINAL_CLASS, ancRef));
                         }
-                        
-                        cr // if it is a class ref, and not final then no problem, it can be an ancestor
+
+                        if let Ok (dmut cref) = alias sym:.getClassRef () {
+                             // if it is a class ref, and not final then no problem, it can be an ancestor
+                            cref:.setAncestor (ancRef);
+                        } else panic;
+
+                        return ancRef?;
                     }
                     x => { // This is not a class, cannot inherit non class types
                         throw copy ErrorMsg::fatal (ancestor.getLoc (), format (ValidateErrorMessage::INHERIT_NO_CLASS, x));
@@ -253,6 +258,8 @@ pub class ClassValidator {
                 }
             }
         }
+
+        none
     }
     
     /*!
@@ -381,28 +388,18 @@ pub class ClassValidator {
      * @throws:
      *   - &ErrorMsg: if there is an error in the validation of the fields
      */
-    fn validateFields (self, dmut context : &Validator, dmut sym : &ClassSymbol, ancestor : &Type)
+    fn validateFields (self, dmut context : &Validator, dmut sym : &ClassSymbol, ancestor : (&ClassRefType)?)
         throws ErrorMsg
     {                
         let localFields = self.validateLocalFields (alias context, alias sym); // Validate the fields declared in the class def
-        let allFields = match ancestor {
-            cl : &ClassRefType => {
-                let ancestorFields = cl.getFields (); // Get the fields declared in the ancestor class
-                self.verifyFieldCollisions (alias context, ancestorFields, localFields); // Verify that there is no collistion between ancestor fields and local fields
-
-                ancestorFields ~ localFields            
-            }
-            _ => { localFields }
-        };
+        if let Ok (cl) = ancestor {
+            self.verifyFieldCollisions (cl.getFields (), localFields);
+        }
 
         // Update the class type info definition in the symbol, so it has access to the fields
-        match sym.getClassRef () {
-            oldRef : &ClassRefType => {
-                let dmut clRef = copy ClassRefType::withField (oldRef, allFields, localFields);
-                sym:.setClassRef (clRef);
-            }
-            _ => panic; // The function was called where exactly ?!! verify that there is previous classref in the symbol
-        }
+        if let Ok (dmut cref) = alias sym:.getClassRef () {
+            cref:.setFields (localFields);
+        } else panic; // The function was called where exactly ?!! verify that there is previous classref in the symbol
     }
 
     /**
@@ -524,7 +521,7 @@ pub class ClassValidator {
      * @throws:
      *   - &ErrorMsg: if there is a collision     
      */
-    fn verifyFieldCollisions (self, dmut _ : &Validator, ancestorFields : [&Value], localFields : [&Value])
+    fn verifyFieldCollisions (self, ancestorFields : [&Value], localFields : [&Value])
         throws ErrorMsg
     {
         let mut errors : [&ErrorMsg] = [];
@@ -585,10 +582,10 @@ pub class ClassValidator {
      * @throws:
      *     - &ErrorMsg: if there is an error in the validation
      */
-    fn validateConstructors (self, dmut context : &Validator, dmut sym : &ClassSymbol)
+    fn validateConstructors (self, dmut context : &Validator, dmut sym : &ClassSymbol, inModule : bool)
         throws ErrorMsg
     {
-        if let oldRef : &ClassRefType = sym.getClassRef () {
+        if let Ok (dmut cref) = alias sym:.getClassRef () {
             let mut errors    : [&ErrorMsg]           = [];
             let mut ctors     : [&CtorPrototypeValue] = []; // list of ctor prototypes
             let mut ctorProts : [MethodProtection]    = []; // Protection of constructors
@@ -602,8 +599,11 @@ pub class ClassValidator {
                         ctor : &ConstructorSymbol => { // If this is a constructor we validate its constructor
                             match context:.getSymbolFromRef (ctor) {
                                 dmut mutCtor : &ConstructorSymbol => {
-                                    self.validateConstructorProto (alias context, alias mutCtor, oldRef, ref ctors, ref ctorProts);
-                                    sym:.insertAddMethod (alias mutCtor); // Add the symbol for finalization (if 'in module')
+                                    self.validateConstructorProto (alias context, alias mutCtor, cref, ref ctors, ref ctorProts);
+                                    if inModule {
+                                        // Add the symbol for finalization (if 'in module')
+                                        sym:.insertAddMethod (alias mutCtor);
+                                    }
                                 }
                                 _ => panic;
                             }
@@ -611,7 +611,7 @@ pub class ClassValidator {
                         tmp : &TemplateSymbol => {
                             match tmp.getContent ().getContent () {
                                 _ : &ConstructorDecl => {
-                                    self.validateTemplateConstructorProto (alias context, tmp, oldRef, ref templateCtors, ref templateCtorProts);
+                                    self.validateTemplateConstructorProto (alias context, tmp, cref, ref templateCtors, ref templateCtorProts);
                                 }
                             }
                         }
@@ -626,10 +626,8 @@ pub class ClassValidator {
             if (errors.len != 0us) throw copy ErrorMsg::list (errors);
 
             // Update the class type info definition in the symbol, so we have access to the ctors of the class
-            let dmut clRef = copy ClassRefType::withCtors (oldRef, ctors, ctorProts);
-            clRef = copy ClassRefType::withTemplateCtors (clRef, templateCtors, templateCtorProts);
-
-            sym:.setClassRef (clRef); // Class validation is finished, it can be constructed now
+            cref:.setCtors (ctors, ctorProts);
+            cref:.setTemplateCtors (templateCtors, templateCtorProts);
         }
 
         else panic; // no supposed to be here, if we validate the ctors, we already validated vtable and fields
@@ -694,13 +692,13 @@ pub class ClassValidator {
      *    - ctors: the list of ctors of the struct type
      *    - sym: the symbol declaring the struct
      * */
-    fn validateMovableCtors (self, dmut context : &Validator, dmut sym : &ClassSymbol)
+    fn validateMovableCtors (self, dmut context : &Validator, dmut sym : &ClassSymbol, inModule : bool)
         throws ErrorMsg
     {
         if (sym.isEntity ()) {
-            if let oldRef : &ClassRefType = sym.getClassRef () {
-                let oldCtors = oldRef.getCtors ();
-                let oldCtorProts = oldRef.getCtorProtections ();
+            if let Ok (dmut cref) = alias sym:.getClassRef () {
+                let oldCtors = cref.getCtors ();
+                let oldCtorProts = cref.getCtorProtections ();
 
                 let mut hasDefault = false;
                 for it in oldCtors if let ct : &CtorPrototypeValue = it && (ct.getRename () == "" && it.getParameters ().len == 0) {
@@ -709,9 +707,8 @@ pub class ClassValidator {
                 }
 
                 if (!hasDefault) {
-                    let nCtor = self.createDefaultCtor (alias context, alias sym, oldRef);
-                    let dmut nClref = copy ClassRefType::withCtors (oldRef, oldCtors ~ [nCtor], oldCtorProts ~ [MethodProtection::PUB]);
-                    sym:.setClassRef (nClref);
+                    let nCtor = self.createDefaultCtor (alias context, alias sym, cref, inModule);
+                    cref:.setCtors (oldCtors ~ [nCtor], oldCtorProts ~ [MethodProtection::PUB]);
                 } catch {
                     err : &ErrorMsg => {
                         throw copy ErrorMsg::fatal (sym.getLoc (), format (ValidateErrorMessage::NO_DEFAULT_CTOR_MOVE_STRUCT, sym.getPath ()),
@@ -725,7 +722,7 @@ pub class ClassValidator {
     /**
      * Create a ctors that init all field with default value
      * */
-    fn createDefaultCtor (self, dmut context : &Validator, dmut sym : &ClassSymbol, cl : &ClassRefType)-> &MethodPrototypeValue
+    fn createDefaultCtor (self, dmut context : &Validator, dmut sym : &ClassSymbol, cl : &ClassRefType, inModule : bool)-> &MethodPrototypeValue
         throws ErrorMsg
     {
         let mut errors : [&ErrorMsg] = [];
@@ -740,7 +737,10 @@ pub class ClassValidator {
 
         let ctor = copy ConstructorDecl (rename, " * *default constructor, generated by the compiler*", proto, body);
         let dmut ctorSym : &ConstructorSymbol = context:.getDeclarator ().declareConstructor (ctor, alias sym, protection-> Protection::PUBLIC);
-        sym:.insertAddMethod (alias ctorSym);
+        if inModule {
+            sym:.insertAddMethod (alias ctorSym);
+        }
+
         return context:.getFunctionValidator ():.validateCtorPrototype (alias context, alias ctorSym, cl);
     }
 
@@ -761,12 +761,12 @@ pub class ClassValidator {
      * @throws:
      *    - &ErrorMsg: if there is an error in the vtable validation
      */
-    fn validateVtable (self, dmut context : &Validator, dmut sym : &ClassSymbol, ancestor : &Type)
+    fn validateVtable (self, dmut context : &Validator, dmut sym : &ClassSymbol, ancestor : (&ClassRefType)?, inModule : bool)
         throws ErrorMsg
     {
-        if let oldRef : &ClassRefType = sym.getClassRef () {
+        if let Ok (dmut cref) = alias sym:.getClassRef () {
             // Validate the vtable, and get the list of method prototypes, and their protections
-            let (vtable, protection, implTraits, allImpls, templateMeths, templateProts) = self.validateVtable (alias context, alias sym, oldRef, ancestor);
+            let (vtable, protection, implTraits, allImpls, templateMeths, templateProts) = self.validateVtable (alias context, alias sym, cref, ancestor, inModule);
 
             // Verify that all methods have a proper body
             // Only abstract class can have empty methods, because they don't generate a vtable
@@ -778,14 +778,13 @@ pub class ClassValidator {
                 }
 
                 if (notes.len != 0us) {
-                    throw copy ErrorMsg::fatal (sym.getLoc (), format (ValidateErrorMessage::NON_ABSTRACT_NOT_COMPLETE, oldRef),
+                    throw copy ErrorMsg::fatal (sym.getLoc (), format (ValidateErrorMessage::NON_ABSTRACT_NOT_COMPLETE, cref),
                                                 notes-> notes);
                 }
             }
 
             // Update the class type info definition in the symbol, so it has access to the vtable
-            let dmut clRef = copy ClassRefType::withVtable (oldRef, vtable, protection, implTraits, allImpls, templateMeths, templateProts);
-            sym:.setClassRef (clRef);
+            cref:.setVtable (vtable, protection, implTraits, allImpls, templateMeths, templateProts);
         }
 
         else panic;
@@ -805,7 +804,7 @@ pub class ClassValidator {
      *    - .0: the list of methods prototype of the vtable
      *    - .1: the list of protection of the methods
      */
-    fn validateVtable (self, dmut context : &Validator, dmut sym : &ClassSymbol, clRef : &ClassRefType, ancestor : &Type)-> ([&MethodPrototypeValue], [MethodProtection], [&TraitRefType], [&TraitRefType], [&TemplateRefMethodValue], [MethodProtection])
+    fn validateVtable (self, dmut context : &Validator, dmut sym : &ClassSymbol, clRef : &ClassRefType, ancestor : (&ClassRefType)?, inModule : bool)-> ([&MethodPrototypeValue], [MethodProtection], [&TraitRefType], [&TraitRefType], [&TemplateRefMethodValue], [MethodProtection])
         throws ErrorMsg
     {
         let mut vtable     : [mut &MethodPrototypeValue] = [];
@@ -844,7 +843,9 @@ pub class ClassValidator {
             match meth {
                 EmptySymbol () => {} // if it is an empty symbol, then the method was declared in ancestor or trait, and put in the class as it was (not over)
                 _ => {
-                    sym:.insertAddMethod (alias meth); // The method is new or overriden
+                    if inModule {
+                        sym:.insertAddMethod (alias meth); // The method is new or overriden
+                    }
                 }
             }
         }
@@ -869,27 +870,25 @@ pub class ClassValidator {
      *   - vtable: same as .0, but updatable
      *   - prots: almost same as .1, but updatable (and PRV is now PRV_PARENT)
      */
-    fn retreiveAncestorVtable (self, ancestor : &Type, ref mut vtable : [mut &MethodPrototypeValue], ref mut prots : [MethodProtection], ref mut addMethods : [dmut &Symbol], ref mut allImpls : [&TraitRefType], ref mut templateMeths : [&TemplateRefMethodValue], ref mut templateProts : [MethodProtection]) {
-        match ancestor {
-            clRef : &ClassRefType => { // there is an ancestor
-                let ancVtable = clRef.getVtable ();
-                let ancProts = clRef.getVtableProtections ();
-                let ancImpls = clRef.getAllImplTraits ();
-                let ancTempl = clRef.getTemplateMethods ();
-                let ancTemplPr = clRef.getTemplateMethodProtections ();
+    fn retreiveAncestorVtable (self, ancestor : (&ClassRefType)?, ref mut vtable : [mut &MethodPrototypeValue], ref mut prots : [MethodProtection], ref mut addMethods : [dmut &Symbol], ref mut allImpls : [&TraitRefType], ref mut templateMeths : [&TemplateRefMethodValue], ref mut templateProts : [MethodProtection]) {
+        if let Ok (clRef) = ancestor {  // there is an ancestor
+            let ancVtable = clRef.getVtable ();
+            let ancProts = clRef.getVtableProtections ();
+            let ancImpls = clRef.getAllImplTraits ();
+            let ancTempl = clRef.getTemplateMethods ();
+            let ancTemplPr = clRef.getTemplateMethodProtections ();
 
-                vtable ~= ancVtable;
-                addMethods ~= copy [alias EMPTY_SYMBOL ; ancVtable.len];
+            vtable ~= ancVtable;
+            addMethods ~= copy [alias EMPTY_SYMBOL ; ancVtable.len];
 
-                for j in ancProts { // Insert the protection in the vtable of the current class 
-                    if (j == MethodProtection::PRV) { prots ~= [MethodProtection::PRV_PARENT]; } // private methods are not accessible in child class
-                    else { prots ~= [j]; }
-                }
-
-                templateMeths ~= ancTempl;
-                templateProts ~= ancTemplPr;
-                allImpls ~= ancImpls;
+            for j in ancProts { // Insert the protection in the vtable of the current class
+                if (j == MethodProtection::PRV) { prots ~= [MethodProtection::PRV_PARENT]; } // private methods are not accessible in child class
+                else { prots ~= [j]; }
             }
+
+            templateMeths ~= ancTempl;
+            templateProts ~= ancTemplPr;
+            allImpls ~= ancImpls;
         }
     }
 
@@ -1437,18 +1436,14 @@ pub class ClassValidator {
      *    - clRef: the type of the class being validated
      *    - ancestor: the ancestor of the class
      * */
-    fn validateDestructor (self, dmut context : &Validator, dmut sym : &ClassSymbol, ancestor : &Type)
+    fn validateDestructor (self, dmut context : &Validator, dmut sym : &ClassSymbol, ancestor : (&ClassRefType)?, inModule : bool)
         throws ErrorMsg
     {
-        match sym.getClassRef () {
-            oldRef : &ClassRefType => {
-                let dtor = self.validateVtableDtor (alias context, alias sym, oldRef, ancestor);
-
-                let dmut clRef = copy ClassRefType::withDtor (oldRef, dtor);
-                sym:.setClassRef (clRef);
-            }
-            _ => panic;
+        if let Ok (dmut cref) = alias sym:.getClassRef () {
+            let dtor = self.validateVtableDtor (alias context, alias sym, cref, ancestor, inModule);
+            cref:.setDtor (dtor);
         }
+        else panic;
     }
 
     /**
@@ -1462,11 +1457,11 @@ pub class ClassValidator {
      *    - &ErrorMsg: if there is an error in the validation
      * @returns: the prototype of the destructor
      */
-    fn validateVtableDtor (self, dmut context : &Validator, dmut sym : &ClassSymbol, clRef : &ClassRefType, ancestor : &Type)-> &Value
+    fn validateVtableDtor (self, dmut context : &Validator, dmut sym : &ClassSymbol, clRef : &ClassRefType, ancestor : (&ClassRefType)?, inModule : bool)-> &Value
         throws ErrorMsg
     {
         let ancDtor = match ancestor {
-            ancRef : &ClassRefType => { // maybe the ancestor has a destructor
+            Ok (ancRef) => { // maybe the ancestor has a destructor
                 ancRef.getDestructor ()
             }
             _ => { // No ancestor, so no destructor at all
@@ -1492,7 +1487,10 @@ pub class ClassValidator {
 
         let dmut dtor = sym:.getDestructor ();
         if let dmut func : &DestructorSymbol = alias dtor { // a destructor is defined, we return its prototype
-            sym:.insertAddMethod (alias func);
+            if inModule {
+                sym:.insertAddMethod (alias func);
+            }
+
             if (forceMovable || !func.isEmpty ()) {
                 return context:.getFunctionValidator ():.validateDtorPrototype (alias context, alias func, clRef, ancDtor-> ancDtor);
             }
@@ -1502,7 +1500,7 @@ pub class ClassValidator {
 
         if dtor of EmptySymbol { // no destructor in the class
             if (forceMovable) {
-                return self.createDefaultDtor (alias context, alias sym, clRef);
+                return self.createDefaultDtor (alias context, alias sym, clRef, inModule);
             }
 
             return ancDtor;
@@ -1514,7 +1512,7 @@ pub class ClassValidator {
     /**
      * Create a default dtor for an entity that has no dtor but has fields needing to be destroyed
      * */
-    fn createDefaultDtor (self, dmut context : &Validator, dmut sym : &ClassSymbol, clRef : &ClassRefType)-> &Value
+    fn createDefaultDtor (self, dmut context : &Validator, dmut sym : &ClassSymbol, clRef : &ClassRefType, inModule : bool)-> &Value
         throws ErrorMsg
     {
         let selfLoc = copy Word (Keys::SELF, sym.getLoc ());
@@ -1527,7 +1525,9 @@ pub class ClassValidator {
         let body = copy BlockExpr (sym.getLoc (), sym.getLoc (), []);
         let dtor = copy DestructorDecl (copy Word (Keys::DTOR, sym.getLoc ()), [], var, body);
         let dmut dtorSym = context:.getDeclarator ().declareDestructor (dtor, alias sym);
-        sym:.insertAddMethod (alias dtorSym);
+        if inModule {
+            sym:.insertAddMethod (alias dtorSym);
+        }
 
         context:.getFunctionValidator ():.validateDtorPrototype (alias context, alias dtorSym, clRef, ancDtor-> UNIT_VALUE)
     }
@@ -1550,7 +1550,7 @@ pub class ClassValidator {
         throws ErrorMsg
     {
         let loc = sym.getLoc ();
-        if let oldRef : &ClassRefType = sym.getClassRef () {
+        if let Ok (dmut cref) = alias sym:.getClassRef () {
             let type = context:.validateTypeInfo (sym.getLoc ());
             let id = context:.validateTypeIDs (sym.getLoc (),
                                                if (sym.isStruct ()) { TypeInfoIDS::STRUCT } else { TypeInfoIDS::OBJECT });
@@ -1561,9 +1561,9 @@ pub class ClassValidator {
                 _ => panic;
             };
 
-            let size = context:.getSizeofValidator ():.validateType (sym.getLoc (), oldRef);
-            let innerSlice = match oldRef.getAncestor () {
-                anc : &ClassRefType => {
+            let size = context:.getSizeofValidator ():.validateType (sym.getLoc (), cref);
+            let innerSlice = match cref.getAncestor () {
+                Ok (anc) => {
                     let ancType = copy ArrayType (loc, type, 1us);
                     context.createSliceAliasFromArray (loc, ancType,
                                                        copy ArrayValue (loc, ancType, copy [anc.getTypeInfo ()]))
@@ -1581,8 +1581,7 @@ pub class ClassValidator {
                                                   sym.getPath ().toStr ());
 
 
-            let dmut newCl = copy ClassRefType::withTypeInfo (oldRef, typeinfoFin);
-            sym:.setClassRef (newCl);
+            cref:.setTypeInfo (typeinfoFin);
         }
 
         else panic;
@@ -1600,16 +1599,14 @@ pub class ClassValidator {
      * @returns: true if the class was already validated, or is currently in validation
      */
     fn checkValidation (self, sym : &ClassSymbol)-> bool {
-        match sym.getClassRef () {
-            // The class has no typeinfo, but maybe it is currently in validation (recursive class validation)
-            EmptyGenerator () => {
-                if sym in self._validation {
-                    return true;
-                }
-
-                false
+        if let Ok () = sym.getClassRef () {
+            true
+        } else {
+            if sym in self._validation {
+                return true;
             }
-            _ => { true }
+
+            false
         }
     }
 
