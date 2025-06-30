@@ -37,7 +37,10 @@ pub class ClassValidator {
 
     // The list of class symbols currently in validation to avoid infinite recursion,
     // and validating multiple times the same symbol
-    let mut _validation : [&Symbol => mut ()] = copy [];
+    let mut _validation : [&Symbol => mut u32] = copy [];
+
+    // The list of class symbol to finalize when self._validation.len == 0
+    let mut _toFinalize : [&Symbol => dmut &ClassSymbol] = copy [];
 
     /**
      * Create a new empty validator
@@ -60,30 +63,40 @@ pub class ClassValidator {
         // We don't validate if we already have an error
         if (!sym.getErrorGenerator ().hasValue) {
 
-            // we revalidate the content if inModule, recursive validation might make the type incomplete (fields, ctors, ...)
-            if (inModule || !self.checkValidation (sym)) {
+            if !sym.getClassRef ().hasValue {
+                sym:.setClassRef (copy ClassRefType (sym.getLoc (), sym));
+            }
+
+            let validationLevel = if inModule { 1u32 } else { self.checkValidation (sym) };
+            if validationLevel < 3 {
+                self._validation [sym] = validationLevel + 1;
+
                 context:.pushReferent (alias sym);
                 context:.enterForeign (isFnBody-> false);
 
-                logging::info ("Validate class layout %", sym.getPath ());
+                logging::info ("Validate class layout % (%)", sym.getPath (), validationLevel);
 
-                if !sym.getClassRef ().hasValue {
-                    sym:.setClassRef (copy ClassRefType (sym.getLoc (), sym));
-                }
-
-                self:.validateClassContent (alias context, alias sym, inModule); // This cannot throw (cf. the function def)
+                 // This cannot throw (cf. the function def)
+                self:.validateClassContent (alias context, alias sym, inModule, validationLevel);
 
                 context:.exitForeign ();
                 context:.popReferent ();
+
+                if validationLevel == 1 {
+                    self._validation:.remove (sym);
+                }
+            }
+
+            // If there is no error in the prototype of the class, and we are inModule, then we add it to finalizable classes
+            if let Err () = sym.getErrorGenerator () && inModule{
+                self._toFinalize [sym] = (alias sym);
+            }
+
+            if self._validation.len == 0 {
+                self:.finalizeClassSymbols (alias context);
             }
 
             if let Ok (r) = sym.getClassRef () {
-                if (inModule) { // if we are "in module" we need to validate the symbols of the class (addMethods)
-                    logging::info ("Validate class content %", sym.getPath ());
-
-                    self:.finalizeClassValidation (alias context, alias sym, r);
-                }
-
                 return r;
             }
         }
@@ -99,6 +112,36 @@ pub class ClassValidator {
 
         panic;
     }
+
+    /**
+     * Finalize all the class symbols that need finalization when validation levels reaches 0 (to avoid forward complex dependencies)
+     * */
+    pub fn finalizeClassSymbols (mut self, dmut context : &Validator)
+        throws ErrorMsg
+    {
+        let dmut toFinalize = alias self._toFinalize;
+        self._toFinalize = copy [];
+
+        let dmut errors : [&ErrorMsg] = [];
+        for _, dmut sym in alias toFinalize {
+            if let Ok (r) = sym.getClassRef () {
+                {
+                    logging::info ("Finalize class symbol %", sym.getPath ());
+                    self:.finalizeClassValidation (alias context, alias sym, r);
+                } catch {
+                    err : &ErrorMsg => {
+                        errors ~= [err];
+                    }
+                }
+            } else panic;
+        }
+
+        self._toFinalize = copy [];
+        if errors.len != 0 {
+            throw copy ErrorMsg::list (errors);
+        }
+    }
+
 
     /*!
      * ================================================================================
@@ -172,8 +215,7 @@ pub class ClassValidator {
      *   - sym: the symbol to validate
      *   - inModule: if true, then the methods of the class are validated and inserted in the generators of the context
      */
-    fn validateClassContent (mut self, dmut context : &Validator, dmut sym : &ClassSymbol, inModule : bool) {
-        self._validation [sym] = ();
+    fn validateClassContent (mut self, dmut context : &Validator, dmut sym : &ClassSymbol, inModule : bool, validationLevel : u32) {
         {            
             // First we need to validate the ancestor of the class, to generate the vtable, the child class vtable being an override of the one of the ancestor
             let ancestor = self.validateAncestor (alias context, alias sym);
@@ -183,14 +225,14 @@ pub class ClassValidator {
 
             // Validate the ctors prototypes of the class
             // Ctors does not need fields to be validated
-            self.validateConstructors (alias context, alias sym, inModule);
+            self.validateConstructors (alias context, alias sym, inModule, validationLevel == 2);
 
             // Validate the vtable (without validating the method bodies, just the prototypes)
-            self.validateVtable (alias context, alias sym, ancestor, inModule);
+            self.validateVtable (alias context, alias sym, ancestor, inModule, validationLevel == 2);
 
             // Validate the fields of the class
             // But fields might need the ctors of other class to be validated
-            self.validateFields (alias context, alias sym, ancestor);
+            self.validateFields (alias context, alias sym, ancestor, validationLevel == 2);
 
             // Validate the default movable ctor if the symbol is an entity
             self.validateMovableCtors (alias context, alias sym, inModule);
@@ -211,8 +253,6 @@ pub class ClassValidator {
                                                                                    notes-> copy [err])));
             }
         }
-
-        self._validation:.remove (sym);    
     }
 
     /*!
@@ -286,23 +326,27 @@ pub class ClassValidator {
     fn validateCtes (self, dmut context : &Validator, dmut sym : &ClassSymbol)
         throws ErrorMsg
     {
-        self.validateCondBlocks (alias context, alias sym);
-        let mut errors : [&ErrorMsg] = [];
+        if !sym.getCondBlockValidated () {
+            self.validateCondBlocks (alias context, alias sym);
+            let mut errors : [&ErrorMsg] = [];
 
-        if (sym.getAssertions ().len != 0us) {
-            context:.enterForeign (isFnBody-> false); // There are not inside function
+            if (sym.getAssertions ().len != 0us) {
+                context:.enterForeign (isFnBody-> false); // There are not inside function
 
-            for it in sym.getAssertions () {
-                context:.validateCteValue (it); // validate the assertion
-            } catch { 
-                err : &ErrorMsg => { errors ~= [err]; }
-            }          
+                for it in sym.getAssertions () {
+                    context:.validateCteValue (it); // validate the assertion
+                } catch {
+                    err : &ErrorMsg => { errors ~= [err]; }
+                }
 
-            context:.exitForeign ();
+                context:.exitForeign ();
+            }
+
+            sym:.setCondBlockValidated ();
+
+            // Some assertion failed
+            if (errors.len != 0us) throw copy ErrorMsg::list (errors);
         }
-
-        // Some assertion failed
-        if (errors.len != 0us) throw copy ErrorMsg::list (errors);
     }
     
     /**
@@ -388,17 +432,15 @@ pub class ClassValidator {
      * @throws:
      *   - &ErrorMsg: if there is an error in the validation of the fields
      */
-    fn validateFields (self, dmut context : &Validator, dmut sym : &ClassSymbol, ancestor : (&ClassRefType)?)
+    fn validateFields (self, dmut context : &Validator, dmut sym : &ClassSymbol, ancestor : (&ClassRefType)?, precary : bool)
         throws ErrorMsg
-    {                
-        let localFields = self.validateLocalFields (alias context, alias sym); // Validate the fields declared in the class def
-        if let Ok (cl) = ancestor {
-            self.verifyFieldCollisions (cl.getFields (), localFields);
-        }
-
+    {
         // Update the class type info definition in the symbol, so it has access to the fields
         if let Ok (dmut cref) = alias sym:.getClassRef () {
-            cref:.setFields (localFields);
+            let localFields = self.validateLocalFields (alias context, alias sym, alias cref, precary); // Validate the fields declared in the class def
+            if let Ok (cl) = ancestor {
+                self.verifyFieldCollisions (cl.getFields (), localFields);
+            }
         } else panic; // The function was called where exactly ?!! verify that there is previous classref in the symbol
     }
 
@@ -411,17 +453,18 @@ pub class ClassValidator {
      * @throws:
      *    - &ErrorMsg: if there was an error in one or more field validation
      */
-    fn validateLocalFields (self, dmut context : &Validator, dmut sym : &ClassSymbol)-> [&VarDeclValue]
+    fn validateLocalFields (self, dmut context : &Validator, dmut sym : &ClassSymbol, dmut cref : &ClassRefType, precary : bool)-> [&VarDeclValue]
         throws ErrorMsg
     {
         context:.enterForeign (isFnBody-> false); // A new foreign, we don't wan't to pollute current context
         context:.enterBlock (); // A block, we will add variable definitions
 
         let mut errors : [&ErrorMsg]         = [];
-        let mut fields : [&VarDeclValue]     = [];
+        let mut fields : [mut &VarDeclValue] = copy [copy VarDeclValue (f.getLoc (), ERROR_TYPE, UNIT_VALUE, isMutable-> false) for f in sym.getFields ()];
         let mut names  : [[c8] => mut &Word] = copy [];
+        cref:.setFields (fields);
 
-        for f in sym.getFields () {
+        for i, f in sym.getFields () {
             {
                 // Fields are just like variable decls
                 let field = context:.getValueValidator ().validateVarDecl (alias context, f, needInitValue-> false);
@@ -453,17 +496,20 @@ pub class ClassValidator {
                 self.verifyShadow (ref names, field);
 
                 // We add the validated field
-                fields ~= [field];
+                fields [i] = field;
             } catch {
-                err : &ErrorMsg => { errors ~= [err]; }
+                err : &ErrorMsg => {
+                    errors ~= [err];
+                }
             }
         }
 
         context:.quitBlock (warnUnused-> false); // We entered a block at the beginning of the function
         context:.exitForeign (); // We entered a foreign
 
-        if (errors.len != 0us) throw copy ErrorMsg::list (errors);
+        if (!precary && errors.len != 0us) throw copy ErrorMsg::list (errors);
 
+        cref:.setFields (fields);
         fields // returning the list of fields
     }
 
@@ -582,7 +628,7 @@ pub class ClassValidator {
      * @throws:
      *     - &ErrorMsg: if there is an error in the validation
      */
-    fn validateConstructors (self, dmut context : &Validator, dmut sym : &ClassSymbol, inModule : bool)
+    fn validateConstructors (self, dmut context : &Validator, dmut sym : &ClassSymbol, inModule : bool, noValue : bool)
         throws ErrorMsg
     {
         if let Ok (dmut cref) = alias sym:.getClassRef () {
@@ -599,7 +645,7 @@ pub class ClassValidator {
                         ctor : &ConstructorSymbol => { // If this is a constructor we validate its constructor
                             match context:.getSymbolFromRef (ctor) {
                                 dmut mutCtor : &ConstructorSymbol => {
-                                    self.validateConstructorProto (alias context, alias mutCtor, cref, ref ctors, ref ctorProts);
+                                    self.validateConstructorProto (alias context, alias mutCtor, cref, ref ctors, ref ctorProts, noValue);
                                     if inModule {
                                         // Add the symbol for finalization (if 'in module')
                                         sym:.insertAddMethod (alias mutCtor);
@@ -646,10 +692,10 @@ pub class ClassValidator {
      *    - ctorList: append the prototype of the ctor
      *    - ctorProts: append the protection of the ctor
      */
-    fn validateConstructorProto (self, dmut context : &Validator, dmut ctor : &ConstructorSymbol, clRef : &ClassRefType, ref mut ctorList : [&CtorPrototypeValue], ref mut ctorProts : [MethodProtection])
+    fn validateConstructorProto (self, dmut context : &Validator, dmut ctor : &ConstructorSymbol, clRef : &ClassRefType, ref mut ctorList : [&CtorPrototypeValue], ref mut ctorProts : [MethodProtection], noValue : bool)
         throws ErrorMsg
     {
-        let proto = context:.getFunctionValidator ():.validateCtorPrototype (alias context, alias ctor, clRef);
+        let proto = context:.getFunctionValidator ():.validateCtorPrototype (alias context, alias ctor, clRef, noValue-> noValue);
         for it in ctorList {
             if self.isCtorSimilar (proto, it) {
                 throw copy ErrorMsg::fatal (proto.getLoc (), end-> it.getLoc (), format (ValidateErrorMessage::COLLIDING_METHOD_DEFINITION, proto, it));
@@ -761,12 +807,12 @@ pub class ClassValidator {
      * @throws:
      *    - &ErrorMsg: if there is an error in the vtable validation
      */
-    fn validateVtable (self, dmut context : &Validator, dmut sym : &ClassSymbol, ancestor : (&ClassRefType)?, inModule : bool)
+    fn validateVtable (self, dmut context : &Validator, dmut sym : &ClassSymbol, ancestor : (&ClassRefType)?, inModule : bool, noValue : bool)
         throws ErrorMsg
     {
         if let Ok (dmut cref) = alias sym:.getClassRef () {
             // Validate the vtable, and get the list of method prototypes, and their protections
-            let (vtable, protection, implTraits, allImpls, templateMeths, templateProts) = self.validateVtable (alias context, alias sym, cref, ancestor, inModule);
+            let (vtable, protection, implTraits, allImpls, templateMeths, templateProts) = self.validateVtable (alias context, alias sym, cref, ancestor, inModule, noValue);
 
             // Verify that all methods have a proper body
             // Only abstract class can have empty methods, because they don't generate a vtable
@@ -804,7 +850,7 @@ pub class ClassValidator {
      *    - .0: the list of methods prototype of the vtable
      *    - .1: the list of protection of the methods
      */
-    fn validateVtable (self, dmut context : &Validator, dmut sym : &ClassSymbol, clRef : &ClassRefType, ancestor : (&ClassRefType)?, inModule : bool)-> ([&MethodPrototypeValue], [MethodProtection], [&TraitRefType], [&TraitRefType], [&TemplateRefMethodValue], [MethodProtection])
+    fn validateVtable (self, dmut context : &Validator, dmut sym : &ClassSymbol, clRef : &ClassRefType, ancestor : (&ClassRefType)?, inModule : bool, noValue : bool)-> ([&MethodPrototypeValue], [MethodProtection], [&TraitRefType], [&TraitRefType], [&TemplateRefMethodValue], [MethodProtection])
         throws ErrorMsg
     {
         let mut vtable     : [mut &MethodPrototypeValue] = [];
@@ -822,7 +868,7 @@ pub class ClassValidator {
         self.retreiveAncestorVtable (ancestor, ref vtable, ref prots, ref addMethods, ref allImpls, ref templateMeths, ref templateProts);
 
         // Create the vector containing all the methods defined in implemented traits
-        let implemented = self.retreiveImplsVtable (alias context, sym, clRef, ref vtable, ref prots, ref addMethods);
+        let implemented = self.retreiveImplsVtable (alias context, sym, clRef, noValue, ref vtable, ref prots, ref addMethods);
 
         for i in implemented { impls ~= [i._1]; } // store the list of traits that were implemented by the class
 
@@ -831,10 +877,10 @@ pub class ClassValidator {
         //  2) All the methods declared in implemented traits
         // There is no method declared in the class (either new, over, of impl over) in the vtable
         // So we start by validating the methods that are declared outside implementations
-        self.validateDirectVtable (alias context, sym, clRef, ref vtable, ref prots, ref addMethods, ref templateMeths, ref templateProts);
+        self.validateDirectVtable (alias context, sym, clRef, noValue, ref vtable, ref prots, ref addMethods, ref templateMeths, ref templateProts);
 
         // An now the methods that are declared inside implementations (overriding)
-        self.validateImplsVtable (alias context, clRef, implemented, ref vtable, ref prots, ref addMethods);
+        self.validateImplsVtable (alias context, clRef, implemented, noValue, ref vtable, ref prots, ref addMethods);
 
         // Insert the symbol of the methods that has to be fully validated if the class is "in module"
         // These symbols are the methods that are declared inside the class (new, over or impl over)
@@ -914,7 +960,7 @@ pub class ClassValidator {
      * @throws:
      *   - &ErrorMsg: if there is an error in the validation    
      */
-    fn retreiveImplsVtable (self, dmut context : &Validator, sym : &ClassSymbol, clRef : &ClassRefType, ref mut vtable : [mut &MethodPrototypeValue], ref mut vtableProt : [mut MethodProtection], ref mut addMethods : [dmut &Symbol])-> [(&ImplSymbol, &TraitRefType)]
+    fn retreiveImplsVtable (self, dmut context : &Validator, sym : &ClassSymbol, clRef : &ClassRefType, noValue : bool, ref mut vtable : [mut &MethodPrototypeValue], ref mut vtableProt : [mut MethodProtection], ref mut addMethods : [dmut &Symbol])-> [(&ImplSymbol, &TraitRefType)]
         throws ErrorMsg
     {
         let mut implemented : [(&ImplSymbol, &TraitRefType)] = [];
@@ -932,7 +978,7 @@ pub class ClassValidator {
                             }
                         }
 
-                        let ret = self.retreiveImplVtable (alias context, im.getLoc (), tr, clRef, ref vtable, ref vtableProt, ref addMethods);
+                        let ret = self.retreiveImplVtable (alias context, im.getLoc (), tr, clRef, noValue, ref vtable, ref vtableProt, ref addMethods);
                         implemented ~= [(im, ret)];
                     }
                 }
@@ -961,7 +1007,7 @@ pub class ClassValidator {
      * @throws:
      *   - &ErrorMsg: if there is an error in the validation (for example, 'im' does not implement a trait) 
      */
-    fn retreiveImplVtable (self, dmut context : &Validator, loc : &Word, tr : &Type, clRef : &ClassRefType, ref mut vtable : [mut &MethodPrototypeValue], ref mut vtableProt : [mut MethodProtection], ref mut addMethods : [dmut &Symbol])-> &TraitRefType
+    fn retreiveImplVtable (self, dmut context : &Validator, loc : &Word, tr : &Type, clRef : &ClassRefType, noValue : bool, ref mut vtable : [mut &MethodPrototypeValue], ref mut vtableProt : [mut MethodProtection], ref mut addMethods : [dmut &Symbol])-> &TraitRefType
         throws ErrorMsg
     {
         match tr {
@@ -971,7 +1017,7 @@ pub class ClassValidator {
                     let dmut mSym = alias context:.getSymbolFromRef (it);
                     if let dmut f : &FunctionSymbol = alias mSym { // Method definition
                         {
-                            self.retreiveImplVtableMethod (alias context, loc, alias f, clRef, trRef, ref vtable, ref vtableProt, ref addMethods);
+                            self.retreiveImplVtableMethod (alias context, loc, alias f, clRef, trRef, noValue, ref vtable, ref vtableProt, ref addMethods);
                         } catch {
                             err : &ErrorMsg => { errors ~= [err]; }
                         }
@@ -1003,11 +1049,11 @@ pub class ClassValidator {
      * @throws:
      *   - &ErrorMsg: if there is an error in the validation
      */
-    fn retreiveImplVtableMethod (self, dmut context : &Validator, loc : &Word, dmut func : &FunctionSymbol, clRef : &ClassRefType, trRef : &TraitRefType, ref mut vtable : [mut &MethodPrototypeValue], ref mut vtableProt : [mut MethodProtection], ref mut addMethods : [dmut &Symbol])
+    fn retreiveImplVtableMethod (self, dmut context : &Validator, loc : &Word, dmut func : &FunctionSymbol, clRef : &ClassRefType, trRef : &TraitRefType, noValue : bool, ref mut vtable : [mut &MethodPrototypeValue], ref mut vtableProt : [mut MethodProtection], ref mut addMethods : [dmut &Symbol])
         throws ErrorMsg
     {
         // Validate the prototype of the method
-        let meth = context:.getFunctionValidator ():.validateMethodPrototype (alias context, alias func, clRef, trRef);
+        let meth = context:.getFunctionValidator ():.validateMethodPrototype (alias context, alias func, clRef, trRef, noValue-> noValue);
 
         // Create a delegate type, in order to compare the methods of the vtable
         // The idea behind the following loop is that if a an ancestor has already implemented the trait, we have to replace the implemented methods by this new implementation                
@@ -1057,12 +1103,12 @@ pub class ClassValidator {
      * @throws:
      *   - &ErrorMsg: if there is an error in the validation (for example, 'im' does not implement a trait) 
      */
-    fn validateImplsVtable (self, dmut context : &Validator, clRef : &ClassRefType, implemented : [(&ImplSymbol, &TraitRefType)], ref mut vtable : [mut &MethodPrototypeValue], ref mut vtableProt : [mut MethodProtection], ref mut addMethods : [dmut &Symbol])
+    fn validateImplsVtable (self, dmut context : &Validator, clRef : &ClassRefType, implemented : [(&ImplSymbol, &TraitRefType)], noValue : bool, ref mut vtable : [mut &MethodPrototypeValue], ref mut vtableProt : [mut MethodProtection], ref mut addMethods : [dmut &Symbol])
         throws ErrorMsg
     {
         let mut errors : [&ErrorMsg] = [];
         for im in implemented { // Validate the overriden methods inside implementations
-            self.validateImplVtable (alias context, im._0, im._1, clRef, ref vtable, ref vtableProt, ref addMethods);
+            self.validateImplVtable (alias context, im._0, im._1, clRef, noValue, ref vtable, ref vtableProt, ref addMethods);
         } catch {
             err : &ErrorMsg => { errors ~= [err]; }
         }
@@ -1083,7 +1129,7 @@ pub class ClassValidator {
      * @throws:
      *   - &ErrorMsg: if there is an error in the validation (for example, 'im' does not implement a trait) 
      */
-    fn validateImplVtable (self, dmut context : &Validator, im : &ImplSymbol, trRef : &TraitRefType, clRef : &ClassRefType, ref mut vtable : [mut &MethodPrototypeValue], ref mut vtableProt : [mut MethodProtection], ref mut addMethods : [dmut &Symbol])
+    fn validateImplVtable (self, dmut context : &Validator, im : &ImplSymbol, trRef : &TraitRefType, clRef : &ClassRefType, noValue : bool, ref mut vtable : [mut &MethodPrototypeValue], ref mut vtableProt : [mut MethodProtection], ref mut addMethods : [dmut &Symbol])
         throws ErrorMsg
     {
         let mut errors : [&ErrorMsg] = [];
@@ -1092,7 +1138,7 @@ pub class ClassValidator {
             func : &FunctionSymbol => {
                 let dmut mutSym = context:.getSymbolFromRef (func);
                 if let dmut mutFunc : &FunctionSymbol = alias mutSym {
-                    self.validateImplVtableMethod (alias context, im.getLoc (), alias mutFunc, clRef, trRef, ref vtable, ref vtableProt, ref addMethods);
+                    self.validateImplVtableMethod (alias context, im.getLoc (), alias mutFunc, clRef, trRef, noValue, ref vtable, ref vtableProt, ref addMethods);
                 }
             } catch {
                 err : &ErrorMsg => { errors ~= [err]; }
@@ -1119,10 +1165,10 @@ pub class ClassValidator {
      * @throws:
      *   - &ErrorMsg: if there is an error in the validation (for example, 'im' does not implement a trait) 
      */
-    fn validateImplVtableMethod (self, dmut context : &Validator, _ : &Word, dmut func : &FunctionSymbol, clRef : &ClassRefType, trRef : &TraitRefType, ref mut vtable : [mut &MethodPrototypeValue], ref mut vtableProt : [mut MethodProtection], ref mut addMethods : [dmut &Symbol])
+    fn validateImplVtableMethod (self, dmut context : &Validator, _ : &Word, dmut func : &FunctionSymbol, clRef : &ClassRefType, trRef : &TraitRefType, noValue : bool, ref mut vtable : [mut &MethodPrototypeValue], ref mut vtableProt : [mut MethodProtection], ref mut addMethods : [dmut &Symbol])
         throws ErrorMsg
     {
-        let meth = context:.getFunctionValidator ():.validateMethodPrototype (alias context, alias func, clRef, traitRef-> trRef);
+        let meth = context:.getFunctionValidator ():.validateMethodPrototype (alias context, alias func, clRef, traitRef-> trRef, noValue-> noValue);
         let methProt = match func.getProtection () { 
             Protection::PRIVATE   => { MethodProtection::PRV }
             Protection::PROTECTED => { MethodProtection::PROT }
@@ -1163,7 +1209,7 @@ pub class ClassValidator {
      * @throws:
      *   - &ErrorMsg: if there is an error in the validation
      */
-    fn validateDirectVtable (self, dmut context : &Validator, sym : &ClassSymbol, clRef : &ClassRefType, ref mut vtable : [mut &MethodPrototypeValue], ref mut vtableProt : [mut MethodProtection], ref mut addMethods : [dmut &Symbol], ref mut templateMeths : [&TemplateRefMethodValue], ref mut templateProts : [MethodProtection])
+    fn validateDirectVtable (self, dmut context : &Validator, sym : &ClassSymbol, clRef : &ClassRefType, noValue : bool, ref mut vtable : [mut &MethodPrototypeValue], ref mut vtableProt : [mut MethodProtection], ref mut addMethods : [dmut &Symbol], ref mut templateMeths : [&TemplateRefMethodValue], ref mut templateProts : [MethodProtection])
         throws ErrorMsg
     {
         let mut errors : [&ErrorMsg] = [];
@@ -1172,7 +1218,7 @@ pub class ClassValidator {
                 match it {
                     func : &FunctionSymbol => {
                         if let dmut mutFunc : &FunctionSymbol = context:.getSymbolFromRef (func) {
-                            self.validateDirectVtableMethod (alias context, alias mutFunc, clRef, ref vtable, ref vtableProt, ref addMethods); // validate the redefinition for the vtable
+                            self.validateDirectVtableMethod (alias context, alias mutFunc, clRef, noValue, ref vtable, ref vtableProt, ref addMethods); // validate the redefinition for the vtable
                         }
                     }
                     t : &TemplateSymbol => {
@@ -1215,10 +1261,10 @@ pub class ClassValidator {
      * @throws:
      *   - &ErrorMsg: if there is an error in the validation 
      */
-    fn validateDirectVtableMethod (self, dmut context : &Validator, dmut func : &FunctionSymbol, clRef : &ClassRefType, ref mut vtable : [mut &MethodPrototypeValue], ref mut vtableProt : [mut MethodProtection], ref mut addMethods : [dmut &Symbol])
+    fn validateDirectVtableMethod (self, dmut context : &Validator, dmut func : &FunctionSymbol, clRef : &ClassRefType, noValue : bool, ref mut vtable : [mut &MethodPrototypeValue], ref mut vtableProt : [mut MethodProtection], ref mut addMethods : [dmut &Symbol])
         throws ErrorMsg
     {
-        let meth = context:.getFunctionValidator ():.validateMethodPrototype (alias context, alias func, clRef);
+        let meth = context:.getFunctionValidator ():.validateMethodPrototype (alias context, alias func, clRef, noValue-> noValue);
         let methProt = match func.getProtection () {
             Protection::PRIVATE   => { MethodProtection::PRV }
             Protection::PROTECTED => { MethodProtection::PROT }
@@ -1598,16 +1644,21 @@ pub class ClassValidator {
     /**
      * @returns: true if the class was already validated, or is currently in validation
      */
-    fn checkValidation (self, sym : &ClassSymbol)-> bool {
-        if let Ok () = sym.getClassRef () {
-            true
-        } else {
-            if sym in self._validation {
-                return true;
+    fn checkValidation (self, sym : &ClassSymbol)-> u32 {
+        if let Ok (cref) = sym.getClassRef () {
+            if cref.getTypeInfo () !of UnitValue {
+                return 3;
             }
 
-            false
+            if let Ok (level) = self._validation [sym] {
+                if cref.hasCtors () { return 3; }
+                else return level;
+            }
+
+            return 1;
         }
+
+        return 1;
     }
 
     /**
