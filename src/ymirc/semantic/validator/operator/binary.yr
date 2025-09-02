@@ -1909,7 +1909,8 @@ pub record BinaryOpValidator {
             context.implicitEnumUnwrap (context:.validateValue (bin.getLeft ()))
         };
 
-        self.validateFieldOperation (alias context, bin.getLoc (), op, left, bin.getRight ())
+        println ("IS IN CALL? ========");
+        self.validateFieldOperation (alias context, bin.getLoc (), op, left, bin.getRight (), inCall-> context.isInCall (bin))
     }
 
 
@@ -1925,12 +1926,12 @@ pub record BinaryOpValidator {
      * @throws:
      *    - &ErrorMsg: if the operation is not valid
      * */
-    pub fn validateFieldOperation (self, dmut context : &Validator, loc : &Word, op : BinaryOperators, left : &Value, right : &Expression)-> &Value
+    pub fn validateFieldOperation (self, dmut context : &Validator, loc : &Word, op : BinaryOperators, left : &Value, right : &Expression, inCall : bool)-> &Value
         throws ErrorMsg
     {
         match left.getType () {
             cptr : &ClassPtrType => {
-                return self.validateClassFieldVtableOperation (alias context, loc, cptr, left, right);
+                return self.validateClassFieldVtableOperation (alias context, loc, cptr, left, right, inCall);
             }
             tuple : &TupleType => {
                 return self.validateTupleFieldOperation (alias context, loc, op, tuple, left, right);
@@ -1974,7 +1975,7 @@ pub record BinaryOpValidator {
      *    - left: the instance value
      *    - right: the right operand
      */
-    fn validateClassFieldVtableOperation (self, dmut context : &Validator, loc : &Word, cptr : &ClassPtrType, left : &Value, right : &Expression)-> &Value
+    fn validateClassFieldVtableOperation (self, dmut context : &Validator, loc : &Word, cptr : &ClassPtrType, left : &Value, right : &Expression, assign : bool = false, inCall : bool)-> &Value
         throws ErrorMsg
     {
         if !cptr.getInner ().hasTypeInfo () {
@@ -1984,25 +1985,115 @@ pub record BinaryOpValidator {
         }
 
         let (inPrv, inProt) = context.getCurrentClassContextProtections (cptr.getInner ());
+
+        // ====================================================================================================
+        // =====================================          FIELD          ======================================
+        // ====================================================================================================
+
+        // Field have the priority
+        let fieldResult = self.validateClassFieldAccess (alias context, loc, left, right, cptr.getInner (), inProt, inPrv)?;
+        if let Ok (fieldAcc) = fieldResult {
+            return fieldAcc;
+        }
+
+        let dmut notes : [&ErrorMsg] = [];
+        let dmut startNotes : [&ErrorMsg] = [];
+
+        // ====================================================================================================
+        // =====================================          VTABLE          =====================================
+        // ====================================================================================================
+
+        // No field, maybe a method
         {
-            return self.validateClassFieldAccess (alias context, loc, left, right, cptr.getInner (), inProt, inPrv);
-        } catch {
-            err : &ErrorMsg => {
-                {
-                    match self.validateClassVtableAccess (alias context, loc, left, right, cptr.getInner (), isProxy-> context.isSuperProxy (left), inProt, inPrv) {
-                        UnitValue () => throw err;
-                        v : _ => return v;
-                    };
-                } catch {
-                    vtableErr : &ErrorMsg => {
-                        match self.validateClassBasicFieldAccess (alias context, left, right, cptr) {
-                            UnitValue () => throw vtableErr;
-                            v : _ => return v;
+            // access to the method in vtable, using normal access (inCall -> methods, !inCall && !assign-> @field[access], !inCall && assign-> @field[assigns]), warning: (assign && inCall) has no meaning
+            let fstVtAcc = self.validateClassVtableAccess (alias context, loc, left, right, cptr.getInner (), isProxy-> context.isSuperProxy (left), inProt, inPrv, assign-> (assign && !inCall), inCall-> inCall)?;
+            if let Ok (vtableAcc) = fstVtAcc {
+                return vtableAcc;
+            }
+
+            if let Err (err : &ErrorMsg) = fstVtAcc { // we sort out the errors, to put forward vtable, before field methods
+                if inCall { startNotes ~= [err]; }
+                else { notes ~= [err]; }
+            }
+
+            // Failure, no methods has the correct name
+            if inCall && !assign { // but maybe a field access does even inside an inCall (e.g. '@field fn foo (self)-> (dg (i32)-> void)', can be called with 'f.foo (12)');
+                let scdVtAcc = self.validateClassVtableAccess (alias context, loc, left, right, cptr.getInner (), isProxy-> context.isSuperProxy (left), inProt, inPrv, assign-> false, inCall-> false)?;
+                if let Ok (vtableAcc) = fstVtAcc {
+                    return vtableAcc;
+                }
+
+                if let Err (err : &ErrorMsg) = scdVtAcc { notes ~= [err]; }
+            }
+        }
+
+        // No method, maybe a basic field, such as __super, __typeinfo, etc.
+        if let Ok (basicAcc) = self.validateClassBasicFieldAccess (alias context, left, right, cptr) {
+            return basicAcc;
+        }
+
+        // ====================================================================================================
+        // =====================================          ERRORS          =====================================
+        // ====================================================================================================
+
+        {
+            // no luck, last try but this time only to have a better error message
+            if !inCall {
+                // If we are not in call, maybe something went wrong earlier and inCall was meant
+                // method access outside call are incomplete, we can already print that error
+                let fstVtAcc = self.validateClassVtableAccess (alias context, loc, left, right, cptr.getInner (), isProxy-> context.isSuperProxy (left), inProt, inPrv, assign-> false, inCall-> true)?;
+                if let Ok (vtableAcc) = fstVtAcc {
+                    if let m : &MultSymValue = vtableAcc {
+                        for v in m.getValues () if let mt : &MethodDelegateValue = v {
+                            startNotes ~= [copy ErrorMsg::fatal (loc, format (ValidateErrorMessage::IMPLICIT_ADDRESS_METHOD, mt, tags-> FormatTags (withParams-> true)),
+                                                                 notes-> copy [copy ErrorMsg::note (loc, format (ValidateErrorMessage::FORGET_PAR_PROTO_CALL, "()"), oneLine-> true),
+                                                                               copy ErrorMsg::note (loc, format (ValidateErrorMessage::FORGET_AND_PROTO), oneLine-> true)])];
                         }
+                    } else if let mt : &MethodDelegateValue = vtableAcc {
+                        startNotes ~= [copy ErrorMsg::fatal (loc, format (ValidateErrorMessage::IMPLICIT_ADDRESS_METHOD, mt, tags-> FormatTags (withParams-> true)),
+                                                             notes-> copy [copy ErrorMsg::note (loc, format (ValidateErrorMessage::FORGET_PAR_PROTO_CALL, "()"), oneLine-> true),
+                                                                           copy ErrorMsg::note (loc, format (ValidateErrorMessage::FORGET_AND_PROTO), oneLine-> true)])];
+                    }
+                }
+
+                if let Err (err : &ErrorMsg) = fstVtAcc { startNotes ~= [err]; }
+            }
+
+            else {
+                // Check for field access, even not applicable printing the error message can be useful
+                if let Ok (vtableAcc) = self.validateClassVtableAccess (alias context, loc, left, right, cptr.getInner (), isProxy-> context.isSuperProxy (left), inProt, inPrv, assign-> false, inCall-> false, forceCall-> false)? {
+                    if let m : &MultSymValue = vtableAcc {
+                        for v in m.getValues () if let mt : &MethodDelegateValue = v {
+                            notes ~= [copy ErrorMsg::note (mt.getPrototype ().getLoc (), format (ValidateErrorMessage::FIELD_METHOD_ACCESS_NOT_APPLICABLE, mt, tags-> FormatTags (withParams-> true)), oneLine-> true)];
+                        }
+                    } else if let mt : &MethodDelegateValue = vtableAcc {
+                        notes ~= [copy ErrorMsg::note (mt.getPrototype ().getLoc (), format (ValidateErrorMessage::FIELD_METHOD_ACCESS_NOT_APPLICABLE, mt, tags-> FormatTags (withParams-> true)), oneLine-> true)];
                     }
                 }
             }
+
+            // Check for field assign, even not applicable printing the error message can be useful
+            if let Ok (vtableAcc) = self.validateClassVtableAccess (alias context, loc, left, right, cptr.getInner (), isProxy-> context.isSuperProxy (left), inProt, inPrv, assign-> true, inCall-> false)? {
+                if let m : &MultSymValue = vtableAcc {
+                    for v in m.getValues () if let mt : &MethodDelegateValue = v {
+                        notes ~= [copy ErrorMsg::note (mt.getPrototype ().getLoc (), format (ValidateErrorMessage::FIELD_METHOD_ASSIGN_NOT_APPLICABLE, mt, tags-> FormatTags (withParams-> true)), oneLine-> true)];
+                    }
+                } else if let mt : &MethodDelegateValue = vtableAcc {
+                    notes ~= [copy ErrorMsg::note (mt.getPrototype ().getLoc (), format (ValidateErrorMessage::FIELD_METHOD_ASSIGN_NOT_APPLICABLE, mt, tags-> FormatTags (withParams-> true)), oneLine-> true)];
+                }
+            }
         }
+
+        // ====================================================================================================
+        // =============================          FINALIZATION OF ERROR          ==============================
+        // ====================================================================================================
+
+        if let Err (msg : &ErrorMsg) = fieldResult {
+            throw msg.withNote (startNotes ~ notes);
+        }
+
+        // class field access throws an error, or return something, we cannot reach this point
+        panic;
     }
 
     /**
@@ -2096,39 +2187,38 @@ pub record BinaryOpValidator {
      *     - inPrv: true iif current context has access to private vtable
      *     - allowImmut: true iif an alias can be used to access a const method
      */
-    pub fn validateClassVtableAccess (self, dmut context : &Validator, loc : &Word, left : &Value, right : &Expression, clRef : &ClassRefType, isProxy : bool, inProt : bool, inPrv : bool, allowImmut : bool = false, fieldCall : bool = true)-> &Value
+    pub fn validateClassVtableAccess (self, dmut context : &Validator, loc : &Word, left : &Value, right : &Expression, clRef : &ClassRefType, isProxy : bool, inProt : bool, inPrv : bool, allowImmut : bool = false, assign : bool = false, inCall : bool = false, forceCall : bool = true)-> &Value
         throws ErrorMsg
     {
         let mut errors : [&ErrorMsg] = [];
         let mut values : [&Value] = [];
-        let mut isFields : [bool] = [];
 
-        self.validateMethodClassAccess (alias context, loc, left, right, clRef, isProxy, inProt, inPrv, ref values, ref isFields, ref errors, allowImmut);
-        self.validateTemplateMethodClassAccess (alias context, left, right, clRef, inProt, inPrv, ref values, ref isFields, ref errors, allowImmut);
+        if inCall {
+            self.validateMethodClassAccess (alias context, left, right, clRef, isProxy, inProt, inPrv, ref values, ref errors, allowImmut);
+            self.validateTemplateMethodClassAccess (alias context, left, right, clRef, inProt, inPrv, ref values, ref errors, allowImmut);
+        } else {
+            self.validateMethodFieldClassAccess (alias context, loc, left, right, clRef, isProxy, inProt, inPrv, ref values, ref errors, assign);
+        }
 
         if (values.len == 0us) {
             if (errors.len != 0us) throw copy ErrorMsg::list (errors);
-            UNIT_VALUE // the class has no method named right
-        } else if (values.len == 1us) {
-            if (isFields [0us] && fieldCall) {
-                return context:.getCallOpValidator ().validate (alias context, right.getLoc (), values [0us], []);
+            if inCall {
+                throw copy ErrorMsg::note (right.getLoc (), format (ValidateErrorMessage::CLASS_NO_METHOD, left.getType (), right), oneLine-> true);
+            } else {
+                throw copy ErrorMsg::note (right.getLoc (), format (ValidateErrorMessage::CLASS_NO_FIELD_ACCESS_METHOD, left.getType (), right), oneLine-> true);
             }
-
-            values[0us]
-        } else {
-            let mut isFullField = true;
-            for i in isFields if !i {
-                isFullField = false;
-                break;
-            }
-
-            let dmut ret = copy MultSymValue (right.getLoc (), values, prettyStr-> format ("%", right));
-            if isFullField {
-                return context:.getCallOpValidator ().validate (alias context, right.getLoc (), ret, []);
-            }
-
-            ret
         }
+
+        if !inCall && !assign && forceCall {
+            let dmut ret = copy MultSymValue (right.getLoc (), values);
+            return context:.getCallOpValidator ().validate (alias context, right.getLoc (), ret, []);
+        }
+
+        else if (values.len == 1us) {
+            return values [0us];
+        }
+
+        return copy MultSymValue (right.getLoc (), values, prettyStr-> format ("%", right));
     }
 
     /**
@@ -2139,7 +2229,7 @@ pub record BinaryOpValidator {
      *     - right: the field accessed
      * @returns: UnitValue if the access is wrong, a value otherwise
      * */
-    fn validateClassBasicFieldAccess (self, dmut context : &Validator, left : &Value, right : &Expression, cptr : &ClassPtrType)-> &Value
+    fn validateClassBasicFieldAccess (self, dmut context : &Validator, left : &Value, right : &Expression, cptr : &ClassPtrType)-> (&Value)?
         throws ErrorMsg
     {
         let clRef = cptr.getInner ();
@@ -2148,23 +2238,23 @@ pub record BinaryOpValidator {
                 let indent = context:.getSubTypeValidator ().removeUnders (v.getLoc ().str);
                 if (indent == Keys::TYPEINFO) {
                     if (cptr.isStruct ()) {
-                        return context:.getTypeInfoValidator ().validate (alias context, left.getLoc (), cptr);
+                        return (context:.getTypeInfoValidator ().validate (alias context, left.getLoc (), cptr))?;
                     } else {
                         let typeinfoT = clRef.getTypeInfo ().asOf!{&Value} ().getType ();
-                        return copy ClassTypeInfoAccessValue (v.getLoc (), typeinfoT, str-> left);
+                        return (copy ClassTypeInfoAccessValue (v.getLoc (), typeinfoT, str-> left))?;
                     }
                 }
 
                 if (indent == Keys::TYPEID) {
                     if (cptr.isStruct ()) {
                         let content = format ("%", cptr);
-                        return makeStringSliceValue (left.getLoc (), content)
+                        return (makeStringSliceValue (left.getLoc (), content))?;
                     } else {
                         let typeinfoV = clRef.getTypeInfo ().asOf!{&TypeInfoValue} ();
                         let nameT = typeinfoV.getName ().getType ();
 
                         let typeinfo = copy ClassTypeInfoAccessValue (v.getLoc (), typeinfoV.getType (), str-> left);
-                        return copy StructFieldAccessValue (v.getLoc (), nameT, typeinfo, TypeInfoKeys::NAME);
+                        return (copy StructFieldAccessValue (v.getLoc (), nameT, typeinfo, TypeInfoKeys::NAME))?;
                     }
                 }
 
@@ -2172,9 +2262,9 @@ pub record BinaryOpValidator {
                     if (!context.isSelf (left)) throw copy ErrorMsg::fatal (v.getLoc (), end-> left.getLoc (), format (ValidateErrorMessage::SUPER_NO_SELF_CLASS, cptr));
                     match clRef.getAncestor () {
                         Ok (c) => {
-                            return copy SuperProxyValue (v.getLoc (),
-                                                         c.createInstance (isMutable-> cptr.isMutable (), isInnerMutable-> cptr.isDeeplyMutable ()),
-                                                         left);
+                            return (copy SuperProxyValue (v.getLoc (),
+                                                          c.createInstance (isMutable-> cptr.isMutable (), isInnerMutable-> cptr.isDeeplyMutable ()),
+                                                          left))?;
                         }
                         _ => {
                             throw copy ErrorMsg::fatal (v.getLoc (), end-> left.getLoc (), format (ValidateErrorMessage::NO_SUPER_CLASS, cptr));
@@ -2184,11 +2274,11 @@ pub record BinaryOpValidator {
             }
         }
 
-        UNIT_VALUE
+        none
     }
 
     /**
-     * Validate the access to the non template methods from the vtable of a class value
+     * Validate the access to the non template methods from the vtable of a class value, inside a call expression, thus ignoring @field methods
      * * @params:
      *    - context: the context of the validation
      *    - left: the object value
@@ -2199,89 +2289,58 @@ pub record BinaryOpValidator {
      * @returns:
      *    - values: insert all method delegate values
      * */
-    fn validateMethodClassAccess (self, dmut context : &Validator, loc : &Word, left : &Value, right : &Expression, clRef : &ClassRefType, isProxy : bool, inProt : bool, inPrv : bool, ref mut values : [&Value], ref mut isFields : [bool], ref mut errors : [&ErrorMsg], allowImmut : bool) {
-        match right {
-            meth : &VarExpr => {
-                for i, v in clRef.getVtable () {
-                    if (v.getSymbol ().getPath ().file () == meth.getLoc ().str) {
-                        if (v.getSymbol ().getProtection () == Protection::PRIVATE && !inPrv) {
-                            errors ~= [copy ErrorMsg::fatal (right.getLoc (), format (DeclareErrorMessage::PRIVATE_IN_THIS_CONTEXT, v, tags-> FormatTags (withParams-> true)),
-                                                             notes-> copy [copy ErrorMsg::note (v.getSymbol ().getLoc (), ValidateErrorMessage::DECLARED_HERE)])];
-                        } else if (v.getSymbol ().getProtection () == Protection::PROTECTED && !inPrv && !inProt) {
-                            errors ~= [copy ErrorMsg::fatal (right.getLoc (), format (DeclareErrorMessage::PRIVATE_IN_THIS_CONTEXT, v, tags-> FormatTags (withParams-> true)),
-                                                             notes-> copy [copy ErrorMsg::note (v.getSymbol ().getLoc (), ValidateErrorMessage::DECLARED_HERE)])];
-                        } else {
-                            let isDirect = if isProxy {
-                                true
-                            } else if clRef.hasAncestor () {
-                                // final class with no ancestor does not need vtable
-                                (!v.isVirtual () || clRef.getSymbol ().isFinal () || clRef.getSymbol ().isStruct ())
-                            } else {
-                                // method that are not over and are final are not virtual
-                                !v.isVirtual ()
-                            };
+    fn validateMethodClassAccess (self, dmut _ : &Validator, left : &Value, right : &Expression, clRef : &ClassRefType, isProxy : bool, inProt : bool, inPrv : bool, ref mut values : [&Value], ref mut errors : [&ErrorMsg], allowImmut : bool) {
+        if let meth : &VarExpr = right for i, v in clRef.getVtable () {
+            if (v.getSymbol ().getPath ().file () == meth.getLoc ().str) && (!v.isFieldAssign () && !v.isField ()) {
+                if (v.getSymbol ().getProtection () == Protection::PRIVATE && !inPrv) {
+                    errors ~= [copy ErrorMsg::fatal (right.getLoc (), format (DeclareErrorMessage::PRIVATE_IN_THIS_CONTEXT, v, tags-> FormatTags (withParams-> true)),
+                                                     notes-> copy [copy ErrorMsg::note (v.getSymbol ().getLoc (), ValidateErrorMessage::DECLARED_HERE)])];
+                } else if (v.getSymbol ().getProtection () == Protection::PROTECTED && !inPrv && !inProt) {
+                    errors ~= [copy ErrorMsg::fatal (right.getLoc (), format (DeclareErrorMessage::PRIVATE_IN_THIS_CONTEXT, v, tags-> FormatTags (withParams-> true)),
+                                                     notes-> copy [copy ErrorMsg::note (v.getSymbol ().getLoc (), ValidateErrorMessage::DECLARED_HERE)])];
+                } else {
+                    let isDirect = if isProxy {
+                        true
+                    } else if clRef.hasAncestor () {
+                        // final class with no ancestor does not need vtable
+                        (!v.isVirtual () || clRef.getSymbol ().isFinal () || clRef.getSymbol ().isStruct ())
+                    } else {
+                        // method that are not over and are final are not virtual
+                        !v.isVirtual ()
+                    };
 
-                            let mut success = true;
-                            let mut caller = left;
-                            let isField = v.isField ();
-                            if isField {
-                                if left of ClassAliaserValue {
-                                    errors ~= [copy ErrorMsg::fatal (v.getLoc (), format (ValidateErrorMessage::FIELD_METHOD_ALIAS, v, tags-> FormatTags (withParams-> true)),
-                                                                     notes-> copy [copy ErrorMsg::note (left.getLoc (), format (ValidateErrorMessage::UNECESSARY_ALIAS_FIELD_METHOD, left.getType ()))])];
-                                    success = false;
-                                }
+                    if (v.isMutable () && left !of ClassAliaserValue) {
+                        let mut notes = copy [copy ErrorMsg::note (left.getLoc (), format (ValidateErrorMessage::IMPLICIT_ALIAS, left.getType ()))];
+                        if (left of AliaserValue) notes = notes ~ copy [copy ErrorMsg::note (left.getLoc (), end-> v.getLoc (), format (ValidateErrorMessage::SIMPLE_ALIAS_NOT_CLASS), oneLine-> true)];
 
-                                else if v.isMutable () {
-                                    {
-                                        caller = context:.getValueValidator ().validateAlias (alias context, loc, left, isClass-> true, isField-> false);
-                                    } catch {
-                                        err => {
-                                            errors ~= [copy ErrorMsg::fatal (v.getLoc (), format (ValidateErrorMessage::FIELD_METHOD_MUTABLE_ALIAS, v, tags-> FormatTags (withParams-> true)),
-                                                                             notes-> copy [err])];
-                                            success = false;
-                                        }
-                                    }
-                                }
-                            }
+                        errors ~= [copy ErrorMsg::fatal (v.getLoc (), format (ValidateErrorMessage::MUTABLE_METHOD, v, tags-> FormatTags (withParams-> true)),
+                                                         notes-> notes)];
+                    }
 
-                            else {
-                                if (v.isMutable () && left !of ClassAliaserValue) {
-                                    let mut notes = copy [copy ErrorMsg::note (left.getLoc (), format (ValidateErrorMessage::IMPLICIT_ALIAS, left.getType ()))];
-                                    if (left of AliaserValue) notes = notes ~ copy [copy ErrorMsg::note (left.getLoc (), end-> v.getLoc (), format (ValidateErrorMessage::SIMPLE_ALIAS_NOT_CLASS), oneLine-> true)];
+                    else if (!v.isMutable () && (left of ClassAliaserValue || left of AliaserValue) && !allowImmut) {
+                        errors ~= [copy ErrorMsg::fatal (v.getLoc (), format (ValidateErrorMessage::CONST_METHOD, v, tags-> FormatTags (withParams-> true)),
+                                                         notes-> copy [copy ErrorMsg::note (left.getLoc (), format (ValidateErrorMessage::UNECESSARY_ALIAS, left.getType ()))])];
+                    }
 
-                                    errors ~= [copy ErrorMsg::fatal (v.getLoc (), format (ValidateErrorMessage::MUTABLE_METHOD, v, tags-> FormatTags (withParams-> true)),
-                                                                     notes-> notes)];
-                                    success = false;
-                                } else if (!v.isMutable () && (left of ClassAliaserValue || left of AliaserValue) && !allowImmut) {
-                                    errors ~= [copy ErrorMsg::fatal (v.getLoc (), format (ValidateErrorMessage::CONST_METHOD, v, tags-> FormatTags (withParams-> true)),
-                                                                     notes-> copy [copy ErrorMsg::note (left.getLoc (), format (ValidateErrorMessage::UNECESSARY_ALIAS, left.getType ()))])];
-                                    success = false;
-                                }
-                            }
+                    else if v.isEmpty () && isDirect {
+                        errors ~= [copy ErrorMsg::fatal (v.getLoc (), format (ValidateErrorMessage::EMPTY_METHOD_CALL, v, tags-> FormatTags (withParams-> true)),
+                                                         notes-> copy [copy ErrorMsg::note (left.getLoc (), format (ValidateErrorMessage::ABSTRACT_CLASS_CALL, left.getType ()))])];
+                    }
 
-                            if v.isEmpty () && isDirect {
-                                errors ~= [copy ErrorMsg::fatal (v.getLoc (), format (ValidateErrorMessage::EMPTY_METHOD_CALL, v, tags-> FormatTags (withParams-> true)),
-                                                                 notes-> copy [copy ErrorMsg::note (left.getLoc (), format (ValidateErrorMessage::ABSTRACT_CLASS_CALL, left.getType ()))])];
-                                success = false;
-                            }
-
-                            if success {
-                                isFields ~= [isField];
-                                values ~= [copy MethodDelegateValue (v.getLoc (), v, closure-> caller, direct-> isDirect, vtableIndex-> i, isStruct-> clRef.isStruct ())];
-                            }
-                        }
+                    else {
+                        values ~= [copy MethodDelegateValue (v.getLoc (), v, closure-> left, direct-> isDirect, vtableIndex-> i, isStruct-> clRef.isStruct ())];
                     }
                 }
             }
-            // _ => {
-            // We don't throw an error, assuming that validateClassFieldAccess is always called before, thus the error would be replicated
-            // }
-        };
+        }
 
+        // _ => {
+        // We don't throw an error, assuming that validateClassFieldAccess is always called before, thus the error would be replicated
+        // }
     }
 
     /**
-     * Validate the access to the template methods defined within the class symbol
+     * Validate the access to the template methods defined within the class symbol, inside a call expression, thus ignoring @field methods
      * @params:
      *    - context: the context of the validation
      *    - left: the object value
@@ -2292,33 +2351,97 @@ pub record BinaryOpValidator {
      * @returns:
      *    - values: insert all template values
      * */
-    fn validateTemplateMethodClassAccess (self, dmut _ : &Validator, left : &Value, right : &Expression, clRef : &ClassRefType, inProt : bool, inPrv : bool, ref mut values : [&Value], ref mut isFields : [bool], ref mut errors : [&ErrorMsg], allowImmut : bool) {
-        match right {
-            meth : &VarExpr => {
-                let prots = clRef.getTemplateMethodProtections ();
-                for i, v in clRef.getTemplateMethods () {
-                    if (v.getFunctionName () == meth.getLoc ().str) {
-                        if (prots [i] <= MethodProtection::PRV && !inPrv) {
-                            errors ~= [copy ErrorMsg::fatal (right.getLoc (), format (DeclareErrorMessage::PRIVATE_IN_THIS_CONTEXT, v, tags-> FormatTags (withParams-> true)),
-                                                             notes-> copy [copy ErrorMsg::note (v.getSymbol ().getLoc (), ValidateErrorMessage::DECLARED_HERE)])];
-                        } else if (prots [i] == MethodProtection::PROT && !inPrv && !inProt) {
-                            errors ~= [copy ErrorMsg::fatal (right.getLoc (), format (DeclareErrorMessage::PRIVATE_IN_THIS_CONTEXT, v, tags-> FormatTags (withParams-> true)),
-                                                             notes-> copy [copy ErrorMsg::note (v.getSymbol ().getLoc (), ValidateErrorMessage::DECLARED_HERE)])];
-                        } else {
-                            if (v.isMutable () && left !of ClassAliaserValue) {
-                                let mut notes = copy [copy ErrorMsg::note (left.getLoc (), format (ValidateErrorMessage::IMPLICIT_ALIAS, left.getType ()))];
-                                if (left of AliaserValue) notes = notes ~ [copy ErrorMsg::note (left.getLoc (), end-> v.getLoc (), format (ValidateErrorMessage::SIMPLE_ALIAS_NOT_CLASS), oneLine-> true)];
+    fn validateTemplateMethodClassAccess (self, dmut _ : &Validator, left : &Value, right : &Expression, clRef : &ClassRefType, inProt : bool, inPrv : bool, ref mut values : [&Value], ref mut errors : [&ErrorMsg], allowImmut : bool) {
+        if let meth : &VarExpr = right {
+            let prots = clRef.getTemplateMethodProtections ();
+            for i, v in clRef.getTemplateMethods () {
+                if (v.getFunctionName () == meth.getLoc ().str) {
+                    if (prots [i] <= MethodProtection::PRV && !inPrv) {
+                        errors ~= [copy ErrorMsg::fatal (right.getLoc (), format (DeclareErrorMessage::PRIVATE_IN_THIS_CONTEXT, v, tags-> FormatTags (withParams-> true)),
+                                                         notes-> copy [copy ErrorMsg::note (v.getSymbol ().getLoc (), ValidateErrorMessage::DECLARED_HERE)])];
+                    } else if (prots [i] == MethodProtection::PROT && !inPrv && !inProt) {
+                        errors ~= [copy ErrorMsg::fatal (right.getLoc (), format (DeclareErrorMessage::PRIVATE_IN_THIS_CONTEXT, v, tags-> FormatTags (withParams-> true)),
+                                                         notes-> copy [copy ErrorMsg::note (v.getSymbol ().getLoc (), ValidateErrorMessage::DECLARED_HERE)])];
+                    } else {
 
-                                errors ~= [copy ErrorMsg::fatal (v.getLoc (), format (ValidateErrorMessage::MUTABLE_METHOD, v, tags-> FormatTags (withParams-> true)),
-                                                                 notes-> notes)];
-                            } else if (!v.isMutable () && (left of ClassAliaserValue || left of AliaserValue) && !allowImmut) {
-                                errors ~= [copy ErrorMsg::fatal (v.getLoc (), format (ValidateErrorMessage::CONST_METHOD, v, tags-> FormatTags (withParams-> true)),
-                                                                 notes-> copy [copy ErrorMsg::note (left.getLoc (), format (ValidateErrorMessage::UNECESSARY_ALIAS, left.getType ()))])];
-                            } else {
-                                isFields ~= [false];
-                                values ~= [copy MethodDelegateTemplateValue (v.getLoc (), v, closure-> left, isStruct-> clRef.isStruct ())];
+                        if (v.isMutable () && left !of ClassAliaserValue) {
+                            let mut notes = copy [copy ErrorMsg::note (left.getLoc (), format (ValidateErrorMessage::IMPLICIT_ALIAS, left.getType ()))];
+                            if (left of AliaserValue) notes = notes ~ [copy ErrorMsg::note (left.getLoc (), end-> v.getLoc (), format (ValidateErrorMessage::SIMPLE_ALIAS_NOT_CLASS), oneLine-> true)];
+
+                            errors ~= [copy ErrorMsg::fatal (v.getLoc (), format (ValidateErrorMessage::MUTABLE_METHOD, v, tags-> FormatTags (withParams-> true)),
+                                                             notes-> notes)];
+                        }
+
+                        else if (!v.isMutable () && (left of ClassAliaserValue || left of AliaserValue) && !allowImmut) {
+                            errors ~= [copy ErrorMsg::fatal (v.getLoc (), format (ValidateErrorMessage::CONST_METHOD, v, tags-> FormatTags (withParams-> true)),
+                                                             notes-> copy [copy ErrorMsg::note (left.getLoc (), format (ValidateErrorMessage::UNECESSARY_ALIAS, left.getType ()))])];
+                        }
+
+                        else {
+                            values ~= [copy MethodDelegateTemplateValue (v.getLoc (), v, closure-> left, isStruct-> clRef.isStruct ())];
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * =================================          METHOD FIELDS          ==================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Validate an access to method of a class, but outside a call expression, thus selection only @field methods
+     * */
+    fn validateMethodFieldClassAccess (self, dmut context : &Validator, loc : &Word, left : &Value, right : &Expression, clRef : &ClassRefType, isProxy : bool, inProt : bool, inPrv : bool, ref mut values : [&Value], ref mut errors : [&ErrorMsg], assign : bool) {
+        if let meth : &VarExpr = right for i, v in clRef.getVtable () {
+            let applicable = (v.isField () && !assign) || (v.isFieldAssign () && assign);
+
+            if (v.getSymbol ().getPath ().file () == meth.getLoc ().str) && applicable {
+                if (v.getSymbol ().getProtection () == Protection::PRIVATE && !inPrv) {
+                    errors ~= [copy ErrorMsg::fatal (right.getLoc (), format (DeclareErrorMessage::PRIVATE_IN_THIS_CONTEXT, v, tags-> FormatTags (withParams-> true)),
+                                                     notes-> copy [copy ErrorMsg::note (v.getSymbol ().getLoc (), ValidateErrorMessage::DECLARED_HERE)])];
+                } else if (v.getSymbol ().getProtection () == Protection::PROTECTED && !inPrv && !inProt) {
+                    errors ~= [copy ErrorMsg::fatal (right.getLoc (), format (DeclareErrorMessage::PRIVATE_IN_THIS_CONTEXT, v, tags-> FormatTags (withParams-> true)),
+                                                     notes-> copy [copy ErrorMsg::note (v.getSymbol ().getLoc (), ValidateErrorMessage::DECLARED_HERE)])];
+                } else {
+                    let isDirect = if isProxy {
+                        true
+                    } else if clRef.hasAncestor () {
+                        // final class with no ancestor does not need vtable
+                        (!v.isVirtual () || clRef.getSymbol ().isFinal () || clRef.getSymbol ().isStruct ())
+                    } else {
+                        // method that are not over and are final are not virtual
+                        !v.isVirtual ()
+                    };
+
+                    let mut caller = left;
+                    let mut success = true;
+
+                    if left of ClassAliaserValue {
+                        errors ~= [copy ErrorMsg::fatal (v.getLoc (), format (ValidateErrorMessage::FIELD_METHOD_ALIAS, v, tags-> FormatTags (withParams-> true)),
+                                                         notes-> copy [copy ErrorMsg::note (left.getLoc (), format (ValidateErrorMessage::UNECESSARY_ALIAS_FIELD_METHOD, left.getType ()))])];
+                        success = false;
+                    }
+
+                    else if v.isMutable () {
+                        {
+                            caller = context:.getValueValidator ().validateAlias (alias context, loc, left, isClass-> true, isField-> false);
+                        } catch {
+                            err => {
+                                errors ~= [copy ErrorMsg::fatal (v.getLoc (), format (ValidateErrorMessage::FIELD_METHOD_MUTABLE_ALIAS, v, tags-> FormatTags (withParams-> true)),
+                                                                 notes-> copy [err])];
+                                success = false;
                             }
                         }
+                    }
+
+                    if success {
+                        values ~= [copy MethodDelegateValue (v.getLoc (), v, closure-> caller, direct-> isDirect, vtableIndex-> i, isStruct-> clRef.isStruct ())];
                     }
                 }
             }
@@ -3089,17 +3212,41 @@ pub record BinaryOpValidator {
     fn validateAffectOperation (self, dmut context : &Validator, op : BinaryOperators, bin : &BinaryExpr)-> &Value
         throws ErrorMsg
     {
+        let mut notes : [&ErrorMsg] = [];
         match bin.getLeft () { // Affection can be an index assign operation
             m : &MultOperatorExpr => { // in that case left operand is an index operation
                 if (m.isIndex ()) {
                     // We try the operation rewrite
                     return self.validateIndexAssignOperation (alias context, op, m, bin);
+                } // we don't catch, everything is managed in the specific method
+            }
+            bL : &BinaryExpr => {
+                let (_, _, type) = self.toOperator (bL.getLoc ());
+                if type == OperatorType::FIELD {
+
+                    // return none if just not applicable
+                    if let Ok (v) = self.validateFieldAssignOperation (alias context, op, bL, bin) {
+                        return v;
+                    }
+                } catch { // throws if applicable but failed
+                    err => { notes ~= [err]; }
                 }
             }
         }
 
-        let left = context:.validateValue (bin.getLeft (), noReduce-> true);
-        self.validateAffectOperation (alias context, bin.getLoc (), op, left, bin.getRight ())
+        {
+            let left = context:.validateValue (bin.getLeft (), noReduce-> true);
+            self.validateAffectOperation (alias context, bin.getLoc (), op, left, bin.getRight ())
+        } catch {
+            err => { // maybe index or field assign failed
+                if notes.len != 0 {
+                    throw copy ErrorMsg::fatal (bin.getLoc (), ValidateErrorMessage::VALIDATING,
+                                                notes-> copy [err] ~ notes);
+                } else {
+                    throw err;
+                }
+            }
+        }
     }
 
     /**
@@ -3228,6 +3375,45 @@ pub record BinaryOpValidator {
             }
         }
     }
+
+    /**
+     * Try to validate a field assign operation (a.foo = z), where a is a class value and calling method field assign may be present
+     * @returns: the assignement value, or none if just not applicable
+     * @warning: returning none means the assign method don't exists, but throwing an error means they were found but not compilation failed
+     * */
+    fn validateFieldAssignOperation (self, dmut context : &Validator, op : BinaryOperators, leftExpr : &BinaryExpr, bin : &BinaryExpr)-> (&Value?)
+        throws ErrorMsg
+    {
+        let leftIndex = context.implicitEnumUnwrap (context:.validateValue (leftExpr.getLeft ()));
+
+        // Try to find vtable assign index elements
+        if let cptr : &ClassPtrType =  leftIndex.getType () {
+            if !cptr.getInner ().hasTypeInfo () {
+                if let dmut sym : &ClassSymbol = context:.getClassFromRef (cptr.getInner ().getSymbol ()) {
+                    context:.getClassValidator ():.validateClassLayout (alias context, alias sym);
+                } else panic;
+            }
+
+            let (inPrv, inProt) = context.getCurrentClassContextProtections (cptr.getInner ());
+            let leftMethO = self.validateClassVtableAccess (alias context, leftExpr.getLoc (), leftIndex, leftExpr.getRight (), cptr.getInner (), isProxy-> context.isSuperProxy (leftIndex), inProt, inPrv, assign-> true, inCall-> false)?;
+            let leftMeth = if let Ok (v) = leftMethO {
+                v
+            } else { return none; };
+
+            let right = if op != BinaryOperators::EQUAL {
+                let rightMeth = self.validateClassVtableAccess (alias context, leftExpr.getLoc (), leftIndex, leftExpr.getRight (), cptr.getInner (), isProxy-> context.isSuperProxy (leftIndex), inProt, inPrv, assign-> false, inCall-> false);
+                self.validateAffectRight (alias context, bin.getLoc (), op, rightMeth, bin.getRight ())
+            } else {
+                context:.validateValue (bin.getRight ())
+            };
+
+            let ret = context:.getCallOpValidator ().validate (alias context, bin.getLoc (), leftMeth, copy [right]);
+            return (ret)?;
+        }
+
+        none
+    }
+
 
     /**
      * Validate the right operand of an affectation
