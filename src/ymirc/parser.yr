@@ -1,42 +1,37 @@
-mod ymirc::parser;
-import ymirc::args::_;
+in parser;
 
-import std::io, std::conv;
-import ymirc::syntax::_;
-import ymirc::errors::_;
-import ymirc::utils::_;
-import ymirc::lexing::lexer;
-import ymirc::lexing::word;
+use ymirc::syntax::{_, declaration::_, expression::_};
+use ymirc::errors::_;
+use ymirc::args;
+use ymirc::utils::_;
 
-import ymirc::syntax::visitor;
-import ymirc::semantic::declarator::visitor;
-import ymirc::semantic::validator::visitor;
-import ymirc::lint::expander::visitor;
-import ymirc::lint::optimizer::visitor;
-import ymirc::lint::node::_;
+use ymirc::lexing::{lexer, word};
+use ymirc::lint::{expander::visitor,
+                  optimizer::visitor,
+                  node::_};
 
-import ymirc::semantic::declarator::errors;
-import ymirc::semantic::generator::base;
-import ymirc::semantic::symbol::base;
+use ymirc::semantic::{doc::visitor,
+                      declarator::errors,
+                      declarator::visitor,
+                      validator::visitor,
+                      generator,
+                      symbol};
 
-
-import std::time::_;
-import std::fs::_;
-import std::env;
-import std::collection::vec;
+use std::{fs::_, env, io, conv};
 
 
 /**
  * The main class of the ymirc compiler
  * This class perform the different parsing step of the compilation, and gives the result to the backend
  */
+@final
 pub class Parser {
 
     // Options passed to the parser
     let _args : YmirArguments;
 
     // The syntaxic node read during syntax step
-    let mut _syntNode : &SyntaxNode = UnitExpr::new ();
+    let mut _syntNode : &SyntaxNode = EMPTY_EXPR;
 
     // The list of generators created during validation
     let mut _semGenerators : [&Generator] = [];
@@ -44,8 +39,8 @@ pub class Parser {
     // The list of generator created after expansion / finalization
     let mut _expNodes : [&YILNode] = [];
 
-    // The list of generator created after optimization
-    let mut _optNodes : [&YILNode] = [];
+    // The list of complex types created during expansion
+    let mut _expTypes : [&YILType] = [];
 
     /**
      * Create an empty file parser
@@ -93,17 +88,17 @@ pub class Parser {
     }
 
     /**
-     * @returns: the list of generators after optimization
-     * */
-    pub fn getOptYILNodes (self)-> [&YILNode] {
-        self._optNodes
-    }
-
-    /**
      * @returns: the list of generators nodes after expansion
      * */
     pub fn getExpYILNodes (self)-> [&YILNode] {
         self._expNodes
+    }
+
+    /**
+     * @returns: the list of types generated after expansion
+     * */
+    pub fn getExpYILTypes (self)-> [&YILType] {
+        self._expTypes
     }
 
     /*!
@@ -120,9 +115,9 @@ pub class Parser {
      *    - the generators created by validation process
      */
     pub fn parseAll (mut self)
-        throws &ErrorMsg
+        throws ErrorMsg
     {
-        let mut path = Path::new (self._args.file);
+        let mut path = Path (self._args.file);
         let mut package = path.parent ();
         if (!path.isAbsolute ()) {
             path = env::currentDir ().push (path);
@@ -138,20 +133,19 @@ pub class Parser {
      * @params: 
      *  - file: the path of the file
      */
-    fn parsePackage (mut self, file : &Path)
-        throws &ErrorMsg
+    fn parsePackage (mut self, file : Path)
+        throws ErrorMsg
     {
+        logging::info ("Compile package %", file.toStr ());
         let s1 = self:.syntaxStep (file);
         self._syntNode = s1;
 
-        let s2 = self:.validationStep (file, s1);
+        let (modules, s2) = self:.validationStep (file, s1);
         self._semGenerators = s2;
 
-        let s3 = self:.expansionStep (file, s2);
+        let (s3, s4) = self:.expansionStep (file, modules, s2);
         self._expNodes = s3;
-
-        let s4 = self:.optimizationStep (file, s3);
-        self._optNodes = s4;
+        self._expTypes = s4;
     }
 
     /*!
@@ -171,14 +165,14 @@ pub class Parser {
      * @throws:
      *    - &ErrorMsg: if there are syntaxic errors
      * */
-    fn syntaxStep (mut self, file : &Path)-> &ModuleDecl
-        throws &ErrorMsg
+    fn syntaxStep (mut self, file : Path)-> &ModuleDecl
+        throws ErrorMsg
     {
-        SyntaxVisitor::new (file):.read ()
+        (copy SyntaxVisitor (file)):.read ()
     } catch {
         err : &ErrorMsg => throw err;
         _ : &FsError => {
-            throw ErrorMsg::fatal (EOF_WORD, format (DeclareErrorMessage::NO_SUCH_FILE, file.toStr ()), oneLine-> true);
+            throw copy ErrorMsg::fatal (EOF_WORD, format (DeclareErrorMessage::NO_SUCH_FILE, file.toStr ()), oneLine-> true);
         }
     }
 
@@ -195,44 +189,47 @@ pub class Parser {
      * @params:
      *     - file: the path of the file in which the module was read
      *     - modSynt: the module to declare and validate
-     * @returns: the list of generators created by the module
+     * @returns:
+     *     - .0: the list of validated files
+     *     - .1: the list of generators created by the module
      * @throws:
      *     - &ErrorMsg: if there are error during the validation
      * */
-    fn validationStep (mut self, file : &Path, modSynt : &ModuleDecl)-> [&Generator]
-        throws &ErrorMsg
+    fn validationStep (mut self, file : Path, modSynt : &ModuleDecl)-> ([Path], [&Generator])
+        throws ErrorMsg
     {
-        if (self._args.noSem) return [];
+        if (self._args.noSem) return ([], []);
 
-        let dmut declarator = Declarator::new (packageDir-> file.parent ());
+        let dmut declarator = copy Declarator (packageDir-> file.parent ());
         self:.importExternPackages (alias declarator);
 
         let dmut modSym = declarator:.declareGlobal (modSynt, global::state::instance ().getPackage ());
         if (global::state::instance ().isYmirDumping ()) {
             {
-                with dmut f = File::create (file.addExtension ("ydump-decls.1"s8), write-> true) {
-                    let dmut formatter = Formatter::new ();
-                    modSym.formatSymTree (alias formatter);
-                    f:.write (formatter[]);
-                }
+                let dmut f = File::create (file.addExtension ("ydump-decls.1"), write-> true);
+                let dmut formatter = copy Formatter ();
+                modSym.formatSymTree (alias formatter);
+                f:.write (formatter[]);
             } catch {
                 err : &FsError => println( err );
             }
         }
 
-        let dmut valid = Validator::new (alias declarator);
+        let dmut valid = copy Validator (alias declarator);
         valid:.validate (alias modSym);
 
         if (global::state::instance ().isYmirDumping ()) {
             {
-                with dmut f = File::create (file.addExtension ("ydump-decls.2"s8), write-> true) {
-                    let dmut formatter = Formatter::new ();
+                {
+                    let dmut f = File::create (file.addExtension ("ydump-decls.2"), write-> true);
+                    let dmut formatter = copy Formatter ();
                     modSym.formatSymTree (alias formatter);
                     f:.write (formatter[]);
                 }
-                with dmut f = File::create (file.addExtension ("ydump-sem"s8), write-> true) {
+                {
+                    let dmut f = File::create (file.addExtension ("ydump-sem"), write-> true);
                     for i in valid.getGenerators () {
-                        f:.write (format ("%\n", i, withTags-> ["withVarIds"s8]));
+                        f:.write (format ("%\n", i, tags-> FormatTags (withVarIds-> true)));
                     }
                 }
             } catch {
@@ -242,105 +239,81 @@ pub class Parser {
 
         // Validation succeeded to generate symbols, but some were failing for aside reasons
         if (valid.getMissingGenerators ().len != 0us) {
-            throw ErrorMsg::list (valid.getMissingGenerators ());
+            throw copy ErrorMsg::list (valid.getMissingGenerators ());
         }
 
-        return valid.getGenerators ();
+        if (global::state::instance ().isDocDumping ()) {
+            {
+                let dmut f = File::create (global::state::instance ().getDocDumpFile (), write-> true);
+                let dmut docVisitor = DocVisitor (packageDir-> file.parent ());
+                let js = docVisitor.dump (modSym);
+                f:.write (std::config::json::dump (js));
+            } catch {
+                err : &FsError => { println (err); }
+            }
+        }
+
+        return (valid.getCompiledModules (), valid.getGenerators ());
     }
 
     /**
      * Import a external package imported using the -I option
      * */
     fn importExternPackages (mut self, dmut declarator : &Declarator)
-        throws &ErrorMsg
+        throws ErrorMsg
     {
-        let dmut errors = Vec!{&ErrorMsg}::new ();
+        let mut errors : [&ErrorMsg] = [];
         if (!global::state::instance ().isStandalone ()) {
             self:.importExternPackage (alias declarator, global::state::instance ().getCorePath ());
             declarator:.computeCoreUseDecls ();
         } catch {
-            err : &ErrorMsg => errors:.push (err);
+            err : &ErrorMsg => { errors ~= [err]; }
         }
 
         for dir in global::state::instance ().getIncludeDirs () {
             {
                 self:.importExternPackage (alias declarator, dir);
             } catch {
-                err : &ErrorMsg => errors:.push (err);
+                err : &ErrorMsg => { errors ~= [err]; }
             }
         }
 
         {
             declarator:.finalizeExternDeclaration ();
         } catch {
-            err : &ErrorMsg => errors:.push (err);
+            err : &ErrorMsg => { errors ~= [err]; }
         }
 
-        if (errors.len () != 0us) {
-            throw ErrorMsg::list (errors[]);
+        if (errors.len != 0us) {
+            throw copy ErrorMsg::list (errors);
         }
     }
 
     /**
      * Import the external package at path 'path'
      * */
-    fn importExternPackage (mut self, dmut declarator : &Declarator, path : &Path)
-        throws &ErrorMsg
+    fn importExternPackage (mut self, dmut declarator : &Declarator, path : Path)
+        throws ErrorMsg
     {
         let (file, pack) = if (fs::sys::isDir (path)) {
-            (path.push ("__lib__.yr"s8), path)
+            (path.push ("__lib__.yr"), path)
         } else {
             (path, path.parent ())
         };
 
+        logging::info ("Loading external package %", file.toStr ());
         {
-            let modSynt = SyntaxVisitor::new (file):.read ();
+            let modSynt = (copy SyntaxVisitor (file)):.read ();
             declarator:.declareExtern (modSynt, pack);
         } catch {
             err : &ErrorMsg => {
-                throw ErrorMsg::fatal (EOF_WORD, format (DeclareErrorMessage::IMPORT_EXTERN_PACKAGE, path.toStr ()), oneLine-> true, notes-> [err]);
+                throw copy ErrorMsg::fatal (EOF_WORD, format (DeclareErrorMessage::IMPORT_EXTERN_PACKAGE, path.toStr ()), oneLine-> true, notes-> copy [err]);
             }
             _ : &FsError => {
-                throw ErrorMsg::fatal (EOF_WORD, format (DeclareErrorMessage::IMPORT_EXTERN_PACKAGE, path.toStr ()), oneLine-> true,
-                                       notes-> [ErrorMsg::fatal (EOF_WORD, format (DeclareErrorMessage::NO_SUCH_FILE, file.toStr ()), oneLine-> true)]);
+                throw copy ErrorMsg::fatal (EOF_WORD, format (DeclareErrorMessage::IMPORT_EXTERN_PACKAGE, path.toStr ()), oneLine-> true,
+                                            notes-> copy [copy ErrorMsg::fatal (EOF_WORD, format (DeclareErrorMessage::NO_SUCH_FILE, file.toStr ()), oneLine-> true)]);
             }
         }
-    }
-
-    /*!
-     * ============================================================================
-     * ============================================================================
-     * ======================          OPTIMIZATION        ========================
-     * ============================================================================
-     * ============================================================================
-     */
-
-    /**
-     * Optimize the generators validated during the validation step
-     * @params:
-     *     - file: the file in which everything was originated
-     *     - gen: the list of generators to optimize
-     * @returns: the list of optimized generators
-     * */
-    fn optimizationStep (mut self, file : &Path, gens : [&YILNode])-> [&YILNode] {
-        if (self._args.noOpt) return gens;
-
-        let dmut optim = Optimizer::new ();
-        let opts = optim:.optimize (gens);
-
-        if (global::state::instance ().isYmirDumping ()) {
-            {
-                with dmut f = File::create (file.addExtension ("ydump-opt"s8), write-> true) {
-                    for i in opts {
-                        f:.write (format ("%\n", i, withTags-> ["withVarIds"s8]));
-                    }
-                }
-            } catch {
-                err : &FsError => println( err );
-            }
-        }
-
-        opts
     }
 
     /*!
@@ -356,30 +329,122 @@ pub class Parser {
      * It also transforms all the complex operators (Copier, Aliaser, etc.) into simple ones, such that backend does not need to worry about implementations
      * This step is the last before sending the generators to the backend
      * @params:
-     *     - file : &Path,
+     *     - file : Path,
      *     - gens: the list of generators to transform
      * @returns: the list of  nodes to send to the backend
      * */
-    fn expansionStep (mut self, file : &Path, gens : [&Generator])-> [&YILNode] {
-        if (self._args.noLint) return [];
+    fn expansionStep (mut self, file : Path, compiled : [Path], gens : [&Generator])-> ([&YILNode], [&YILType]) {
+        if (self._args.noLint) return ([], []);
 
-        let dmut exp = Expander::new ();
+        let dmut exp = copy Expander ();
         let finals = exp:.finalize (gens);
+        let types = exp.getTypes ();
 
         if (global::state::instance ().isYmirDumping ()) {
             {
+                use std::algorithm::sorting;
+                let dmut f = File::create (file.addExtension ("ydump-yil"), write-> true);
+                for t in sort (copy types, |a, b| => { a.getUniqId () < b.getUniqId () }) {
+                    f:.write (format ("%;\n", t, tags-> FormatTags (withParams-> true)));
+                }
 
-                with dmut f = File::create (file.addExtension ("ydump-yil"s8), write-> true) {
-                    for fi in finals {
-                        f:.write (format ("%\n", fi, withTags-> ["withVarIds"s8]));
-                    }
+                for fi in finals {
+                    f:.write (format ("%\n", fi, tags-> FormatTags (withVarIds-> true)));
                 }
             } catch {
-                err : &FsError => println( err );
+                err : &FsError => println (err);
             }
         }
 
-        finals
+        if (global::state::instance ().isDumpDependencies ()) {
+            self.writeModuleDependencies (file, compiled, finals);
+        }
+
+        (finals, types)
+    }
+
+    /**
+     * Write the dependencies of the modules in files, and the list of symbol names generated within the module
+     * */
+    pub fn writeModuleDependencies (self, file : Path, modules : [Path], nodes : [&YILSymbol]) {
+        logging::info ("Export module dependencies");
+        let dmut dependencies : [Path => [Path => ()]] = copy [];
+        let mut symbols : [Path => mut [[c8]]] = copy [];
+        let packageDir = file.parent ();
+
+        for m in modules {
+            symbols [m] = [];
+            dependencies [m] = copy [];
+        }
+
+        for n in nodes {
+            if packageDir.isPrefix (n.getPath ()) {
+                let nP = n.getPath ().removePrefix (packageDir);
+                if nP !in dependencies {
+                    dependencies [nP] = copy [];
+                }
+
+                for _, p in n.getReferences () if p != n.getPath () {
+                    if let Ok (dmut lst) = alias dependencies [nP] {
+                        lst [p] = ();
+                    } else panic;
+                }
+
+                if let Ok (lst) = symbols [nP] {
+                    let rest = lst ~ [n.getName ()];
+                    symbols [nP] = rest;
+                } else {
+                    symbols [nP] = copy [n.getName ()];
+                }
+            }
+        }
+
+        self.produceDependencyFiles (dependencies, symbols);
+    }
+
+    /**
+     * Produce the dependency tree file listing dependencies between source files
+     * */
+    fn produceDependencyFiles (self, graph : [Path => [Path => ()]], syms : [Path => [[c8]]]) {
+        {
+            let root = global::state::instance ().getDependencyDumpDir ();
+            if (!fs::sys::isDir (root)) {
+                fs::sys::createDir (root);
+            }
+
+            for v, neigh in graph {
+                {
+                    let p = root.push (v.toStr (sep-> "_")).addExtension ("deps");
+                    if (fs::sys::isFile (p)) {
+                        fs::sys::removeFile (p);
+                    }
+
+                    let dmut f = File::create (p, write-> true);
+                    for z in neigh {
+                        f:.write (z.addExtension ("yr").toStr ());
+                        f:.write ("\n");
+                    }
+                }
+
+                {
+                    let p = root.push (v.toStr (sep-> "_")).addExtension ("syms");
+                    if (fs::sys::isFile (p)) {
+                        fs::sys::removeFile (p);
+                    }
+
+                    let dmut f = File::create (p, write-> true);
+                    if let Ok (lst) = syms [v] for z in lst {
+                        f:.write (z);
+                        f:.write ("\n");
+                    }
+                }
+            }
+        } catch {
+            err => {
+                logging::failure ("Failed to write dependency file\n\t=>", err);
+                return;
+            }
+        }
     }
 
 }
