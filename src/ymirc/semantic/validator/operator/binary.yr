@@ -1909,7 +1909,6 @@ pub record BinaryOpValidator {
             context.implicitEnumUnwrap (context:.validateValue (bin.getLeft ()))
         };
 
-        println ("IS IN CALL? ========");
         self.validateFieldOperation (alias context, bin.getLoc (), op, left, bin.getRight (), inCall-> context.isInCall (bin))
     }
 
@@ -2204,8 +2203,10 @@ pub record BinaryOpValidator {
             if (errors.len != 0us) throw copy ErrorMsg::list (errors);
             if inCall {
                 throw copy ErrorMsg::note (right.getLoc (), format (ValidateErrorMessage::CLASS_NO_METHOD, left.getType (), right), oneLine-> true);
-            } else {
+            } else if !assign {
                 throw copy ErrorMsg::note (right.getLoc (), format (ValidateErrorMessage::CLASS_NO_FIELD_ACCESS_METHOD, left.getType (), right), oneLine-> true);
+            } else {
+                throw copy ErrorMsg::note (right.getLoc (), format (ValidateErrorMessage::CLASS_NO_FIELD_ASSIGN_METHOD, left.getType (), right), oneLine-> true);
             }
         }
 
@@ -3224,13 +3225,10 @@ pub record BinaryOpValidator {
                 let (_, _, type) = self.toOperator (bL.getLoc ());
                 if type == OperatorType::FIELD {
 
-                    // return none if just not applicable
-                    if let Ok (v) = self.validateFieldAssignOperation (alias context, op, bL, bin) {
-                        return v;
-                    }
-                } catch { // throws if applicable but failed
-                    err => { notes ~= [err]; }
-                }
+                    // we try the operation rewrite, applicable only on class instances
+                    return self.validateFieldAssignOperation (alias context, op, bL, bin);
+
+                } // we don't catch, everything is managed in the specific method
             }
         }
 
@@ -3381,37 +3379,62 @@ pub record BinaryOpValidator {
      * @returns: the assignement value, or none if just not applicable
      * @warning: returning none means the assign method don't exists, but throwing an error means they were found but not compilation failed
      * */
-    fn validateFieldAssignOperation (self, dmut context : &Validator, op : BinaryOperators, leftExpr : &BinaryExpr, bin : &BinaryExpr)-> (&Value?)
+    fn validateFieldAssignOperation (self, dmut context : &Validator, op : BinaryOperators, leftExpr : &BinaryExpr, bin : &BinaryExpr)-> &Value
         throws ErrorMsg
     {
         let leftIndex = context.implicitEnumUnwrap (context:.validateValue (leftExpr.getLeft ()));
 
         // Try to find vtable assign index elements
         if let cptr : &ClassPtrType =  leftIndex.getType () {
+            let mut error : (&ErrorMsg)? = none;
+            let (inPrv, inProt) = context.getCurrentClassContextProtections (cptr.getInner ());
+
             if !cptr.getInner ().hasTypeInfo () {
                 if let dmut sym : &ClassSymbol = context:.getClassFromRef (cptr.getInner ().getSymbol ()) {
                     context:.getClassValidator ():.validateClassLayout (alias context, alias sym);
                 } else panic;
             }
 
-            let (inPrv, inProt) = context.getCurrentClassContextProtections (cptr.getInner ());
-            let leftMethO = self.validateClassVtableAccess (alias context, leftExpr.getLoc (), leftIndex, leftExpr.getRight (), cptr.getInner (), isProxy-> context.isSuperProxy (leftIndex), inProt, inPrv, assign-> true, inCall-> false)?;
-            let leftMeth = if let Ok (v) = leftMethO {
-                v
-            } else { return none; };
+            // 1. try to using a class access/assign methods
+            {
+                let leftMeth = self.validateClassVtableAccess (alias context, leftExpr.getLoc (), leftIndex, leftExpr.getRight (), cptr.getInner (), isProxy-> context.isSuperProxy (leftIndex), inProt, inPrv, assign-> true, inCall-> false);
+                let right = if op != BinaryOperators::EQUAL {
+                    let rightMeth = self.validateClassVtableAccess (alias context, leftExpr.getLoc (), leftIndex, leftExpr.getRight (), cptr.getInner (), isProxy-> context.isSuperProxy (leftIndex), inProt, inPrv, assign-> false, inCall-> false);
+                    self.validateAffectRight (alias context, bin.getLoc (), op, rightMeth, bin.getRight ())
+                } else {
+                    context:.validateValue (bin.getRight ())
+                };
 
-            let right = if op != BinaryOperators::EQUAL {
-                let rightMeth = self.validateClassVtableAccess (alias context, leftExpr.getLoc (), leftIndex, leftExpr.getRight (), cptr.getInner (), isProxy-> context.isSuperProxy (leftIndex), inProt, inPrv, assign-> false, inCall-> false);
-                self.validateAffectRight (alias context, bin.getLoc (), op, rightMeth, bin.getRight ())
-            } else {
-                context:.validateValue (bin.getRight ())
-            };
+                let ret = context:.getCallOpValidator ().validate (alias context, bin.getLoc (), leftMeth, copy [right]);
+                return ret;
+            } catch {
+                // failed to validate field method assign
+                err : &ErrorMsg => {
+                    if err.isNote () {
+                        error = (err.asFatal ())?;
+                    } else error = (err)?;
+                }
+            }
 
-            let ret = context:.getCallOpValidator ().validate (alias context, bin.getLoc (), leftMeth, copy [right]);
-            return (ret)?;
+            // 2. try access basic field from class object
+            {
+                let field = self.validateClassFieldAccess (alias context, leftExpr.getLoc (), leftIndex, leftExpr.getRight (), cptr.getInner (), inProt, inPrv);
+                return self.validateAffectOperation (alias context, bin.getLoc (), op, field, bin.getRight ());
+            } catch {
+                err : &ErrorMsg => {
+                    if let Ok (prev) = error {
+                        throw copy ErrorMsg::list (copy [prev, err]);
+                    }
+
+                    throw err;
+                }
+            }
         }
 
-        none
+        else { // not a class
+            let left = context:.validateValue (bin.getLeft (), noReduce-> true);
+            self.validateAffectOperation (alias context, bin.getLoc (), op, left, bin.getRight ())
+        }
     }
 
 
