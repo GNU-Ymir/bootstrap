@@ -934,7 +934,7 @@ pub class FunctionValidator {
         let throwers = self.validateThrowers (alias context, func.getThrowerLoc (), func.getThrowers ());
         self.verifyUndefAttributes (func.getAttributes ());
 
-        let (selfParam, parameters, body, hasRedirect) = {
+        let (selfParam, parameters, preConstruct, ancCall, body, hasRedirect) = {
             context:.enterBlock ();
             // We need a class ptr for the self parameter
             let clPtr = clRef.createInstance (true, true);
@@ -942,17 +942,17 @@ pub class FunctionValidator {
             let selfParam = copy ProtoVarValue (copy Word (Keys::SELF, func.getLoc ()), clPtr, UNIT_VALUE, true, isSelf-> true, isReference-> clRef.isStruct ());   // Self parameters (first hidden param)
             let (_, parameters) = self:.validatePrototype (alias context, sym, func.getFunctionProtoDecl (), forMethod-> false, noValue-> noValue); // unlike methods self is not written in the prototype, so we need to validate all parameters
 
-            let (body, hasRedirect) = if (validateBody) { // We validate the body
+            let (preConstruct, ancCall, body, hasRedirect) = if (validateBody) { // We validate the body
                 self.validateCtorBody (alias context, sym, func, clPtr.getInner (), selfParam, throwers)
             } else { // we validate only the prototype
-                (UNIT_VALUE, false)
+                (UNIT_VALUE, none, UNIT_VALUE, false)
             }
 
-            (selfParam, parameters, body, hasRedirect) // don't add the self parameter in the prototype, we don't have it when calling the prototype
+            (selfParam, parameters, preConstruct, ancCall, body, hasRedirect) // don't add the self parameter in the prototype, we don't have it when calling the prototype
         } catch {
             err : &ErrorMsg => {
                 errors ~= [err];
-                (UNIT_VALUE, cast!{[&ProtoVarValue]} ([]), UNIT_VALUE, false)
+                (UNIT_VALUE, cast!{[&ProtoVarValue]} ([]), UNIT_VALUE, none, UNIT_VALUE, false)
             }
         } exit {
             {
@@ -963,34 +963,117 @@ pub class FunctionValidator {
         }
 
         if (errors.len != 0us) throw copy ErrorMsg::list (errors);
+
+        let rewrite = if let Ok (map) = sym.getTemplateMapper () {
+            TemplateRewriter (map)?
+        } else { none };
+
         if (validateBody && func.getBody () !of EmptyExpression) {
             if let selfV : &ProtoVarValue = selfParam {
-                let frame = copy FrameGenerator (func.getLoc (), sym.getPath (), copy [selfV] ~ parameters, copy VoidType (sym.getLoc ()), body, FrameKind::CTOR,
-                                                 isWeak-> (sym.isWeak () || clRef.getSymbol ().isWeak ()),
-                                                 templateMapper-> sym.getTemplateMapper ());
+                let params = copy [selfV] ~ parameters;
+                let frame = if !clRef.isStruct () {
+                    let (preFrame, preFrameProto) = self.createPrePostConstructorFrame (func.getLoc (), sym, clRef, params, throwers, preConstruct, true, ancCall, rename-> func.getRename ().str, fromTemplate-> rewrite);
+                    let (postFrame, postFrameProto) = self.createPrePostConstructorFrame (func.getLoc (), sym, clRef, params, throwers, body, false, ancCall, rename-> func.getRename ().str, fromTemplate-> rewrite);
+                    context:.insertGenerator (alias sym, preFrame);
+                    context:.insertGenerator (alias sym, postFrame);
+
+                    let callerBody = self.createConstructorBody (func.getLoc (), clRef, params, preFrameProto, postFrameProto);
+                    copy FrameGenerator (func.getLoc (), sym.getPath (), params, VOID_TYPE,
+                                         callerBody,
+                                         FrameKind::CTOR,
+                                         isWeak-> (sym.isWeak () || clRef.getSymbol ().isWeak ()),
+                                         templateMapper-> sym.getTemplateMapper ())
+                } else {
+                    copy FrameGenerator (func.getLoc (), sym.getPath (), params, VOID_TYPE,
+                                         copy BlockValue (func.getLoc (), VOID_TYPE, copy [preConstruct, body]),
+                                         FrameKind::CTOR,
+                                         isWeak-> (sym.isWeak () || clRef.getSymbol ().isWeak ()),
+                                         templateMapper-> sym.getTemplateMapper ())
+                }
 
                 context:.insertGenerator (alias sym, frame);
             } else panic;
         }
 
-        let gen = match sym.getTemplateMapper () {
-            Ok (map) => {
-                copy CtorPrototypeValue (sym.getLoc (), sym, parameters, throwers, clRef, rename-> func.getRename ().str,
-                                         attributes-> func.getAttributes (), fromTemplate-> TemplateRewriter (map)?)
-            }
-            _ => {
-                copy CtorPrototypeValue (sym.getLoc (), sym, parameters, throwers, clRef, rename-> func.getRename ().str,
-                                         attributes-> func.getAttributes ())
-            }
-        }
+        let gen = copy CtorPrototypeValue (sym.getLoc (), sym, parameters, throwers, clRef, rename-> func.getRename ().str,
+                                         attributes-> func.getAttributes (), fromTemplate-> rewrite);
 
         if (validateBody && hasRedirect) {
-            sym:.setFrameProto (gen, body, hasRedirect);
+            sym:.setFrameProto (gen, preConstruct, hasRedirect);
             let mut entered : [&Symbol => mut ()] = copy [];
             context.verifyInfiniteCtorRecursion (gen, ref entered);
         }
 
         gen
+    }
+
+    /**
+     * Create the frame of the ctor containing only the pre or the post part
+     * @params:
+     *    - loc: the location of the ctor
+     *    - sym: the constructor being validated
+     *    - clRef: the class reference being validated
+     *    - params: the list of parameters (including self)
+     *    - body: the list of instruction in the ctor part
+     *    - pre: true iif the part is a preconstruction (init of the fields)
+     *    - ancCall: the call value to the ancestor ctor
+     *    - rename: the name of the ctor
+     *    - fromTemplate: the template rewritter
+     * @returns:
+     *    - .0: the generated frame
+     *    - .1: the prototype of the generated frame
+     * */
+    fn createPrePostConstructorFrame (self, loc : &Word, sym : &ConstructorSymbol, clRef : &ClassRefType, params : [&ProtoVarValue], throwers : [(&Word, &Type)], body : &Value, pre : bool, ancCall : (&Value)?, rename : [c8], fromTemplate : (TemplateRewriter)?)-> (&FrameGenerator, &CtorPrototypeValue) {
+        let code = (if pre { FrameKind::CTOR_PRE } else { FrameKind::CTOR_POST });
+        let finalBody = if let Ok (c : &CtorCallValue) = ancCall {
+            let ac = if pre { c.cloneForPre () } else { c.cloneForPost () };
+            copy BlockValue (loc, VOID_TYPE, copy [ac, body])
+        } else {
+            body
+        };
+
+        let dmut frame = copy FrameGenerator (loc, sym.getPath (), params, VOID_TYPE, finalBody,
+                                              code,
+                                              isWeak-> (sym.isWeak () || clRef.getSymbol ().isWeak ()),
+                                              templateMapper-> sym.getTemplateMapper ());
+
+
+        let proto = copy CtorPrototypeValue (loc, sym,
+                                             pre-> pre,
+                                             post-> !pre,
+                                             parameters-> params [1 .. $],
+                                             throwers-> throwers,
+                                             attributes-> [],
+                                             clRef,
+                                             rename-> rename,
+                                             fromTemplate-> fromTemplate);
+
+        return (frame, proto);
+    }
+
+    /**
+     * Create the body of the complete ctor frame calling pre and post constructors functions
+     * @params:
+     *    - loc: the location of the ctor to build
+     *    - params: the parameters passed to the ctor
+     *    - preCtor: the pre part of the ctor
+     *    - postCtor: the post part of the ctor
+     * @returns: the body of the ctor
+     * */
+    fn createConstructorBody (self, loc : &Word, clRef : &ClassRefType, params : [&ProtoVarValue], preCtor : &CtorPrototypeValue, postCtor : &CtorPrototypeValue)-> &Value {
+        let dmut values = copy [
+            (copy VarRefValue (v.getLoc (), v.getLoc (), v.getType (), v.getUniqId (), isSelf-> v.isSelf (), isReference-> v.isReference ()))
+                for v in params];
+
+        let ptrType = clRef.createInstance (true, true);
+
+        let preDeleg = copy CtorDelegateValue (loc, ptrType, instance-> values [0], proto-> preCtor);
+        let postDeleg = copy CtorDelegateValue (loc, ptrType, instance-> values [0], proto-> postCtor);
+
+        let preCall = copy CtorCallValue (loc, ptrType, preDeleg, values [1 .. $]);
+        let postCall = copy CtorCallValue (loc, ptrType, postDeleg, values [1 .. $]);
+
+        copy BlockValue (loc, VOID_TYPE, copy [preCall, postCall])
     }
 
     /**
@@ -1002,11 +1085,15 @@ pub class FunctionValidator {
      *    - ctor: the ctor whose body is being validated
      *    - clRef: the type of the class containing the ctor
      *    - selfParam: the protovarvalue of the hidden self parameter
-     * @returns: the body of the ctor
+     * @returns:
+     *    - .0: the body of the preConstruction
+     *    - .1: the call to the ctor of the ancestor
+     *    - .2: the body of the postConstruction
+     *    - .3: true iif the ctor calls a redirect constructor
      * @throws:
      *    - &ErrorMsg: if there was an error in the validation     
      */
-    fn validateCtorBody (self, dmut context : &Validator, sym : &ConstructorSymbol, ctor : &ConstructorDecl, clRef : &ClassRefType, selfParam : &Value, throwers : [(&Word, &Type)])-> (&Value, bool)
+    fn validateCtorBody (self, dmut context : &Validator, sym : &ConstructorSymbol, ctor : &ConstructorDecl, clRef : &ClassRefType, selfParam : &Value, throwers : [(&Word, &Type)])-> (&Value, (&Value)?, &Value, bool)
         throws ErrorMsg
     {
         logging::info ("Validate ctor %", sym.getPath ());
@@ -1018,10 +1105,10 @@ pub class FunctionValidator {
         context:.getLocal (selfParam.getLoc (), selfParam.getLoc ().str, canBeInClosure-> false);
 
         // Reference to the self hidden param
-        let selfValue = copy VarRefValue (selfParam.getLoc (), selfParam.getLoc (), selfParam.getType (), selfParam.getUniqId (), isSelf-> true);
+        let selfValue = copy VarRefValue (selfParam.getLoc (), selfParam.getLoc (), selfParam.getType (), selfParam.getUniqId (), isSelf-> true, isReference-> clRef.isStruct ());
         
         // Validate the pre construction of the constructor (construction of fields, and ancestor)
-        let (preConstruct, hasRedirect) = self.validatePreConstructor (alias context, ctor, clRef, selfValue);
+        let (preConstruct, ancCall, hasRedirect) = self.validatePreConstructor (alias context, ctor, clRef, selfValue);
 
 
         // From this point, return is allowed
@@ -1040,13 +1127,10 @@ pub class FunctionValidator {
                                               throwers,
                                               unsafeLoc);
 
-        // the body contains the pre construction, and the proper body
-        let finalBody = match preConstruct {
-            UnitValue () => { copy [body] }
-            _ => { copy [preConstruct, body] }
-        };
-
-        (copy BlockValue (ctor.getLoc (), VOID_TYPE, finalBody), hasRedirect)
+        (preConstruct,
+         ancCall,
+         body,
+         hasRedirect)
     }       
 
     /**
@@ -1061,22 +1145,17 @@ pub class FunctionValidator {
      * @throws: 
      *    - &ErrorMsg: if there was an error in the validation
      */
-    fn validatePreConstructor (self, dmut context : &Validator, func : &ConstructorDecl, clRef : &ClassRefType, selfParam : &Value)-> (&Value, bool)
+    fn validatePreConstructor (self, dmut context : &Validator, func : &ConstructorDecl, clRef : &ClassRefType, selfParam : &Value)-> (&Value, (&Value)?, bool)
         throws ErrorMsg
     {
         if (func.getExplicitCstrsCall () == Keys::SELF) { // There is a redirection of construction
-            return (self.validateRedirectCtor (alias context, func, clRef, selfParam), true);
+            return (self.validateRedirectCtor (alias context, func, clRef, selfParam), none, true);
         }
 
-        let mut block : [&Value] = []; // list of instructions
+        // Call the ancestor ctor
         let ancCall = self.validateAncestorCtorCall (alias context, func, clRef, selfParam);
-        match ancCall {
-            UnitValue () => {} // Don't add an empty value
-            _ =>  {
-                block ~= [ancCall]; // There is an ancestor, and its ctor is called
-            }
-        }        
 
+        let mut block : [&Value] = []; // list of instructions
         let fieldCtor = self.validateFieldCtors (alias context, func, clRef, selfParam);
         match fieldCtor {
             UnitValue () => {} // Don't add an empty value
@@ -1085,14 +1164,9 @@ pub class FunctionValidator {
             }
         }
 
-        let finVal = if (block.len != 0us) {
-            // We create the block of instruction, containing super call, and field ctors
-            copy BlockValue (func.getLoc (), VOID_TYPE, block)
-        } else {
-            UNIT_VALUE
-        };
-
-        (finVal, false)
+        (copy BlockValue (func.getLoc (), VOID_TYPE, block),
+         ancCall,
+         false)
     }
 
     /**
@@ -1145,11 +1219,13 @@ pub class FunctionValidator {
      *    - func: the declaration of the constructor
      *    - clRef: the type of the class that is being validated
      *    - selfParam: the self parameters
-     * @returns: the instruction calling the ancestor constructor (or Unit, if there is not call)
+     * @returns: An option if class has an ancestor
+     *    - .0: the call to the pre part of the ancestor constructor
+     *    - .1: the call to the post part of the ancestor constructor
      * @throws: 
      *    - &ErrorMsg: if there is an error in the validation
      */
-    fn validateAncestorCtorCall (self, dmut context : &Validator, func : &ConstructorDecl, clRef : &ClassRefType, selfParam : &Value)-> &Value
+    fn validateAncestorCtorCall (self, dmut context : &Validator, func : &ConstructorDecl, clRef : &ClassRefType, selfParam : &Value)-> (&Value)?
         throws ErrorMsg
     {
         match clRef.getAncestor () {
@@ -1160,7 +1236,10 @@ pub class FunctionValidator {
 
                 {
                     let ctors = self.createCtorDelegate (alias context, superLoc, ancestor, selfParam, renameLoc-> func.getExplicitSuperName (), templateParams-> func.getSuperTemplateParams ());
-                    return context:.getCallOpValidator ().validate (alias context, superLoc, ctors, rights, inCopy-> true); // Call the ctors with the parameters and return the one that succeeded
+
+                    // Call the ctors with the parameters and return the one that succeeded
+                    let result = context:.getCallOpValidator ().validate (alias context, superLoc, ctors, rights, inCopy-> true);
+                    return (result)?;
                 } catch { 
                     err : &ErrorMsg => { // None succeeded (TODO print private candidates)
                         throw copy ErrorMsg::fatal (superLoc, format (ValidateErrorMessage::UNDEFINED_SUPER_CALL_CTOR, rights),
@@ -1174,7 +1253,7 @@ pub class FunctionValidator {
                     throw copy ErrorMsg::fatal (func.getExplicitCstrsCall (), format (ValidateErrorMessage::NO_SUPER_CLASS, clRef));
                 }
                 
-                return UNIT_VALUE;
+                return none;
             }            
         }        
     }
