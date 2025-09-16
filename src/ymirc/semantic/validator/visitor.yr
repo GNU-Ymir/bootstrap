@@ -1089,7 +1089,7 @@ pub class Validator {
         self._symbols:.back ():.front ().content ["#{CLOSURE-VARREF}"] = copy VarRefValue (copy Word ("#{CLOSURE-VARREF}", loc), EOF_WORD, VOID_TYPE, refId);
         self._usedSyms:.back ():.front ().content ["#{CLOSURE-VARREF}"] = EOF_WORD;
         
-        self._closureType:.push (copy ClosureType (EOF_WORD, [], [], [], refId,
+        self._closureType:.push (copy ClosureType (EOF_WORD, [], [], [], [], refId,
                                                    self._symbols [closureIndex],
                                                    alias self._usedSyms:[closureIndex]));
     }
@@ -1378,6 +1378,38 @@ pub class Validator {
         }
 
         UNIT_VALUE
+    }
+
+    /**
+     * Force the variable declared locally to be put inside the closure
+     * @params:
+     *   - name: the name of the variable to put in the closure
+     *   - forceRef: true iif the variable is inserted by reference
+     * */
+    pub fn forceInClosure (mut self, loc : &Word, name : [c8], type : &Type, byReference : bool)-> &Value
+        throws ErrorMsg
+    {
+        self:.getInClosure (loc, name, type, byReference-> byReference)
+    }
+
+    /**
+     * Finalize the closure, meaning all variable that can enclosed have been enclosed
+     * */
+    pub fn finalizeClosure (mut self) {
+        if (self._closureType.len == 0us) panic;
+
+        let dmut closureType = self._closureType:.back ();
+        let dmut secClosureType = copy ClosureType (closureType.getLoc (),
+                                                    innerTypes-> closureType.getInnerTypes (),
+                                                    innerNames-> closureType.getInnerNames (),
+                                                    innerValues-> closureType.getInnerValues (),
+                                                    innerRefs-> closureType.getInnerRefs (),
+                                                    refId-> closureType.getRefId (),
+                                                    symbols-> closureType.getClosureSymbols (),
+                                                    closureType:.getClosureUsed (),
+                                                    finalized-> true);
+
+        self._closureType:.setBack (alias secClosureType);
     }
 
     /**
@@ -2098,8 +2130,12 @@ pub class Validator {
         } else if (value of MapAccessValue) {
             throw copy ErrorMsg::fatal (end-> loc, value.getLoc (), format (ValidateErrorMessage::NOT_A_LVALUE_MAP_ACCESS, value));
         } else if (!allowImmutable && value of ClosureFieldAccessValue) {
-            throw copy ErrorMsg::fatal (end-> loc, value.getLoc (), format (ValidateErrorMessage::NOT_A_LVALUE_CLOSURE, value));
-        } else if (self.isLazy (value)) {
+            if let v : &ClosureFieldAccessValue = value && !v.byRef () {
+                throw copy ErrorMsg::fatal (end-> loc, value.getLoc (), format (ValidateErrorMessage::NOT_A_LVALUE_CLOSURE, value));
+            }
+        }
+
+        if (self.isLazy (value)) {
             throw copy ErrorMsg::fatal (end-> loc, value.getLoc (), format (ValidateErrorMessage::NOT_A_LVALUE_LAZY, value));
         }
 
@@ -3546,8 +3582,10 @@ pub class Validator {
         if (self._closureType.len == 0us) return UNIT_VALUE;
 
         let dmut closureType = self._closureType:.back ();
-        let (field, index) = closureType.getField (name);
+        let (field, byRef, index) = closureType.getField (name);
         if (field of NoneType) {
+            if closureType.isFinalized () { return UNIT_VALUE; }
+
             let syms = closureType.getClosureSymbols ();
             for i in 0us .. syms.len {
                 if let Ok (g) = syms [i].content [name] {
@@ -3558,26 +3596,80 @@ pub class Validator {
                     let types = closureType.getInnerTypes () ~ [type];
                     let names = closureType.getInnerNames () ~ [name];
                     let values = closureType.getInnerValues () ~ [val];
+                    let refs = closureType.getInnerRefs () ~ [false];
                     let fndIndex = values.len - 1us;
 
-                    let dmut secClosureType = copy ClosureType (closureType.getLoc (), types, names, values, closureType.getRefId (), syms, closureType:.getClosureUsed ());
+                    let dmut secClosureType = copy ClosureType (closureType.getLoc (),
+                                                                innerTypes-> types,
+                                                                innerNames-> names,
+                                                                innerValues-> values,
+                                                                innerRefs-> refs,
+                                                                closureType.getRefId (), syms, closureType:.getClosureUsed ());
+
                     self._closureType:.setBack (alias secClosureType);
 
                     let oldRef = self:.getLocal (EOF_WORD, "#{CLOSURE-VARREF}", canBeInClosure-> false);
                     if let v : &VarRefValue = oldRef {
-                        let closureRef = copy VarRefValue (oldRef.getLoc (), EOF_WORD, secClosureType, v.getRefId (), isSelf-> v.isSelf ());
+                        let closureRef = copy VarRefValue (oldRef.getLoc (), EOF_WORD, secClosureType, v.getRefId (), isSelf-> v.isSelf (), isReference-> false);
                         self._symbols:.back ():.front ().content ["#{CLOSURE-VARREF}"] = closureRef;
 
-                        return copy ClosureFieldAccessValue (copy Word (name, loc), type, closureRef, fndIndex, name-> name);
+                        return copy ClosureFieldAccessValue (copy Word (name, loc), type, closureRef, fndIndex, name-> name, byRef-> false);
                     } else panic;
                 }
             }
         } else {
             let closureRef = self:.getLocal (EOF_WORD, "#{CLOSURE-VARREF}", canBeInClosure-> false);
-            return copy ClosureFieldAccessValue (copy Word (name, loc), field, closureRef, index, name-> name);
+            return copy ClosureFieldAccessValue (copy Word (name, loc), field, closureRef, index, name-> name, byRef-> byRef);
         }
-        
+
         UNIT_VALUE
+    } catch {
+        err : &ErrorMsg => throw err;
+    }
+
+    /**
+     * @returns: a local variable that is enclosed
+     */
+    fn getInClosure (mut self, loc : &Word, name : [c8], type : &Type, byReference : bool)-> &Value
+        throws ErrorMsg
+    {
+        if (self._closureType.len == 0us) panic;
+
+        let dmut closureType = self._closureType:.back ();
+        let (field, byRefField, index) = closureType.getField (name);
+        if (field of NoneType) {
+            let syms = closureType.getClosureSymbols ();
+            for i in 0 .. syms.len if let Ok (_) = syms [i].content [name] {
+                closureType:.getClosureUsed ():[i].content [name] = EOF_WORD;
+                break;
+            }
+
+            let types = closureType.getInnerTypes () ~ [type];
+            let names = closureType.getInnerNames () ~ [name];
+            let values = closureType.getInnerValues () ~ [UNIT_VALUE];
+            let refs  = closureType.getInnerRefs () ~ [byReference];
+            let fndIndex = values.len - 1us;
+
+            let dmut secClosureType = copy ClosureType (closureType.getLoc (),
+                                                        innerTypes-> types,
+                                                        innerNames-> names,
+                                                        innerValues-> values,
+                                                        innerRefs-> refs,
+                                                        closureType.getRefId (), syms, closureType:.getClosureUsed ());
+            self._closureType:.setBack (alias secClosureType);
+
+            let oldRef = self:.getLocal (EOF_WORD, "#{CLOSURE-VARREF}", canBeInClosure-> false);
+            if let v : &VarRefValue = oldRef {
+                let closureRef = copy VarRefValue (oldRef.getLoc (), EOF_WORD, secClosureType, v.getRefId (), isSelf-> v.isSelf (), isReference-> false);
+                self._symbols:.back ():.front ().content ["#{CLOSURE-VARREF}"] = closureRef;
+
+                return copy ClosureFieldAccessValue (copy Word (name, loc), type, closureRef, fndIndex, name-> name, byRef-> byReference);
+            } else panic;
+        } else {
+            let closureRef = self:.getLocal (EOF_WORD, "#{CLOSURE-VARREF}", canBeInClosure-> false);
+            return copy ClosureFieldAccessValue (copy Word (name, loc), field, closureRef, index, name-> name, byRef-> byRefField);
+        }
+
     } catch {
         err : &ErrorMsg => throw err;
     }

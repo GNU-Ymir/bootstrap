@@ -929,30 +929,29 @@ pub class FunctionValidator {
     fn validateConstructor (mut self, dmut context : &Validator, dmut sym : &ConstructorSymbol, clRef : &ClassRefType, validateBody : bool = false, noValue : bool = false)-> &CtorPrototypeValue
         throws ErrorMsg
     {
+        if validateBody {
+            if clRef.isStruct () {
+                return self:.validateStructConstructor (alias context, alias sym, clRef);
+            } else {
+                return self:.validateClassConstructor (alias context, alias sym, clRef);
+            }
+        }
+
         let func = sym.getContent ();
-        let mut errors : [&ErrorMsg] = [];
         let throwers = self.validateThrowers (alias context, func.getThrowerLoc (), func.getThrowers ());
         self.verifyUndefAttributes (func.getAttributes ());
 
-        let (selfParam, parameters, preConstruct, ancCall, body, hasRedirect) = {
+        let mut errors : [&ErrorMsg] = [];
+        let (parameters) = {
             context:.enterBlock ();
             // We need a class ptr for the self parameter
-            let clPtr = clRef.createInstance (true, true);
-
-            let selfParam = copy ProtoVarValue (copy Word (Keys::SELF, func.getLoc ()), clPtr, UNIT_VALUE, true, isSelf-> true, isReference-> clRef.isStruct ());   // Self parameters (first hidden param)
             let (_, parameters) = self:.validatePrototype (alias context, sym, func.getFunctionProtoDecl (), forMethod-> false, noValue-> noValue); // unlike methods self is not written in the prototype, so we need to validate all parameters
 
-            let (preConstruct, ancCall, body, hasRedirect) = if (validateBody) { // We validate the body
-                self.validateCtorBody (alias context, sym, func, clPtr.getInner (), selfParam, throwers)
-            } else { // we validate only the prototype
-                (UNIT_VALUE, none, UNIT_VALUE, false)
-            }
-
-            (selfParam, parameters, preConstruct, ancCall, body, hasRedirect) // don't add the self parameter in the prototype, we don't have it when calling the prototype
+            parameters
         } catch {
             err : &ErrorMsg => {
                 errors ~= [err];
-                (UNIT_VALUE, cast!{[&ProtoVarValue]} ([]), UNIT_VALUE, none, UNIT_VALUE, false)
+                []
             }
         } exit {
             {
@@ -963,33 +962,86 @@ pub class FunctionValidator {
         }
 
         if (errors.len != 0us) throw copy ErrorMsg::list (errors);
-
         let rewrite = if let Ok (map) = sym.getTemplateMapper () {
             TemplateRewriter (map)?
         } else { none };
 
-        if (validateBody && func.getBody () !of EmptyExpression) {
+        copy CtorPrototypeValue (sym.getLoc (),
+                                 sym,
+                                 parameters,
+                                 throwers,
+                                 clRef,
+                                 rename-> func.getRename ().str,
+                                 attributes-> func.getAttributes (),
+                                 fromTemplate-> rewrite)
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * =============================          STRUCT CTOR VALIDATION          =============================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Validate a constructor for a structure (simpler than class ctors, as there is no closure to create)
+     * @params:
+     *    - context: the context of the validation
+     *    - sym: the symbol to validate
+     *    - clRef: the struct containing the constructor
+     * @returns: the prototype of the ctor
+     * */
+    fn validateStructConstructor (mut self, dmut context : &Validator, dmut sym : &ConstructorSymbol, clRef : &ClassRefType)-> &CtorPrototypeValue
+        throws ErrorMsg
+    {
+        let func = sym.getContent ();
+        let throwers = self.validateThrowers (alias context, func.getThrowerLoc (), func.getThrowers ());
+
+        let mut errors : [&ErrorMsg] = [];
+
+        let (selfParam, parameters, preConstruct, body, hasRedirect) = {
+            context:.enterBlock ();
+            // We need a class ptr for the self parameter
+            let clPtr = clRef.createInstance (true, true);
+
+            // Self parameters (first hidden param)
+            let selfParam = copy ProtoVarValue (copy Word (Keys::SELF, func.getLoc ()), clPtr, UNIT_VALUE, true, isSelf-> true, isReference-> true);
+
+            // unlike methods self is not written in the prototype, so we need to validate all parameters (hence: forMethod-> false)
+            let (_, parameters) = self:.validatePrototype (alias context, sym, func.getFunctionProtoDecl (), forMethod-> false, noValue-> false);
+
+            // We validate the body
+            let (preConstruct, body, hasRedirect) = self.validateStructCtorBody (alias context, sym, func, clPtr.getInner (), selfParam, throwers);
+
+            // don't add the self parameter in the prototype, we don't have it when calling the prototypea
+            (selfParam, parameters, preConstruct, body, hasRedirect)
+        } catch {
+            err : &ErrorMsg => {
+                errors ~= [err];
+                (UNIT_VALUE, cast!{[&ProtoVarValue]} ([]), UNIT_VALUE, UNIT_VALUE, false)
+            }
+        } exit {
+            {
+                context:.quitBlock (warnUnused-> (errors.len == 0us));
+            } catch {
+                err : &ErrorMsg => { errors ~= [err]; }
+            }
+        }
+
+        if (errors.len != 0us) throw copy ErrorMsg::list (errors);
+        let rewrite = if let Ok (map) = sym.getTemplateMapper () {
+            TemplateRewriter (map)?
+        } else { none };
+
+        if (func.getBody () !of EmptyExpression) {
             if let selfV : &ProtoVarValue = selfParam {
                 let params = copy [selfV] ~ parameters;
-                let frame = if !clRef.isStruct () {
-                    let (preFrame, preFrameProto) = self.createPrePostConstructorFrame (func.getLoc (), sym, clRef, params, throwers, preConstruct, true, ancCall, rename-> func.getRename ().str, fromTemplate-> rewrite);
-                    let (postFrame, postFrameProto) = self.createPrePostConstructorFrame (func.getLoc (), sym, clRef, params, throwers, body, false, ancCall, rename-> func.getRename ().str, fromTemplate-> rewrite);
-                    context:.insertGenerator (alias sym, preFrame);
-                    context:.insertGenerator (alias sym, postFrame);
-
-                    let callerBody = self.createConstructorBody (func.getLoc (), clRef, params, preFrameProto, postFrameProto);
-                    copy FrameGenerator (func.getLoc (), sym.getPath (), params, VOID_TYPE,
-                                         callerBody,
-                                         FrameKind::CTOR,
-                                         isWeak-> (sym.isWeak () || clRef.getSymbol ().isWeak ()),
-                                         templateMapper-> sym.getTemplateMapper ())
-                } else {
-                    copy FrameGenerator (func.getLoc (), sym.getPath (), params, VOID_TYPE,
-                                         copy BlockValue (func.getLoc (), VOID_TYPE, copy [preConstruct, body]),
-                                         FrameKind::CTOR,
-                                         isWeak-> (sym.isWeak () || clRef.getSymbol ().isWeak ()),
-                                         templateMapper-> sym.getTemplateMapper ())
-                }
+                let frame = copy FrameGenerator (func.getLoc (), sym.getPath (), params, VOID_TYPE,
+                                                 copy BlockValue (func.getLoc (), VOID_TYPE, copy [preConstruct, body]),
+                                                 FrameKind::CTOR,
+                                                 isWeak-> (sym.isWeak () || clRef.getSymbol ().isWeak ()),
+                                                 templateMapper-> sym.getTemplateMapper ());
 
                 context:.insertGenerator (alias sym, frame);
             } else panic;
@@ -998,7 +1050,7 @@ pub class FunctionValidator {
         let gen = copy CtorPrototypeValue (sym.getLoc (), sym, parameters, throwers, clRef, rename-> func.getRename ().str,
                                          attributes-> func.getAttributes (), fromTemplate-> rewrite);
 
-        if (validateBody && hasRedirect) {
+        if (hasRedirect) {
             sym:.setFrameProto (gen, preConstruct, hasRedirect);
             let mut entered : [&Symbol => mut ()] = copy [];
             context.verifyInfiniteCtorRecursion (gen, ref entered);
@@ -1008,78 +1060,9 @@ pub class FunctionValidator {
     }
 
     /**
-     * Create the frame of the ctor containing only the pre or the post part
-     * @params:
-     *    - loc: the location of the ctor
-     *    - sym: the constructor being validated
-     *    - clRef: the class reference being validated
-     *    - params: the list of parameters (including self)
-     *    - body: the list of instruction in the ctor part
-     *    - pre: true iif the part is a preconstruction (init of the fields)
-     *    - ancCall: the call value to the ancestor ctor
-     *    - rename: the name of the ctor
-     *    - fromTemplate: the template rewritter
-     * @returns:
-     *    - .0: the generated frame
-     *    - .1: the prototype of the generated frame
-     * */
-    fn createPrePostConstructorFrame (self, loc : &Word, sym : &ConstructorSymbol, clRef : &ClassRefType, params : [&ProtoVarValue], throwers : [(&Word, &Type)], body : &Value, pre : bool, ancCall : (&Value)?, rename : [c8], fromTemplate : (TemplateRewriter)?)-> (&FrameGenerator, &CtorPrototypeValue) {
-        let code = (if pre { FrameKind::CTOR_PRE } else { FrameKind::CTOR_POST });
-        let finalBody = if let Ok (c : &CtorCallValue) = ancCall {
-            let ac = if pre { c.cloneForPre () } else { c.cloneForPost () };
-            copy BlockValue (loc, VOID_TYPE, copy [ac, body])
-        } else {
-            body
-        };
-
-        let dmut frame = copy FrameGenerator (loc, sym.getPath (), params, VOID_TYPE, finalBody,
-                                              code,
-                                              isWeak-> (sym.isWeak () || clRef.getSymbol ().isWeak ()),
-                                              templateMapper-> sym.getTemplateMapper ());
-
-
-        let proto = copy CtorPrototypeValue (loc, sym,
-                                             pre-> pre,
-                                             post-> !pre,
-                                             parameters-> params [1 .. $],
-                                             throwers-> throwers,
-                                             attributes-> [],
-                                             clRef,
-                                             rename-> rename,
-                                             fromTemplate-> fromTemplate);
-
-        return (frame, proto);
-    }
-
-    /**
-     * Create the body of the complete ctor frame calling pre and post constructors functions
-     * @params:
-     *    - loc: the location of the ctor to build
-     *    - params: the parameters passed to the ctor
-     *    - preCtor: the pre part of the ctor
-     *    - postCtor: the post part of the ctor
-     * @returns: the body of the ctor
-     * */
-    fn createConstructorBody (self, loc : &Word, clRef : &ClassRefType, params : [&ProtoVarValue], preCtor : &CtorPrototypeValue, postCtor : &CtorPrototypeValue)-> &Value {
-        let dmut values = copy [
-            (copy VarRefValue (v.getLoc (), v.getLoc (), v.getType (), v.getUniqId (), isSelf-> v.isSelf (), isReference-> v.isReference ()))
-                for v in params];
-
-        let ptrType = clRef.createInstance (true, true);
-
-        let preDeleg = copy CtorDelegateValue (loc, ptrType, instance-> values [0], proto-> preCtor);
-        let postDeleg = copy CtorDelegateValue (loc, ptrType, instance-> values [0], proto-> postCtor);
-
-        let preCall = copy CtorCallValue (loc, ptrType, preDeleg, values [1 .. $]);
-        let postCall = copy CtorCallValue (loc, ptrType, postDeleg, values [1 .. $]);
-
-        copy BlockValue (loc, VOID_TYPE, copy [preCall, postCall])
-    }
-
-    /**
      * Validation of the body of the constructor
      * This function is different from validateFunctionBody, because it also validates the pre constructor
-     * @params: 
+     * @params:
      *    - context: the context of the validation
      *    - sym: the symbol being validated
      *    - ctor: the ctor whose body is being validated
@@ -1087,29 +1070,25 @@ pub class FunctionValidator {
      *    - selfParam: the protovarvalue of the hidden self parameter
      * @returns:
      *    - .0: the body of the preConstruction
-     *    - .1: the call to the ctor of the ancestor
-     *    - .2: the body of the postConstruction
-     *    - .3: true iif the ctor calls a redirect constructor
+     *    - .1: the body of the postConstruction
+     *    - .2: true iif the ctor calls a redirect constructor
      * @throws:
-     *    - &ErrorMsg: if there was an error in the validation     
+     *    - &ErrorMsg: if there was an error in the validation
      */
-    fn validateCtorBody (self, dmut context : &Validator, sym : &ConstructorSymbol, ctor : &ConstructorDecl, clRef : &ClassRefType, selfParam : &Value, throwers : [(&Word, &Type)])-> (&Value, (&Value)?, &Value, bool)
+    fn validateStructCtorBody (self, dmut context : &Validator, sym : &ConstructorSymbol, ctor : &ConstructorDecl, clRef : &ClassRefType, selfParam : &Value, throwers : [(&Word, &Type)])-> (&Value, &Value, bool)
         throws ErrorMsg
     {
-        logging::info ("Validate ctor %", sym.getPath ());
-
-        //
-        //
-        // insert self in the scope, alongside with parameters (its an hidden param)
-        context:.insertLocal (selfParam.getLoc (), selfParam.getLoc ().str, selfParam, canShadow-> true);
-        context:.getLocal (selfParam.getLoc (), selfParam.getLoc ().str, canBeInClosure-> false);
+        logging::info ("Validate struct ctor %", sym.getPath ());
 
         // Reference to the self hidden param
         let selfValue = copy VarRefValue (selfParam.getLoc (), selfParam.getLoc (), selfParam.getType (), selfParam.getUniqId (), isSelf-> true, isReference-> clRef.isStruct ());
         
         // Validate the pre construction of the constructor (construction of fields, and ancestor)
-        let (preConstruct, ancCall, hasRedirect) = self.validatePreConstructor (alias context, ctor, clRef, selfValue);
+        let (preConstruct, hasRedirect) = self.validateStructPreConstructor (alias context, ctor, clRef, selfValue);
 
+        // insert self in the scope, alongside with parameters (its an hidden param)
+        context:.insertLocal (selfParam.getLoc (), selfParam.getLoc ().str, selfParam, canShadow-> true);
+        context:.getLocal (selfParam.getLoc (), selfParam.getLoc ().str, canBeInClosure-> false);
 
         // From this point, return is allowed
         context:.enterFunctionBody ();
@@ -1117,26 +1096,19 @@ pub class FunctionValidator {
         let mut unsafeLoc = self.getUnsafeLoc (ctor.getAttributes ());
         if (unsafeLoc.isEof () && sym.isUnsafe ()) { unsafeLoc = ctor.getLoc (); } // extern C function are unsafe without attributes
 
-        let ancThrs = if let Ok (anc) = ancCall {
-            anc.getThrowers ()
-        } else { [] };
-
         // Validate the body of the constructor (return void type)
         let body = self.validateFunctionBody (alias context,
                                               ctor.getLoc (),
                                               sym.getPath (),
                                               ctor.getBody (),
                                               copy VoidType (sym.getLoc ()),
-                                              preThrowing-> (preConstruct.getThrowers () ~ ancThrs),
+                                              preThrowing-> preConstruct.getThrowers (),
                                               throwers,
                                               unsafeLoc);
 
 
 
-        (preConstruct,
-         ancCall,
-         body,
-         hasRedirect)
+        (preConstruct, body, hasRedirect)
     }       
 
     /**
@@ -1151,15 +1123,17 @@ pub class FunctionValidator {
      * @throws: 
      *    - &ErrorMsg: if there was an error in the validation
      */
-    fn validatePreConstructor (self, dmut context : &Validator, func : &ConstructorDecl, clRef : &ClassRefType, selfParam : &Value)-> (&Value, (&Value)?, bool)
+    fn validateStructPreConstructor (self, dmut context : &Validator, func : &ConstructorDecl, clRef : &ClassRefType, selfParam : &Value)-> (&Value, bool)
         throws ErrorMsg
     {
         if (func.getExplicitCstrsCall () == Keys::SELF) { // There is a redirection of construction
-            return (self.validateRedirectCtor (alias context, func, clRef, selfParam), none, true);
+            return (self.validateStructRedirectCtor (alias context, func, clRef, selfParam), true);
         }
 
-        // Call the ancestor ctor
-        let ancCall = self.validateAncestorCtorCall (alias context, func, clRef, selfParam);
+        // Struct don't have ancestors
+        else if (func.getExplicitCstrsCall () == Keys::SUPER) {
+            throw copy ErrorMsg::fatal (func.getExplicitCstrsCall (), format (ValidateErrorMessage::NO_SUPER_CLASS, clRef));
+        }
 
         let mut block : [&Value] = []; // list of instructions
         let fieldCtor = self.validateFieldCtors (alias context, func, clRef, selfParam);
@@ -1170,9 +1144,7 @@ pub class FunctionValidator {
             }
         }
 
-        (copy BlockValue (func.getLoc (), VOID_TYPE, block),
-         ancCall,
-         false)
+        (copy BlockValue (func.getLoc (), VOID_TYPE, block), false)
     }
 
     /**
@@ -1186,7 +1158,7 @@ pub class FunctionValidator {
      * @throws: 
      *    - &ErrorMsg: if there is an error in the validation
      */
-    fn validateRedirectCtor (self, dmut context : &Validator, func : &ConstructorDecl, clRef : &ClassRefType, selfParam : &Value)-> &Value
+    fn validateStructRedirectCtor (self, dmut context : &Validator, func : &ConstructorDecl, clRef : &ClassRefType, selfParam : &Value)-> &Value
         throws ErrorMsg
     {
         let mut errors : [&ErrorMsg] = [];
@@ -1199,7 +1171,10 @@ pub class FunctionValidator {
         
         let ret = {
             // Ignore the current constructor, it cannot be called by redirection
-            let ctors = self.createCtorDelegate (alias context, selfLoc, clRef, selfParam, renameLoc-> func.getExplicitSuperName (), templateParams-> func.getSuperTemplateParams ());
+            let ctors = self.createCtorDelegate (alias context, selfLoc, clRef, selfParam, nextDg-> UNIT_VALUE,
+                                                 renameLoc-> func.getExplicitSuperName (),
+                                                 templateParams-> func.getSuperTemplateParams ());
+
             context:.getCallOpValidator ().validate (alias context, selfLoc, ctors, rights, inCopy-> true)
         } catch { 
             err : &ErrorMsg => { // None succeeded (TODO print private candidates)
@@ -1217,7 +1192,317 @@ pub class FunctionValidator {
         if (errors.len != 0us) throw copy ErrorMsg::list (errors);
         ret
     }
-    
+
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * =============================          CLASS CTOR VALIDATION          ==============================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+
+    /**
+     * Validate a constructor for a structure (simpler than class ctors, as there is no closure to create)
+     * @params:
+     *    - context: the context of the validation
+     *    - sym: the symbol to validate
+     *    - clRef: the struct containing the constructor
+     * @returns: the prototype of the ctor
+     * */
+    fn validateClassConstructor (mut self, dmut context : &Validator, dmut sym : &ConstructorSymbol, clRef : &ClassRefType)-> &CtorPrototypeValue
+        throws ErrorMsg
+    {
+        let func = sym.getContent ();
+        let throwers = self.validateThrowers (alias context, func.getThrowerLoc (), func.getThrowers ());
+
+        let mut errors : [&ErrorMsg] = [];
+
+        let (selfParam, parameters, nextDg, body, hasRedirect) = {
+            context:.enterBlock ();
+            // We need a class ptr for the self parameter
+            let clPtr = clRef.createInstance (true, true);
+
+            // Self parameters (first hidden param)
+            let selfParam = copy ProtoVarValue (copy Word (Keys::SELF, func.getLoc ()), clPtr, UNIT_VALUE, isMutable-> true, isSelf-> true, isReference-> false);
+
+            // unlike methods self is not written in the prototype, so we need to validate all parameters (hence: forMethod-> false)
+            let (_, parameters) = self:.validatePrototype (alias context, sym, func.getFunctionProtoDecl (), forMethod-> false, noValue-> false);
+
+            // Class ctor have a delegate as last parameters if the class is not final
+            // This delegate is called after field init, to init the fields of child class before entering ctor body
+            let dgType = copy DelegateType (func.getLoc (), [], [], [], VOID_TYPE, canBeNull-> true);
+            let nextDg = copy ProtoVarValue (copy Word (ClassKeys::NEXT, func.getLoc ()), dgType, UNIT_VALUE, isMutable-> false, isReference-> false);
+
+            // We validate the body
+            let (body, hasRedirect) = self:.validateClassCtorBody (alias context, alias sym, func, clPtr.getInner (), selfParam, parameters, nextDg, throwers);
+
+            // don't add the self parameter in the prototype, we don't have it when calling the prototypea
+            (selfParam, parameters, (nextDg)?, body, hasRedirect)
+        } catch {
+            err : &ErrorMsg => {
+                errors ~= [err];
+                (UNIT_VALUE, cast!{[&ProtoVarValue]} ([]), none, UNIT_VALUE, none)
+            }
+        } exit {
+            {
+                context:.quitBlock (warnUnused-> (errors.len == 0us));
+            } catch {
+                err : &ErrorMsg => { errors ~= [err]; }
+            }
+        }
+
+        if (errors.len != 0us) throw copy ErrorMsg::list (errors);
+        let rewrite = if let Ok (map) = sym.getTemplateMapper () {
+            TemplateRewriter (map)?
+        } else { none };
+
+        if (func.getBody () !of EmptyExpression) {
+            if let selfV : &ProtoVarValue = selfParam {
+                let mut params = copy [selfV] ~ parameters;
+                if let Ok (n : &ProtoVarValue) = nextDg { params ~= [n]; };
+
+                let frame = copy FrameGenerator (func.getLoc (), sym.getPath (), params, VOID_TYPE,
+                                                 body,
+                                                 FrameKind::CTOR_CLASS,
+                                                 isWeak-> (sym.isWeak () || clRef.getSymbol ().isWeak ()),
+                                                 templateMapper-> sym.getTemplateMapper ());
+
+                context:.insertGenerator (alias sym, frame);
+            } else panic;
+        }
+
+        let gen = copy CtorPrototypeValue (sym.getLoc (), sym, parameters, throwers, clRef,
+                                           rename-> func.getRename ().str,
+                                           attributes-> func.getAttributes (),
+                                           fromTemplate-> rewrite);
+
+        if let Ok (call) = hasRedirect {
+            sym:.setFrameProto (gen, call, true);
+            let mut entered : [&Symbol => mut ()] = copy [];
+            context.verifyInfiniteCtorRecursion (gen, ref entered);
+        }
+
+        gen
+    }
+
+    /**
+     * Validation of the body of the constructor
+     * This function is different from validateFunctionBody, because it also validates the pre constructor
+     * @params:
+     *    - context: the context of the validation
+     *    - sym: the symbol being validated
+     *    - ctor: the ctor whose body is being validated
+     *    - clRef: the type of the class containing the ctor
+     *    - selfParam: the protovarvalue of the hidden self parameter
+     * @returns:
+     *    - .0: the call to the preCtor
+     *    - .1: the call to the postCtor
+     *    - .2: true iif there is a redirection
+     * @throws:
+     *    - &ErrorMsg: if there was an error in the validation
+     */
+    fn validateClassCtorBody (mut self, dmut context : &Validator, dmut sym : &ConstructorSymbol, ctor : &ConstructorDecl, clRef : &ClassRefType, selfParam : &Value, parameters : [&ProtoVarValue], nextDg : &ProtoVarValue, throwers : [(&Word, &Type)])-> (&Value, (&Value)?)
+        throws ErrorMsg
+    {
+        logging::info  ("Validate class ctor %", sym.getPath ());
+
+        // Validate the pre constructor closure frame
+        let (preBody, preThrowers, hasRedirect) = self:.validateClassPreCtor (alias context, alias sym, ctor, clRef, selfParam, parameters, nextDg);
+
+        let mut bodyValues : [&Value] = [];
+        if preBody !of UnitValue {
+            bodyValues ~= [preBody];
+        }
+
+        // insert self in the scope, alongside with parameters (its an hidden param)
+        context:.insertLocal (selfParam.getLoc (), selfParam.getLoc ().str, selfParam, canShadow-> true);
+        context:.getLocal (selfParam.getLoc (), selfParam.getLoc ().str, canBeInClosure-> false);
+
+        // From this point, return is allowed
+        context:.enterFunctionBody ();
+
+        let mut unsafeLoc = self.getUnsafeLoc (ctor.getAttributes ());
+        if (unsafeLoc.isEof () && sym.isUnsafe ()) { unsafeLoc = ctor.getLoc (); } // extern C function are unsafe without attributes
+
+        let body = self.validateFunctionBody (alias context,
+                                              ctor.getLoc (),
+                                              sym.getPath (),
+                                              ctor.getBody (),
+                                              VOID_TYPE,
+                                              preThrowing-> preThrowers,
+                                              throwers,
+                                              unsafeLoc);
+
+        bodyValues ~= [body];
+        (copy BlockValue (selfParam.getLoc (), VOID_TYPE, bodyValues), if hasRedirect { preBody? } else { none })
+    }
+
+
+    /**
+     * Validate the construction of the fields, and the call to parent ctor
+     * */
+    fn validateClassPreCtor (mut self, dmut context : &Validator, dmut sym : &ConstructorSymbol, func : &ConstructorDecl, clRef : &ClassRefType, selfParam : &Value, parameters : [&ProtoVarValue], nextDg : &ProtoVarValue)-> (&Value, [(&Word, &Type)], bool)
+        throws ErrorMsg
+    {
+        let selfValue = copy VarRefValue (selfParam.getLoc (), selfParam.getLoc (),
+                                          selfParam.getType (), selfParam.getUniqId (),
+                                          isSelf-> true,
+                                          isReference-> false);
+
+        // There is a redirection of construction
+        if (func.getExplicitCstrsCall () == Keys::SELF) {
+            let body = self.validateStructRedirectCtor (alias context, func, clRef, selfValue);
+            return (body, body.getThrowers (), true);
+        }
+
+        // No ancestor, everything can be inlined
+        if !clRef.getAncestor ().hasValue {
+            // Struct don't have ancestors
+            if (func.getExplicitCstrsCall () == Keys::SUPER) {
+                throw copy ErrorMsg::fatal (func.getExplicitCstrsCall (), format (ValidateErrorMessage::NO_SUPER_CLASS, clRef));
+            }
+
+            let mut block : [&Value] = [];
+            let fieldCtor = self.validateFieldCtors (alias context, func, clRef, selfValue);
+            if fieldCtor !of UnitValue {
+                block ~= [fieldCtor];
+            }
+
+            let nextValue = copy VarRefValue (nextDg.getLoc (), nextDg.getLoc (),
+                                              nextDg.getType (), nextDg.getUniqId (),
+                                              isSelf-> true,
+                                              isReference-> false);
+
+            let nextCall = context:.getCallOpValidator ().validate (alias context, nextValue.getLoc (), nextValue, []);
+            block ~= [nextCall];
+
+            let body = copy BlockValue (func.getLoc (), VOID_TYPE, block);
+            return (body, body.getThrowers (), false);
+        }
+
+        else { // If the class has an ancestor we have to validate a lambda function to initialize the fields of the class before calling the body of the parent ctor
+            let (dgValue, throwers) = self:.validateClassLambdaPre (alias context, alias sym, func, clRef, selfParam, parameters, nextDg);
+            let ancCall = self.validateAncestorCtorCall (alias context, func, clRef, selfValue, dgValue);
+
+            return (ancCall, (ancCall.getThrowers () ~ throwers), false);
+        }
+    }
+
+    fn validateClassLambdaPre (mut self, dmut context : &Validator, dmut sym : &ConstructorSymbol, func : &ConstructorDecl, clRef : &ClassRefType, selfParam : &Value, parameters : [&ProtoVarValue], nextDg : &ProtoVarValue)-> (&Value, [(&Word, &Type)])
+        throws ErrorMsg
+    {
+        let refId = generator::generateUniqID ();
+        let index = context.getCurrentClosingIndex ();
+        let mut errors : [&ErrorMsg] = [];
+
+        let name = format ("_%_%", sym.getLoc ().line, sym.getLoc ().col);
+        let frameName = sym.getPath ().push (name);
+
+        // Enter a foreign because we don't want to pollute the current function scope
+        context:.enterForeign (isLambda-> true, isFnBody-> true, clContext-> context.getCurrentClassContext ());
+        context:.enterBlock ();
+        let dmut closureValues : [&Value] = [];
+        let dmut closureTypes : [&Type] = [];
+
+        let (body, closure) = {
+            context:.enterClosure (func.getLoc (), refId, index);
+            let body = {
+                let selfValue = copy VarRefValue (selfParam.getLoc (), selfParam.getLoc (),
+                                                  selfParam.getType (), selfParam.getUniqId (),
+                                                  isSelf-> true,
+                                                  isReference-> false);
+
+                closureValues ~= [selfValue];
+                closureTypes ~= [selfParam.getType ()];
+
+                let closuredSelf = context:.forceInClosure (func.getLoc (), Keys::SELF, selfValue.getType (), byReference-> false);
+                let nextDgValue = copy VarRefValue (nextDg.getLoc (), nextDg.getLoc (),
+                                                    nextDg.getType (), nextDg.getUniqId (),
+                                                    isSelf-> true,
+                                                    isReference-> false);
+
+                closureValues ~= [nextDgValue];
+                closureTypes ~= [nextDg.getType ()];
+
+                let closuredNext = context:.forceInClosure (func.getLoc (), ClassKeys::NEXT, nextDgValue.getType (), byReference-> false);
+                for v in parameters {
+                    let refVar : &Value = copy VarRefValue (v.getLoc (), v.getLoc (), v.getType (), v.getUniqId (),
+                                                            isSelf-> false,
+                                                            isReference-> v.isReference ());
+                    let addrVar = copy AddressValue (v.getLoc (), copy PointerType (refVar.getLoc (), refVar.getType (), isMutable-> true), refVar);
+                    context:.forceInClosure (func.getLoc (), v.getLoc ().str, refVar.getType (), byReference-> true);
+                    closureValues ~= [addrVar];
+                    closureTypes ~= [addrVar.getType ()];
+                }
+
+                context:.finalizeClosure ();
+
+                let mut block : [&Value] = [];
+                let fieldCtor = self.validateFieldCtors (alias context, func, clRef, closuredSelf);
+                if fieldCtor !of UnitValue {
+                    block ~= [fieldCtor];
+                }
+
+                let nextCall = context:.getCallOpValidator ().validate (alias context, closuredNext.getLoc (), closuredNext, []);
+                block ~= [nextCall];
+
+                copy BlockValue (func.getLoc (), VOID_TYPE, block)
+            } catch {
+                err => {
+                    errors ~= [err];
+                    UNIT_VALUE
+                }
+            };
+
+            let closure = context:.exitClosure ();
+
+            (body, closure)
+        };
+
+        {
+            context:.quitBlock (warnUnused-> false);
+            context:.exitForeign ();
+        } catch {
+            err => { errors ~= [err]; }
+        }
+
+        if errors.len != 0 {
+            throw copy ErrorMsg::list (errors);
+        }
+
+        let closureType = copy TupleType (closure.getLoc (), closureTypes);
+        let ptrType = copy PointerType (closure.getLoc (), closureType, isMutable-> false);
+
+        let fstParam = copy ProtoVarValue (copy Word ("#{CLOSURE-VARREF}"s8, closure.getLoc ()), ptrType, refId-> refId);
+        let frame = copy FrameGenerator (func.getLoc (),
+                                         frameName,
+                                         copy [fstParam],
+                                         VOID_TYPE,
+                                         body,
+                                         FrameKind::LMBD,
+                                         isWeak-> (sym.isWeak () || clRef.getSymbol ().isWeak ()),
+                                         templateMapper-> sym.getTemplateMapper ());
+
+
+        let closureValue = copy AddressValue (func.getLoc (), ptrType, copy TupleValue (closure.getLoc (), closureType, closureValues));
+
+        let proto = copy NamePrototypeValue (func.getLoc (), frameName, copy [fstParam], VOID_TYPE, isLambda-> true);
+        let dgValue = copy NameDelegateValue (func.getLoc (),
+                                              proto,
+                                              closure-> closureValue,
+                                              references-> [],
+                                              lazys-> [],
+                                              parameters-> [],
+                                              retType-> VOID_TYPE,
+                                              fromFptr-> false);
+
+        context:.insertGenerator (alias sym, frame);
+
+        return (dgValue, body.getThrowers ());
+    }
+
     /**
      * Validate the call of the ancestor constructor (if there is an ancestor)
      * @params: 
@@ -1231,38 +1516,37 @@ pub class FunctionValidator {
      * @throws: 
      *    - &ErrorMsg: if there is an error in the validation
      */
-    fn validateAncestorCtorCall (self, dmut context : &Validator, func : &ConstructorDecl, clRef : &ClassRefType, selfParam : &Value)-> (&Value)?
+    fn validateAncestorCtorCall (self, dmut context : &Validator, func : &ConstructorDecl, clRef : &ClassRefType, selfParam : &Value, childDg : &Value)-> &Value
         throws ErrorMsg
     {
-        match clRef.getAncestor () {
-            Ok (ancestor) => {
-                // If the super call is implicit, we need a valid location
-                let superLoc = if (func.getExplicitCstrsCall ().isEof ()) { func.getLoc () } else { func.getExplicitCstrsCall () };
-                let mut rights : [&Value] = copy [context:.validateValue (v) for v in func.getSuperParams ()];
+        if let Ok (ancestor) = clRef.getAncestor () {
+            // If the super call is implicit, we need a valid location
+            let superLoc = if (func.getExplicitCstrsCall ().isEof ()) { func.getLoc () } else { func.getExplicitCstrsCall () };
+            let mut rights : [&Value] = copy [context:.validateValue (v) for v in func.getSuperParams ()];
 
-                {
-                    let ctors = self.createCtorDelegate (alias context, superLoc, ancestor, selfParam, renameLoc-> func.getExplicitSuperName (), templateParams-> func.getSuperTemplateParams ());
+            {
+                let ctors = self.createCtorDelegate (alias context, superLoc, ancestor, selfParam, childDg, renameLoc-> func.getExplicitSuperName (), templateParams-> func.getSuperTemplateParams ());
 
-                    // Call the ctors with the parameters and return the one that succeeded
-                    let result = context:.getCallOpValidator ().validate (alias context, superLoc, ctors, rights, inCopy-> true);
-                    return (result)?;
-                } catch { 
-                    err : &ErrorMsg => { // None succeeded (TODO print private candidates)
-                        throw copy ErrorMsg::fatal (superLoc, format (ValidateErrorMessage::UNDEFINED_SUPER_CALL_CTOR, rights),
-                                                    notes-> copy [err]);
-                    }
+                // Call the ctors with the parameters and return the one that succeeded
+                return context:.getCallOpValidator ().validate (alias context, superLoc, ctors, rights, inCopy-> true);
+            } catch {
+                err : &ErrorMsg => { // None succeeded (TODO print private candidates)
+                    throw copy ErrorMsg::fatal (superLoc, format (ValidateErrorMessage::UNDEFINED_SUPER_CALL_CTOR, rights),
+                                                notes-> copy [err]);
                 }
             }
-            _ => {
-                // Class does not have any ancestor, so it can't be called
-                if (func.getExplicitCstrsCall () == Keys::SUPER) {
-                    throw copy ErrorMsg::fatal (func.getExplicitCstrsCall (), format (ValidateErrorMessage::NO_SUPER_CLASS, clRef));
-                }
-                
-                return none;
-            }            
-        }        
+        }
+
+        panic;
     }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ==================================          COMMON CTOR          ===================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
 
     /**
      * Create a mult sym containing all the constructor of the class with the given instance
@@ -1274,11 +1558,11 @@ pub class FunctionValidator {
      *    - prettyStr: the name of the call
      * @returns: a MultSymValue with all the available ctors (can be of len == 0us)
      */
-    fn createCtorDelegate (self, dmut context : &Validator, loc : &Word, clRef : &ClassRefType, selfParam : &Value, renameLoc : &Word, templateParams : &Expression)-> &Value
+    fn createCtorDelegate (self, dmut context : &Validator, loc : &Word, clRef : &ClassRefType, selfParam : &Value, nextDg : &Value, renameLoc : &Word, templateParams : &Expression)-> &Value
         throws ErrorMsg
     {
         let rename = if (renameLoc.isEof ()) { "" } else { renameLoc.str };
-        let ctors = context:.getSubTypeValidator ().validateClassCtors (alias context, loc, clRef, name-> rename, selfParam-> selfParam, fromSubType-> true);
+        let ctors = context:.getSubTypeValidator ().validateClassCtors (alias context, loc, clRef, name-> rename, selfParam-> selfParam, nextDg-> nextDg, fromSubType-> true);
 
         match templateParams {
             EmptyExpression () => { ctors }
@@ -1318,7 +1602,8 @@ pub class FunctionValidator {
                 willBeValidated [it._0.str] = ();
             }
 
-            for v in clRef.getLocalFields () {  // Validate all the fields that were not validated by pre construction
+            // Verify that all fields have an initial value
+            for v in clRef.getLocalFields () {
                 {
                     if (v.getLoc ().str !in willBeValidated) { // (cite 1), so we can initialize the fields that are not pre constructed first
                         if (v.getValue () of UnitValue) {
@@ -1334,27 +1619,27 @@ pub class FunctionValidator {
                 }
             }
 
-            if (errors.len != 0us) throw copy ErrorMsg::list (errors);
-            for it in func.getFieldConstructors () { // Validate all the fields that are written in the pre construction
-                let name = it._0;
-                if let Ok (w : &Word) = context.getFieldValidated ().content [name.str] {
-                    let notes = copy [copy ErrorMsg::note (w, format (ValidateErrorMessage::HERE))];
-                    errors ~= [copy ErrorMsg::fatal (name, format (ValidateErrorMessage::MULTIPLE_FIELD_INIT, name.str),
-                                                     notes-> notes)];
+            // Validate all the fields that are written in the pre construction after fields that have default values
+            for it in func.getFieldConstructors () {
+                {
+                    let name = it._0;
+                    if let Ok (w : &Word) = context.getFieldValidated ().content [name.str] {
+                        let notes = copy [copy ErrorMsg::note (w, format (ValidateErrorMessage::HERE))];
+                        errors ~= [copy ErrorMsg::fatal (name, format (ValidateErrorMessage::MULTIPLE_FIELD_INIT, name.str),
+                                                         notes-> notes)];
 
-                } else {
-                    let field = context:.getBinOpValidator ().validateClassFieldAccess (alias context, name, selfParam, copy VarExpr (name), clRef, true, true, verifyValidation-> false, withAncestor-> false);
-                    let value = context:.verifyCompatibleTypeWithValue (field.getLoc (), field.getType (), context:.validateValue (it._1), byReference-> false);
-                    context.verifyMemoryOwner (field.getLoc (), field.getType (), value, byReference-> false);
+                    } else {
+                        let field = context:.getBinOpValidator ().validateClassFieldAccess (alias context, name, selfParam, copy VarExpr (name), clRef, true, true, verifyValidation-> false, withAncestor-> false);
+                        let value = context:.verifyCompatibleTypeWithValue (field.getLoc (), field.getType (), context:.validateValue (it._1), byReference-> false);
+                        context.verifyMemoryOwner (field.getLoc (), field.getType (), value, byReference-> false);
 
-                    instrs ~= [copy AffectValue (name, field.getType (), field, value)];
-                    context:.setFieldValidated (name.str, name);
+                        instrs ~= [copy AffectValue (name, field.getType (), field, value)];
+                        context:.setFieldValidated (name.str, name);
+                    }
+                } catch {
+                    err : &ErrorMsg => { errors ~= [err]; }
                 }
-            } catch {
-                err : &ErrorMsg => { errors ~= [err]; }
             }
-        } catch {
-            err : &ErrorMsg => { errors ~= [err]; }
         }
 
         context:.quitFieldConstruction (); // We don't forget to quit the field validation, from that point all fields are accessible
