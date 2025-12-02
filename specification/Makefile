@@ -1,13 +1,13 @@
 main: build
-	cd .build ; pdflatex main
+	cd .build ; lualatex main
 	cp .build/main.pdf .
 
 refs: build
-	cd .build ; pdflatex main
+	cd .build ; lualatex main
 	# cd .build ; bibtex main
 	# cd .build ; bibtex main
-	cd .build ; pdflatex main
-	cd .build ; pdflatex main
+	cd .build ; lualatex main
+	cd .build ; lualatex main
 	cp .build/main.pdf .
 
 build:
