@@ -1,0 +1,1004 @@
+in visitor;
+
+use ymirc::errors::message;
+use ymirc::global::{core_, state, common};
+use ymirc::lexing::word;
+use ymirc::syntax::keys;
+
+use ymirc::lint::node::{_, instr::_, global::_, type::_, value::_};
+use ymirc::lint::exporter::_;
+
+use ymirc::utils::{format, log};
+
+use std::{io, fs::{path, file}};
+
+/**
+ * This generator export YIL nodes into a object file that can be reloaded as is
+ * Can be useful to build objects with different back-ends
+ * */
+pub record YILExporter {
+
+    // The directory in which the modules come from
+    let _packageDir : Path;
+
+    prv {
+        
+        // The list of types to export
+        // name => (bytecode)
+        let mut _types : [usize => mut &YILType] = copy [];
+
+        // The bytecode of all symbols
+        // name => (weak, bytecode)
+        let mut _symbols : [[c8] => mut (bool, &YILSymbol)] = copy [];
+        
+    }
+    
+    prv { // headers
+                
+        // The list of symbols to export in a file
+        let dmut _exportSymbols : [Path => [[c8] => ()]] = copy [];
+
+        // The list of files found and to export 
+        let dmut _exportFiles : [Path => ()] = copy [];
+        
+    }
+
+
+    prv { // context
+
+        // The offest of string in the string table
+        let dmut _currentStringTableHead : [[c8] => usize] = copy [];
+
+        // The offest of string in the string table
+        let dmut _currentStringU8TableHead : [[u8] => usize] = copy [];
+
+        // The offset of the type in the type table
+        let dmut _currentTypeTableHead : [usize => ()] = copy [];
+
+        // The table for locations
+        let dmut _currentLocationTableHead : [([c8], u64, u64) => usize] = copy [];
+
+        // The string table of the file being exported
+        let dmut _currentLocationTableContent : &ByteStream = copy ByteStream ();
+        
+        // The string table of the file being exported
+        let dmut _currentStringTableContent : &ByteStream = copy ByteStream ();
+
+        // The type table of the file being exported
+        let dmut _currentTypeTableContent : &ByteStream = copy ByteStream ();
+
+        // The symbol table of the file being exported
+        let dmut _currentSymbolTableContent : &ByteStream = copy ByteStream ();
+    }
+        
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ======================================          CTOR          ======================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+    
+    pub self (packageDir : Path)
+        with _packageDir = packageDir
+    {}
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          WRITING          =====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Write the binary yil files
+     * */
+    pub fn writeFiles (mut self)
+        throws ErrorMsg
+    {
+        if !fs::sys::isDir (state::instance ().getYILOutput ()) {
+            fs::sys::createDir (state::instance ().getYILOutput (), recursive-> true);
+        } catch {
+            _ => {                
+                throw copy ErrorMsg::fatal (EOF_WORD, "Failed to create YIL output directory - permission denied");
+            }
+        }
+        
+        for p, _ in self._exportFiles {
+            self:.writeFile (p);            
+        }
+    }
+
+    /**
+     * Write a binary yil file
+     * */
+    fn writeFile (mut self, path : Path)
+        throws ErrorMsg
+    {
+        if let Ok (toExport) = self._exportSymbols [path] {
+            
+            let file = path.removePrefix (self._packageDir).stripExtension ();
+            let outP = state::instance ().getYILOutput ().push (file.toStr (sep-> "_")).addExtension (common::CommonVars::YIL_EXTENSION);
+
+            logging::info ("Export module % -> %"s8, file.toStr (sep-> "::"), outP.toStr ());
+        
+            self._currentTypeTableHead   = copy [];
+            self._currentLocationTableHead   = copy [];
+            self._currentStringTableHead = copy [];
+            
+            self._currentTypeTableContent:.clear ();        
+            self._currentLocationTableContent:.clear ();            
+            self._currentSymbolTableContent:.clear ();
+            self._currentStringTableContent:.clear ();
+            
+            for symName, _ in toExport if let Ok (sym) = self._symbols [symName] {
+                self:.exportSymbol (sym._1);
+            }
+            
+            self.writeFileContent (outP,
+                                   self._currentSymbolTableContent[],
+                                   self._currentLocationTableContent[],
+                                   self._currentTypeTableContent[],
+                                   self._currentStringTableContent[]);        
+        }
+    }
+    
+    /**
+     * Write the YIL bytecode content into the file
+     * */
+    fn writeFileContent (self, path : Path, symbols : [u8], locations : [u8], types : [u8], strings : [u8])
+        throws ErrorMsg
+    {
+        
+        let dmut file = File::create (path, write-> true);
+        file:.write ("YIL");
+
+        let dmut length = copy ByteStream (); 
+        length:.write!{u64} (types.len)
+            :.write!{u64} (locations.len)
+            :.write!{u64} (symbols.len)
+            :.write!{u64} (strings.len);
+        
+        file:.writeBytes (length[]);                
+        file:.writeBytes (types);
+        file:.writeBytes (locations);
+        file:.writeBytes (symbols);
+        file:.writeBytes (strings);
+        file:.close ();
+        
+    } catch {
+        _ => {
+            throw copy ErrorMsg::fatal (EOF_WORD, format ("Failed to write YIL byte file %(y), permission denied", path.toStr ()));
+        }
+    }
+    
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          SYMBOLS          =====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Register the list of symbol into the exporter table
+     * */
+    pub fn registerSymbols (mut self, syms : [&YILSymbol]) {
+        // We start by registering all symbol names
+        for sym in syms {
+            self._symbols [sym.getName ()] = (sym.isWeak (), sym);
+        }
+
+        // And we compose the headers of the files
+        for sym in syms {
+            let loc = Path (sym.getLoc ().filename);
+            
+            if self.checkPassFilter (loc) {
+                for rf in sym.getReferences () if let Ok (dep) = self._symbols [rf] && dep._0 {
+                    self:.addSymbol (loc, rf);
+                }
+
+                self:.addSymbol (loc, sym.getName ());                    
+                self._exportFiles [loc] = ();
+            }
+        }
+    }
+
+    /**
+     * Register the list of types in the exporter table
+     * */
+    pub fn registerTypes (mut self, types : [&YILType]) {
+        for t in types {
+            self._types [t.getUniqId ()] = t;
+        }
+    }
+    
+    
+    /**
+     * Add a symbol into the exportation table of a module path
+     * */
+    prv fn addSymbol (mut self, loc : Path, name : [c8]) {
+        // Symbol
+        {
+            let dmut syms = if let Ok (dmut table) = alias self._exportSymbols [loc] {
+                alias table
+            } else {
+                copy []
+            };
+
+            syms [name] = ();
+            self._exportSymbols [loc] = alias syms;
+        }        
+    }
+
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ==================================          EXPORTATION          ===================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+        
+    /**
+     * Export a node    
+     * */
+    prv fn exportSymbol (mut self, node : &YILSymbol) {                    
+        match node {
+            f : &YILFrame => {
+                self:.exportFrame (f)
+            }
+            c : &YILConstant => {
+                self:.exportConstant (c)
+            }
+            g : &YILGlobalVar => {
+                self:.exportGlobal (g)
+            }
+            _ => {
+                eprintln (node.__typeinfo__.name);
+                eprintln (format ("%", node));
+                panic;
+            }
+        }                
+    }    
+    
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * =====================================          FRAMES          =====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Transform a YIL Frame into bytecode
+     * */
+    fn exportFrame (mut self, node : &YILFrame) {
+        let dmut stream = alias self._currentSymbolTableContent;
+        
+        stream:.write!{u8} (SymbolID::FRAME);
+        stream:.write!{u64} (self:.exportLocation (node.getLoc ()));
+        stream:.write!{u8} (node.isWeak ());            
+        stream:.write!{u64} (self:.exportString (node.getName ()));
+        stream:.write!{u8} (node.isGlobalCtor ());
+        
+        self:.exportFramePrototype (node, alias stream);    
+        self:.exportInstruction (node.getBody (), alias stream);                                                            
+    }    
+
+
+    /**
+     * Export the prototype of a frame     
+     * */
+    fn exportFramePrototype (mut self, frame : &YILFrame, dmut stream : &ByteStream) {        
+        stream:.write!{u32} (frame.getParameters ().len);
+        for var in frame.getParameters () {
+            self:.exportVarDecl (var, alias stream);
+        }
+        
+        stream:.write!{u64} (self:.exportType (frame.getReturnType ()));                
+    }
+
+/*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          CONSTANT          ====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+    
+    /**
+     * Transform a YIL Constant into bytecode
+     * */
+    fn exportConstant (mut self, node : &YILConstant) {
+        let dmut stream = alias self._currentSymbolTableContent;
+        
+        stream:.write!{u8} (SymbolID::CONSTANT);
+        stream:.write!{u64} (self:.exportLocation (node.getLoc ()));
+        stream:.write!{u8} (node.isWeak ());
+        stream:.write!{u64} (self:.exportString (node.getName ()));
+
+        stream:.write!{bool} (node.isLocal ());
+        self:.exportValue (node.getValue (), alias stream);                                
+    }    
+    
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ===================================          GLOBAL VAR          ===================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Transform a YIL Global Var into bytecode
+     * */
+    fn exportGlobal (mut self, node : &YILGlobalVar) {
+        let dmut stream = alias self._currentSymbolTableContent;
+        
+        stream:.write!{u8} (SymbolID::GLOBAL);
+        stream:.write!{u64} (self:.exportLocation (node.getLoc ()));
+        stream:.write!{u8} (node.isWeak ());
+        stream:.write!{u64} (self:.exportString (node.getName ()));
+
+        stream:.write!{bool} (node.isThreadLocal ());        
+        self:.exportValue (node.getValue (), alias stream);
+    }    
+
+    
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ==================================          INSTRUCTIONS          ==================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Convert an instruction into bytecode
+     * */
+    fn exportInstruction (mut self, instr : &YILInstr, dmut stream : &ByteStream) {
+        match instr {
+            a : &YILAffect     => { self:.exportAffect (a, alias stream); }
+            b : &YILBlock      => { self:.exportBlock (b, alias stream); }
+            c : &YILCall       => { self:.exportCall (c, alias stream); }
+            c : &YILCondJmp    => { self:.exportCondJmp (c, alias stream); }
+            g : &YILGoto       => { self:.exportGoto (g, alias stream); }
+            l : &YILLabel      => { self:.exportLabel (l, alias stream); }
+            r : &YILReturn     => { self:.exportReturn (r, alias stream); }
+            v : &YILVarDecl    => { self:.exportVarDecl (v, alias stream); }
+            t : &YILTryFinally => { self:.exportTryFinally (t, alias stream); }
+            c : &YILTryCatch   => { self:.exportTryCatch (c, alias stream); }
+            _ => {
+                eprintln (instr.__typeinfo__.name);
+                panic;
+            }
+        }   
+    }
+
+    /**
+     * Convert an affectation into bytecode
+     * */
+    fn exportAffect (mut self, aff : &YILAffect, dmut stream : &ByteStream) {
+        stream:.write!{u32} (ValueID::AFFECT);
+        stream:.write!{u64} (self:.exportLocation (aff.getLoc ()));
+        
+        self:.exportValue (aff.getLeft (), alias stream);
+        self:.exportValue (aff.getRight (), alias stream);        
+    }
+
+    /**
+     * Convert a block into bytecode
+     * */
+    fn exportBlock (mut self, blk : &YILBlock, dmut stream : &ByteStream) {
+        stream:.write!{u32} (ValueID::BLOCK);
+        stream:.write!{u64} (self:.exportLocation (blk.getLoc ()));
+        
+        stream:.write!{u64} (blk.getInners ().len);
+        for inner in blk.getInners () {
+            self:.exportInstruction (inner, alias stream);
+        }        
+    }
+
+    /**
+     * Convert a call into bytecode
+     * */
+    fn exportCall (mut self, call : &YILCall, dmut stream : &ByteStream) {
+        stream:.write!{u32} (ValueID::CALL);
+        stream:.write!{u64} (self:.exportLocation (call.getLoc ()));
+        self:.exportValue (call.getContent (), alias stream);        
+    }
+
+    /**
+     * Convert a cond jump into bytecode
+     * */
+    fn exportCondJmp (mut self, cnd : &YILCondJmp, dmut stream : &ByteStream) {
+        stream:.write!{u32} (ValueID::COND_JMP);
+        stream:.write!{u64} (self:.exportLocation (cnd.getLoc ()));
+        
+        stream:.write!{u64} (cnd.getThenLabel ().getLabelId ());
+        stream:.write!{u64} (self:.exportString (cnd.getThenLabel ().getName ()));
+        stream:.write!{u64} (cnd.getElseLabel ().getLabelId ());
+        stream:.write!{u64} (self:.exportString (cnd.getElseLabel ().getName ()));
+
+        self:.exportValue (cnd.getCond (), alias stream);
+    }
+
+    /**
+     * Convert a goto into bytecode
+     * */
+    fn exportGoto (mut self, goto : &YILGoto, dmut stream : &ByteStream) {
+        stream:.write!{u32} (ValueID::GOTO);
+        stream:.write!{u64} (self:.exportLocation (goto.getLoc ()));
+
+        stream:.write!{u64} (goto.getLabel ().getLabelId ());
+        stream:.write!{u64} (self:.exportString (goto.getLabel ().getName ()));
+    }
+
+    /**
+     * Convert a label into bytecode
+     * */
+    fn exportLabel (mut self, lbl : &YILLabel, dmut stream : &ByteStream) {
+        stream:.write!{u32} (ValueID::LABEL);
+        stream:.write!{u64} (self:.exportLocation (lbl.getLoc ()));
+        stream:.write!{u64} (lbl.getLabelId ());
+        stream:.write!{u64} (self:.exportString (lbl.getName ()));                
+    }
+
+    /**
+     * Convert a return into bytecode
+     * */
+    fn exportReturn (mut self, ret : &YILReturn, dmut stream : &ByteStream) {
+        stream:.write!{u32} (ValueID::RETURN);
+        stream:.write!{u64} (self:.exportLocation (ret.getLoc ()));
+        self:.exportValue (ret.getValue (), alias stream);        
+    }
+        
+    /**
+     * Convert a try finally into bytecode
+     * */
+    fn exportTryFinally (mut self, try : &YILTryFinally, dmut stream : &ByteStream) {
+        stream:.write!{u32} (ValueID::TRY_FIN);        
+        stream:.write!{u64} (self:.exportLocation (try.getLoc ()));
+
+        stream:.write!{u64} (try.getTryPart ().len);
+        stream:.write!{u64} (try.getFinallyPart ().len);
+
+        for instr in try.getTryPart () {
+            self:.exportInstruction (instr, alias stream);
+        }
+        
+        for instr in try.getFinallyPart () {
+            self:.exportInstruction (instr, alias stream);
+        }        
+    }
+
+    /**
+     * Convert a try catch into bytecode
+     * */
+    fn exportTryCatch (mut self, try : &YILTryCatch, dmut stream : &ByteStream) {
+        stream:.write!{u32} (ValueID::TRY_CATCH);        
+        stream:.write!{u64} (self:.exportLocation (try.getLoc ()));
+
+        stream:.write!{u64} (self:.exportType (try.getCatcherType ()));
+        stream:.write!{u64} (try.getTryPart ().len);
+        stream:.write!{u64} (try.getCatchPart ().len);
+
+        for instr in try.getTryPart () {
+            self:.exportInstruction (instr, alias stream);
+        }
+        
+        for instr in try.getCatchPart () {
+            self:.exportInstruction (instr, alias stream);
+        }
+    }
+
+    /**
+     * Convert variable declaration into bytecode
+     * */
+    fn exportVarDecl (mut self, var : &YILVarDecl, dmut stream : &ByteStream) {        
+        stream:.write!{u32} (ValueID::VAR_DECL);        
+        stream:.write!{u64} (self:.exportLocation (var.getLoc ()));
+        
+        stream:.write!{u64} (self:.exportString (var.getName ()));
+        stream:.write!{u64} (self:.exportType (var.getType ()));
+        stream:.write!{u64} (var.getVarId ());        
+        stream:.write!{bool} (var.isTemp ());        
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * =====================================          VALUES          =====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Export a value into the stream
+     * */
+    fn exportValue (mut self, value : &YILValue, dmut stream : &ByteStream) {
+        match value {
+            a : &YILArrayAccessValue => { return self:.exportArrayAccess (a, alias stream); }
+            a : &YILAddrValue        => { return self:.exportAddr (a, alias stream); }
+            a : &YILArrayValue       => { return self:.exportArrayLit (a, alias stream); }
+            s : &YILStringValue      => { return self:.exportStringLit (s, alias stream); }
+            b : &YILBinaryValue      => { return self:.exportBinary (b, alias stream); }
+            c : &YILCastValue        => { return self:.exportCast (c, alias stream); }
+            f : &YILFieldValue       => { return self:.exportField (f, alias stream); }
+            f : &YILFloatValue       => { return self:.exportFloat (f, alias stream); }
+            i : &YILIntValue         => { return self:.exportInt (i, alias stream); }
+            c : &YILNameCallValue    => { return self:.exportNameCall (c, alias stream); }
+            c : &YILPtrCallValue     => { return self:.exportPtrCall (c, alias stream); }
+            t : &YILTupleValue       => { return self:.exportTupleValue (t, alias stream); }
+            u : &YILUnaryValue       => { return self:.exportUnary (u, alias stream); }
+            v : &YILVar              => { return self:.exportVarValue(v, alias stream); }
+            u : &YILUnrefValue       => { return self:.exportUnref (u, alias stream); }
+            b : &YILBeginCatch       => { return self:.exportBeginCatch (b, alias stream); }
+            u : &YILUnit             => { return self:.exportUnit (u, alias stream); }
+            _ => {
+                eprintln (value.__typeinfo__.name);
+                panic;
+            }
+        }
+    }    
+
+    /**
+     * Convert an array access to byte code
+     * */
+    fn exportArrayAccess (mut self, a : &YILArrayAccessValue, dmut stream : &ByteStream) {
+        stream:.write!{u32} (ValueID::ARRAY_ACCESS_V);
+        stream:.write!{u64} (self:.exportLocation (a.getLoc ()));
+        stream:.write!{u64} (self:.exportType (a.getType ()));
+        
+        self:.exportValue (a.getValue (), alias stream);
+        self:.exportValue (a.getIndex (), alias stream);
+    }
+
+    /**
+     * Convert an address value to byte code
+     * */
+    fn exportAddr (mut self, a : &YILAddrValue, dmut stream : &ByteStream) {
+        stream:.write!{u32} (ValueID::ADDR_V);
+        stream:.write!{u64} (self:.exportLocation (a.getLoc ()));
+        stream:.write!{u64} (self:.exportType (a.getType ()));
+
+        self:.exportValue (a.getValue (), alias stream);
+    }
+
+    /**
+     * Convert an array value to byte code
+     * */
+    fn exportArrayLit (mut self, a : &YILArrayValue, dmut stream : &ByteStream) {
+        stream:.write!{u32} (ValueID::ARRAY_LIT_V);
+        stream:.write!{u64} (self:.exportLocation (a.getLoc ()));
+        stream:.write!{u64} (self:.exportType (a.getType ()));
+        stream:.write!{u64} (a.getValue ().len);
+
+        for inner in a.getValue () {
+            self:.exportValue (inner, alias stream);
+        }
+    }
+
+    /**
+     * Convert a begin catch value to byte code
+     * */
+    fn exportBeginCatch (mut self, a : &YILBeginCatch, dmut stream : &ByteStream) {
+        stream:.write!{u32} (ValueID::BEGIN_CATCH_V);
+        stream:.write!{u64} (self:.exportLocation (a.getLoc ()));
+        stream:.write!{u64} (self:.exportType (a.getType ()));
+        stream:.write!{u64} (self:.exportString (a.getName ()));        
+    }
+    
+    /**
+     * Convert an string value to byte code
+     * */
+    fn exportStringLit (mut self, a : &YILStringValue, dmut stream : &ByteStream) {
+        stream:.write!{u32} (ValueID::STRING_LIT_V);
+        stream:.write!{u64} (self:.exportLocation (a.getLoc ()));
+        stream:.write!{u64} (self:.exportType (a.getType ()));
+        stream:.write!{u64} (self:.exportString (a.getValue ()));
+    }
+
+    /**
+     * Convert an binary value to byte code
+     * */
+    fn exportBinary (mut self, a : &YILBinaryValue, dmut stream : &ByteStream) {
+        stream:.write!{u32} (ValueID::BINARY_V);
+        stream:.write!{u64} (self:.exportLocation (a.getLoc ()));
+        stream:.write!{u64} (self:.exportType (a.getType ()));
+
+        for i, o in BinaryOperators::__members__ {
+            if o == a.getOperator () {
+                stream:.write!{u64} (i);
+                break;
+            }
+        }
+            
+        self:.exportValue (a.getLeft (), alias stream);
+        self:.exportValue (a.getRight (), alias stream);
+    }
+
+    /**
+     * Convert a cast value to byte code
+     * */
+    fn exportCast (mut self, a : &YILCastValue, dmut stream : &ByteStream) {
+        stream:.write!{u32} (ValueID::CAST_V);
+        stream:.write!{u64} (self:.exportLocation (a.getLoc ()));
+        stream:.write!{u64} (self:.exportType (a.getType ()));
+        
+        self:.exportValue (a.getValue (), alias stream);
+    }
+
+    /**
+     * Convert a field value to byte code
+     * */
+    fn exportField (mut self, a : &YILFieldValue, dmut stream : &ByteStream) {
+        stream:.write!{u32} (ValueID::FIELD_V);
+        stream:.write!{u64} (self:.exportLocation (a.getLoc ()));
+        stream:.write!{u64} (self:.exportType (a.getType ()));
+
+        if a.getName ().len == 0 {
+            stream:.write!{bool} (false);
+            stream:.write!{u64} (a.getIndex ());
+        } else {
+            stream:.write!{bool} (true);
+            stream:.write!{u64} (self:.exportString (a.getName ()));
+        }
+        
+        self:.exportValue (a.getValue (), alias stream);
+    }
+
+    /**
+     * Convert a float value to byte code
+     * */
+    fn exportFloat (mut self, a : &YILFloatValue, dmut stream : &ByteStream) {
+        stream:.write!{u32} (ValueID::FLOAT_V);
+        stream:.write!{u64} (self:.exportLocation (a.getLoc ()));
+        stream:.write!{u64} (self:.exportType (a.getType ()));        
+
+        stream:.write!{u64} (self:.exportString (a.getValue ().toHexString ()));
+    }
+
+    /**
+     * Convert a int value to byte code
+     * */
+    fn exportInt (mut self, a : &YILIntValue, dmut stream : &ByteStream) {
+        stream:.write!{u32} (ValueID::INT_V);
+        stream:.write!{u64} (self:.exportLocation (a.getLoc ()));
+        stream:.write!{u64} (self:.exportType (a.getType ()));        
+
+        // assume we can't have a int value > 64 bits
+        stream:.write!{u64} (a.getValue ().toN!{u64} ());         
+    }
+    
+    /**
+     * Convert a name call value to byte code
+     * */
+    fn exportNameCall (mut self, a : &YILNameCallValue, dmut stream : &ByteStream) {
+        stream:.write!{u32} (ValueID::NAME_CALL_V);
+        stream:.write!{u64} (self:.exportLocation (a.getLoc ()));
+        stream:.write!{u64} (self:.exportType (a.getType ()));
+
+        stream:.write!{u64} (self:.exportString (a.getFuncName ()));        
+        stream:.write!{u64} (a.getParameters ().len);
+        
+        for inner in a.getParameters () {
+            self:.exportValue (inner, alias stream);
+        }    
+    }
+
+    /**
+     * Convert a ptr call value to byte code
+     * */
+    fn exportPtrCall (mut self, a : &YILPtrCallValue, dmut stream : &ByteStream) {
+        stream:.write!{u32} (ValueID::PTR_CALL_V);
+        stream:.write!{u64} (self:.exportLocation (a.getLoc ()));
+        stream:.write!{u64} (self:.exportType (a.getType ()));
+
+        self:.exportValue (a.getFuncPtr (), alias stream);                
+        stream:.write!{u64} (a.getParameters ().len);
+        
+        for inner in a.getParameters () {
+            self:.exportValue (inner, alias stream);
+        }        
+    }
+    
+    /**
+     * Convert a tuple value to byte code
+     * */
+    fn exportTupleValue (mut self, a : &YILTupleValue, dmut stream : &ByteStream) {
+        stream:.write!{u32} (ValueID::TUPLE_V);
+        stream:.write!{u64} (self:.exportLocation (a.getLoc ()));
+        stream:.write!{u64} (self:.exportType (a.getType ()));
+
+        stream:.write!{u64} (a.getFieldNames ().len);
+        stream:.write!{u64} (a.getValue ().len);
+
+        for field in a.getFieldNames () {
+            stream:.write!{u64} (self:.exportString (field));
+        }
+        
+        for inner in a.getValue () {
+            self:.exportValue (inner, alias stream);
+        }
+    }
+
+    /**
+     * Convert a unary value to byte code
+     * */
+    fn exportUnary (mut self, a : &YILUnaryValue, dmut stream : &ByteStream) {
+        stream:.write!{u32} (ValueID::UNARY_V);
+        stream:.write!{u64} (self:.exportLocation (a.getLoc ()));
+        stream:.write!{u64} (self:.exportType (a.getType ()));
+
+        for i, o in UnaryOperators::__members__ {
+            if o == a.getOperator () {
+                stream:.write!{u64} (i);
+                break;
+            }
+        }
+                
+        self:.exportValue (a.getValue (), alias stream);
+    }
+
+    /**
+     * Convert a var value to byte code
+     * */
+    fn exportVarValue (mut self, a : &YILVar, dmut stream : &ByteStream) {
+        stream:.write!{u32} (ValueID::VAR_V);
+        stream:.write!{u64} (self:.exportLocation (a.getLoc ()));
+        stream:.write!{u64} (self:.exportType (a.getType ()));
+
+        stream:.write!{u64} (self:.exportString (a.getName ()));
+        stream:.write!{u64} (a.getVarId ());
+        stream:.write!{bool} (a.isThreadLocal ());
+        stream:.write!{bool} (a.isTemp ());
+    }
+
+    /**
+     * Convert an unref value to byte code
+     * */
+    fn exportUnref (mut self, a : &YILUnrefValue, dmut stream : &ByteStream) {
+        stream:.write!{u32} (ValueID::UNREF_V);
+        stream:.write!{u64} (self:.exportLocation (a.getLoc ()));
+        stream:.write!{u64} (self:.exportType (a.getType ()));
+        
+        self:.exportValue (a.getValue (), alias stream);
+    }
+
+    /**
+     * Convert an unref value to byte code
+     * */
+    fn exportUnit (mut self, _ : &YILUnit, dmut stream : &ByteStream) {
+        stream:.write!{u32} (ValueID::UNIT_V);
+    }
+        
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * =====================================          TYPES          ======================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Transform a type into YIL bytecode
+     * */
+    prv fn exportType (mut self, type : &YILType)-> usize {
+        // already exported
+        if type.getUniqId () in self._currentTypeTableHead  { 
+            return type.getUniqId () + TypeID::OFFSET; 
+        }
+
+        // Add to the type table, and return the offset
+        match type {
+            a : &YILArray   => { self:.exportArrayType (a); }                                         
+            t : &YILTuple   => { self:.exportTupleType (t); }
+            p : &YILPointer => { self:.exportPointerType (p); }            
+        }
+
+        return self.getExportTypeID (type);        
+    }
+
+    /**
+     * Export an array type
+     * */
+    fn exportArrayType (mut self, type : &YILArray) {        
+        let dmut stream = alias self._currentTypeTableContent;
+
+        stream:.write!{u8} (TypeID::ARRAY);
+        stream:.write!{u64} (type.getUniqId ());
+        stream:.write!{u64} (type.getLen ());                
+        stream:.write!{u64} (self.getExportTypeID (type.getInner ()));        
+        
+        self._currentTypeTableHead [type.getUniqId ()] = ();                        
+        self:.exportType (type.getInner ());        
+    }
+
+    /**
+     * Export an pointer type
+     * */
+    fn exportPointerType (mut self, type : &YILPointer) {
+        let dmut stream = alias self._currentTypeTableContent;
+        
+        stream:.write!{u8} (TypeID::POINTER);
+        stream:.write!{u64} (type.getUniqId ());
+        stream:.write!{u64} (self.getExportTypeID (type.getInner ()));
+            
+        self._currentTypeTableHead [type.getUniqId ()] = ();                                
+        self:.exportType (type.getInner ());
+    }
+
+    /**
+     * Export an pointer type
+     * */
+    fn exportTupleType (mut self, type : &YILTuple) {        
+        let dmut stream = alias self._currentTypeTableContent;        
+
+        stream:.write!{u8} (TypeID::TUPLE);
+        stream:.write!{u64} (type.getUniqId ()); 
+        stream:.write!{u64} (type.getInners ().len);
+
+        for i in 0 .. type.getInners ().len {
+            if type.getFieldNames ().len > i {
+                stream:.write!{bool} (true);
+                stream:.write!{u64} (self:.exportString (type.getFieldNames () [i]));                                
+            } else {
+                stream:.write!{bool} (false);                
+            }
+
+            stream:.write!{u64} (self.getExportTypeID (type.getInners ()[i]));                
+        }
+        
+        self._currentTypeTableHead [type.getUniqId ()] = ();                        
+        for inner in type.getInners () {
+            self:.exportType (inner);
+        }
+    }
+
+    /**
+     * @returns: the exported type idea in the type table
+     * */
+    fn getExportTypeID (self, t : &YILType)-> usize {
+        if t of YILVoid {
+            return TypeID::VOID;
+        }
+        
+        if let f : &YILFloat = t {
+            match f.getCodeSize () {
+                32 => return TypeID::FLOAT_32;
+                64 => return TypeID::FLOAT_64;
+                80 => return TypeID::FLOAT_80;
+                _ => return TypeID::FLOAT_MAX;
+            }
+        }
+        if let i : &YILInt = t {
+            match (i.getCodeSize (), i.isSigned ()) {
+                (8, false) => { return TypeID::UINT_8; }
+                (16, false) => { return TypeID::UINT_16; }
+                (32, false) => { return TypeID::UINT_32; }
+                (64, false) => { return TypeID::UINT_64; }
+                (_, false) => { return TypeID::UINT_MAX; }
+
+                (8, true) => { return TypeID::SINT_8; }
+                (16, true) => { return TypeID::SINT_16; }
+                (32, true) => { return TypeID::SINT_32; }
+                (64, true) => { return TypeID::SINT_64; }
+                _ => { return TypeID::SINT_MAX; }                                    
+            }
+        }
+                    
+        return t.getUniqId () + TypeID::OFFSET;
+    }
+
+    
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          STRINGS          =====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Export a location into the current export tables
+     * */
+    fn exportLocation (mut self, loc : &Word)-> usize {
+        if let Ok (u) = self._currentLocationTableHead [(loc.filename, loc.line, loc.col)] {
+            return u;
+        }
+
+        let ret = self._currentLocationTableContent[].len;        
+        let off = self:.exportString (loc.filename);
+
+        let dmut stream = alias self._currentLocationTableContent;
+        
+        stream:.write!{u64} (off);
+        stream:.write!{u64} (loc.line);
+        stream:.write!{u32} (loc.col);
+                        
+        ret
+    }
+    
+    /**
+     * Export a string into the string table
+     * */
+    fn exportString (mut self, str : [c8])-> usize {
+        if let Ok (u) = self._currentStringTableHead [str] {
+            return u;
+        }
+
+        let ret = self._currentStringTableContent[].len;        
+        self._currentStringTableHead [str] = ret;
+        
+        self._currentStringTableContent:.write!{u64} (str.len);
+        self._currentStringTableContent:.write!{[c8]} (str);
+
+        ret
+    }    
+
+    /**
+     * Export a string into the string table (where the string can be in different utf)
+     * */
+    fn exportString (mut self, str : [u8])-> usize {
+        if let Ok (u) = self._currentStringU8TableHead [str] {
+            return u;
+        }
+
+        let ret = self._currentStringTableContent[].len;        
+        self._currentStringU8TableHead [str] = ret;
+        
+        self._currentStringTableContent:.write!{u64} (str.len);
+        self._currentStringTableContent:.write!{[u8]} (str);
+
+        ret
+    }    
+
+    
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * =====================================          UTILS          ======================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+    
+        
+    
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          CHECKINC          ====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Check wether the module path is to be compiled by the filter
+     * */
+    prv fn checkPassFilter (self, importPath : Path)-> bool {
+        let absLoc = importPath.stripExtension ();
+        if (absLoc.isEmpty ()) return false; // empty file path
+        if !self._packageDir.isPrefix (absLoc) { // External module are always lazy
+            return false;
+        }
+
+        // No module filters, thus we export everything
+        if (!state::instance ().hasModuleFilters ()) {
+            return true;
+        }
+
+        // A module from the package being compiled, but is is filtered out?
+        let relLoc = absLoc.removePrefix (self._packageDir);
+        for p in state::instance ().getModuleFilters () {
+            if p == relLoc { // one of the selected file to compile
+                return true;
+            }
+        }
+
+        return false;
+    }
+   
+}
