@@ -1,0 +1,421 @@
+in import;
+
+
+use ymirc::errors::message;
+use ymirc::global::{core_, state, common};
+use ymirc::lexing::word;
+use ymirc::syntax::keys;
+
+use ymirc::lint::node::{_, instr::_, global::_, type::_, value::_};
+use ymirc::lint::serialize::_;
+
+use ymirc::utils::{format, log};
+
+use std::{io, fs::{path, file, errors}, time::instant};
+use std::{algorithm::sorting};
+
+/**
+ * This importer reads a YIL bytecode file and recompose the YIL nodes from it
+ * */
+pub record YILImporter {
+    
+    prv {
+
+        // The list of weak symbols imported
+        // name => date of the import file
+        let mut _weakSymbols : [[c8] => Instant] = copy [];
+        
+        // The list of imported frames
+        let mut _frames : [[c8] => mut &YILFrame] = copy [];
+
+        // The list of imported constants
+        let mut _constants : [[c8] => mut &YILConstant] = copy [];
+
+        // The list of imported global variables
+        let mut _globalVars : [[c8] => mut &YILGlobalVar] = copy [];
+        
+    }
+
+    prv {
+
+        // The string table of the module
+        let mut _currentTypeTable : [u8] = [];    
+
+        // The location table of the module
+        let mut _currentLocationTable : [u8] = [];
+        
+        // The string table of the module
+        let mut _currentSymbolTable : [u8] = [];
+        
+        // The string table of the module
+        let mut _currentStringTable : [u8] = [];
+
+        // The list of type imported in the current module
+        let dmut _currentLoadedTypes : [usize => &YILType] = copy [];
+
+        // The list of locations read from the table
+        let mut _currentLoadedLocations : [u64 => mut &Word] = copy [];
+        
+        // The list of string read from the string table
+        let mut _currentLoadedStrings : [u64 => mut [c8]] = copy [];
+                        
+    }
+    
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ======================================          CTOR          ======================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+    
+    pub self () {}
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * =====================================          USAGE          ======================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Import a YIL bytecode file
+     * */
+    pub fn import (mut self, name : Path)
+        throws ErrorMsg
+    {
+        let dmut file = File::open (name, read-> true);
+        let dmut content = file:.readBytesAll ();
+        let mut reader = ByteReader (content);
+        
+        let head = reader:.read!{[c8 ; 3]} ();
+        if head != "YIL" {
+            throw copy ErrorMsg::fatal (EOF_WORD, format (SerializeYILErrorMessage::MALFORMED_BYTECODE));
+        }
+
+        let sizeByteSize = reader:.read!{u32} ();
+        if sizeByteSize != state::instance ().getSizeTypeSize () {
+            throw copy ErrorMsg::fatal (EOF_WORD, format (SerializeYILErrorMessage::MISMATCH_ARCH_POINTER_SIZE,
+                                                          sizeByteSize,
+                                                          state::instance ().getSizeTypeSize ()));
+        }
+
+        logging::info ("Loading a %bits bytecode file %", sizeByteSize, name.toStr ());
+        
+        let tableSizes = reader:.read!{[u64 ; 4]} ();                
+        let buffer = reader[];    
+        
+        let typeOff = 0u64;
+        let locOff = typeOff + tableSizes [0];
+        let symOff = locOff + tableSizes [1];
+        let stringOff = symOff + tableSizes [2];
+        let stringEnd = stringOff + tableSizes [3];
+
+        if stringEnd != buffer.len {
+            throw copy ErrorMsg::fatal (EOF_WORD, format (SerializeYILErrorMessage::MALFORMED_BYTECODE));
+        }
+
+        self._currentTypeTable     = buffer [typeOff .. locOff];
+        self._currentLocationTable = buffer [locOff .. symOff];
+        self._currentSymbolTable   = buffer [symOff .. stringOff];
+        self._currentStringTable   = buffer [stringOff .. stringEnd];
+
+        self._currentLoadedTypes = copy [];
+        self._currentLoadedLocations = copy [];
+        self._currentLoadedStrings = copy [];        
+
+        self:.loadCurrentTypes ();        
+    } catch {
+        FsError () => {
+            throw copy ErrorMsg::fatal (EOF_WORD, format (SerializeYILErrorMessage::FAILED_TO_READ_BYTE_FILE, name.toStr ()));
+        }
+        err : &ErrorMsg => {
+            throw copy ErrorMsg::fatal (EOF_WORD, format (SerializeYILErrorMessage::FAILED_TO_PARSE_BYTE_FILE, name.toStr ()),
+                                        notes-> copy [err]);
+        }
+    }
+
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * =====================================          TYPES          ======================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Load the types in the type table being read
+     * */
+    fn loadCurrentTypes (mut self)
+        throws ErrorMsg
+    {
+        let mut reader = ByteReader (self._currentTypeTable);
+        while reader.len != 0 {
+            let t = reader:.read!{u8} ();
+            match t {
+                TypeID::ARRAY => {
+                    self:.loadArrayType (ref reader);
+                }
+                TypeID::POINTER => {
+                    self:.loadPointerType (ref reader);
+                }
+                TypeID::TUPLE => {
+                    self:.loadTupleType (ref reader);
+                }
+                _ => {
+                    throw copy ErrorMsg::fatal (EOF_WORD, format (SerializeYILErrorMessage::MALFORMED_BYTECODE_TYPE_TABLE));
+                }
+            }
+        }
+        
+        self:.wrapUpTypeReferences ();     
+    }
+
+    /**
+     * All types are loaded, but some are recursive and therefore contains placeholders that have to be wrapped up
+     * */
+    fn wrapUpTypeReferences (mut self)
+        throws ErrorMsg
+    {
+        
+        for _, dmut type in alias self._currentLoadedTypes match alias type {
+            dmut array : &YILArray => {
+                if let (hold : &YILTypePlaceHolder) = array.getInner () {
+                    array:.setInner (self.getType (cast!u64 (hold.getUniqId ())));
+                }
+            }
+            dmut tuple : &YILTuple => {
+                let mut inners : [mut &YILType] = copy tuple.getInners ();
+                for i, inner in inners {
+                    if let hold : &YILTypePlaceHolder = inner {
+                        inners [i] = self.getType (cast!u64 (hold.getUniqId ()));
+                    }
+                }
+
+                tuple:.setInners (inners, tuple.getFieldNames ());
+            }
+            dmut ptr : &YILPointer => {
+                if let (hold : &YILTypePlaceHolder) = ptr.getInner () {
+                    ptr:.setInner (self.getType (cast!u64 (hold.getUniqId ())));
+                }                
+            }
+            _ => {
+                eprintln (type.__typeinfo__.name);
+                eprintln (format ("%", type));
+                panic;
+            }
+        } 
+        
+    }
+
+    /**
+     * Load an array type from the type table
+     * */
+    fn loadArrayType (mut self, ref mut reader : ByteReader)
+        throws ErrorMsg
+    {
+        let id = reader:.read!{u64} ();
+        let len = reader:.read!{u64} ();
+        let innerId = reader:.read!{u64} ();
+
+        let inner = self.getTypeOrPlaceHolder (innerId);
+        self._currentLoadedTypes [cast!usize (id)] = copy YILArray (inner, cast!usize (len), uid-> cast!usize (id));                       
+    }
+
+    /**
+     * Load a pointer type from the type table
+     * */
+    fn loadPointerType (mut self, ref mut reader : ByteReader)
+        throws ErrorMsg
+    {
+        let id = reader:.read!{u64} ();        
+        let innerId = reader:.read!{u64} ();
+
+        let inner = self.getTypeOrPlaceHolder (innerId);
+        self._currentLoadedTypes [cast!usize (id)] = copy YILPointer (inner, uid-> cast!usize (id));
+    }
+
+    /**
+     * Load a tuple type from the type table
+     * */
+    fn loadTupleType (mut self, ref mut reader : ByteReader)
+        throws ErrorMsg
+    {
+        let id = reader:.read!{u64} ();
+        let isUnion = reader:.read!{bool} ();
+        let isPacked = reader:.read!{bool} ();
+        
+        let len = reader:.read!{u64} ();        
+
+        let mut inners : [mut &YILType] = [];
+        let mut names : [[c8]] = [];
+        
+        for _ in 0 .. len {
+            let hasName = reader:.read!{bool} ();
+            let name = if hasName {
+                let stringOff = reader:.read!{u64} ();
+                self:.importString (stringOff)
+            } else { "" };
+
+            let innerId = reader:.read!{u64} ();
+            let inner = self.getTypeOrPlaceHolder (innerId);
+            inners ~= [inner];
+            names ~= [name];
+        }
+
+        self._currentLoadedTypes [cast!usize (id)] = copy YILTuple (inners,
+                                                       fieldNames-> names,
+                                                       isUnion-> isUnion,
+                                                       isPacked-> isPacked,
+                                                       uid-> cast!usize (id),
+                                                       prepared-> true);                
+    }
+
+    /**
+     * Find the type in the loaded table, or a place holder type that will be change after all types have been loaded     
+     * */
+    fn getTypeOrPlaceHolder (self, id : u64)-> &YILType
+        throws ErrorMsg
+    {        
+        if id >= TypeID::OFFSET { // A compound type
+            if let Ok (t) = self._currentLoadedTypes [cast!usize (id - TypeID::OFFSET)] {
+                return t;
+            }
+
+            return copy YILTypePlaceHolder (cast!usize (id));
+        }
+
+        return self.getScalarType (id);
+    }
+    
+    /**
+     * @returns: a type in the loaded table (assuming the id is offseted)
+     * */
+    fn getType (self, id : u64)-> &YILType
+        throws ErrorMsg
+    {
+        if id >= TypeID::OFFSET {
+            println ("GET : ", id - TypeID::OFFSET);
+            if let Ok (inner) = self._currentLoadedTypes [cast!usize (id - TypeID::OFFSET)] {
+                return inner;
+            }
+
+            // Should be in the table but not found
+            throw copy ErrorMsg::fatal (EOF_WORD, format (SerializeYILErrorMessage::MALFORMED_BYTECODE_TYPE_TABLE));            
+        }
+
+        return self.getScalarType (id);
+    }
+
+    /**
+     * @returns: a scalar type from a TypeID
+     * */
+    fn getScalarType (self, id : u64)-> &YILType
+        throws ErrorMsg
+    {
+        // A scalar standard type
+        match id {
+            TypeID::FLOAT_32 => { return YIL_FLOAT_32; }
+            TypeID::FLOAT_64 => { return YIL_FLOAT_64; }
+            TypeID::FLOAT_80 => { return YIL_FLOAT_80; }
+            TypeID::FLOAT_MAX => { return YIL_FLOAT_MAX; }
+
+            TypeID::UINT_8 => { return YIL_UINT_8; }
+            TypeID::UINT_16 => { return YIL_UINT_16; }
+            TypeID::UINT_32 => { return YIL_UINT_32; }
+            TypeID::UINT_64 => { return YIL_UINT_64; }
+            TypeID::UINT_MAX => { return YIL_UINT_MAX; }
+
+            TypeID::SINT_8 => { return YIL_SINT_8; }
+            TypeID::SINT_16 => { return YIL_SINT_16; }
+            TypeID::SINT_32 => { return YIL_SINT_32; }
+            TypeID::SINT_64 => { return YIL_SINT_64; }
+            TypeID::SINT_MAX => { return YIL_SINT_MAX; }
+
+            TypeID::VOID => { return YIL_VOID; }
+            _ => {
+                throw copy ErrorMsg::fatal (EOF_WORD, format (SerializeYILErrorMessage::MALFORMED_BYTECODE_TYPE_TABLE));                
+            }
+        }
+    }
+
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ==================================          STRING TABLE          ==================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Import a string in the string table
+     * */
+    fn importString (mut self, offset : u64)-> [c8]
+        throws ErrorMsg
+    {
+        if let Ok (str) = self._currentLoadedStrings [offset] {
+            return str;
+        }
+
+        if offset >= self._currentStringTable.len {
+            throw copy ErrorMsg::fatal (EOF_WORD, format (SerializeYILErrorMessage::MALFORMED_BYTECODE_STRING_TABLE));            
+        }
+
+        {
+            let mut reader = ByteReader (self._currentStringTable [cast!usize (offset) .. $]);
+            let len = reader:.read!{u64} ();
+            let content = reader:.read!{[c8]} (cast!usize (len));
+            
+            self._currentLoadedStrings [offset] = content;
+            return content;
+        } catch {
+            _ => {
+                throw copy ErrorMsg::fatal (EOF_WORD, format (SerializeYILErrorMessage::MALFORMED_BYTECODE_STRING_TABLE));                
+            }
+        }
+    }
+    
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          GETTERS          =====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * @returns: true if no module have been imported
+     * */
+    pub fn isEmpty (self)-> bool {
+        return self._frames.len == 0 
+            && self._constants.len == 0
+            && self._globalVars.len == 0;
+    }
+
+    /**
+     * @returns: all the nodes imported during the module importations
+     * */
+    pub fn getNodes (self)-> [&YILNode] {
+        let mut csts : [mut &YILSymbol] = copy [fr for _, fr in self._constants];
+        let mut frs : [mut &YILSymbol] = copy [fr for _, fr in self._frames];
+        let mut vrs : [mut &YILSymbol] = copy [fr for _, fr in self._globalVars];
+
+        csts = sort (alias csts, |a, b| => {
+            a.getName () < b.getName ()
+        });
+
+        frs = sort (alias frs, |a, b| => {
+            a.getName () < b.getName ()
+        });
+
+        vrs = sort (alias vrs, |a, b| => {
+            a.getName () < b.getName ()
+        });
+        
+        csts ~ vrs ~ frs
+    }
+    
+}
