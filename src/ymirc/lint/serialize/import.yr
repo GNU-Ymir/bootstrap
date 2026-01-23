@@ -9,7 +9,7 @@ use ymirc::syntax::keys;
 use ymirc::lint::node::{_, instr::_, global::_, type::_, value::_};
 use ymirc::lint::serialize::_;
 
-use ymirc::utils::{format, log};
+use ymirc::utils::{format, log, bigint, bigfloat};
 
 use std::{io, fs::{path, file, errors}, time::instant};
 use std::{algorithm::sorting};
@@ -20,24 +20,23 @@ use std::{algorithm::sorting};
 pub record YILImporter {
     
     prv {
-
-        // The list of weak symbols imported
-        // name => date of the import file
-        let mut _weakSymbols : [[c8] => Instant] = copy [];
         
         // The list of imported frames
-        let mut _frames : [[c8] => mut &YILFrame] = copy [];
+        let mut _frames : [[c8] => mut (&YILFrame, Instant)] = copy [];
 
         // The list of imported constants
-        let mut _constants : [[c8] => mut &YILConstant] = copy [];
+        let mut _constants : [[c8] => mut (&YILConstant, Instant)] = copy [];
 
         // The list of imported global variables
-        let mut _globalVars : [[c8] => mut &YILGlobalVar] = copy [];
+        let mut _globalVars : [[c8] => mut (&YILGlobalVar, Instant)] = copy [];
         
     }
 
     prv {
 
+        // The instant of the file being read (to choose between weak symbol collisions)
+        let mut _currentInstant : Instant = Instant::now ();
+        
         // The string table of the module
         let mut _currentTypeTable : [u8] = [];    
 
@@ -51,14 +50,25 @@ pub record YILImporter {
         let mut _currentStringTable : [u8] = [];
 
         // The list of type imported in the current module
-        let dmut _currentLoadedTypes : [usize => &YILType] = copy [];
+        let dmut _currentImportedTypes : [usize => &YILType] = copy [];
 
         // The list of locations read from the table
-        let mut _currentLoadedLocations : [u64 => mut &Word] = copy [];
+        let mut _currentImportedLocations : [u64 => mut &Word] = copy [];
         
         // The list of string read from the string table
-        let mut _currentLoadedStrings : [u64 => mut [c8]] = copy [];
-                        
+        let mut _currentImportedStrings : [u64 => mut [c8]] = copy [];
+
+        // The list of labels in the current frame
+        // gotos must all refere to the same label is they have the same uid
+        let mut _currentFrameLabels : [usize => mut &YILLabel] = copy [];
+
+        // The list of labels in the current frame
+        // gotos must all refere to the same label is they have the same uid
+        let mut _currentFrameVars : [usize => mut &YILVar] = copy [];
+
+        // True only the value read are frame values 
+        let mut _inFrame : bool = false;
+        
     }
     
     /*!
@@ -101,7 +111,7 @@ pub record YILImporter {
                                                           state::instance ().getSizeTypeSize ()));
         }
 
-        logging::info ("Loading a %bits bytecode file %", sizeByteSize, name.toStr ());
+        logging::info ("Importing a %bits bytecode file %", sizeByteSize, name.toStr ());
         
         let tableSizes = reader:.read!{[u64 ; 4]} ();                
         let buffer = reader[];    
@@ -115,17 +125,19 @@ pub record YILImporter {
         if stringEnd != buffer.len {
             throw copy ErrorMsg::fatal (EOF_WORD, format (SerializeYILErrorMessage::MALFORMED_BYTECODE));
         }
-
+        
         self._currentTypeTable     = buffer [typeOff .. locOff];
         self._currentLocationTable = buffer [locOff .. symOff];
         self._currentSymbolTable   = buffer [symOff .. stringOff];
         self._currentStringTable   = buffer [stringOff .. stringEnd];
 
-        self._currentLoadedTypes = copy [];
-        self._currentLoadedLocations = copy [];
-        self._currentLoadedStrings = copy [];        
+        self._currentInstant = fs::sys::fileDate (name);
+        self._currentImportedTypes = copy [];
+        self._currentImportedLocations = copy [];
+        self._currentImportedStrings = copy [];        
 
-        self:.loadCurrentTypes ();        
+        self:.importTypes ();
+        self:.importSymbols ();    
     } catch {
         FsError () => {
             throw copy ErrorMsg::fatal (EOF_WORD, format (SerializeYILErrorMessage::FAILED_TO_READ_BYTE_FILE, name.toStr ()));
@@ -136,7 +148,743 @@ pub record YILImporter {
         }
     }
 
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          SYMBOLS          =====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
 
+    /**
+     * Import all the symbols in the current imported module
+     * */
+    fn importSymbols (mut self)
+        throws ErrorMsg
+    {
+        let mut reader = ByteReader (self._currentSymbolTable);
+        while reader.len != 0 {
+            let t = reader:.read!{u8} ();
+            match t {
+                SymbolID::FRAME => {
+                    self:.importFrame (ref reader);
+                }
+                SymbolID::CONSTANT => {
+                    self:.importConstant (ref reader);
+                }
+                SymbolID::GLOBAL => {
+                    self:.importGlobal (ref reader);
+                }
+                _ => {
+                    throw copy ErrorMsg::fatal (EOF_WORD, format (SerializeYILErrorMessage::MALFORMED_BYTECODE_SYMBOL_TABLE));
+                }
+            }
+        }
+    }
+
+    /**
+     * Import a frame in the current symbol table
+     * */
+    fn importFrame (mut self, ref mut reader : ByteReader)
+        throws ErrorMsg
+    {
+        // Header
+        let loc = self:.importLocation (reader:.read!{u64} ());
+        let isWeak = reader:.read!{bool} ();
+        let name = self:.importString (reader:.read!{u64} ());
+        let isGlbCtor = reader:.read!{bool} ();
+
+        // Prototype             
+        let nbParams = reader:.read!{u32} ();
+        let vars : [&YILVarDecl] = copy [self:.importVarDecl (ref reader) for _ in 0 .. nbParams];
+        
+        let retType = self.getType (reader:.read!{u64} ());
+
+        // Content
+        self._currentFrameLabels = copy [];
+        self._currentFrameVars = copy [];
+        self._inFrame = true;
+        
+        let body = self:.importInstruction (ref reader);
+
+        // Insertion
+        let replace = {
+            if let Ok ((oldF, oldI)) = self._frames [name] {
+                if !isWeak { // Either old is weak, or new is more recent
+                    oldF.isWeak () || self._currentInstant > oldI  
+                }            
+                else { // only replace if old is weak and older                 
+                    oldF.isWeak () && self._currentInstant > oldI                
+                }                        
+            } else {
+                true
+            }
+        };
+        
+        if replace {            
+            let result = copy YILFrame (loc,
+                                        name,
+                                        vars,
+                                        retType,
+                                        body,
+                                        copy [],
+                                        isWeak-> isWeak,
+                                        isGlobalCtor-> isGlbCtor);
+            
+            self._frames [name] = (result, self._currentInstant);
+        }
+    }    
+
+    /**
+     * Import a constant in the current symbol table
+     * */
+    fn importConstant (mut self, ref mut reader : ByteReader)
+        throws ErrorMsg
+    {
+        // Head
+        let loc = self:.importLocation (reader:.read!{u64} ());
+        let isWeak = reader:.read!{bool} ();
+        let name = self:.importString (reader:.read!{u64} ());
+        let isLocal = reader:.read!{bool} ();
+        
+        // Value
+        self._currentFrameLabels = copy [];
+        self._currentFrameVars = copy []; 
+        self._inFrame = false;
+        let value = self:.importValue (ref reader);
+
+        // Insertion
+        let replace = {
+            if let Ok ((oldF, oldI)) = self._constants [name] {
+                if !isWeak { // Either old is weak, or new is more recent
+                    oldF.isWeak () || self._currentInstant > oldI  
+                }            
+                else { // only replace if old is weak and older                 
+                    oldF.isWeak () && self._currentInstant > oldI                
+                }                        
+            } else {
+                true
+            }
+        };
+
+        if replace {
+            let result = copy YILConstant (loc,
+                                           name,
+                                           value,
+                                           copy [],
+                                           isWeak-> isWeak,
+                                           isLocal-> isLocal);
+            
+            self._constants [name] = (result, self._currentInstant);
+        }
+        
+    }
+
+    /**
+     * Import a constant in the current symbol table
+     * */
+    fn importGlobal (mut self, ref mut reader : ByteReader)
+        throws ErrorMsg
+    {
+        // Head
+        let loc = self:.importLocation (reader:.read!{u64} ());
+        let isWeak = reader:.read!{bool} ();
+        let name = self:.importString (reader:.read!{u64} ()); 
+        let isLocal = reader:.read!{bool} ();
+
+        // Value
+        self._currentFrameLabels = copy [];
+        self._currentFrameVars = copy [];
+        self._inFrame = false;
+        let value = self:.importValue (ref reader);        
+        
+        // Insertions
+        let replace = {
+            if let Ok ((oldF, oldI)) = self._globalVars [name] {
+                if !isWeak { // Either old is weak, or new is more recent
+                    oldF.isWeak () || self._currentInstant > oldI  
+                }            
+                else { // only replace if old is weak and older                 
+                    oldF.isWeak () && self._currentInstant > oldI                
+                }                        
+            } else {
+                true
+            }
+        };
+
+        if replace {
+            let result = copy YILGlobalVar (loc,
+                                            name,
+                                            value,
+                                            copy [],
+                                            isWeak-> isWeak,
+                                            isThreadLocal-> isLocal);
+            
+            self._globalVars [name] = (result, self._currentInstant);
+        }    
+    }
+    
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ==================================          INSTRUCTIONS          ==================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Import an instruction from the bytecode
+     * */
+    fn importInstruction (mut self, ref mut reader : ByteReader)-> &YILInstr
+        throws ErrorMsg
+    {
+        let code = reader:.read!{u32} ();
+        match code {
+            ValueID::AFFECT    => { return self:.importAffect (ref reader); }
+            ValueID::BLOCK     => { return self:.importBlock (ref reader); }
+            ValueID::CALL      => { return self:.importCall (ref reader); }
+            ValueID::COND_JMP  => { return self:.importCondJmp (ref reader); }
+            ValueID::GOTO      => { return self:.importGoto (ref reader); }
+            ValueID::LABEL     => { return self:.importLabel (ref reader); }
+            ValueID::RETURN    => { return self:.importReturn (ref reader); }
+            ValueID::TRY_CATCH => { return self:.importTryCatch (ref reader); }
+            ValueID::TRY_FIN   => { return self:.importTryFinally (ref reader); }
+            ValueID::VAR_DECL  => { return self:.importVarDecl (ref reader); }
+            _ => {
+                throw copy ErrorMsg::fatal (EOF_WORD, format (SerializeYILErrorMessage::MALFORMED_BYTECODE_SYMBOL_TABLE));
+            }            
+        }
+    }
+
+    /**
+     * Import an affection instruction from the bytecode
+     * */
+    fn importAffect (mut self, ref mut reader : ByteReader)-> &YILAffect
+        throws ErrorMsg
+    {
+        let loc = self:.importLocation (reader:.read!{u64} ());
+        let left = self:.importValue (ref reader);
+        let right = self:.importValue (ref reader);
+
+        copy YILAffect (loc, left, right)
+    }
+
+    /**
+     * Import a block of instructions from the bytecode
+     * */
+    fn importBlock (mut self, ref mut reader : ByteReader)-> &YILBlock
+        throws ErrorMsg
+    {
+        let loc = self:.importLocation (reader:.read!{u64} ());
+        let nb = reader:.read!{u64} ();
+        let instr = copy [self:.importInstruction (ref reader) for _ in 0 .. nb];        
+
+        copy YILBlock (loc, instr)
+    }
+
+    /**
+     * Import a call instruction from the bytecode
+     * */
+    fn importCall (mut self, ref mut reader : ByteReader)-> &YILCall
+        throws ErrorMsg
+    {
+        let loc = self:.importLocation (reader:.read!{u64} ());
+        let value = self:.importValue (ref reader);
+
+        copy YILCall (loc, value)
+    }
+
+    /**
+     * Import a conditional jmp instruction from the bytecode
+     * */
+    fn importCondJmp (mut self, ref mut reader : ByteReader)-> &YILCondJmp
+        throws ErrorMsg
+    {
+        let loc = self:.importLocation (reader:.read!{u64} ());
+
+        let thenLoc = self:.importLocation (reader:.read!{u64} ());
+        let thenId = cast!usize (reader:.read!{u64} ());
+        let thenName = self:.importString (reader:.read!{u64} ());
+
+        let elseLoc = self:.importLocation (reader:.read!{u64} ());
+        let elseId = cast!usize (reader:.read!{u64} ());
+        let elseName = self:.importString (reader:.read!{u64} ());
+
+        let test = self:.importValue (ref reader);
+        
+        let thenLbl = if let Ok (lb) = self._currentFrameLabels [thenId] {
+            lb
+        } else {
+            let lb = copy YILLabel (thenLoc, thenName, thenId);
+            self._currentFrameLabels [thenId] = lb;
+            lb
+        };
+        
+        let elseLbl = if let Ok (lb) = self._currentFrameLabels [elseId] {
+            lb
+        } else {
+            let lb = copy YILLabel (elseLoc, elseName, elseId);
+            self._currentFrameLabels [elseId] = lb;
+            lb
+        };                
+        
+        copy YILCondJmp (loc, test, thenLbl, elseLbl)
+    }
+    
+    /**
+     * Import a goto instruction from the bytecode
+     * */
+    fn importGoto (mut self, ref mut reader : ByteReader)-> &YILGoto
+        throws ErrorMsg
+    {
+        let loc = self:.importLocation (reader:.read!{u64} ());
+
+        let thenLoc = self:.importLocation (reader:.read!{u64} ());
+        let thenId = cast!usize (reader:.read!{u64} ());
+        let thenName = self:.importString (reader:.read!{u64} ());
+
+        let thenLbl = if let Ok (lb) = self._currentFrameLabels [thenId] {
+            lb
+        } else {
+            let lb = copy YILLabel (thenLoc, thenName, thenId);
+            self._currentFrameLabels [thenId] = lb;
+            lb
+        };
+        
+        copy YILGoto (loc, thenLbl)
+    }
+
+    /**
+     * Import a label instruction from the bytecode
+     * */
+    fn importLabel (mut self, ref mut reader : ByteReader)-> &YILLabel
+        throws ErrorMsg
+    {        
+        let loc = self:.importLocation (reader:.read!{u64} ());
+        let id = cast!usize (reader:.read!{u64} ());
+        let name = self:.importString (reader:.read!{u64} ());
+
+        let label = if let Ok (lb) = self._currentFrameLabels [id] {
+            lb
+        } else {
+            let lb = copy YILLabel (loc, name, id);
+            self._currentFrameLabels [id] = lb;
+            lb
+        };
+
+        label
+    }
+
+    /**
+     * Import a return instruction from the bytecode
+     * */
+    fn importReturn (mut self, ref mut reader : ByteReader)-> &YILReturn
+        throws ErrorMsg
+    {
+        let loc = self:.importLocation (reader:.read!{u64} ());
+        let value = self:.importValue (ref reader);
+
+        copy YILReturn (loc, value)
+    }
+
+    /**
+     * Import a try catch instruction from the bytecode
+     * */
+    fn importTryCatch (mut self, ref mut reader : ByteReader)-> &YILTryCatch
+        throws ErrorMsg
+    {
+        let loc = self:.importLocation (reader:.read!{u64} ());
+        let type = self.getType (reader:.read!{u64} ());
+
+        let tryLen = reader:.read!{u64} ();
+        let catchLen = reader:.read!{u64} ();
+        
+        let tryPart : [&YILInstr] = copy [self:.importInstruction (ref reader) for _ in 0 .. tryLen];
+        let catchPart : [&YILInstr] = copy [self:.importInstruction (ref reader) for _ in 0 .. catchLen];        
+
+        copy YILTryCatch (loc, type, tryPart, catchPart)
+    }
+
+    /**
+     * Import a try finally instruction from the bytecode
+     * */
+    fn importTryFinally (mut self, ref mut reader : ByteReader)-> &YILTryFinally
+        throws ErrorMsg
+    {
+        let loc = self:.importLocation (reader:.read!{u64} ());        
+        let tryLen = reader:.read!{u64} ();
+        let finLen = reader:.read!{u64} ();
+
+        let tryPart : [&YILInstr] = copy [self:.importInstruction (ref reader) for _ in 0 .. tryLen];
+        let finPart : [&YILInstr] = copy [self:.importInstruction (ref reader) for _ in 0 .. finLen];
+        
+        copy YILTryFinally (loc, tryPart, finPart)
+    }
+
+    /**
+     * Import a variable declaration from the bytecode
+     * */
+    fn importVarDecl (mut self, ref mut reader : ByteReader)-> &YILVarDecl
+        throws ErrorMsg
+    {
+        let loc = self:.importLocation (reader:.read!{u64} ());
+        
+        let name = self:.importString (reader:.read!{u64} ());        
+        let type = self.getType (reader:.read!{u64} ());
+        let id = cast!usize (reader:.read!{u64} ());
+        let isTemp = reader:.read!{bool} ();
+
+        copy YILVarDecl (loc, name, type, id, isTemp-> isTemp)
+    }
+    
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * =====================================          VALUES          =====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */    
+
+    /**
+     * Import a value from the bytecode
+     * */
+    fn importValue (mut self, ref mut reader : ByteReader)-> &YILValue
+        throws ErrorMsg
+    {
+        let code = reader:.read!{u32} ();
+        match code {
+            ValueID::ADDR_V         => { return self:.importAddrValue (ref reader); }
+            ValueID::ARRAY_ACCESS_V => { return self:.importArrayAccessValue (ref reader); }
+            ValueID::ARRAY_LIT_V    => { return self:.importArrayLitValue (ref reader); }
+            ValueID::BEGIN_CATCH_V  => { return self:.importBeginCatchValue (ref reader); }
+            ValueID::BINARY_V       => { return self:.importBinaryValue (ref reader); }
+            ValueID::CAST_V         => { return self:.importCastValue (ref reader); }
+            ValueID::FIELD_V        => { return self:.importFieldValue (ref reader); }
+            ValueID::FLOAT_V        => { return self:.importFloatValue (ref reader); }
+            ValueID::INT_V          => { return self:.importIntValue (ref reader); }
+            ValueID::NAME_CALL_V    => { return self:.importNameCallValue (ref reader); }
+            ValueID::PTR_CALL_V     => { return self:.importPtrCallValue (ref reader); }
+            ValueID::STRING_LIT_V   => { return self:.importStringLitValue (ref reader); }
+            ValueID::TUPLE_V        => { return self:.importTupleValue (ref reader); }
+            ValueID::UNARY_V        => { return self:.importUnaryValue (ref reader); }
+            ValueID::UNIT_V         => { return self:.importUnitValue (ref reader); }
+            ValueID::UNREF_V        => { return self:.importUnrefValue (ref reader); }
+            ValueID::VAR_V          => { return self:.importVarValue (ref reader); }
+            _ => {
+                throw copy ErrorMsg::fatal (EOF_WORD, format (SerializeYILErrorMessage::MALFORMED_BYTECODE_SYMBOL_TABLE));
+            }
+        }
+    }
+
+    /**
+     * Import an address value from the bytecode
+     * */
+    fn importAddrValue (mut self, ref mut reader : ByteReader)-> &YILAddrValue
+        throws ErrorMsg
+    {
+        let loc = self:.importLocation (reader:.read!{u64} ());
+        let type = self.getType (reader:.read!{u64} ());
+        let value = self:.importValue (ref reader);
+
+        copy YILAddrValue (loc, type, value)
+    }
+
+    /**
+     * Import an array access value from the bytecode
+     * */
+    fn importArrayAccessValue (mut self, ref mut reader : ByteReader)-> &YILArrayAccessValue
+        throws ErrorMsg
+    {
+        let loc = self:.importLocation (reader:.read!{u64} ());
+        let type = self.getType (reader:.read!{u64} ());
+
+        let value = self:.importValue (ref reader);
+        let index = self:.importValue (ref reader);
+
+        copy YILArrayAccessValue (loc, type, value, index)
+    }
+
+    /**
+     * Import an array access value from the bytecode
+     * */
+    fn importArrayLitValue (mut self, ref mut reader : ByteReader)-> &YILArrayValue
+        throws ErrorMsg
+    {
+        let loc = self:.importLocation (reader:.read!{u64} ());
+        let type = self.getType (reader:.read!{u64} ());
+
+        let len = reader:.read!{u64} ();
+        let values : [&YILValue] = copy [self:.importValue (ref reader) for _ in 0 .. len];        
+
+        copy YILArrayValue (loc, type, values)
+    }
+
+    /**
+     * Import a begin catch value from the bytecode
+     * */
+    fn importBeginCatchValue (mut self, ref mut reader : ByteReader)-> &YILBeginCatch
+        throws ErrorMsg
+    {
+        let loc = self:.importLocation (reader:.read!{u64} ());        
+        let name = self:.importString (reader:.read!{u64} ());
+
+        copy YILBeginCatch (loc, name)
+    }
+
+    /**
+     * Import a begin catch value from the bytecode
+     * */
+    fn importStringLitValue (mut self, ref mut reader : ByteReader)-> &YILStringValue
+        throws ErrorMsg
+    {
+        let loc = self:.importLocation (reader:.read!{u64} ());
+        let type = self.getType (reader:.read!{u64} ());
+        let content = self:.importStringAsU8 (reader:.read!{u64} ());
+
+        copy YILStringValue (loc, type, content)
+    }
+    
+    /**
+     * Import a binary operator value from the bytecode
+     * */
+    fn importBinaryValue (mut self, ref mut reader : ByteReader)-> &YILBinaryValue
+        throws ErrorMsg
+    {
+        let loc = self:.importLocation (reader:.read!{u64} ());
+        let type = self.getType (reader:.read!{u64} ());
+        let opCode = reader:.read!{u64} ();
+
+        if opCode >= BinaryOperators::__members__.len {
+            throw copy ErrorMsg::fatal (EOF_WORD, format (SerializeYILErrorMessage::MALFORMED_BYTECODE_SYMBOL_TABLE));
+        }
+        
+        let mut op = BinaryOperators::__members__ [0];        
+        for i, o in BinaryOperators::__members__ {
+            if i == opCode {                
+                op = o;
+                break;
+            }
+        }
+
+        let left = self:.importValue (ref reader);
+        let right = self:.importValue (ref reader);
+
+        copy YILBinaryValue (loc, type, op, left, right)
+    }
+
+    /**
+     * Import a cast operator value from the bytecode
+     * */
+    fn importCastValue (mut self, ref mut reader : ByteReader)-> &YILCastValue
+        throws ErrorMsg
+    {
+        let loc = self:.importLocation (reader:.read!{u64} ());
+        let type = self.getType (reader:.read!{u64} ());
+        let value = self:.importValue (ref reader);
+
+        copy YILCastValue (loc, type, value)
+    }
+
+    /**
+     * Import a field access operator value from the bytecode
+     * */
+    fn importFieldValue (mut self, ref mut reader : ByteReader)-> &YILFieldValue
+        throws ErrorMsg
+    {
+        let loc = self:.importLocation (reader:.read!{u64} ());
+        let type = self.getType (reader:.read!{u64} ());
+        let isName = reader:.read!{bool} ();
+
+        let mut name : [c8] = "";
+        let mut index : usize = 0;
+        if isName {
+            name = self:.importString (reader:.read!{u64} ());
+        } else {
+            index = cast!usize (reader:.read!{u64} ());
+        }
+
+        let value = self:.importValue (ref reader);
+        copy YILFieldValue (loc, type, value, index-> index, name-> name)
+    }
+
+    /**
+     * Import a float value from the bytecode
+     * */
+    fn importFloatValue (mut self, ref mut reader : ByteReader)-> &YILFloatValue
+        throws ErrorMsg
+    {
+        let loc = self:.importLocation (reader:.read!{u64} ());
+        let type = self.getType (reader:.read!{u64} ());
+        
+        let floatV = self:.importString (reader:.read!{u64} ());        
+        let bigF = copy BigFloat (floatV, base-> 0u32); // precision = 0 for mpfr to detect hexstring
+
+        copy YILFloatValue (loc, type, bigF)
+    }
+
+    /**
+     * Import an int value from the bytecode
+     * */
+    fn importIntValue (mut self, ref mut reader : ByteReader)-> &YILIntValue
+        throws ErrorMsg
+    {
+        let loc = self:.importLocation (reader:.read!{u64} ());
+        let type = self.getType (reader:.read!{u64} ());
+
+        let bigI = if let iT : &YILInt = type {
+            if iT.isSigned () {
+                copy BigInt (reader:.read!{i64} ())
+            } else {
+                copy BigInt (reader:.read!{u64} ())
+            }
+        } else {
+            throw copy ErrorMsg::fatal (EOF_WORD, format (SerializeYILErrorMessage::MALFORMED_BYTECODE_SYMBOL_TABLE));   
+        }
+
+        copy YILIntValue (loc, type, bigI)
+    }
+
+    /**
+     * Import an name call value from the bytecode
+     * */
+    fn importNameCallValue (mut self, ref mut reader : ByteReader)-> &YILNameCallValue
+        throws ErrorMsg
+    {
+        let loc = self:.importLocation (reader:.read!{u64} ());
+        let type = self.getType (reader:.read!{u64} ());
+        let name = self:.importString (reader:.read!{u64} ());
+        
+        let nbParams = reader:.read!{u64} ();
+        let params = copy [self:.importValue (ref reader) for _ in 0 .. nbParams];
+
+        copy YILNameCallValue (loc, type, name, params)
+    }
+
+    /**
+     * Import an function pointer call value from the bytecode
+     * */
+    fn importPtrCallValue (mut self, ref mut reader : ByteReader)-> &YILPtrCallValue
+        throws ErrorMsg
+    {
+        let loc = self:.importLocation (reader:.read!{u64} ());
+        let type = self.getType (reader:.read!{u64} ());
+        
+        let nbParams = reader:.read!{u64} ();
+        let ptr = self:.importValue (ref reader); 
+        let params = copy [self:.importValue (ref reader) for _ in 0 .. nbParams];
+
+        copy YILPtrCallValue (loc, type, ptr, params)
+    }
+
+    /**
+     * Import an tuple literal value from the bytecode
+     * */
+    fn importTupleValue (mut self, ref mut reader : ByteReader)-> &YILTupleValue
+        throws ErrorMsg
+    {
+        let loc = self:.importLocation (reader:.read!{u64} ());
+        let type = self.getType (reader:.read!{u64} ());
+        
+        let nbFieldNames = reader:.read!{u64} ();
+        let nbFieldValues = reader:.read!{u64} ();
+        
+        let fieldNames = copy [self:.importString (reader:.read!{u64} ()) for _ in 0 .. nbFieldNames];
+        let fieldValues = copy [self:.importValue (ref reader) for _ in 0 .. nbFieldValues];
+
+        copy YILTupleValue (loc, type, fieldValues, fieldNames-> fieldNames)
+    }
+
+    /**
+     * Import an unary operator value from the bytecode
+     * */
+    fn importUnaryValue (mut self, ref mut reader : ByteReader)-> &YILUnaryValue
+        throws ErrorMsg
+    {
+        let loc = self:.importLocation (reader:.read!{u64} ());
+        let type = self.getType (reader:.read!{u64} ());
+        let opCode = reader:.read!{u64} ();
+
+        if opCode >= UnaryOperators::__members__.len {
+            throw copy ErrorMsg::fatal (EOF_WORD, format (SerializeYILErrorMessage::MALFORMED_BYTECODE_SYMBOL_TABLE));
+        }
+        
+        let mut op = UnaryOperators::__members__ [0];        
+        for i, o in UnaryOperators::__members__ {
+            if i == opCode {                
+                op = o;
+                break;
+            }
+        }
+
+        let value = self:.importValue (ref reader);
+        copy YILUnaryValue (loc, type, op, value)
+    }
+
+    /**
+     * Import a var value from the bytecode
+     * */
+    fn importVarValue (mut self, ref mut reader : ByteReader)-> &YILVar
+        throws ErrorMsg
+    {
+        let loc = self:.importLocation (reader:.read!{u64} ());
+        let type = self.getType (reader:.read!{u64} ());
+        let name = self:.importString (reader:.read!{u64} ());
+        let id = cast!usize (reader:.read!{u64} ());
+        let isThLocal = reader:.read!{bool} ();
+        let isTemp = reader:.read!{bool} ();
+
+        // Verification that there was not some devious thing going on
+        if let Ok (var) = self._currentFrameVars [id] && self._inFrame {            
+            if var.getType () != type {
+                throw copy ErrorMsg::fatal (EOF_WORD, format (SerializeYILErrorMessage::MALFORMED_BYTECODE_SYMBOL_TABLE));  
+            }
+
+            if var.getName () != name {
+                throw copy ErrorMsg::fatal (EOF_WORD, format (SerializeYILErrorMessage::MALFORMED_BYTECODE_SYMBOL_TABLE));  
+            }
+
+            if var.isThreadLocal () != isThLocal {
+                throw copy ErrorMsg::fatal (EOF_WORD, format (SerializeYILErrorMessage::MALFORMED_BYTECODE_SYMBOL_TABLE));  
+            }
+
+            if var.isTemp () != isTemp {
+                throw copy ErrorMsg::fatal (EOF_WORD, format (SerializeYILErrorMessage::MALFORMED_BYTECODE_SYMBOL_TABLE));  
+            }            
+
+            // Exactly the same, no need for clone
+            if var.getLoc () == loc {
+                return var;
+            }
+        }
+        
+        let var = copy YILVar (loc, name, type, id, isTemp-> isTemp, isThreadLocal-> isThLocal);        
+        self._currentFrameVars [id] = var;
+
+        var
+    }
+
+    /**
+     * Import a unref value from the bytecode
+     * */
+    fn importUnrefValue (mut self, ref mut reader : ByteReader)-> &YILUnrefValue
+        throws ErrorMsg
+    {
+        let loc = self:.importLocation (reader:.read!{u64} ());
+        let type = self.getType (reader:.read!{u64} ());
+        let value = self:.importValue (ref reader);
+
+        copy YILUnrefValue (loc, type, value)
+    }
+
+    /**
+     * Import a unref value from the bytecode
+     * */
+    fn importUnitValue (mut self, ref mut reader : ByteReader)-> &YILUnit {
+        reader;
+        YIL_UNIT_VALUE
+    }
+    
     /*!
      * ====================================================================================================
      * ====================================================================================================
@@ -146,9 +894,9 @@ pub record YILImporter {
      */
 
     /**
-     * Load the types in the type table being read
+     * Import the types in the type table being read
      * */
-    fn loadCurrentTypes (mut self)
+    fn importTypes (mut self)
         throws ErrorMsg
     {
         let mut reader = ByteReader (self._currentTypeTable);
@@ -156,13 +904,13 @@ pub record YILImporter {
             let t = reader:.read!{u8} ();
             match t {
                 TypeID::ARRAY => {
-                    self:.loadArrayType (ref reader);
+                    self:.importArrayType (ref reader);
                 }
                 TypeID::POINTER => {
-                    self:.loadPointerType (ref reader);
+                    self:.importPointerType (ref reader);
                 }
                 TypeID::TUPLE => {
-                    self:.loadTupleType (ref reader);
+                    self:.importTupleType (ref reader);
                 }
                 _ => {
                     throw copy ErrorMsg::fatal (EOF_WORD, format (SerializeYILErrorMessage::MALFORMED_BYTECODE_TYPE_TABLE));
@@ -174,13 +922,13 @@ pub record YILImporter {
     }
 
     /**
-     * All types are loaded, but some are recursive and therefore contains placeholders that have to be wrapped up
+     * All types are imported, but some are recursive and therefore contains placeholders that have to be wrapped up
      * */
     fn wrapUpTypeReferences (mut self)
         throws ErrorMsg
     {
         
-        for _, dmut type in alias self._currentLoadedTypes match alias type {
+        for _, dmut type in alias self._currentImportedTypes match alias type {
             dmut array : &YILArray => {
                 if let (hold : &YILTypePlaceHolder) = array.getInner () {
                     array:.setInner (self.getType (cast!u64 (hold.getUniqId ())));
@@ -211,9 +959,9 @@ pub record YILImporter {
     }
 
     /**
-     * Load an array type from the type table
+     * Import an array type from the type table
      * */
-    fn loadArrayType (mut self, ref mut reader : ByteReader)
+    fn importArrayType (mut self, ref mut reader : ByteReader)
         throws ErrorMsg
     {
         let id = reader:.read!{u64} ();
@@ -221,66 +969,54 @@ pub record YILImporter {
         let innerId = reader:.read!{u64} ();
 
         let inner = self.getTypeOrPlaceHolder (innerId);
-        self._currentLoadedTypes [cast!usize (id)] = copy YILArray (inner, cast!usize (len), uid-> cast!usize (id));                       
+        self._currentImportedTypes [cast!usize (id)] = copy YILArray (inner, cast!usize (len), uid-> cast!usize (id));                       
     }
 
     /**
-     * Load a pointer type from the type table
+     * Import a pointer type from the type table
      * */
-    fn loadPointerType (mut self, ref mut reader : ByteReader)
+    fn importPointerType (mut self, ref mut reader : ByteReader)
         throws ErrorMsg
     {
         let id = reader:.read!{u64} ();        
         let innerId = reader:.read!{u64} ();
 
         let inner = self.getTypeOrPlaceHolder (innerId);
-        self._currentLoadedTypes [cast!usize (id)] = copy YILPointer (inner, uid-> cast!usize (id));
+        self._currentImportedTypes [cast!usize (id)] = copy YILPointer (inner, uid-> cast!usize (id));
     }
 
     /**
-     * Load a tuple type from the type table
+     * Import a tuple type from the type table
      * */
-    fn loadTupleType (mut self, ref mut reader : ByteReader)
+    fn importTupleType (mut self, ref mut reader : ByteReader)
         throws ErrorMsg
     {
         let id = reader:.read!{u64} ();
         let isUnion = reader:.read!{bool} ();
         let isPacked = reader:.read!{bool} ();
-        
-        let len = reader:.read!{u64} ();        
 
-        let mut inners : [mut &YILType] = [];
-        let mut names : [[c8]] = [];
-        
-        for _ in 0 .. len {
-            let hasName = reader:.read!{bool} ();
-            let name = if hasName {
-                let stringOff = reader:.read!{u64} ();
-                self:.importString (stringOff)
-            } else { "" };
+        let nbNames = reader:.read!{u64} ();
+        let nbFields = reader:.read!{u64} ();        
 
-            let innerId = reader:.read!{u64} ();
-            let inner = self.getTypeOrPlaceHolder (innerId);
-            inners ~= [inner];
-            names ~= [name];
-        }
+        let names  = copy [self:.importString (reader:.read!{u64} ()) for _ in 0 .. nbNames];
+        let inners = copy [self.getTypeOrPlaceHolder (reader:.read!{u64} ()) for _ in 0 .. nbFields];                
 
-        self._currentLoadedTypes [cast!usize (id)] = copy YILTuple (inners,
-                                                       fieldNames-> names,
-                                                       isUnion-> isUnion,
-                                                       isPacked-> isPacked,
-                                                       uid-> cast!usize (id),
-                                                       prepared-> true);                
+        self._currentImportedTypes [cast!usize (id)] = copy YILTuple (inners,
+                                                                      fieldNames-> names,
+                                                                      isUnion-> isUnion,
+                                                                      isPacked-> isPacked,
+                                                                      uid-> cast!usize (id),
+                                                                      prepared-> true);                
     }
 
     /**
-     * Find the type in the loaded table, or a place holder type that will be change after all types have been loaded     
+     * Find the type in the imported table, or a place holder type that will be change after all types have been imported     
      * */
     fn getTypeOrPlaceHolder (self, id : u64)-> &YILType
         throws ErrorMsg
     {        
         if id >= TypeID::OFFSET { // A compound type
-            if let Ok (t) = self._currentLoadedTypes [cast!usize (id - TypeID::OFFSET)] {
+            if let Ok (t) = self._currentImportedTypes [cast!usize (id - TypeID::OFFSET)] {
                 return t;
             }
 
@@ -291,14 +1027,13 @@ pub record YILImporter {
     }
     
     /**
-     * @returns: a type in the loaded table (assuming the id is offseted)
+     * @returns: a type in the imported table (assuming the id is offseted)
      * */
     fn getType (self, id : u64)-> &YILType
         throws ErrorMsg
     {
-        if id >= TypeID::OFFSET {
-            println ("GET : ", id - TypeID::OFFSET);
-            if let Ok (inner) = self._currentLoadedTypes [cast!usize (id - TypeID::OFFSET)] {
+        if id >= TypeID::OFFSET {            
+            if let Ok (inner) = self._currentImportedTypes [cast!usize (id - TypeID::OFFSET)] {
                 return inner;
             }
 
@@ -356,7 +1091,7 @@ pub record YILImporter {
     fn importString (mut self, offset : u64)-> [c8]
         throws ErrorMsg
     {
-        if let Ok (str) = self._currentLoadedStrings [offset] {
+        if let Ok (str) = self._currentImportedStrings [offset] {
             return str;
         }
 
@@ -369,11 +1104,72 @@ pub record YILImporter {
             let len = reader:.read!{u64} ();
             let content = reader:.read!{[c8]} (cast!usize (len));
             
-            self._currentLoadedStrings [offset] = content;
+            self._currentImportedStrings [offset] = content;
             return content;
         } catch {
             _ => {
                 throw copy ErrorMsg::fatal (EOF_WORD, format (SerializeYILErrorMessage::MALFORMED_BYTECODE_STRING_TABLE));                
+            }
+        }
+    }
+
+    /**
+     * Import a string in the string table (without converting it to [c8])
+     * */
+    fn importStringAsU8 (mut self, offset : u64)-> [u8]
+        throws ErrorMsg
+    {        
+        if offset >= self._currentStringTable.len {
+            throw copy ErrorMsg::fatal (EOF_WORD, format (SerializeYILErrorMessage::MALFORMED_BYTECODE_STRING_TABLE));            
+        }
+
+        {
+            let mut reader = ByteReader (self._currentStringTable [cast!usize (offset) .. $]);
+            let len = reader:.read!{u64} ();
+            if reader[].len < len {
+                throw copy ErrorMsg::fatal (EOF_WORD, format (SerializeYILErrorMessage::MALFORMED_BYTECODE_STRING_TABLE));                
+            }
+            
+            return reader[][0 .. cast!usize (len)];            
+        } catch {
+            _ => {
+                throw copy ErrorMsg::fatal (EOF_WORD, format (SerializeYILErrorMessage::MALFORMED_BYTECODE_STRING_TABLE));                
+            }
+        }
+    }
+
+    /**    
+     * Import a location in the location table
+     * */
+    fn importLocation (mut self, offset : u64)-> &Word
+        throws ErrorMsg
+    {
+        if let Ok (loc) = self._currentImportedLocations [offset] {
+            return loc;
+        }
+        
+        if offset >= self._currentLocationTable.len {
+            throw copy ErrorMsg::fatal (EOF_WORD, format (SerializeYILErrorMessage::MALFORMED_BYTECODE_LOCATION_TABLE));            
+        }
+
+        {
+            let mut reader = ByteReader (self._currentLocationTable [cast!usize (offset) .. $]);
+            let strOff = reader:.read!{u64} ();
+            let line = reader:.read!{u32} ();
+            let col = reader:.read!{u32} ();
+
+            let file = self:.importString (strOff);
+
+            // We didn't export source file seek, lineSeek
+            // they are only used in the front for error management, we don't care in YIL pass
+            // All we want it being able to give debug location to the backend
+            let word = copy Word ("", file, "", cast!u64 (line), cast!u64 (col), 0us, 0us);
+            self._currentImportedLocations [offset] = word;
+
+            return word;
+        } catch {
+            _ => {                
+                throw copy ErrorMsg::fatal (EOF_WORD, format (SerializeYILErrorMessage::MALFORMED_BYTECODE_LOCATION_TABLE));                
             }
         }
     }
@@ -399,9 +1195,9 @@ pub record YILImporter {
      * @returns: all the nodes imported during the module importations
      * */
     pub fn getNodes (self)-> [&YILNode] {
-        let mut csts : [mut &YILSymbol] = copy [fr for _, fr in self._constants];
-        let mut frs : [mut &YILSymbol] = copy [fr for _, fr in self._frames];
-        let mut vrs : [mut &YILSymbol] = copy [fr for _, fr in self._globalVars];
+        let mut csts : [mut &YILSymbol] = copy [c._0 for _, c in self._constants];
+        let mut frs : [mut &YILSymbol] = copy [f._0 for _, f in self._frames];
+        let mut vrs : [mut &YILSymbol] = copy [g._0 for _, g in self._globalVars];
 
         csts = sort (alias csts, |a, b| => {
             a.getName () < b.getName ()
@@ -413,9 +1209,14 @@ pub record YILImporter {
 
         vrs = sort (alias vrs, |a, b| => {
             a.getName () < b.getName ()
-        });
+        });        
         
-        csts ~ vrs ~ frs
+        let result = csts ~ vrs ~ frs;
+        for s in result {
+            println (format ("%", s, tags-> FormatTags (withVarIds-> true)));            
+        }
+
+        result
     }
     
 }
