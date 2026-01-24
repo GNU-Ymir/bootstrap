@@ -51,9 +51,6 @@ pub record YILImporter {
 
         // The list of type imported in the current module
         let dmut _currentImportedTypes : [usize => &YILType] = copy [];
-
-        // The list of locations read from the table
-        let mut _currentImportedLocations : [u64 => mut &Word] = copy [];
         
         // The list of string read from the string table
         let mut _currentImportedStrings : [u64 => mut [c8]] = copy [];
@@ -68,6 +65,9 @@ pub record YILImporter {
 
         // True only the value read are frame values 
         let mut _inFrame : bool = false;
+
+        // Types coming from different module must not have the same typeids
+        let mut _globalTypeId : usize = 0us;
         
     }
     
@@ -97,23 +97,33 @@ pub record YILImporter {
     {
         let dmut file = File::open (name, read-> true);
         let dmut content = file:.readBytesAll ();
+        if content.len == 0 { // empty YIL file ignored
+            return;
+        }
+        
         let mut reader = ByteReader (content);
         
         let head = reader:.read!{[c8 ; 3]} ();
+        let sizeByteSize = reader:.read!{u32} ();        
+        let tableSizes = reader:.read!{[u64 ; 4]} ();
+
+        // Not a YIL file
         if head != "YIL" {
             throw copy ErrorMsg::fatal (EOF_WORD, format (SerializeYILErrorMessage::MALFORMED_BYTECODE));
         }
 
-        let sizeByteSize = reader:.read!{u32} ();
-        if sizeByteSize != state::instance ().getSizeTypeSize () {
+        // Empty symbol table, nothing to import
+        if tableSizes [2] == 0 {
+            return;
+        }
+            
+        if sizeByteSize != state::instance ().getSizeTypeSize () {            
             throw copy ErrorMsg::fatal (EOF_WORD, format (SerializeYILErrorMessage::MISMATCH_ARCH_POINTER_SIZE,
                                                           sizeByteSize,
-                                                          state::instance ().getSizeTypeSize ()));
+                                                          state::instance ().getSizeTypeSize ()));        
         }
 
-        logging::info ("Importing a %bits bytecode file %", sizeByteSize, name.toStr ());
-        
-        let tableSizes = reader:.read!{[u64 ; 4]} ();                
+        logging::info ("Importing a %bits bytecode file %", sizeByteSize, name.toStr ());        
         let buffer = reader[];    
         
         let typeOff = 0u64;
@@ -132,12 +142,11 @@ pub record YILImporter {
         self._currentStringTable   = buffer [stringOff .. stringEnd];
 
         self._currentInstant = fs::sys::fileDate (name);
-        self._currentImportedTypes = copy [];
-        self._currentImportedLocations = copy [];
+        self._currentImportedTypes = copy [];        
         self._currentImportedStrings = copy [];        
-
+                 
         self:.importTypes ();
-        self:.importSymbols ();    
+        self:.importSymbols ();        
     } catch {
         FsError () => {
             throw copy ErrorMsg::fatal (EOF_WORD, format (SerializeYILErrorMessage::FAILED_TO_READ_BYTE_FILE, name.toStr ()));
@@ -188,50 +197,60 @@ pub record YILImporter {
     fn importFrame (mut self, ref mut reader : ByteReader)
         throws ErrorMsg
     {
-        // Header
-        let loc = self:.importLocation (reader:.read!{u64} ());
+        let locOff = reader:.read!{u64} ();
         let isWeak = reader:.read!{bool} ();
-        let name = self:.importString (reader:.read!{u64} ());
+        let nameOff = reader:.read!{u64} ();
         let isGlbCtor = reader:.read!{bool} ();
-
-        // Prototype             
-        let nbParams = reader:.read!{u32} ();
-        let vars : [&YILVarDecl] = copy [self:.importVarDecl (ref reader) for _ in 0 .. nbParams];
         
-        let retType = self.getType (reader:.read!{u64} ());
-
-        // Content
-        self._currentFrameLabels = copy [];
-        self._currentFrameVars = copy [];
-        self._inFrame = true;
+        // Header
+        let loc = self:.importLocation (locOff);        
+        let name = self:.importString (nameOff);
         
-        let body = self:.importInstruction (ref reader);
-
-        // Insertion
-        let replace = {
-            if let Ok ((oldF, oldI)) = self._frames [name] {
-                if !isWeak { // Either old is weak, or new is more recent
-                    oldF.isWeak () || self._currentInstant > oldI  
-                }            
-                else { // only replace if old is weak and older                 
-                    oldF.isWeak () && self._currentInstant > oldI                
-                }                        
-            } else {
-                true
-            }
-        };
-        
-        if replace {            
-            let result = copy YILFrame (loc,
-                                        name,
-                                        vars,
-                                        retType,
-                                        body,
-                                        copy [],
-                                        isWeak-> isWeak,
-                                        isGlobalCtor-> isGlbCtor);
+        {
+            // Prototype             
+            let nbParams = reader:.read!{u32} ();
+            let vars : [&YILVarDecl] = copy [self:.importVarDecl (ref reader) for _ in 0 .. nbParams];
             
-            self._frames [name] = (result, self._currentInstant);
+            let retType = self.getType (reader:.read!{u64} ());
+
+            // Content
+            self._currentFrameLabels = copy [];
+            self._currentFrameVars = copy [];
+            self._inFrame = true;
+            
+            let body = self:.importInstruction (ref reader);
+
+            // Insertion
+            let replace = {
+                if let Ok ((oldF, oldI)) = self._frames [name] {
+                    if !isWeak { // Either old is weak, or new is more recent
+                        oldF.isWeak () || self._currentInstant > oldI  
+                    }            
+                    else { // only replace if old is weak and older                 
+                        oldF.isWeak () && self._currentInstant > oldI                
+                    }                        
+                } else {
+                    true
+                }
+            };
+            
+            if replace {            
+                let result = copy YILFrame (loc,
+                                            name,
+                                            vars,
+                                            retType,
+                                            body,
+                                            copy [],
+                                            isWeak-> isWeak,
+                                            isGlobalCtor-> isGlbCtor);
+                
+                self._frames [name] = (result, self._currentInstant);
+            }
+        } catch {
+            err => {
+                throw copy ErrorMsg::fatal (EOF_WORD, format (SerializeYILErrorMessage::IMPORTING_FRAME, name),
+                                            notes-> copy [err]);
+            }
         }
     }    
 
@@ -246,40 +265,46 @@ pub record YILImporter {
         let isWeak = reader:.read!{bool} ();
         let name = self:.importString (reader:.read!{u64} ());
         let isLocal = reader:.read!{bool} ();
-        
-        // Value
-        self._currentFrameLabels = copy [];
-        self._currentFrameVars = copy []; 
-        self._inFrame = false;
-        let value = self:.importValue (ref reader);
 
-        // Insertion
-        let replace = {
-            if let Ok ((oldF, oldI)) = self._constants [name] {
-                if !isWeak { // Either old is weak, or new is more recent
-                    oldF.isWeak () || self._currentInstant > oldI  
-                }            
-                else { // only replace if old is weak and older                 
-                    oldF.isWeak () && self._currentInstant > oldI                
-                }                        
-            } else {
-                true
+        {
+            // Value
+            self._currentFrameLabels = copy [];
+            self._currentFrameVars = copy []; 
+            self._inFrame = false;
+            let value = self:.importValue (ref reader);
+
+            // Insertion
+            let replace = {
+                if let Ok ((oldF, oldI)) = self._constants [name] {
+                    if !isWeak { // Either old is weak, or new is more recent
+                        oldF.isWeak () || self._currentInstant > oldI  
+                    }            
+                    else { // only replace if old is weak and older                 
+                        oldF.isWeak () && self._currentInstant > oldI                
+                    }                        
+                } else {
+                    true
+                }
+            };
+
+            if replace {
+                let result = copy YILConstant (loc,
+                                               name,
+                                               value,
+                                               copy [],
+                                               isWeak-> isWeak,
+                                               isLocal-> isLocal);
+                
+                self._constants [name] = (result, self._currentInstant);
+            }        
+        } catch {
+            err => {
+                throw copy ErrorMsg::fatal (EOF_WORD, format (SerializeYILErrorMessage::IMPORTING_CONSTANT, name),
+                                            notes-> copy [err]);
             }
-        };
-
-        if replace {
-            let result = copy YILConstant (loc,
-                                           name,
-                                           value,
-                                           copy [],
-                                           isWeak-> isWeak,
-                                           isLocal-> isLocal);
-            
-            self._constants [name] = (result, self._currentInstant);
         }
-        
     }
-
+    
     /**
      * Import a constant in the current symbol table
      * */
@@ -292,36 +317,43 @@ pub record YILImporter {
         let name = self:.importString (reader:.read!{u64} ()); 
         let isLocal = reader:.read!{bool} ();
 
-        // Value
-        self._currentFrameLabels = copy [];
-        self._currentFrameVars = copy [];
-        self._inFrame = false;
-        let value = self:.importValue (ref reader);        
-        
-        // Insertions
-        let replace = {
-            if let Ok ((oldF, oldI)) = self._globalVars [name] {
-                if !isWeak { // Either old is weak, or new is more recent
-                    oldF.isWeak () || self._currentInstant > oldI  
-                }            
-                else { // only replace if old is weak and older                 
-                    oldF.isWeak () && self._currentInstant > oldI                
-                }                        
-            } else {
-                true
-            }
-        };
-
-        if replace {
-            let result = copy YILGlobalVar (loc,
-                                            name,
-                                            value,
-                                            copy [],
-                                            isWeak-> isWeak,
-                                            isThreadLocal-> isLocal);
+        {
+            // Value
+            self._currentFrameLabels = copy [];
+            self._currentFrameVars = copy [];
+            self._inFrame = false;
+            let value = self:.importValue (ref reader);        
             
-            self._globalVars [name] = (result, self._currentInstant);
-        }    
+            // Insertions
+            let replace = {
+                if let Ok ((oldF, oldI)) = self._globalVars [name] {
+                    if !isWeak { // Either old is weak, or new is more recent
+                        oldF.isWeak () || self._currentInstant > oldI  
+                    }            
+                    else { // only replace if old is weak and older                 
+                        oldF.isWeak () && self._currentInstant > oldI                
+                    }                        
+                } else {
+                    true
+                }
+            };
+
+            if replace {
+                let result = copy YILGlobalVar (loc,
+                                                name,
+                                                value,
+                                                copy [],
+                                                isWeak-> isWeak,
+                                                isThreadLocal-> isLocal);
+                
+                self._globalVars [name] = (result, self._currentInstant);
+            }
+        } catch {
+            err => {
+                throw copy ErrorMsg::fatal (EOF_WORD, format (SerializeYILErrorMessage::IMPORTING_GLOBAL_VAR, name),
+                                            notes-> copy [err]);
+            }
+        }
     }
     
 
@@ -667,7 +699,7 @@ pub record YILImporter {
             }
         }
 
-        let left = self:.importValue (ref reader);
+        let left = self:.importValue (ref reader);        
         let right = self:.importValue (ref reader);
 
         copy YILBinaryValue (loc, type, op, left, right)
@@ -694,8 +726,8 @@ pub record YILImporter {
     {
         let loc = self:.importLocation (reader:.read!{u64} ());
         let type = self.getType (reader:.read!{u64} ());
-        let isName = reader:.read!{bool} ();
-
+        let isName = reader:.read!{bool} ();        
+        
         let mut name : [c8] = "";
         let mut index : usize = 0;
         if isName {
@@ -729,9 +761,9 @@ pub record YILImporter {
     fn importIntValue (mut self, ref mut reader : ByteReader)-> &YILIntValue
         throws ErrorMsg
     {
-        let loc = self:.importLocation (reader:.read!{u64} ());
+        let loc = self:.importLocation (reader:.read!{u64} ());        
         let type = self.getType (reader:.read!{u64} ());
-
+                
         let bigI = if let iT : &YILInt = type {
             if iT.isSigned () {
                 copy BigInt (reader:.read!{i64} ())
@@ -833,33 +865,39 @@ pub record YILImporter {
         let id = cast!usize (reader:.read!{u64} ());
         let isThLocal = reader:.read!{bool} ();
         let isTemp = reader:.read!{bool} ();
+    
+        if id != 0 {             
+            // Verification that there was not some devious thing going on
+            if let Ok (var) = self._currentFrameVars [id] && self._inFrame {            
+                if var.getType () != type {
+                    throw copy ErrorMsg::fatal (EOF_WORD, format (SerializeYILErrorMessage::MALFORMED_BYTECODE_SYMBOL_TABLE));  
+                }
 
-        // Verification that there was not some devious thing going on
-        if let Ok (var) = self._currentFrameVars [id] && self._inFrame {            
-            if var.getType () != type {
-                throw copy ErrorMsg::fatal (EOF_WORD, format (SerializeYILErrorMessage::MALFORMED_BYTECODE_SYMBOL_TABLE));  
-            }
+                if var.getName () != name {                    
+                    throw copy ErrorMsg::fatal (EOF_WORD, format (SerializeYILErrorMessage::MALFORMED_BYTECODE_SYMBOL_TABLE));  
+                }
 
-            if var.getName () != name {
-                throw copy ErrorMsg::fatal (EOF_WORD, format (SerializeYILErrorMessage::MALFORMED_BYTECODE_SYMBOL_TABLE));  
-            }
+                if var.isThreadLocal () != isThLocal {
+                    throw copy ErrorMsg::fatal (EOF_WORD, format (SerializeYILErrorMessage::MALFORMED_BYTECODE_SYMBOL_TABLE));  
+                }
 
-            if var.isThreadLocal () != isThLocal {
-                throw copy ErrorMsg::fatal (EOF_WORD, format (SerializeYILErrorMessage::MALFORMED_BYTECODE_SYMBOL_TABLE));  
-            }
+                if var.isTemp () != isTemp {
+                    throw copy ErrorMsg::fatal (EOF_WORD, format (SerializeYILErrorMessage::MALFORMED_BYTECODE_SYMBOL_TABLE));  
+                }            
 
-            if var.isTemp () != isTemp {
-                throw copy ErrorMsg::fatal (EOF_WORD, format (SerializeYILErrorMessage::MALFORMED_BYTECODE_SYMBOL_TABLE));  
-            }            
-
-            // Exactly the same, no need for clone
-            if var.getLoc () == loc {
-                return var;
+                // Exactly the same, no need for clone
+                if var.getLoc () == loc {
+                    return var;
+                }
             }
         }
         
         let var = copy YILVar (loc, name, type, id, isTemp-> isTemp, isThreadLocal-> isThLocal);        
-        self._currentFrameVars [id] = var;
+
+        // 0 id vars are global variables
+        if id != 0 {
+            self._currentFrameVars [id] = var;
+        }
 
         var
     }
@@ -969,7 +1007,7 @@ pub record YILImporter {
         let innerId = reader:.read!{u64} ();
 
         let inner = self.getTypeOrPlaceHolder (innerId);
-        self._currentImportedTypes [cast!usize (id)] = copy YILArray (inner, cast!usize (len), uid-> cast!usize (id));                       
+        self._currentImportedTypes [cast!usize (id)] = copy YILArray (inner, cast!usize (len), uid-> self:.generateUniqTypeId ());                       
     }
 
     /**
@@ -982,7 +1020,7 @@ pub record YILImporter {
         let innerId = reader:.read!{u64} ();
 
         let inner = self.getTypeOrPlaceHolder (innerId);
-        self._currentImportedTypes [cast!usize (id)] = copy YILPointer (inner, uid-> cast!usize (id));
+        self._currentImportedTypes [cast!usize (id)] = copy YILPointer (inner, uid-> self:.generateUniqTypeId ());
     }
 
     /**
@@ -1005,7 +1043,7 @@ pub record YILImporter {
                                                                       fieldNames-> names,
                                                                       isUnion-> isUnion,
                                                                       isPacked-> isPacked,
-                                                                      uid-> cast!usize (id),
+                                                                      uid-> self:.generateUniqTypeId (),
                                                                       prepared-> true);                
     }
 
@@ -1076,6 +1114,13 @@ pub record YILImporter {
         }
     }
 
+    /**
+     * @returns: a uniq global ID for types 
+     * */
+    fn generateUniqTypeId (mut self)-> usize {
+        self._globalTypeId += 1;
+        self._globalTypeId
+    }
 
     /*!
      * ====================================================================================================
@@ -1125,7 +1170,7 @@ pub record YILImporter {
 
         {
             let mut reader = ByteReader (self._currentStringTable [cast!usize (offset) .. $]);
-            let len = reader:.read!{u64} ();
+            let len = reader:.read!{u64} ();            
             if reader[].len < len {
                 throw copy ErrorMsg::fatal (EOF_WORD, format (SerializeYILErrorMessage::MALFORMED_BYTECODE_STRING_TABLE));                
             }
@@ -1143,11 +1188,7 @@ pub record YILImporter {
      * */
     fn importLocation (mut self, offset : u64)-> &Word
         throws ErrorMsg
-    {
-        if let Ok (loc) = self._currentImportedLocations [offset] {
-            return loc;
-        }
-        
+    {        
         if offset >= self._currentLocationTable.len {
             throw copy ErrorMsg::fatal (EOF_WORD, format (SerializeYILErrorMessage::MALFORMED_BYTECODE_LOCATION_TABLE));            
         }
@@ -1164,8 +1205,6 @@ pub record YILImporter {
             // they are only used in the front for error management, we don't care in YIL pass
             // All we want it being able to give debug location to the backend
             let word = copy Word ("", file, "", cast!u64 (line), cast!u64 (col), 0us, 0us);
-            self._currentImportedLocations [offset] = word;
-
             return word;
         } catch {
             _ => {                
