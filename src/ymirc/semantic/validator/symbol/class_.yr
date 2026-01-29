@@ -28,7 +28,10 @@ use ymirc::semantic::generator::value::{_,
                                         syntax::_,
                                         template::_};
 
-def MAX_RECURSIVE_LEVEL = 3;
+extern (C) fn _yrt_exc_get_stack_trace ()-> [*(void)];
+extern (C) fn _yrt_exc_resolve_stack_trace (trc : [*void])-> [c8];
+
+def MAX_RECURSIVE_LEVEL = 3u32;
 
 /**
  * The class validator is the class responsible for class symbol validation
@@ -43,6 +46,12 @@ pub class ClassValidator {
     // The list of class symbol to finalize when self._validation.len == 0
     let mut _toFinalize : [&Symbol => dmut &ClassSymbol] = copy [];
 
+    // true if we are validating a precary, and therefore all forward dependencies are also precary
+    let mut _forcePrecary : bool = false;
+
+    // List of all type that have been validate precarily that needs to be revalited when context is more convinient
+    let dmut _postForceValidation : [&Symbol => (&ClassSymbol, bool)] = copy [];
+    
     /**
      * Create a new empty validator
      */
@@ -198,22 +207,48 @@ pub class ClassValidator {
     pub fn validateClassLayout (mut self, dmut context : &Validator, dmut sym : &ClassSymbol, inModule : bool = false, validationLevel : u32 = 2u32) {
         self._validation [sym] = validationLevel + 1;
 
-        {
-            context:.pushReferent (alias sym);
-            context:.enterForeign (isFnBody-> false);
+        // We are entering a precary validation for the first time?
+        let forced = if (validationLevel > 1 && !self._forcePrecary) {
+            self._forcePrecary = true;
+            true
+        } else {
+            false
+        };        
+        
+        
+        context:.pushReferent (alias sym);
+        context:.enterForeign (isFnBody-> false);
 
-            logging::info ("Validate class layout % (%)", sym.getPath (), validationLevel);
+        logging::info ("Validate class layout % (%)", sym.getPath (), validationLevel);
 
-            // This cannot throw (cf. the function def)
-            self:.validateClassContent (alias context, alias sym, inModule, validationLevel);
-        } exit {
-            context:.exitForeign ();
-            context:.popReferent ();
+        // This cannot throw (cf. the function def)
+        let (precary, success) = self:.validateClassContent (alias context, alias sym, inModule, validationLevel);
 
-            if validationLevel == 1 {
-                self._validation:.remove (sym);
+        if success { // not success means we have unrecoverable error even in precary (or not precary validation)
+            // If the validation failed to be complete due to forward reference, we need to validate it again later
+            if !forced && (precary && validationLevel == 1) {
+                self._postForceValidation [sym] = (alias sym, inModule);
             }
         }
+            
+        context:.exitForeign ();
+        context:.popReferent ();
+
+        if validationLevel == 1 {
+            self._validation:.remove (sym);
+        }
+
+        // Exit the precary context from the first class validation that entered it
+        if forced {
+            self._forcePrecary = false;
+
+            // Validate all the class that have been force precary and failed
+            let dmut cp = alias self._postForceValidation;
+            self._postForceValidation = copy [];
+            for _, dmut z in alias cp {                
+                self:.validateClassLayout (alias context, alias z._0, inModule-> z._1, validationLevel-> 1u32);
+            }                
+        }        
     }
 
     /**
@@ -223,8 +258,11 @@ pub class ClassValidator {
      *   - context: the context of the validation
      *   - sym: the symbol to validate
      *   - inModule: if true, then the methods of the class are validated and inserted in the generators of the context
+     * @returns:
+     *   - .0: true iif the validation of field was precary (i.e. some fields validation failed due to forward references)
+     *   - .1: true iif the validation was successful (or precary)
      */
-    fn validateClassContent (mut self, dmut context : &Validator, dmut sym : &ClassSymbol, inModule : bool, validationLevel : u32) {
+    fn validateClassContent (mut self, dmut context : &Validator, dmut sym : &ClassSymbol, inModule : bool, validationLevel : u32)-> (bool, bool) {
         {            
             // First we need to validate the ancestor of the class, to generate the vtable, the child class vtable being an override of the one of the ancestor
             let ancestor = self:.validateAncestor (alias context, alias sym);
@@ -232,26 +270,30 @@ pub class ClassValidator {
             // Validate the static assertions of the class definition (@warning: this is only performed if the validation is a root validation-> self._validation.len == 1us, to avoid too deep and unreadable errors)
             self.validateCtes (alias context, alias sym);
 
+            // List the trait implemented by the class before validating vtable
+            self.validateImplsSimple (alias context, alias sym, ancestor);
+            
             // Validate the ctors prototypes of the class
             // Ctors does not need fields to be validated
-            self.validateConstructors (alias context, alias sym, inModule, validationLevel > 1);
+            self.validateConstructors (alias context, alias sym, inModule, noValue-> (validationLevel > 1));
 
             // Validate the vtable (without validating the method bodies, just the prototypes)
-            self.validateVtable (alias context, alias sym, ancestor, inModule, validationLevel > 1);
+            self.validateVtable (alias context, alias sym, ancestor, inModule, noValue-> (validationLevel > 1));
 
             // Validate the fields of the class
             // But fields might need the ctors of other class to be validated
-            self.validateFields (alias context, alias sym, ancestor, validationLevel > 1);
+            let fieldSuccess = self.validateFields (alias context, alias sym, ancestor, precary-> (validationLevel > 1));
 
             // Validate the default movable ctor if the symbol is an entity
             self.validateMovableCtors (alias context, alias sym, inModule);
 
             // Validate the dtor of the class
             self.validateDestructor (alias context, alias sym, ancestor, inModule);
-
+            
             // Validate the typeinfo of the class
-            self.validateTypeInfo (alias context, alias sym);
+            self.validateTypeInfo (alias context, alias sym, fake-> !fieldSuccess);
 
+            return (!fieldSuccess, true);            
         } catch {
             err : &ErrorMsg => {
                 // If there is an error in the validation, then write it in the type validation
@@ -260,6 +302,8 @@ pub class ClassValidator {
                 sym:.setErrorGenerator (copy ErrorGenerator (sym.getLoc (),
                                                              copy ErrorMsg::fatal (sym.getLoc (), ValidateErrorMessage::VALIDATING,
                                                                                    notes-> copy [err])));
+
+                return (true, false);
             }
         }
     }
@@ -452,17 +496,18 @@ pub class ClassValidator {
      * @throws:
      *   - &ErrorMsg: if there is an error in the validation of the fields
      */
-    fn validateFields (self, dmut context : &Validator, dmut sym : &ClassSymbol, ancestor : (&ClassRefType)?, precary : bool)
+    fn validateFields (self, dmut context : &Validator, dmut sym : &ClassSymbol, ancestor : (&ClassRefType)?, precary : bool)-> bool
         throws ErrorMsg
     {
         // Update the class type info definition in the symbol, so it has access to the fields
         let dmut cref = alias sym:.getClassRefForce ();
-        let localFields = self.validateLocalFields (alias context, alias sym, alias cref, precary); // Validate the fields declared in the class def
+        let (localFields, success) = self.validateLocalFields (alias context, alias sym, alias cref, precary); // Validate the fields declared in the class def
         if let Ok (cl) = ancestor {
             self.verifyFieldCollisions (cl.getFields (), localFields);
         }
 
         self.verifyFieldCollisionsMethods (localFields, cref.getVtable ());
+        success
     }
 
     /**
@@ -474,7 +519,7 @@ pub class ClassValidator {
      * @throws:
      *    - &ErrorMsg: if there was an error in one or more field validation
      */
-    fn validateLocalFields (self, dmut context : &Validator, dmut sym : &ClassSymbol, dmut cref : &ClassRefType, precary : bool)-> [&VarDeclValue]
+    fn validateLocalFields (self, dmut context : &Validator, dmut sym : &ClassSymbol, dmut cref : &ClassRefType, precary : bool)-> ([&VarDeclValue], bool)
         throws ErrorMsg
     {
         context:.enterForeign (isFnBody-> false); // A new foreign, we don't wan't to pollute current context
@@ -523,11 +568,13 @@ pub class ClassValidator {
 
         context:.quitBlock (warnUnused-> false); // We entered a block at the beginning of the function
         context:.exitForeign (); // We entered a foreign
-
-        if (!precary && errors.len != 0us) throw copy ErrorMsg::list (errors);
+    
+        if (!precary && !self._forcePrecary && errors.len != 0us) {                                    
+            throw copy ErrorMsg::list (errors);
+        }
 
         cref:.setFields (fields);
-        fields // returning the list of fields
+        (fields, errors.len == 0)  // returning the list of fields
     }
 
 
@@ -900,8 +947,9 @@ pub class ClassValidator {
      */
     fn validateVtable (self, dmut context : &Validator, dmut sym : &ClassSymbol, ancestor : (&ClassRefType)?, inModule : bool, noValue : bool)
         throws ErrorMsg
-    {
+    {        
         let dmut cref = alias sym:.getClassRefForce ();
+        
         // Validate the vtable, and get the list of method prototypes, and their protections
         let (vtable, protection, implTraits, allImpls, templateMeths, templateProts) = self.validateVtable (alias context, alias sym, cref, ancestor, inModule, noValue);
 
@@ -919,9 +967,9 @@ pub class ClassValidator {
                                             notes-> notes);
             }
         }
-
+        
         // Update the class type info definition in the symbol, so it has access to the vtable
-        cref:.setVtable (vtable, protection, implTraits, allImpls, templateMeths, templateProts);
+        cref:.setVtable (vtable, protection, implTraits, allImpls, templateMeths, templateProts);    
     }
 
     /**
@@ -1033,6 +1081,51 @@ pub class ClassValidator {
      * ================================================================================
      * ================================================================================
      */
+
+    /** 
+     * Set the class implemented traits without validating their inner vtable
+     * It might be necessary when validating ctors, and vtables to know what are the trait the class implements (for template test for example)
+     * */
+    fn validateImplsSimple (self, dmut context : &Validator, dmut sym : &ClassSymbol, ancestor : (&ClassRefType)?)
+        throws ErrorMsg
+    {
+        let dmut cref = alias sym:.getClassRefForce ();
+        let mut implemented : [&TraitRefType] = [];
+        let mut errors : [&ErrorMsg] = [];
+
+        let mut ancestorImpl : [&TraitRefType] = if let Ok (clRef) = ancestor {
+            clRef.getAllImplTraits ()
+        } else {
+            []
+        };
+        
+        for it in sym.getAllLocalSymbols (protection-> Protection::PRIVATE, sorted-> true) {
+            {
+                if let im : &ImplSymbol = it {                    
+                    let tr = context:.validateType (im.getContent ().getTrait ());
+                    for i in implemented {
+                        if i == tr {
+                            throw copy ErrorMsg::fatal (im.getLoc (), format (ValidateErrorMessage::IMPL_MULTIPLE_TIMES, tr, cref),
+                                                        notes-> copy [copy ErrorMsg::note (i.getLoc (), format (ValidateErrorMessage::HERE))]);
+                        }
+                    }
+                    
+                    if let trRef : &TraitRefType = tr {                                                    
+                        implemented ~= [trRef];
+                    } else {
+                        throw copy ErrorMsg::fatal (tr.getLoc (), format (ValidateErrorMessage::IMPL_NO_TRAIT, tr));
+                    }                
+                }
+            } catch {
+                err : &ErrorMsg => {
+                    errors ~= [err];
+                }
+            }
+        }
+
+        if (errors.len != 0us) throw copy ErrorMsg::list (errors);
+        cref:.setImpls (implemented, ancestorImpl ~ implemented);        
+    }
     
     /**
      * Retreive the list of methods that are declared inside traits, and that are implemented by the class
@@ -1685,7 +1778,7 @@ pub class ClassValidator {
      *    - context: the context of the validation
      *    - sym: the class symbol to validate
      * */
-    fn validateTypeInfo (self, dmut context : &Validator, dmut sym : &ClassSymbol)
+    fn validateTypeInfo (self, dmut context : &Validator, dmut sym : &ClassSymbol, fake : bool)
         throws ErrorMsg
     {
         let loc = sym.getLoc ();
@@ -1699,8 +1792,13 @@ pub class ClassValidator {
         } catch {
             _ => panic;
         };
-
-        let size = context:.getSizeofValidator ():.validateType (sym.getLoc (), cref);
+        
+        let size = if fake {
+            0us
+        } else {
+            context:.getSizeofValidator ():.validateType (sym.getLoc (), cref)
+        };
+        
         let innerSlice = match cref.getAncestor () {
             Ok (anc) => {
                 let ancType = copy ArrayType (loc, type, 1us);
@@ -1711,8 +1809,8 @@ pub class ClassValidator {
                 let ancType = copy ArrayType (loc, type, 0us);
                 context.createSliceAliasFromArray (loc, ancType, copy ArrayValue (loc, ancType, []))
             }
-        };
-
+        };    
+            
         let typeinfoFin = copy TypeInfoValue (loc, type,
                                               idInt,
                                               size,
