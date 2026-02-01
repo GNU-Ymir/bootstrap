@@ -116,25 +116,15 @@ pub record ValueExpander {
         let inner = self.finalize (alias context, t.getValue (), ref list, asLeft-> false);
         let line = copy YILIntValue (t.getLoc (), YIL_UINT_32, cast!usize (t.getLoc ().line));
         let filename = state::relativePath (t.getLoc ().filename);
-
+        
         let fileStr = self.finalize (alias context, makeStringSliceValue (t.getLoc (), filename), ref list, asLeft-> false);
         let funcStr = self.finalize (alias context, makeStringSliceValue (t.getLoc (), context.getCurrentFrameName ()), ref list, asLeft-> false);
 
-        let fileStrType = if let t_ : &YILTuple = fileStr.getType () {
-            t_.getInners ()[1]
-        } else panic;
+        let fileStrType = if let t_ : &YILTuple = fileStr.getType () { t_.getInners ()[1] } else panic;
+        let fileStrPtr = if let t_ : &YILTupleValue = fileStr { t_.getValue ()[1] } else panic;
 
-        let fileStrPtr = if let t_ : &YILTupleValue = fileStr {
-            t_.getValue ()[1]
-        } else panic;
-
-        let funcStrType = if let t_ : &YILTuple = funcStr.getType () {
-            t_.getInners ()[1]
-        } else panic;
-
-        let funcStrPtr = if let t_ : &YILTupleValue = funcStr {
-            t_.getValue ()[1]
-        } else panic;
+        let funcStrType = if let t_ : &YILTuple = funcStr.getType () { t_.getInners ()[1] } else panic;
+        let funcStrPtr = if let t_ : &YILTupleValue = funcStr { t_.getValue ()[1] } else panic;
 
         let (fileStrPtrU, _) = self.createVarForBlock (alias context, t.getLoc (), NONE_TYPE, fileStrType, ref list, withValue-> fileStrPtr);
         let (funcStrPtrU, _) = self.createVarForBlock (alias context, t.getLoc (), NONE_TYPE, funcStrType, ref list, withValue-> funcStrPtr);
@@ -180,7 +170,33 @@ pub record ValueExpander {
 
         YIL_UNIT_VALUE
     }
+    
+    /**
+     * Generate a coverage branch call
+     * */
+    pub fn generateCoverageCall (self, dmut context : &Expander, loc : &Word, ref mut list : StmtList) {
+        if !state::instance ().isCodeCoverage () { // no coverage monitoring 
+            return;
+        }
 
+        if !context.isInCoverageFrame () {
+            return;
+        }
+
+        let coverageId = context:.generateCoverageId (loc);
+        let yilId = copy YILIntValue (loc, YIL_UINT_32, coverageId);                    
+                
+        let call = copy YILNameCallValue (loc,
+                                          YIL_VOID,
+                                          YRuntimeFuncs::COVERAGE_HIT_BRANCH,
+                                          copy [context.getCurrentFrameAddr (),
+                                                context.getCurrentFrameCoverageAddr (),
+                                                yilId]);
+
+        list:.append (copy YILCall (loc, call));
+    }
+
+    
     /**
      * Finalize the registration of a unit test
      * @params:
@@ -605,7 +621,11 @@ pub record ValueExpander {
             }
         }
 
-        self.finalizeCond (c.getLoc (), alias context,  ref list, testVar, ifList, elseList);
+        self.finalizeCond (c.getLoc (), alias context,  ref list,
+                           testVar,
+                           c.getValue ().getLoc (), ifList,
+                           c.getElse ().getLoc (), elseList);
+        
         if (var !of YILUnit) {
             context:.registerVariable (c.getUniqId (), var);
         }
@@ -619,10 +639,18 @@ pub record ValueExpander {
      *    - loc: the location of the condition
      *    - list: the list of statement to fill
      *    - test: the test of the conditional
+     *    - thenLoc : the location of statement to execute if the condition is met
      *    - thenList: the list of statement to execute if the condition is met
+     *    - elseLoc : the location of statement to execute if the condition is not met
      *    - elseList: the list of statement to execute if the condition is not met
+     *    - cover: add code coverage
      * */
-    fn finalizeCond (self, loc : &Word, dmut context : &Expander, ref mut list : StmtList, test : &YILValue, thenList : StmtList, elseList : StmtList) {
+    fn finalizeCond (self, loc : &Word, dmut context : &Expander, ref mut list : StmtList,
+                     test : &YILValue,
+                     thenLoc : &Word, thenList : StmtList,
+                     elseLoc : &Word, elseList : StmtList,
+                     cover : bool = true) {
+        
         let thenLabel = copy YILLabel (loc, "then"s8, context:.generateLblId ());
         let endLabel = copy YILLabel (loc, "end"s8, context:.generateLblId ());
         let elseLabel = if (elseList.len != 0us) {
@@ -633,11 +661,17 @@ pub record ValueExpander {
 
         list:.append (copy YILCondJmp (loc, test, thenLabel, elseLabel));
         list:.append (thenLabel);
+        if cover {
+            self.generateCoverageCall (alias context, thenLoc, ref list);
+        }
         list:.append (thenList);
 
         if (elseList.len != 0us) {
             list:.append (copy YILGoto (loc, endLabel));
             list:.append (elseLabel);
+            if cover {
+                self.generateCoverageCall (alias context, elseLoc, ref list);
+            }
             list:.append (elseList);
         }
 
@@ -724,6 +758,7 @@ pub record ValueExpander {
         }
 
         list:.append (begLabel);
+        self.generateCoverageCall (alias context, l.getValue ().getLoc (), ref list);
         list:.append (loopList);
 
         if (test !of YILUnit) {
@@ -835,7 +870,7 @@ pub record ValueExpander {
 
                         let name = context.getMangler ().mangle (p);
                         context:.registerTouchSym (name, p.getLoc ());
-
+                        
                         let call = copy YILNameCallValue (gen.getLoc (), YIL_VOID, name, copy [copy YILAddrValue (gen.getLoc (), YIL_PTR_VOID, gen)]);
                         let instr = copy YILCall (gen.getLoc (), call);
                         let mut condList = StmtList ();
@@ -947,22 +982,25 @@ pub record ValueExpander {
             }
             16u16 => {
                 for i in 0us .. str.getLen () {
-                    let x : *u8 = cast!{*u8} (cast!{*void} (content.utf16.ptr + (i * u16::size)));
-                    unsafe {
-                        res ~= [x [0], x [1]];
-                    }
+                    let utf16c = content.utf16 [i];
+                    let c1 = cast!u8 ((utf16c >> 8) & 0xFF);
+                    let c2 = cast!u8 (utf16c & 0xFF);
+                    
+                    res ~= [c2, c1];                    
                 }
-                res ~= [0u8];
+                res ~= [0u8, 0u8];
                 YIL_UINT_16
             }
             _ => {
                 for i in 0us .. str.getLen () {
-                    let x : *u8 = cast!{*u8} (cast!{*void} (content.utf32.ptr + (i * u32::size)));
-                    unsafe {
-                        res ~= [x [0], x [1], x [2], x [3]];
-                    }
+                    let utf32c = content.utf32 [i];
+                    let c1 = cast!u8 ((utf32c >> 24) & 0xFF);
+                    let c2 = cast!u8 ((utf32c >> 16) & 0xFF);
+                    let c3 = cast!u8 ((utf32c >> 8) & 0xFF);
+                    let c4 = cast!u8 ((utf32c) & 0xFF);                
+                    res ~= [c4, c3, c2, c1];                    
                 }
-                res ~= [0u8];
+                res ~= [0u8, 0u8, 0u8, 0u8];
                 YIL_UINT_32
             }
         };
@@ -974,7 +1012,32 @@ pub record ValueExpander {
                             copy [len, array, YIL_NULL_VALUE],
                             fieldNames-> copy [SliceKeys::LEN, SliceKeys::PTR, SliceKeys::BLK_INFO])
     }
+    
 
+    /**
+     * Finalize a string value from a utf8 string
+     * */
+    pub fn finalizeStrUtf8 (self, dmut context : &Expander, loc : &Word, str : [c8])-> &YILValue {        
+        let type = context:.getTypeExpander ():.finalizeSlice (YIL_UINT_8);
+
+        if (str.len == 0us) {
+            let len = copy YILIntValue (loc, YIL_UINT_MAX, 0);
+            return copy YILTupleValue (loc, type, copy [len, YIL_NULL_VALUE, YIL_NULL_VALUE],
+                                       fieldNames-> copy [SliceKeys::LEN, SliceKeys::PTR, SliceKeys::BLK_INFO]);
+        }
+
+        let dmut res = copy [cast!u8 (u) for u in str];
+        res ~= [0u8];
+
+        let array = copy YILStringValue (loc, context:.getTypeExpander ():.finalizeArray (YIL_UINT_8, res.len), res);
+        let len = copy YILIntValue (loc, YIL_UINT_MAX, str.len);
+        
+        copy YILTupleValue (loc,
+                            type,
+                            copy [len, array, YIL_NULL_VALUE],
+                            fieldNames-> copy [SliceKeys::LEN, SliceKeys::PTR, SliceKeys::BLK_INFO])                
+    }
+    
     /**
      * Finalize a bool literal
      * */
@@ -1274,7 +1337,7 @@ pub record ValueExpander {
             ifNL:.append (copy YILAffect (b.getLoc (), var, right));
         };
 
-        self.finalizeCond (b.getLoc (), alias context, ref list, leftVar, ifL, ifNL);
+        self.finalizeCond (b.getLoc (), alias context, ref list, leftVar, b.getLoc (), ifL, b.getLoc (), ifNL, cover-> false);
         var
     }
 
@@ -1615,7 +1678,7 @@ pub record ValueExpander {
         };
 
         let result = self.registerUniqValue (alias context, c, call, ref list);
-        if (result of YILUnit) {
+        if (result of YILUnit) {                        
             list:.append (copy YILCall (c.getLoc (), call));
         } else if (c.getType ().isMovable ()) {
             if let v : &YILVar = result {
@@ -1631,7 +1694,7 @@ pub record ValueExpander {
      * @params:
      *   - c: the call value to finalize
      *   - list: the statement list to fill
-     * @returns: the value of the call
+     * @returns: the value of the call     
      * */
     fn finalizeSimpleCall (self, dmut context : &Expander, c : &CallValue, ref mut list : StmtList)-> &YILValue {
         let retType = context:.finalizeType (c.getType ());
@@ -1651,14 +1714,17 @@ pub record ValueExpander {
 
         let name = context.getMangler ().mangle (c.getPrototype ());
         context:.registerTouchSym (name, c.getPrototype ().getImplLoc ());
-
-        copy YILNameCallValue (c.getLoc (), retType, name, params)
+        
+        return copy YILNameCallValue (c.getLoc (), retType, name, params);
     }
 
     /**
      * Finalize a class ctor call value
      * @params:
-     *     -
+     *   - c: the call value to finalize
+     *   - list: the statement list to fill
+     * @returns:
+     *   - 0: the value of the class constructed
      * */
     fn finalizeCtorCall (self, dmut context : &Expander, c : &CtorCallValue, ref mut list : StmtList)-> &YILValue {
         let retType = context:.finalizeType (c.getType ());
@@ -1694,8 +1760,7 @@ pub record ValueExpander {
         }
 
         let name = context.getMangler ().mangle (c.getCtor ().getPrototype ());
-        context:.registerTouchSym (name, c.getCtor ().getPrototype ().getLoc ());
-
+        context:.registerTouchSym (name, c.getCtor ().getPrototype ().getLoc ());                        
         list:.append (copy YILCall (c.getLoc (), copy YILNameCallValue (c.getLoc (), YIL_VOID, name, params)));
         value
     }
@@ -1762,7 +1827,9 @@ pub record ValueExpander {
      * @params:
      *    - f: the function pointer to finalize
      *    - list: the list of statement to fill
-     * @returns: the call
+     * @returns:
+     *   - 0: the call
+     *   - 1: the address of the function being called
      * */
     fn finalizeFuncPtrCall (self, dmut context : &Expander, f : &FuncPtrCallValue, ref mut list : StmtList)-> &YILValue {
         let retType = context:.finalizeType (f.getType ());
@@ -1777,8 +1844,8 @@ pub record ValueExpander {
         if let n : &ProtoFuncPtrValue = f.getFuncPtr () {
             let proto = context.getMangler ().mangle (n.getPrototype ());
             context:.registerTouchSym (proto, n.getPrototype ().getImplLoc ());
-
-            return copy YILNameCallValue (f.getLoc (), retType, proto, params);
+                        
+            return copy YILNameCallValue (f.getLoc (), retType, proto, params);            
         } else {
             let fptr = self.finalize (alias context, f.getFuncPtr (), ref list, asLeft-> false);
             return copy YILPtrCallValue (f.getLoc (), retType, fptr, params);
@@ -1827,7 +1894,7 @@ pub record ValueExpander {
         if (isDirect) {
             let name = context.getMangler ().mangle (methProto.getPrototype ());
             context:.registerTouchSym (name, methProto.getPrototype ().getImplLoc ());
-
+            
             return copy YILNameCallValue (f.getLoc (), retType, name, params);
         } else {
             let fptr = self.createVtableAccess (alias context, f.getLoc (), inst, methProto.getVtableIndex (), ref list);
@@ -2113,7 +2180,9 @@ pub record ValueExpander {
 
         self.finalizeCond (m.getLoc (), alias context, ref list,
                            copy YILBinaryValue (m.getLoc (), YIL_UINT_8, BinaryOperators::DEQUAL, value, YIL_NULL_VALUE),
-                           thenList, elseList);
+                           m.getLoc (), thenList,
+                           m.getLoc (), elseList,
+                           cover-> false);
 
         context:.registerVariable (m.getUniqId (), result);
         return result;

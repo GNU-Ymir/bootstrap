@@ -42,12 +42,17 @@ class LazyRefs {
     pub self () {}
 }
 
+class CoverageLocs {
+    pub let mut content : [&Word] = [];
+    pub self () {}
+}
+
 
 /**
  * The expander class simplifies previously validated symbols
  */
 pub class Expander {
-
+    
     /*!
      * =====================================================================================
      * =====================================================================================
@@ -96,6 +101,12 @@ pub class Expander {
     // The name of the frame being validated
     let dmut _frameName : &List!{[c8]} = copy List!{[c8]} ();
 
+    // The name of the frame being validated
+    let dmut _frameAddr : &List!{&YILValue} = copy List!{&YILValue} ();
+
+    // The name of the frame being validated
+    let dmut _frameCoverAddr : &List!{&YILValue} = copy List!{&YILValue} ();
+
     // The list of symbols touched by the current symbol
     let dmut _touchings : &List!{dmut &Touching} = copy List!{dmut &Touching} ();
 
@@ -110,6 +121,9 @@ pub class Expander {
 
     // The current uniq id for labels in the current frame
     let dmut _lblUniqId : &List!{usize} = copy List!{usize} ();
+
+    // The current uniq id for the coverage calls in the current frame
+    let dmut _coverageUniqIds : &List!{dmut &CoverageLocs} = copy List!{dmut &CoverageLocs} ();
 
     // The var in which to put the result of loops (when breaking)
     let dmut _loopVar : &List!{&YILValue} = copy List!{&YILValue} ();
@@ -148,7 +162,7 @@ pub class Expander {
         for gen in self._generators {
             self:.finalize (gen);
         }
-
+        
         if (state::instance ().isUnittestActive ()) {
             for m, lst in self._moduleWithUnittests {
                 self:.finalizeUnitTestRegistrationFrame (m, lst);
@@ -254,8 +268,19 @@ pub class Expander {
     pub fn finalizeFrame (mut self, frame : &FrameGenerator) {
         let mut list = StmtList ();
 
+        let module = Path (frame.getLoc ().filename).stripExtension ();
+        let enterCoverage = state::instance ().isCodeCoverage () && state::instance ().getPackage ().isPrefix (module);
+        
+        let name = self._mangler.mangle (frame);
+        let FRAME_INFO = self._mangler.mangleCoverageFrameInfo (frame);
+        
+        let frameAddr = copy YILAddrValue (EOF_WORD, YIL_PTR_VOID, copy YILVar (EOF_WORD, name, YIL_VOID, 0us));        
+        let frameCoverAddr = if enterCoverage {
+            copy YILAddrValue (EOF_WORD, YIL_PTR_VOID, copy YILVar (EOF_WORD, FRAME_INFO, YIL_VOID, 0us))
+        } else { YIL_UNIT_VALUE };
+
         self:.enterSymbol ();
-        self:.enterFrame (frame.getName ().toStr ());
+        self:.enterFrame (frame.getName ().toStr (), frameAddr-> frameAddr, frameCoverAddr-> frameCoverAddr);
         self:.enterBlock ();
 
         let mut parameters : [&YILVarDecl] = [];
@@ -291,21 +316,40 @@ pub class Expander {
                 self:.registerVariable (p.getUniqId (), finVref);
             }
         }
-
-
+        
         let _ = self:.finalizeValue (frame.getBody (), ref list);
 
-        let body = if (list.hasDestroy ()) {
+        let mut body = if (list.hasDestroy ()) {
             copy YILTryFinally (frame.getBody ().getLoc (), list[], list.getToDestroy ())
         } else {
             copy YILBlock (frame.getLoc (), list[])
         };
 
+        // In unittest we inject frame code coverage monitoring 
+        if enterCoverage {
+            let loc = frame.getBody ().getLoc ();
+            self:.finalizeCoverageLocTable (frame);            
+            self:.registerTouchSym (FRAME_INFO, loc);
+            
+            let mut pre = StmtList (), mut exit = StmtList ();                        
+            let enterVal = copy YILNameCallValue (loc, YIL_VOID, YRuntimeFuncs::COVERAGE_HIT_ENTER,
+                                                 copy [frameAddr, frameCoverAddr]);
+            
+            pre:.append (copy YILCall (loc, enterVal));
+            pre:.append (body);
+            
+            let exitVal = copy YILNameCallValue (loc, YIL_VOID, YRuntimeFuncs::COVERAGE_HIT_EXIT,
+                                                 copy [frameAddr, frameCoverAddr]);
+            
+            exit:.append (copy YILCall (loc, exitVal));
+
+            body = copy YILTryFinally (loc, pre[], exit[]);
+        }
+
         self:.exitBlock ();
         self:.exitFrame ();
         let touching = self:.exitSymbol ();
-
-        let name = self._mangler.mangle (frame);
+        
         let final = copy YILFrame (frame.getLoc (),
                                    frame.getImplLoc (),
                                    name,
@@ -331,7 +375,7 @@ pub class Expander {
      * */
     fn finalizeMainCall (mut self, loc : &Word, name : [c8], isVoid : bool) {
         let mut list = StmtList ();
-
+        
         self:.enterSymbol ();
         self:.enterFrame (name);
         self:.enterBlock ();
@@ -393,6 +437,8 @@ pub class Expander {
      * */
     fn finalizeUnitTest (mut self, u : &UnitTestGenerator) {
         if (state::instance ().isUnittestActive ()) {
+            let name = self._mangler.mangle (u);
+                        
             self:.enterSymbol ();
             self:.enterFrame (u.getName ().toStr ());
             self:.enterBlock ();
@@ -403,8 +449,7 @@ pub class Expander {
             self:.exitBlock ();
             self:.exitFrame ();
             let touchings = self:.exitSymbol ();
-
-            let name = self._mangler.mangle (u);
+            
             let final = copy YILFrame (u.getLoc (),
                                        u.getLoc (),
                                        name,
@@ -429,29 +474,31 @@ pub class Expander {
      * Finalize the package ctor that registers the unittests
      * */
     fn finalizeUnitTestRegistrationFrame (mut self, module : Path, lst : [(&Word, [c8], [c8])]) {
+        let packageDir = state::instance ().getPackage ();
+        let modulePath = module.removePrefix (packageDir);        
+        
+        let loc = copy Word::empty (filename-> modulePath.toStr (), 0, 0);        
+        let frameName = self._mangler.manglePath (modulePath.stripExtension ());
+        
+        let name = Keys::UNIT_TEST_REGISTER ~ frameName;
+                
         self:.enterSymbol ();
-        self:.enterFrame ("");
+        self:.enterFrame (Keys::UNIT_TEST_REGISTER ~ modulePath.stripExtension ().toStr (sep-> "::"));
         self:.enterBlock ();
 
         let mut list = StmtList ();
         for test in lst {
-            let (loc, name, mangledName) = test;
-            self._valueExpander.finalizeRegisterUnitTest (alias self, name, mangledName, loc, ref list);
+            let (locT, nameT, mangledNameT) = test;
+            self._valueExpander.finalizeRegisterUnitTest (alias self, nameT, mangledNameT, locT, ref list);
         }
 
         self:.exitBlock ();
         self:.exitFrame ();
         let touchings = self:.exitSymbol ();
-
-        let packageDir = state::instance ().getPackage ();
-        let modulePath = module.removePrefix (packageDir);        
-        
-        let loc = copy Word::empty (filename-> modulePath.toStr (), 0, 0);        
-        let frameName = self._mangler.manglePath (modulePath.stripExtension ());        
-        
+                
         let final = copy YILFrame (loc,
                                    loc,
-                                   Keys::UNIT_TEST_REGISTER ~ frameName,
+                                   name,
                                    [],
                                    YIL_VOID,
                                    body-> copy YILBlock (EOF_WORD, list[]),
@@ -464,7 +511,7 @@ pub class Expander {
     /**
      * Finalize the main function that calls the unittests
      * */
-    fn finalizeUnitTestCall (mut self) {
+    fn finalizeUnitTestCall (mut self) {                
         self:.enterSymbol ();
         self:.enterFrame ("");
         self:.enterBlock ();
@@ -733,6 +780,78 @@ pub class Expander {
     }
 
     /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ============================          COVERAGE LOCATIONS TABLE          ============================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Finalize the global constant containing frame code coverage informations
+     * @params:
+     *    - frame: the frame being monitored
+     * */
+    pub fn finalizeCoverageLocTable (mut self, frame : &FrameGenerator) {
+        let lst = self._coverageUniqIds.back ();
+        let loc = frame.getBody ().getLoc ();
+                
+        let LOC_TABLE  = self._mangler.mangleCoverageLocTable (frame);
+        let FRAME_INFO = self._mangler.mangleCoverageFrameInfo (frame);
+
+        let locInnerType = self._typeExpander:.finalizeTuple (inners-> copy [YIL_UINT_32, YIL_UINT_32]);
+        let locResultType = self._typeExpander:.finalizeArray (locInnerType, lst.content.len);
+        
+        if lst.content.len != 0 {                        
+            let mut params : [&YILValue] = [];
+            for l in lst.content {
+                let lineVal = copy YILIntValue (loc, YIL_UINT_32, l.line);
+                let colVal = copy YILIntValue (loc, YIL_UINT_32, l.col);
+                
+                let innerTu = copy YILTupleValue (loc, locInnerType, copy [lineVal, colVal]);
+                params ~= [innerTu];
+            }
+
+            let locTable = copy YILArrayValue (loc, locResultType, params);                        
+            self._weakSymbols [LOC_TABLE] = copy YILConstant (loc, LOC_TABLE, locTable, isWeak-> true, refs-> copy []);            
+        }
+
+        {
+            let strType = self._typeExpander:.finalizeSlice (YIL_UINT_8);
+            let locSliceType = self._typeExpander:.finalizeSlice (locInnerType);
+            let frameInfoType = self._typeExpander:.finalizeTuple (inners-> copy [strType, strType, locSliceType],
+                                                                   fieldNames-> copy [CoverageInfoKeys::FILE, CoverageInfoKeys::FUNC, CoverageInfoKeys::LOCS]);
+
+            let funcStr = self._valueExpander.finalizeStrUtf8 (alias self, loc, frame.getName ().toStr ());
+            let fileStr = self._valueExpander.finalizeStrUtf8 (alias self, loc, loc.filename);
+            let locTableAddr = if lst.content.len == 0 {
+                YIL_NULL_VALUE
+            } else {
+                copy YILAddrValue (loc, YIL_PTR_VOID, copy YILVar (loc, LOC_TABLE, YIL_PTR_VOID, 0us))
+            };
+
+            let len = copy YILIntValue (loc, YIL_UINT_MAX, lst.content.len);
+            let locTableSlice = copy YILTupleValue (loc, locSliceType, copy [len, locTableAddr, YIL_NULL_VALUE],
+                                                    fieldNames-> copy [SliceKeys::LEN, SliceKeys::PTR, SliceKeys::BLK_INFO]);
+            
+            let frameInfoValue = copy YILTupleValue (loc, frameInfoType, copy [fileStr, funcStr, locTableSlice],
+                                                     fieldNames-> copy [CoverageInfoKeys::FILE, CoverageInfoKeys::FUNC, CoverageInfoKeys::LOCS]);
+
+            let dmut refs : [[c8] => Path] = copy [];
+            if lst.content.len != 0 {
+                refs [LOC_TABLE] = Path (loc.filename).stripExtension ();
+            }
+            
+            self._weakSymbols [FRAME_INFO] = copy YILConstant (loc,
+                                                               FRAME_INFO,
+                                                               frameInfoValue,
+                                                               isWeak-> true,
+                                                               refs-> refs);
+        }                
+    }
+    
+    
+    /*!
      * =====================================================================================
      * =====================================================================================
      * ======================          TYPE/VALUE EXPANSION          =======================
@@ -840,7 +959,9 @@ pub class Expander {
      * Register the touch of a foreign symbol
      * */
     pub fn registerTouchSym (mut self, name : [c8], loc : &Word) {
-        self._touchings:.back ().content [name] = Path (loc.filename).stripExtension ();
+        if !self._touchings.isEmpty () {
+            self._touchings:.back ().content [name] = Path (loc.filename).stripExtension ();
+        }
     }
 
     pub fn registerTouchClass (mut self, cl : &Type) {
@@ -860,10 +981,14 @@ pub class Expander {
      * @params:
      *     - name: the name of the frame (not mangled)
      * */
-    fn enterFrame (mut self, name : [c8]) {
+    fn enterFrame (mut self, name : [c8], frameAddr : &YILValue = YIL_UNIT_VALUE, frameCoverAddr : &YILValue = YIL_UNIT_VALUE) {
         self._frameName:.push (name);
+        self._frameAddr:.push (frameAddr);
+        self._frameCoverAddr:.push (frameCoverAddr);
+        
         self._varUniqId:.push (1us); // first ID id 1, 0 means no ref
         self._lblUniqId:.push (1us);
+        self._coverageUniqIds:.push (copy CoverageLocs ());
     }
 
     /**
@@ -871,8 +996,12 @@ pub class Expander {
      * */
     fn exitFrame (mut self) {
         self._frameName:.pop ();
+        self._frameAddr:.pop ();
+        self._frameCoverAddr:.pop ();
+        
         self._varUniqId:.pop ();
         self._lblUniqId:.pop ();
+        self._coverageUniqIds:.pop ();
     }
 
     /**
@@ -887,6 +1016,31 @@ pub class Expander {
      * */
     pub fn getCurrentFrameName (self)-> [c8] {
         self._frameName.back ()
+    }
+
+    /**
+     * @returns: the address of the function being validated
+     * */
+    pub fn getCurrentFrameAddr (self)-> &YILValue {
+        self._frameAddr.back ()
+    }
+
+    /**
+     * @returns: the address of the function being validated
+     * */
+    pub fn getCurrentFrameCoverageAddr (self)-> &YILValue {
+        self._frameCoverAddr.back ()
+    }
+
+    /**
+     * @returns: true if the frame is exporting code coverage metrics
+     * */
+    pub fn isInCoverageFrame (self)-> bool {
+        if self._frameCoverAddr.len != 0 {
+            self._frameCoverAddr.back () !of YILUnit
+        } else {
+            false
+        }
     }
 
     /**
@@ -914,12 +1068,22 @@ pub class Expander {
     }
 
     /**
-     * @returns: the next uniq id for a variable in the current frame
+     * @returns: the next uniq id for a label in the current frame
      * */
     pub fn generateLblId (mut self)-> usize {
         let id = self._lblUniqId.back ();
         self._lblUniqId:.setBack (id + 1);
         id
+    }
+
+    /**
+     * @returns: the next uniq id for a coverage call in the current frame
+     * */
+    pub fn generateCoverageId (mut self, loc : &Word)-> usize {
+        let dmut lst = self._coverageUniqIds:.back ();
+        lst.content ~= [loc];
+        
+        lst.content.len - 1us
     }
 
     /**
