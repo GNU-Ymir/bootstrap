@@ -1,0 +1,626 @@
+in global;
+
+use ymirc::errors::_;
+use ymirc::syntax::{_,
+                    visitor::_,
+                    declaration::_,
+                    expression::{_, literal::_, macro_::_, operator::_, template::_}};
+
+use ymirc::lexing::{word, tokens};
+use ymirc::utils::_;
+
+/**
+ * Syntax visitor to read global symbol declaration
+ * This visitor is executed on the top level of a file
+ * */
+pub record GlobalVisitor {
+
+    // The keywords that can appear in a global extern block
+    let _globalLstProtectedExtern : [[c8]] = copy GlobalDeclKeys::__members__;
+
+    // The keywords that can appear in a global protection block
+    let _globalLstProtected       : [[c8]];
+
+    // The keywords that can appear in a global block
+    let _globalLstAll             : [[c8]];
+    
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ======================================          CTOR          ======================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    pub self ()
+        with _globalLstProtected = self._globalLstProtectedExtern ~ [Keys::EXTERN]
+        , _globalLstAll = self._globalLstProtected ~ [Keys::PUBLIC, Keys::PRIVATE, Keys::USE]
+    {}
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * =================================          IMPLEMENTATION          =================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Read a declaration block
+     * @params:
+     *   - context: the context of the reading
+     *   - loc: the location of the first read word
+     *   - comm: the comment on top of the block to read
+     * @returns: the block read
+     * */
+    pub fn readBlock (self, dmut context : &SyntaxVisitor, loc : &Word, comm : [c8])-> &BlockDecl
+        throws ErrorMsg
+    {
+        self.readBlock (alias context,
+                        loc, 
+                        comm,
+                        closing-> false,
+                        inProtection-> false)
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * =====================================          BLOCKS          =====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+    
+    /**
+     * Read a declaration block
+     * @params:
+     *   - context: the context of the reading
+     *   - loc: the location of the block being read
+     *   - comm: the comment on top of the block to read
+     *   - closing: true iif a Tokens::LACC was read, and a RACC needs to be read to close the current block
+     * @returns: the block read
+     * @verbatim:
+     * ```
+     * decl_block :=   protection_block
+                     | extern_decl_block
+     *               | (attributes? declaration)*
+     *
+     * protection_block := (attributes)? (Keys::PUBLIC | Keys::PRIVATE) declaration
+     *                     | (Keys::PUBLIC | Keys::PRIVATE) '{' protected_decl_block '}'
+     *                     | (Keys::PUBLIC | Keys::PRIVATE) extern_decl_block     
+     *
+     * extern_decl_block := (attributes)? Keys::EXTERN declaration     
+     * 
+     * protected_decl_block :=   extern_decl_block
+     *                         | (attributes? declaration)*
+     *
+     * ```
+     * */
+    fn readBlock (self, dmut context : &SyntaxVisitor, loc : &Word, comm : [c8], closing : bool, inProtection : bool)-> &BlockDecl
+        throws ErrorMsg
+    {
+        let mut decls : [mut &Declaration] = [];
+        {
+            loop {
+                // Read attributes for the next declaration
+                let (attrLoc, attribs, attrComm) = self.readAttributes (alias context);
+
+                let (tok, comm_) = context:.readIf (Tokens::RACC, Keys::PRIVATE, Keys::PUBLIC, Keys::USE, Keys::EXTERN);                                
+                match tok.str {
+                    Keys::PUBLIC | Keys::PRIVATE => {
+                        if inProtection throw copy ErrorMsg::fatal (tok, format (SyntaxErrorMessage::UNEXPECTED, tok));                         
+                        decls ~= [self.readProtectionBlock (alias context, tok, comm ~ comm_, attribs-> (attrLoc, attribs, attrComm))];                    
+                    }
+                    Keys::USE  => {                        
+                        if inProtection throw copy ErrorMsg::fatal (tok, format (SyntaxErrorMessage::UNEXPECTED, tok));
+
+                        self.checkNoAttributes (tok, attrLoc, attribs);
+                        decls ~= self.readUse (alias context, tok, comm ~ comm_);
+                    }
+                    Keys::EXTERN => {                        
+                        decls ~= [self.readExternBlock (alias context,
+                                                        loc-> tok,
+                                                        comm-> comm ~ attrComm ~ comm_,
+                                                        attribs-> (attrLoc, attribs, attrComm))]
+                    }
+                    Tokens::RACC => {                        
+                        if !closing throw copy ErrorMsg::fatal (tok, format (SyntaxErrorMessage::UNEXPECTED, tok));
+                        self.checkNoAttributes (tok, attrLoc, attribs);
+                        break;
+                    }
+                    _ => {
+                        // We read nothing, because there's nothing to read
+                        if context.isEof () {
+                            if closing throw copy ErrorMsg::fatal (loc, SyntaxErrorMessage::BLOCK_NEVER_CLOSED);
+                            self.checkNoAttributes (tok, attrLoc, attribs);
+                            break;
+                        }
+
+                        // Or a declaration
+                        let expected = if inProtection { self._globalLstProtected } else { self._globalLstAll };
+                        decls ~= [self.readDeclaration (alias context,
+                                                        comm-> comm ~ attrComm ~ comm_,
+                                                        attribs-> (attrLoc, attribs),
+                                                        expected-> expected)];                     
+                    }
+                }
+            }
+        } catch {
+            err => {
+                if (!loc.isEof ()) {
+                    throw copy ErrorMsg::note (loc, SyntaxErrorMessage::IN_DECL_BLOCK, notes-> copy [err]);
+                } else {
+                    throw err;
+                }
+            }
+        }
+        
+        copy BlockDecl (loc, comm, decls, protection-> Protection::PRIVATE)        
+    }
+        
+    /**
+     * Read a protection block
+     * @verbatim:
+     * ```
+     * * protection_block := (attributes)? (Keys::PUBLIC | Keys::PRIVATE) declaration
+     *                     | (Keys::PUBLIC | Keys::PRIVATE) '{' protected_decl_block '}'
+     * ```
+     */
+    fn readProtectionBlock (self, dmut context : &SyntaxVisitor, loc : &Word, comm : [c8], attribs : (&Word, [AttributeWord], [c8])) -> &BlockDecl
+        throws ErrorMsg
+    {                
+        let protection = if (loc.str == Keys::PRIVATE) {
+            Protection::PRIVATE
+        } else {
+            Protection::PUBLIC
+        };
+        
+        let (tok, _) = context:.readIf (Tokens::LACC);
+        // No '{' then it's a single declaration
+        let decls = if (tok.isEof ()) {
+            copy [self.readDeclaration (alias context,
+                                        comm-> comm ~ attribs.2,
+                                        attribs-> (attribs.0, attribs.1),
+                                        expected-> self._globalLstProtected)]                                                    
+        } else {
+            // Or a protected block
+            self.checkNoAttributes (tok, attribs._0, attribs._1);
+            let blk = self.readBlock (alias context,
+                                      loc,
+                                      comm,
+                                      closing-> true,
+                                      inProtection-> true);
+            blk.getDeclarations ()
+        }
+        
+        copy BlockDecl (loc, comm, decls, protection-> protection)
+    }
+
+    /**
+     * Read an external declaration block
+     * @verbatim:
+     * ```
+     * extern :=   attributes? Keys::EXTERN (language)? declaration
+     *
+     * language := '(' 'C' ')'
+     *             | '(' 'Y' (',' path)? ')'
+     * 
+     * ```
+     */
+    pub fn readExternBlock (self, dmut context : &SyntaxVisitor,
+                            loc : &Word,
+                            comm : [c8],
+                            attribs : (&Word, [AttributeWord], [c8]))-> &ExternBlockDecl
+        throws ErrorMsg
+    {
+        let (fst, _) = context:.readIf (Tokens::LPAR);
+ 
+        let (lang, space) = if !fst.isEof () {
+            let (ln, _) = context:.readTokens (Keys::CLANG, Keys::YLANG);
+            let space = if ln == Keys::YLANG && !context:.readIf (Tokens::COMA)._0.isEof () {
+                self.readPath (alias context) 
+            } else {
+                EMPTY_EXPR
+            };
+            
+            context:.readTokens (Tokens::RPAR);
+            (ln, space)
+        } else {
+            (copy Word (Keys::YLANG, loc), EMPTY_EXPR)
+        };
+                        
+        let content = self.readDeclaration (alias context,
+                                            comm-> comm ~ attribs._2,
+                                            attribs-> (attribs._0, attribs._1),
+                                            expected-> self._globalLstProtectedExtern);                                                    
+
+        copy ExternBlockDecl (loc, comm, lang, space, content)
+    }    
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ==================================          LOCAL MODULE          ==================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Read a local module
+     * @verbatim:
+     * ```
+     * local_module :=   Keys::MOD Identifier '{' decl_block '}'
+     *                 | Keys::MOD ('if' expression:(0))? Identifier template_param_list decl_block
+     *                 | Keys::MOD ('.' | '::')? Identifier ';'
+     * ```
+     * */
+    fn readLocalModule (self, dmut context : &SyntaxVisitor, loc : &Word, comm : [c8])-> &Declaration
+        throws ErrorMsg
+    {
+        let (hasTest, test) = context:.readTemplateTest ();
+        if !hasTest.isEof () { // a template local module
+            let (ident, _) = context:.readIdentifier (canBeSelf-> false);
+            return self.readTemplateLocalModule (alias context, comm, ident, ifLoc-> hasTest, test);
+        }
+        
+        let (isSub, _) = context:.readIf (Tokens::DCOLON, Tokens::DOT);        
+        let (ident, _) = context:.readIdentifier (canBeSelf-> false);
+
+        let (isEnd, _) = context:.readIf (Tokens::SEMI_COLON);        
+        if isSub.isEof () && isEnd.isEof () { // mod Ident '{' decl_block '}'
+            return self.readLocalModule (alias context, comm, ident); 
+        }
+
+        // 'mod' ('.' | '::')? Ident
+        copy ImportDecl (loc, comm, ident, isSub-> isSub)        
+    }
+    
+    /**
+     * Read a local module (with no if test) but a declaration block
+     * @verbatim:
+     * ```
+     * local_module_block := 'mod' Identifier (template_param_list)? '{' decl_block '}'
+     * ```
+     * */
+    pub fn readLocalModule (self, dmut context : &SyntaxVisitor, comm : [c8], ident : &Word)-> &Declaration
+        throws ErrorMsg
+    {
+        let readNormal = copy |dmut ctx : &SyntaxVisitor| => {
+            let (start, comm_) = ctx:.readTokens (Tokens::LACC);
+            let content = self.readBlock (alias ctx, start, comm_, closing-> true, inProtection-> false);
+            copy ModuleDecl (ident,
+                             EOF_WORD,
+                             comm,
+                             content,
+                             isGlobal-> false)
+        }?;
+            
+        let readTemplate = copy |dmut ctx : &SyntaxVisitor| => {
+            self.readTemplateLocalModule (alias ctx, comm, ident, EOF_WORD, EMPTY_EXPR)
+        }?;
+
+        // It may or may not have templates, we test without templates,
+        // and if it fails, we test with templates
+        return context:.readEither!{&Declaration} (readNormal,
+                                                   readTemplate);                                            
+    }   
+
+    /**
+     * Read a template local module
+     * @verbatim:
+     * ```     
+     * local_module_template := 'mod' ('if' expression:0)? Identifier (template_param_list) '{' decl_block '}'
+     * ```
+     * */
+    pub fn readTemplateLocalModule (self, dmut context : &SyntaxVisitor, comm : [c8], ident : &Word, ifLoc : &Word, test : &Expression)-> &Declaration
+        throws ErrorMsg
+    {
+        let (templates, _) = context:.readTemplateParameters (ifLoc-> ifLoc, force-> true);
+        let (start, comm_) = context:.readTokens (Tokens::LACC);
+
+        let content = self.readBlock (alias context, start, comm_, closing-> true, inProtection-> false);        
+        copy TemplateDecl (ident, comm, templates, test-> test,
+                           copy ModuleDecl (ident, EOF_WORD, comm, content, isGlobal-> false))        
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ======================================          USE          =======================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Read a use declaration
+     * @verbatim:
+     * ```
+     * use_decl := 'use' '::'? Identifier (complex_path)? ';'
+     * ```
+     * */
+    pub fn readUse (self, dmut context : &SyntaxVisitor, loc : &Word, comm : [c8])-> [&Declaration]
+        throws ErrorMsg
+    {
+        let mut res : [mut &Expression] = [];
+        
+        let (isRoot, _) = context:.readIf (Tokens::DCOLON);        
+        let (fst, _) = context:.readIdentifier (canBeSelf-> false);
+
+        self.readComplexPath (alias context, copy VarExpr (fst), ref res);
+
+        
+        context:.readTokens (Tokens::SEMI_COLON);
+
+        copy [copy UseDecl (loc, comm, i, isRoot-> !isRoot.isEof ()) for i in res]                        
+    }
+
+    
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ==================================          DECLARATIONS          ==================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Read a declaration inside a 
+     * */
+    pub fn readDeclaration (self, dmut context : &SyntaxVisitor)-> &Declaration
+        throws ErrorMsg
+    {
+        let (attrLoc, attribs, attrComm) = self.readAttributes (alias context);
+        self.readDeclaration (alias context,
+                              attrComm,
+                              attribs-> (attrLoc, attribs),
+                              expected-> self._globalLstProtectedExtern)
+    }                                                                  
+    
+    /**
+     * Read a declaration
+     * @verbatim:
+     * ```
+     * declaration :=   class_decl
+     *                | function_decl
+     *                | lazy_decl
+     *                | record_decl
+     *                | static_decl
+     *                | entity_decl
+     *                | union_decl     
+     *                | mod_decl
+     *                | def_decl
+     *                | enum_decl
+     *                | macro_decl
+     *                | trait_decl
+     *                | unittest_decl
+     *                | use_decl
+     * ```
+     */
+    fn readDeclaration (self,
+                        dmut context : &SyntaxVisitor,
+                        comm : [c8],
+                        attribs : (&Word, [AttributeWord]),
+                        expected : [[c8]])-> &Declaration
+        
+        throws ErrorMsg
+    {
+        
+        let (tok, postComm) = context:.readToken ();
+
+        // Globals with attributes
+        match tok.str {
+            Keys::CLASS    => { return context:.readClass (tok, comm ~ postComm, attribs-> attribs._1); }
+            Keys::FUNCTION => { return context:.readFunction (tok, comm ~ postComm, attribs-> attribs._1); }
+            Keys::LAZY     => { return context:.readGlobal (tok, comm ~ postComm, attribs-> attribs._1); }
+            Keys::RECORD   => { return context:.readClass (tok, comm ~ postComm, attribs-> attribs._1, isRecord-> true); }
+            Keys::STATIC   => { return context:.readGlobal (tok, comm ~ postComm, isStatic-> true, attribs-> attribs._1); }
+            Keys::ENTITY   => { return context:.readClass (tok, comm ~ postComm, attribs-> attribs._1, isEntity-> true); }
+            Keys::UNION    => { return context:.readClass (tok, comm ~ postComm, attribs-> attribs._1,  isUnion-> true); }
+        }
+                    
+        // Global without attributes
+        self.checkNoAttributes (tok, attribs._0, attribs._1);
+        match tok.str {
+            Keys::MOD      => { return self.readLocalModule (alias context, tok, comm ~ postComm); }
+            
+            Keys::DEF      => { return context:.readDef (tok, comm ~ postComm); }
+            Keys::ENUM     => { return context:.readEnum (tok, comm ~ postComm); }
+            Keys::MACRO    => { return context:.readMacro (tok, comm ~ postComm); }            
+            Keys::TRAIT    => { return context:.readTrait (tok, comm ~ postComm); }
+            Keys::UNITTEST => { return context:.readUnitTest (tok, comm ~ postComm); }                        
+        }                          
+                
+        throw copy ErrorMsg::fatal (tok, format (SyntaxErrorMessage::UNEXPECTED_BUT_LST, tok.str, expected));
+    }
+    
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * =====================================          UTILS          ======================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+    
+    /**
+     * Read a list of custom attributes, if the token Tokens::AT is not read, then an empty list is returned
+     * @info: Not rewindable, if start with Tokens::AT, it is an attribute
+     * @verbatim:
+     * ```
+     * attributes_lst :=  '@' '{' Attribute (Tokens::COMA Attribute)* '}')
+     *                   | '@' Attribute ('@' Attribute)*
+     * ```
+     * @returns:
+     *   - .0: the location of the attribute reading (or EOF if nothing read)
+     *   - .1: the list of attributes read
+     *   - .2: the comments on top of the attribute list
+     */
+    pub fn readAttributes (self, dmut context : &SyntaxVisitor)-> (&Word, [AttributeWord], [c8])
+        throws ErrorMsg
+    {
+        // All attributes start with Tokens::AT '@'
+        let (next, comm) = context:.readIf (Tokens::AT);
+        if (next.isEof ()) return (EOF_WORD, [], []);
+
+        // List starts with '@' '{
+        let (open, _) = context:.readIf (Tokens::LACC);
+        let mut vec : [mut AttributeWord] = [];
+        loop {
+            let (identifier, _) = context:.readTokens (expand Attributes::__members__);
+
+            // Check if already read
+            for j in vec if j.attr == identifier {
+                throw copy ErrorMsg::fatal (j.loc, end-> identifier, format (SyntaxErrorMessage::MULTIPLE_ATTRS, j.attr));            
+            }
+
+            // No need to check wether it exists, it necessarily does, we read it in context:.readTokens
+            for id in Attributes::__members__ if id == identifier {
+                vec ~= [AttributeWord (identifier, id)];                    
+                break;            
+            }
+                        
+
+            // Only one, not a list (not read '{')
+            if (open.isEof ()) {
+                // But they can be chained with another '@'
+                let (at,_) = context:.readIf (Tokens::AT);
+                if (at.isEof ()) break;
+            } else {
+                // multiple, either ',' or '}'
+                let (close, _) = context:.readTokens (Tokens::COMA, Tokens::RACC);
+                if (close.str == Tokens::RACC) break;
+            }
+        }        
+
+        (next, vec, comm)
+    }
+
+    /**
+     * Throw a syntax error if there are attributes in a wrong position (i.e. !attrLoc.isEof)
+     * @params:
+     *    - loc: the location of the declaration that cannot have attributes
+     *    - attrLoc: the attributes location (or EOF if not read)
+     *    - attribs: the list of read attributes
+     * */
+    pub fn checkNoAttributes (self, loc : &Word, attrLoc : &Word, attribs : [AttributeWord])
+        throws ErrorMsg
+    {        
+        if (attrLoc.isEof ()) return;
+        
+        let mut notes : [&ErrorMsg] = [];
+        if !loc.isEof () {
+            notes = copy [copy ErrorMsg::note (loc, "")];
+        }                
+        
+        throw copy ErrorMsg::fatal (attrLoc,
+                                    format (SyntaxErrorMessage::UNEXPECTED_ATTRIBUTES, copy [x.attr for x in attribs]),
+                                    notes-> notes);                
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * =====================================          PATHS          ======================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Read a namepath expression
+     * @verbatim:
+     * ```
+     * namepath_expr := Identifier ('::' Identifier)*
+     * ```
+     */
+    pub fn readPath (self, dmut context : &SyntaxVisitor) -> &Expression
+        throws ErrorMsg
+    {
+        let (fst, _) = context:.readIdentifier (canBeSelf-> false);
+        let mut res : &Expression = copy VarExpr (fst);
+        while let (colon, _) = context:.readIf (Tokens::DCOLON) && !colon.isEof () {            
+            let (next, _) = context:.readIf (Keys::UNDER);
+            match next.str {
+                Keys::UNDER => {
+                    return copy PathExpr (colon, res, copy VarExpr (next));
+                }
+                _ => {
+                    let (ident, _) = context:.readIdentifier (canBeSelf-> false);
+                    res = copy PathExpr (colon, res, copy VarExpr (ident));
+                }
+            }
+        }         
+
+        res
+    }
+
+    /**
+     * Read a complex path
+     * @example:
+     * ====
+     * foo::{bar, baz} => [ foo::bar, foo::baz ]
+     * foo::{bar::{baz, bad::ouch}, fee} ==> [ foo::bar::baz, foo::bar::bad::ouch, foo::fee ]
+     * ====
+     * @verbatim:
+     * ```
+     * complex_path :=   ('::' Identifier)* ('::' '{' sub_complex '}')?
+     *                 | ('::' Identifier)* ('::' '_')?
+     * ```
+     * */
+    fn readComplexPath (self, dmut context : &SyntaxVisitor, root : &Expression, ref mut result : [&Expression])
+        throws ErrorMsg
+    {
+        let mut res = root;        
+        while let (colon, _) = context:.readIf (Tokens::DCOLON) && !colon.isEof () {
+            let (next, _) = context:.readIf (Tokens::LACC, Keys::UNDER);
+            match next.str {
+                Tokens::LACC => {
+                    self.readSubComplexPath (alias context, colon, res, ref result);
+
+                    // We return to avoid adding the current that is not imported by this use
+                    return;
+                }
+                Keys::UNDER => {
+                    res = copy PathExpr (colon, res, copy VarExpr (next));
+                    break;
+                }
+                _ => {                    
+                    let (ident, _) = context:.readIdentifier (canBeSelf-> false);
+                    res = copy PathExpr (next, res, copy VarExpr (ident));
+                }
+            }
+        }
+                             
+        result ~= [res];        
+    }
+
+    /**
+     * Read the sub part of a complex path
+     * @verbatim:
+     * ```
+     * sub_complex :=  inner_sub_complex (',' inner_sub_complex)*
+     * inner_sub_complex :=   Identifier complex_path
+     *                      | '_'
+     * ```
+     * */
+    fn readSubComplexPath (self, dmut context : &SyntaxVisitor, colon : &Word, root : &Expression, ref mut result : [&Expression])
+        throws ErrorMsg
+    {
+        loop {
+            let (next, _) = context:.readIf (Keys::UNDER);
+            match next.str {
+                Keys::UNDER => {
+                    result ~= [copy PathExpr (next, root, copy VarExpr (next))];
+                }
+                _ => {                    
+                    let (ident, _) = context:.readIdentifier (canBeSelf-> false);
+                    let current = copy PathExpr (colon, root, copy VarExpr (ident));
+                    self.readComplexPath (alias context, current, ref result);
+                }
+            }
+
+            let (end, _) = context:.readTokens (Tokens::RACC, Tokens::COMA); 
+            if (end == Tokens::RACC) break;
+        }
+    }
+                
+    
+} 

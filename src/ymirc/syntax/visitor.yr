@@ -1,8 +1,12 @@
 in visitor;
 
+mod ::global;
+mod ::special;
+
 use ymirc::syntax::errors;
 use ymirc::errors::_;
 use ymirc::syntax::{_,
+                    visitor::_,
                     declaration::_,
                     expression::{_, literal::_, macro_::_, operator::_, template::_}};
 
@@ -11,27 +15,6 @@ use ymirc::utils::_;
 use ymirc::global::state;
 
 use std::{fs::_, io};
-
-lazy __SPECIAL_TOKENS__ = SpecialKeysAndTokens ();
-
-/**
- * This struct is used to alloc only one time the arrays of tokens, and avoid lost of perf for allocation of const arrays
- */
-record SpecialKeysAndTokens {
-    pub let binaryOperators : [BinaryOperatorsLevels] = copy BinaryOperatorsLevels::__members__;
-    pub let specialBinaryOperators : [Keys] = copy [Keys::IS, Keys::OF, Keys::IN];
-    pub let macroMult : [MacroMultTokens] = copy MacroMultTokens::__members__;
-    pub let unaryOperators : [UnaryOperators] = copy UnaryOperators::__members__;
-    pub let intrinsicKeys : [IntrinsicKeys] = copy IntrinsicKeys::__members__;
-    pub let decorators : [Decorators] = copy Decorators::__members__;
-    pub let skipTokens : [SkipTokens] = copy SkipTokens::__members__;
-    pub let stringSuffixes : [StringSuffixes] = copy StringSuffixes::__members__;
-    pub let charSuffixes : [CharSuffixes] = copy CharSuffixes::__members__;
-    pub let fixedSuffixes : [FixedSuffixes] = copy FixedSuffixes::__members__;
-    pub let floatSuffixes : [FloatSuffixes] = copy FloatSuffixes::__members__;
-
-    pub self () {}
-}
 
 /**
  * Create a lexer over a file
@@ -73,16 +56,39 @@ pub class SyntaxVisitor {
     // True iif currently reading template call expr without parentheses
     let mut _inTemplateCall : bool = false;
 
-    let _specials : SpecialKeysAndTokens;
+    // The collection of special tokens and keys
+    let _specials : SpecialKeysAndTokens = special::__SPECIAL_TOKENS__;
 
+    // The list storing recoverable states
+    let dmut _recoveringStates : &List!{usize} = copy List!{usize} ();
+    
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          VISITORS          ====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    // The visitor for global declarations
+    let dmut _global : GlobalVisitor = GlobalVisitor ();
+    
+    
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * =====================================          CTORS          ======================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+    
     /**
      * Create a new visitor for a given file
      * @params:
      *  - path: the path of the file to read
      */
     pub self open (path : Path)
-        with _lex = createLexer (path)
-        , _specials = __SPECIAL_TOKENS__
+        with _lex = createLexer (path)        
         , _path = path
         throws FsError
     {
@@ -108,8 +114,7 @@ pub class SyntaxVisitor {
                                 content-> content,
                                 tokens-> tokens::TokenList,
                                 comments-> tokens::CommentList,
-                                skips-> tokens::SkipList)
-        , _specials = __SPECIAL_TOKENS__
+                                skips-> tokens::SkipList)        
         , _path = Path (path)
     {
         for i in Tokens::members {
@@ -169,7 +174,8 @@ pub class SyntaxVisitor {
         throws ErrorMsg
     {
         let (loc, path, comm) = self:.readGlobalPath ();
-        let ret = copy ModuleDecl (loc, path, comm, self:.readBlockDecl (loc, comm), isGlobal-> true);
+        let block = self._global.readBlock (alias self, loc, comm);
+        let ret = copy ModuleDecl (loc, path, comm, block, isGlobal-> true);
         ret
     }
 
@@ -200,206 +206,11 @@ pub class SyntaxVisitor {
         self:.readTokens (Tokens::SEMI_COLON);
         (next, path, comm)
     }
-
-    /**
-     * Read a set of declaration in a global module (or in a global sub symbol, such as local module, protection block, etc.)
-     * @verbatim:
-     * ===================
-     * decl_block := declaration | protection_block | version_block
-     * ===================
-     * @params:
-     *     - close: if false, then the reading stops when the token eof () is found
-     *              , otherwise it stops when the token Tokens::RACC is found
-     */
-    fn readBlockDecl (mut self, loc : &Word, comm : [c8], closing : bool = false, protection : Protection = Protection::PRIVATE, inProtection : bool = false) -> &BlockDecl
-        throws ErrorMsg
-    {
-        let mut decls : [mut &Declaration] = [];
-        loop {
-            let (attrLoc, attribs, attrComm) = self:.readAttributes ();
-
-            let (tok, comm_) = self._lex:.next ();
-            if (closing && tok.str == Tokens::RACC) break;
-            if (!tok.isEof ()) self._lex:.rewind ();
-
-            match tok.str {
-                Keys::PUBLIC | Keys::PRIVATE => {
-                    if (inProtection) {
-                        decls ~= [self:.readDeclaration (comm-> attrComm ~ comm_, attribs-> (attrLoc, attribs))];
-                    } else {
-                        decls ~= [self:.readProtectionBlock (attribs-> (attrLoc, attribs, attrComm))];
-                    }
-                }
-                Keys::VERSION => {
-                    self.checkNoAttributes (tok, attrLoc, attribs);
-                    decls ~= [self:.readVersionBlock (protection-> protection)];
-                }
-                Tokens::LACC => {
-                    self.checkNoAttributes (tok, attrLoc, attribs);
-                    self._lex:.next ();
-                    decls ~= [self:.readBlockDecl (tok, attrComm ~ comm_, closing-> true, protection-> protection, inProtection-> inProtection)];
-                }
-                _ => {
-                    if !tok.isEof () {
-                        decls ~= [self:.readDeclaration (comm-> attrComm ~ comm_, attribs-> (attrLoc, attribs))];
-                    } else if (!closing) {
-                        self.checkNoAttributes (tok, attrLoc, attribs);
-                        break;
-                    } else throw copy ErrorMsg::fatal (tok, SyntaxErrorMessage::BLOCK_NEVER_CLOSED);
-                }
-            }
-        }
-
-        copy BlockDecl (loc, comm, decls, protection-> protection)
-    }
-
-    /**
-     * Read a protection block
-     * @verbatim:
-     * ===============
-     * protection_block :=   (Keys::PRIVATE | Keys::PUBLIC) Tokens::LACC decl_block Tokens::RACC
-     *                     | (Keys::PRIVATE | Keys::PUBLIC) declaration
-     * ===============
-     */
-    fn readProtectionBlock (mut self, attribs : (&Word, [AttributeWord], [c8]) = (EOF_WORD, [], [])) -> &BlockDecl
-        throws ErrorMsg
-    {
-        let (loc, comm) = self:.readIf (Keys::PRIVATE, Keys::PUBLIC);
-        {
-            let protection = if (loc.str == Keys::PRIVATE) { Protection::PRIVATE } else { Protection::PUBLIC };
-            let (tok, _) = self:.readIf (Tokens::LACC);
-            if (tok.isEof ()) {
-                copy BlockDecl (loc, comm, copy [self:.readDeclaration (comm-> comm ~ attribs.2, attribs-> (attribs.0, attribs.1))], protection-> protection)
-            } else {
-                self.checkNoAttributes (tok, attribs._0, attribs._1);
-                self:.readBlockDecl (loc, comm, closing-> true, protection-> protection, inProtection-> true)
-            }
-        } catch {
-            err : &ErrorMsg => {
-                if (!loc.isEof ()) {
-                    throw copy ErrorMsg::note (loc, SyntaxErrorMessage::IN_DECL_BLOCK, notes-> copy [err]);
-                } else {
-                    throw err;
-                }
-            }
-        }
-    }
-
-    /**
-     * Visit a version block
-     * @verbatim:
-     * ================
-     * version_block := Keys::VERSION Tokens::LACC decl_block Tokens::RACC (else Tokens::LACC decl_block Tokens::RACC)?
-     * ================
-     */
-    fn readVersionBlock (mut self, protection : Protection = Protection::PRIVATE, inProtection : bool = false)-> &BlockDecl
-        throws ErrorMsg
-    {
-        let (loc, comm) = self._lex:.next ();
-        {
-            let (v, _) = self:.readIdentifier (canBeSelf-> false);
-            return if state::instance ().isVersionActive (v.str) {
-                self:.readTokens (Tokens::LACC);
-                let block = self:.readBlockDecl (loc, comm, closing-> true, protection-> protection, inProtection-> inProtection);
-                if (!(self:.readIf (Keys::ELSE)._0).isEof ())
-                    self:.ignoreBlock ();
-                block
-            } else {
-                self:.ignoreBlock ();
-                if (!(self:.readIf (Keys::ELSE)._0).isEof ()) {
-                    self:.readTokens (Tokens::LACC);
-                    self:.readBlockDecl (loc, comm, closing-> true, protection-> protection, inProtection-> inProtection)
-                } else {
-                    copy BlockDecl (loc, comm, [])
-                }
-            } ;
-        } catch {
-            err : &ErrorMsg => {
-                if (!loc.isEof ()) {
-                    throw err.appendNotes (copy [copy ErrorMsg::note (loc, SyntaxErrorMessage::IN_DECL_BLOCK)]);
-                } else {
-                    throw err;
-                }
-            }
-        }
-    }
-
-    /**
-     * Ignore a block of element (no matters what is inside)
-     * Basically, it can be used to consider the next block of code as a comment
-     * A block is enclosed by Tokens::LACC and Tokens::RACC
-     */
-    fn ignoreBlock (mut self)
-        throws ErrorMsg
-    {
-        let _ = self:.readTokens (Tokens::LACC);
-        let mut nb = 1u64;
-        loop {
-            let (next, _) = self._lex:.next ();
-            if (next == Tokens::RACC) {
-                nb -= 1u64;
-                if (nb == 0u64)
-                    break;
-            } else if (next == Tokens::LACC) nb += 1u64;
-            else if (next.isEof ())
-            throw copy ErrorMsg::fatal (next, SyntaxErrorMessage::UNTERMINATED_BLOCK);
-        }
-    }
-    /**
-     * Read a declaration
-     * @verbatim:
-     * ==================
-     * decl :=   aka_decl
-     *         | class_decl
-     *         | enum_decl
-     *         | func_decl
-     *         | static_decl
-     *         | import_decl
-     *         | extern_decl
-     *         | macro_decl
-     *         | mod_decl
-     *         | struct_decl
-     *         | trait_decl
-     *         | unittest
-     * ==================
-     */
-    fn readDeclaration (mut self, comm : [c8] = [], attribs : (&Word, [AttributeWord]) = (EOF_WORD, []))-> &Declaration
-        throws ErrorMsg
-    {
-        let (tok, postComm) = self._lex:.next ();
-        match tok.str {
-            Keys::CLASS    => { return self:.readClass (tok, comm ~ postComm, attribs-> attribs._1); }
-            Keys::FUNCTION => { return self:.readFunction (tok, comm ~ postComm, attribs-> attribs._1); }
-            Keys::STRUCT   => { return self:.readClass (tok, comm ~ postComm, attribs-> attribs._1, isEntity-> true); }
-            Keys::RECORD   => { return self:.readClass (tok, comm ~ postComm, attribs-> attribs._1, isRecord-> true); }
-            Keys::UNION   => { return self:.readClass (tok, comm ~ postComm, attribs-> attribs._1,  isUnion-> true); }
-            Keys::STATIC   => { return self:.readGlobal (tok, comm ~ postComm, isStatic-> true, attribs-> attribs._1); }
-            Keys::LAZY     => { return self:.readGlobal (tok, comm ~ postComm, attribs-> attribs._1); }
-            Keys::EXTERN   => { return self:.readExtern (tok, comm ~ postComm, attribs-> attribs); }
-            _ => {
-                self.checkNoAttributes (tok, attribs._0, attribs._1);
-                match tok.str {
-                    Keys::AKA    => { return self:.readAka (tok, comm ~ postComm); }
-                    Keys::ENUM   => { return self:.readEnum (tok, comm ~ postComm); }
-                    Keys::MACRO  => { return self:.readMacro (tok, comm ~ postComm); }
-                    Keys::MOD    => { return self:.readLocalModuleDecl (tok, comm ~ postComm); }
-                    Keys::TRAIT  => { return self:.readTrait (tok, comm ~ postComm); }
-                    Keys::UNITTEST => { return self:.readUnitTest (tok, comm ~ postComm); }
-                    Keys::USE => { return self:.readUse (tok, comm ~ postComm); }
-                }
-
-                throw copy ErrorMsg::fatal (tok, format (SyntaxErrorMessage::UNEXPECTED_BUT_LST, tok.str,
-                                                         copy [Keys::AKA, Keys::CLASS, Keys::ENUM,
-                                                               Keys::USE, Keys::EXTERN, Keys::MACRO, Keys::MOD,
-                                                               Keys::STRUCT, Keys::RECORD, Keys::UNION, Keys::TRAIT, Keys::STATIC, Keys::LAZY]));
-            }
-        }
-    }
-
+    
     /*!
      * ================================================================================
      * ================================================================================
-     * =========================             AKA              =========================
+     * =========================             DEF              =========================
      * ================================================================================
      * ================================================================================
      */
@@ -408,11 +219,11 @@ pub class SyntaxVisitor {
      * Read an aka declaration
      * @verbatim:
      * ===============
-     * aka_decl :=   Keys::AKA Keys::IF expression:(0) Identifier template_param_list Tokens::EQUAL expression:(0)
-     *             | Keys::AKA Identifier (template_param_list)? Tokens::EQUAL expression:(0)
+     * def_decl :=   Keys::DEF Keys::IF expression:(0) Identifier template_param_list Tokens::EQUAL expression:(0)
+     *             | Keys::DEF Identifier (template_param_list)? Tokens::EQUAL expression:(0)
      * ===============
      */
-    fn readAka (mut self, _ : &Word, comm : [c8])-> &Declaration
+    pub fn readDef (mut self, _ : &Word, comm : [c8])-> &Declaration
         throws ErrorMsg
     {
         let (hasTest, test) = self:.readTemplateTest ();
@@ -454,7 +265,7 @@ pub class SyntaxVisitor {
      *               | Keys::CLASS (attributes_list)? Identifier (template_param_list)? (Keys::OVER expression:(0))? class_block_decl
      * ===============
      */
-    fn readClass (mut self,  _ : &Word, comm : [c8], attribs : [AttributeWord], isEntity : bool = false, isRecord : bool = false, isUnion : bool = false)-> &Declaration
+    pub fn readClass (mut self,  _ : &Word, comm : [c8], attribs : [AttributeWord], isEntity : bool = false, isRecord : bool = false, isUnion : bool = false)-> &Declaration
         throws ErrorMsg
     {
         let isStruct = (isEntity || isRecord || isUnion);
@@ -501,8 +312,7 @@ pub class SyntaxVisitor {
      * Read the inner part of a class declaration
      * @verbatim:
      * ================
-     * class_block_decl :=   (Keys::PUBLIC | Keys::PRIVATE | Keys::PROTECTED) class_block_decl
-     *                     | Keys::VERSION Identifier class_block_decl (Keys::ELSE class_block_decl)?
+     * class_block_decl :=   (Keys::PUBLIC | Keys::PRIVATE | Keys::PROTECTED) class_block_decl     
      *                     | Keys::CTE Keys::IF expression:(0) class_block_decl (Keys::ELSE class_block_decl)?
      *                     | class_inner_declaration*
      * ================
@@ -514,7 +324,7 @@ pub class SyntaxVisitor {
     {
         let mut vec : [mut &Declaration] = [];
         loop {
-            let (attrLoc, attribs, attrComm) = self:.readAttributes ();
+            let (attrLoc, attribs, attrComm) = self._global.readAttributes (alias self);
 
             let (next, comm) = self._lex:.next ();
 
@@ -528,7 +338,7 @@ pub class SyntaxVisitor {
                             let (d, c) = self._lex:.next ();
                             copy [self:.readClassInnerDecl (d, attrComm ~ comm ~ c, inImpl-> inImpl, inProtection-> true, attribs-> (attrLoc, attribs), isStruct-> isStruct)]
                         } else {
-                            self.checkNoAttributes (next, attrLoc, attribs);
+                            self._global.checkNoAttributes (next, attrLoc, attribs);
                             self:.readClassBlockDecl (inImpl-> inImpl, closing-> true, inProtection-> true, isStruct-> isStruct)
                         }
                     }  catch {
@@ -539,19 +349,14 @@ pub class SyntaxVisitor {
                         }
                     }
                     vec ~= [copy BlockDecl (next, attrComm ~ comm, inner, protection-> self.toProtection (next.str))];
-                }
-                Keys::VERSION => {
-                    // if (inImpl) throw copy ErrorMsg::fatal (next, format (SyntaxErrorMessage::UNEXPECTED, next.str));
-                    self.checkNoAttributes (next, attrLoc, attribs);
-                    vec ~= [self:.readVersionClass (next, attrComm ~ comm, inProtection-> inProtection, isStruct-> isStruct, inImpl-> inImpl)];
-                }
+                }                
                 Keys::CTE => {
                     // if (inImpl) throw copy ErrorMsg::fatal (next, format (SyntaxErrorMessage::UNEXPECTED, next.str));
-                    self.checkNoAttributes (next, attrLoc, attribs);
+                    self._global.checkNoAttributes (next, attrLoc, attribs);
                     vec ~= [self:.readIfClass (next, attrComm ~ comm, inProtection-> inProtection, isStruct-> isStruct, inImpl-> inImpl)];
                 }
                 Tokens::LACC => {
-                    self.checkNoAttributes (next, attrLoc, attribs);
+                    self._global.checkNoAttributes (next, attrLoc, attribs);
                     if (closing) throw copy ErrorMsg::fatal (next, format (SyntaxErrorMessage::UNEXPECTED_BUT_LST, next.str, copy [Keys::PUBLIC, Keys::PROTECTED, Keys::PRIVATE]));
                     else {
                         let r = self:.readClassBlockDecl (inImpl-> inImpl, closing-> true, inProtection-> inProtection, isStruct-> isStruct);
@@ -559,7 +364,7 @@ pub class SyntaxVisitor {
                     }
                 }
                 Tokens::RACC => {
-                    self.checkNoAttributes (next, attrLoc, attribs);
+                    self._global.checkNoAttributes (next, attrLoc, attribs);
                     if (closing) break;
                     else {
                         if (!isStruct) {
@@ -579,39 +384,6 @@ pub class SyntaxVisitor {
         }
 
         vec
-    }
-
-    /**
-     * Read a version inside a class definition
-     * @verbatim:
-     * ===================
-     * version_class := __version Identifier class_block_decl ('else' class_block_decl)?
-     * ===================
-     * @params:
-     *   - inProtection: impl and import cannot be under protected declarators, and must be declared at root level of the class
-     */
-    fn readVersionClass (mut self, loc : &Word, comm : [c8], inProtection : bool = false, isStruct : bool, inImpl : bool)-> &Declaration
-        throws ErrorMsg
-    {
-        let (v, _) = self:.readIdentifier (canBeSelf-> false);
-        return if state::instance ().isVersionActive (v.str) {
-            self:.readTokens (Tokens::LACC);
-            let block = self:.readClassBlockDecl (closing-> true, inProtection-> inProtection, isStruct-> isStruct, inImpl-> inImpl);
-            if (!(self:.readIf (Keys::ELSE)._0).isEof ()) {
-                self:.ignoreBlock ();
-            }
-
-            copy BlockDecl (loc, comm, block, isSet-> true)
-        } else {
-            self:.ignoreBlock ();
-            if (!(self:.readIf (Keys::ELSE)._0).isEof ()) {
-                self:.readTokens (Tokens::LACC);
-                let block = self:.readClassBlockDecl (closing-> true, inProtection-> inProtection, isStruct-> isStruct, inImpl-> inImpl);
-                copy BlockDecl (loc, comm, block, isSet-> true)
-            } else {
-                copy BlockDecl (loc, comm, [], isSet-> true)
-            }
-        }
     }
 
     /**
@@ -678,7 +450,7 @@ pub class SyntaxVisitor {
             Keys::OVER => { if (!isStruct) return self:.readFunction (loc, comm, isMethod-> true, isOver-> true, attribs-> attribs._1); }
         }
 
-        self.checkNoAttributes (loc, attribs._0, attribs._1);
+        self._global.checkNoAttributes (loc, attribs._0, attribs._1);
         match loc {
             Keys::LET  => {
                 return self:.readGlobal (loc, comm, isField-> true, attribs-> []);
@@ -693,7 +465,9 @@ pub class SyntaxVisitor {
                 if (inProtection) {
                     throw copy ErrorMsg::warn (loc, SyntaxErrorMessage::USE_IN_PROTECTION);
                 }
-                return self:.readUse (loc, comm);
+                
+                let lst = self._global.readUse (alias self, loc, comm);
+                return copy BlockDecl (loc, comm, lst, isSet-> true);
             }
             Keys::DTOR => {
                 // if (isStruct) throw copy ErrorMsg::fatal (loc, format (SyntaxErrorMessage::UNEXPECTED, loc.str));
@@ -825,7 +599,7 @@ pub class SyntaxVisitor {
      * impl := Keys::IMPL expression:(0) (((',' expression:(0))* ';') | class_block_decl)
      * ==================
      */
-    fn readImplement (mut self, loc : &Word, comm : [c8]) -> &Declaration
+    pub fn readImplement (mut self, loc : &Word, comm : [c8]) -> &Declaration
         throws ErrorMsg
     {
         let trait_ = self:.readExpression ();
@@ -868,7 +642,7 @@ pub class SyntaxVisitor {
      * enum_content := (Tokens::PIPE Identifier ('=' expression:(0))?)*
      * =======================
      */
-    fn readEnum (mut self,  loc : &Word, comm : [c8])-> &Declaration
+    pub fn readEnum (mut self,  loc : &Word, comm : [c8])-> &Declaration
         throws ErrorMsg
     {
         let (hasTest, test) = self:.readTemplateTest ();
@@ -929,7 +703,7 @@ pub class SyntaxVisitor {
      *             | Identifier function_proto throwers body
      * ====================
      */
-    fn readFunction (mut self,  _ : &Word, comm : [c8], attribs : [AttributeWord], isMethod : bool = false, isOver : bool = false)-> &Declaration
+    pub fn readFunction (mut self,  _ : &Word, comm : [c8], attribs : [AttributeWord], isMethod : bool = false, isOver : bool = false)-> &Declaration
         throws ErrorMsg
     {
         let (hasTest, test) = self:.readTemplateTest ();
@@ -1061,7 +835,7 @@ pub class SyntaxVisitor {
      * global := var_decl
      * ====================
      */
-    fn readGlobal (mut self,  loc : &Word, comm : [c8], isField : bool = false, isStatic : bool = false, forceType : bool = false, attribs : [AttributeWord])-> &GlobalDecl
+    pub fn readGlobal (mut self,  loc : &Word, comm : [c8], isField : bool = false, isStatic : bool = false, forceType : bool = false, attribs : [AttributeWord])-> &GlobalDecl
         throws ErrorMsg
     {
         let (_, isMutOrDmut) = self:.readDecoratorVariable (canBeLazyOrRef-> false);
@@ -1103,43 +877,6 @@ pub class SyntaxVisitor {
     /*!
      * ================================================================================
      * ================================================================================
-     * =========================            EXTERN            =========================
-     * ================================================================================
-     * ================================================================================
-     */
-
-    /**
-     * Read an extern declaration
-     * @verbatim:
-     * ====================
-     * extern: Keys::EXTERN (Tokens::LPAR Language (Tokens::COMA path)? Tokens::RPAR)? decl_block
-     * ====================
-     */
-    fn readExtern (mut self,  loc : &Word, comm : [c8], attribs : (&Word, [AttributeWord]))-> &ExternBlockDecl
-        throws ErrorMsg
-    {
-        let (n, _) = self:.readIf (Tokens::LPAR);
-        let (language, space) = if (!n.isEof ()) {
-            let (l, _) = self:.readTokens (Keys::CLANG);
-            let space = if (!(self:.readIf (Tokens::COMA)._0).isEof ()) {
-                self:.readPath ()
-            } else { EMPTY_EXPR }
-            self:.readTokens (Tokens::RPAR);
-            (l, space)
-        } else { (copy Word (Keys::YLANG, loc), EMPTY_EXPR) }
-
-        let (tok, _) = self:.readIf (Tokens::LACC);
-        if (tok.isEof ()) {
-            copy ExternBlockDecl (loc, comm, language, space, self:.readDeclaration (comm-> comm, attribs-> attribs))
-        } else {
-            self.checkNoAttributes (tok, attribs._0, attribs._1);
-            copy ExternBlockDecl (loc, comm, language, space, self:.readBlockDecl (loc, comm, closing-> true, inProtection-> true))
-        }
-    }
-
-    /*!
-     * ================================================================================
-     * ================================================================================
      * =========================            MACRO             =========================
      * ================================================================================
      * ================================================================================
@@ -1152,7 +889,7 @@ pub class SyntaxVisitor {
      * macro := Keys::MACRO Identifier macro_block
      * ==================
      */
-    fn readMacro (mut self,  _ : &Word, comm : [c8])-> &MacroDecl
+    pub fn readMacro (mut self,  _ : &Word, comm : [c8])-> &MacroDecl
         throws ErrorMsg
     {
         let (name, _) = self:.readIdentifier (canBeSelf-> false);
@@ -1174,14 +911,11 @@ pub class SyntaxVisitor {
     {
         let mut decls : [mut &Declaration] = [];
         loop {
-            let (n, comm) = self:.readIf (Keys::VERSION, Keys::USE, Tokens::RACC);
+            let (n, comm) = self:.readIf (Keys::USE, Tokens::RACC);
             match n {
-                Tokens::RACC => { break; }
-                Keys::VERSION => {
-                    decls ~= [self:.readVersionMacroBlock (n, comm)];
-                }
-                Keys::USE => {
-                    decls ~= [self:.readUse (n, comm)];
+                Tokens::RACC => { break; }                
+                Keys::USE => {                    
+                    decls ~= self._global.readUse (alias self, n, comm);
                 }
                 _ => {
                     decls ~= [self:.readMacroContent ()];
@@ -1190,37 +924,6 @@ pub class SyntaxVisitor {
         }
 
         decls
-    }
-
-    /**
-     * Visit a version part of a macro block
-     * @verbatim:
-     * ======================
-     * version_macro_block := Keys::VERSION Identifier macro_block (Keys::ELSE macro_block)
-     * ======================
-     */
-    fn readVersionMacroBlock (mut self, loc : &Word, comm : [c8])-> &Declaration
-        throws ErrorMsg
-    {
-        let (ident, _) = self:.readIdentifier (canBeSelf-> false);
-        if (state::instance ().isVersionActive (ident.str)) {
-            self:.readTokens (Tokens::LACC);
-            let decls = self:.readMacroBlock ();
-            if (!(self:.readIf (Keys::ELSE)._0).isEof ()) {
-                self:.ignoreBlock ();
-            }
-
-            copy BlockDecl (loc, comm, decls, protection-> Protection::PUBLIC)
-        } else {
-            self:.ignoreBlock ();
-            if (!(self:.readIf (Keys::ELSE)._0).isEof ()) {
-                self:.readTokens (Tokens::LACC);
-                let decls = self:.readMacroBlock ();
-                copy BlockDecl (loc, comm, decls, protection-> Protection::PUBLIC)
-            } else {
-                copy BlockDecl (loc, comm, [])
-            }
-        }
     }
 
     /**
@@ -1418,97 +1121,6 @@ pub class SyntaxVisitor {
     /*!
      * ================================================================================
      * ================================================================================
-     * =========================            MODULE            =========================
-     * ================================================================================
-     * ================================================================================
-     */
-
-    /**
-     * Read a use declaration
-     * */
-    fn readUse (mut self, loc : &Word, comm : [c8])-> &Declaration
-        throws ErrorMsg
-    {
-        let isRoot = self:.readIf (Tokens::DCOLON)._0;
-
-        let (fst, _) = self:.readIdentifier (canBeSelf-> false);
-        let mut res : [mut &Expression] = [];
-        self:.readComplexPath (copy VarExpr (fst), ref res);
-        self:.readTokens (Tokens::SEMI_COLON);
-
-        copy BlockDecl (loc,
-                        comm,
-                        copy [copy UseDecl (loc, comm, i, isRoot-> !isRoot.isEof ()) for i in res],
-                        isSet-> true)
-    }
-
-    /**
-     * Read a local module
-     * @verbatim:
-     * =====================
-     * local_module :=   Keys::MOD Keys::IF expression:(0) Identifier template_param_list decl_block
-     *                 | Keys::MOD Identifier decl_block
-     *                 | Keys::MOD Identifier Tokens::SEMI_COLON
-     * =====================
-     */
-    fn readLocalModuleDecl (mut self, loc : &Word, comm : [c8])-> &Declaration
-        throws ErrorMsg
-    {
-        let (hasTest, test) = self:.readTemplateTest ();
-        let isSub = if (hasTest.isEof ()) {
-            self:.readIf (Tokens::DCOLON, Tokens::DOT)._0
-        } else {
-            EOF_WORD
-        };
-
-        let (ident, _) = self:.readIdentifier (canBeSelf-> false);
-
-        let end = if (!hasTest.isEof ()) {
-            EOF_WORD
-        } else if (isSub.isEof ()) {
-            self:.readIf (Tokens::SEMI_COLON, Tokens::COMA)._0
-        } else {
-            self:.readTokens (Tokens::SEMI_COLON, Tokens::COMA)._0
-        };
-
-        if (!end.isEof ()) {
-            if (end == Tokens::COMA) {
-                let mut im : [mut &Declaration] = [];
-                im ~= [copy ImportDecl (loc, "", ident, isSub-> isSub)];
-                loop {
-                    let (innerIsSub, _) = self:.readIf (Tokens::DCOLON, Tokens::DOT);
-                    let (current, _) = self:.readIdentifier (canBeSelf-> false);
-                    im ~= [copy ImportDecl (loc, "", current, isSub-> innerIsSub)];
-                    if (self:.readTokens (Tokens::SEMI_COLON, Tokens::COMA)._0 == Tokens::SEMI_COLON) break;
-                }
-
-                copy BlockDecl (loc, comm, im, isSet-> true)
-            } else {
-                copy ImportDecl (loc, comm, ident, isSub-> isSub)
-            }
-        } else {
-            let (templates, tmpErr) = self:.readTemplateParameters (ifLoc-> hasTest);
-
-            let (n, comm_) = {
-                self:.readTokens (Tokens::LACC)
-            } catch {
-                err : &ErrorMsg => throw err.appendNotes (notes-> tmpErr);
-            };
-
-            let content = self:.readBlockDecl (n, comm_, closing-> true, inProtection-> false);
-
-            if (templates.len == 0us) {
-                copy ModuleDecl (ident, EOF_WORD, comm, content, isGlobal-> false)
-            } else {
-                copy TemplateDecl (ident, comm, templates, test-> test,
-                                   copy ModuleDecl (ident, EOF_WORD, comm, content, isGlobal-> false))
-            }
-        }
-    }
-
-    /*!
-     * ================================================================================
-     * ================================================================================
      * =========================            TRAIT             =========================
      * ================================================================================
      * ================================================================================
@@ -1523,7 +1135,7 @@ pub class SyntaxVisitor {
      *               | Keys::TRAIT Identifier class_block_decl
      * =================
      */
-    fn readTrait (mut self,  _ : &Word, comm : [c8])-> &Declaration
+    pub fn readTrait (mut self,  _ : &Word, comm : [c8])-> &Declaration
         throws ErrorMsg
     {
 
@@ -1564,7 +1176,7 @@ pub class SyntaxVisitor {
      * unittest := Keys::UNITTEST expression:(0)
      * ==================
      */
-    fn readUnitTest (mut self, loc : &Word, comm : [c8])-> &Declaration
+    pub fn readUnitTest (mut self, loc : &Word, comm : [c8])-> &Declaration
         throws ErrorMsg
     {
         copy UnitTestDecl (loc, comm, self:.readExpression ())
@@ -1585,7 +1197,7 @@ pub class SyntaxVisitor {
      * @throws:
      *    - ErrorMsg: if !ifLoc.isEof (), but there is no list to read
      */
-    fn readTemplateParameters (mut self, ifLoc : &Word, force : bool = false)-> ([&Expression], [&ErrorMsg])
+    pub fn readTemplateParameters (mut self, ifLoc : &Word, force : bool = false)-> ([&Expression], [&ErrorMsg])
         throws ErrorMsg
     {
         let (begin, _) = if (!ifLoc.isEof () || force) {
@@ -1604,7 +1216,7 @@ pub class SyntaxVisitor {
             loop {
                 let (curr, _) = self._lex:.next ();
                 match curr.str {
-                    Keys::STRUCT | Keys::CLASS | Keys::ALIAS | TemplateVarType::TUPLE | Keys::RECORD | Keys::UNION => {
+                    Keys::ALIAS | Keys::CLASS | Keys::ENTITY | TemplateVarType::TUPLE | Keys::RECORD | Keys::UNION | Keys::ENUM => {
                         let (ident, _) = self:.readIdentifier (canBeSelf-> false);
                         vec ~= [copy TemplateVarExpr (ident, self.toTemplateVarType (curr.str))];
                     }
@@ -1737,7 +1349,7 @@ pub class SyntaxVisitor {
      *   - the location of the if token, (or eof)
      *   - the test expression, or Unit
      */
-    fn readTemplateTest (mut self)-> (&Word, &Expression)
+    pub fn readTemplateTest (mut self)-> (&Word, &Expression)
         throws ErrorMsg
     {
         let (hasTest, _) = self:.readIf (Keys::IF);
@@ -1745,85 +1357,6 @@ pub class SyntaxVisitor {
             (hasTest, EMPTY_EXPR)
         } else {
             (hasTest, self:.readExpression (level-> self._specials.binaryOperators.len))
-        }
-    }
-
-
-    /*!
-     * ================================================================================
-     * ================================================================================
-     * =========================          ATTRIBUTES          =========================
-     * ================================================================================
-     * ================================================================================
-     */
-
-    /**
-     * Read a list of custom attributes, if the token Tokens::AT is not read, then an empty list is returned
-     * @verbatim:
-     * =================
-     * attributes_lst :=   Tokens::AT Keys::LACC Attribute (Tokens::COMA Attribute)* Keys::RACC
-     *                   | Tokens::AT Attribute
-     * =================
-     */
-    fn readAttributes (mut self)-> (&Word, [AttributeWord], [c8])
-        throws ErrorMsg
-    {
-        let (next, comm) = self:.readIf (Tokens::AT);
-        if (next.isEof ()) return (EOF_WORD, [], []);
-
-        let (open, _) = self:.readIf (Tokens::LACC);
-        let mut vec : [mut AttributeWord] = [];
-        loop {
-            let (identifier, _) = self:.readTokens (expand Attributes::__members__);
-            for j in vec {
-                if j.attr == identifier {
-                    throw copy ErrorMsg::fatal (j.loc, end-> identifier, format (SyntaxErrorMessage::MULTIPLE_ATTRS, j.attr));
-                }
-            }
-
-            match identifier {
-                Attributes::ABSTRACT => { vec ~= [AttributeWord (identifier, Attributes::ABSTRACT)]; }
-                Attributes::FINAL    => { vec ~= [AttributeWord (identifier, Attributes::FINAL)]; }
-                Attributes::UNSAFE   => { vec ~= [AttributeWord (identifier, Attributes::UNSAFE)]; }
-                Attributes::INLINE   => { vec ~= [AttributeWord (identifier, Attributes::INLINE)]; }
-                Attributes::FIELD    => { vec ~= [AttributeWord (identifier, Attributes::FIELD)]; }
-                Attributes::THREAD   => { vec ~= [AttributeWord (identifier, Attributes::THREAD)]; }
-                _ => {
-                    throw copy ErrorMsg::fatal (identifier, format (SyntaxErrorMessage::UNDEFINED_ATTRIBUTE, identifier.str));
-                }
-            }
-
-            if (open.isEof ()) {
-                let (at,_) = self:.readIf (Tokens::AT);
-                if (at.isEof ()) break;
-            } else {
-                let (close, _) = self:.readTokens (Tokens::COMA, Tokens::RACC);
-                if (close.str == Tokens::RACC) break;
-            }
-        }  catch {
-            err : &ErrorMsg => {
-                if (!open.isEof ()) {
-                    throw err.appendNotes (copy [copy ErrorMsg::note (open, SyntaxErrorMessage::IN_DECL_BLOCK)]);
-                } else throw err;
-            }
-        }
-
-        (next, vec, comm)
-    }
-
-    /**
-     * Throw a syntax error if there are attributes in a wrong position
-     * */
-    fn checkNoAttributes (self, loc : &Word, attrLoc : &Word, attribs : [AttributeWord])
-        throws ErrorMsg
-    {
-        if (!attrLoc.isEof ()) {
-            if (!loc.isEof ()) {
-                throw copy ErrorMsg::fatal (attrLoc, format (SyntaxErrorMessage::UNEXPECTED_ATTRIBUTES, copy [x.attr for x in attribs]),
-                                            notes-> copy [copy ErrorMsg::note (loc, "")]);
-            } else {
-                throw copy ErrorMsg::fatal (attrLoc, format (SyntaxErrorMessage::UNEXPECTED_ATTRIBUTES, copy [x.attr for x in attribs]));
-            }
         }
     }
 
@@ -1932,7 +1465,7 @@ pub class SyntaxVisitor {
         let (tok, _) = self:.readIf (Tokens::LACC, Keys::IF, Keys::WHILE, Keys::ASSERT,
                                      Keys::BREAK, Keys::DO, Keys::FOR, Keys::MATCH, Keys::FUTURE,
                                      Keys::LET, Keys::RETURN, Keys::FUNCTION, Keys::DELEGATE,
-                                     Keys::LOOP, Keys::THROW, Keys::PANIC, Keys::VERSION, Keys::PRAGMA,
+                                     Keys::LOOP, Keys::THROW, Keys::PANIC, Keys::PRAGMA,
                                      Keys::ATOMIC, Keys::UNSAFE);
 
         match tok {
@@ -1950,8 +1483,7 @@ pub class SyntaxVisitor {
             Keys::FUNCTION => { self:.readFunctionType (tok) }
             Keys::DELEGATE => { self:.readFunctionType (tok) }
             Keys::FUTURE   => { self:.readFutureType (tok) }
-            Keys::THROW    => { self:.readThrow (tok) }
-            Keys::VERSION  => { self:.readVersionExpr (tok) }
+            Keys::THROW    => { self:.readThrow (tok) }            
             Keys::PRAGMA   => { self:.readPragma (tok) }
             Keys::ATOMIC   => { self:.readAtomic (tok) }
             Keys::UNSAFE   => { self:.readUnsafe (tok) }
@@ -2239,16 +1771,19 @@ pub class SyntaxVisitor {
                     }
 
                     last = false;
-                    let (attrLoc, attribs, attrComm) = self:.readAttributes ();
-                    let (d, _) = self:.readIf (Keys::CLASS, Keys::ENUM, Keys::FUNCTION, Keys::USE, Keys::STRUCT, Keys::RECORD, Keys::UNION, Keys::TRAIT);
-                    if (!d.isEof ()) {
-                        self._lex:.rewind ();
-                        decls ~= [self:.readDeclaration (comm-> attrComm, attribs-> (attrLoc, attribs))];
-                        last = true;
-                    } else {
-                        self.checkNoAttributes (EOF_WORD, attrLoc, attribs);
-                        content ~= [self:.readExpression ()];
-                    }
+                    let node = self:.readEither!{&SyntaxNode} (|dmut ctx : &SyntaxVisitor| => { ctx:.readExpression ()? },                    
+                                                               |dmut ctx : &SyntaxVisitor| => {
+                                                                   ctx._global.readDeclaration (alias ctx)?
+                                                               });
+
+                    match node {
+                        e : &Expression => { content ~= [e]; }
+                        d : &Declaration => {
+                            decls ~= [d];
+                            last = true;
+                        }
+                        _ => panic;
+                    }                                                                                
                 } else if (end == Tokens::SEMI_COLON) {
                     last = true;
                 } else break;
@@ -2431,34 +1966,6 @@ pub class SyntaxVisitor {
         let (params, _) = self:.readArgumentList ();
 
         copy PragmaExpr (ident, params)
-    }
-
-
-    /**
-     * Read a version block expr
-     * @verbatim:
-     * =========================
-     * version_block := Keys::VERSION Identifier block (Keys::ELSE block)?
-     * =========================
-     */
-    fn readVersionExpr (mut self, loc : &Word)-> &Expression
-        throws ErrorMsg
-    {
-        let (ident, _) = self:.readIdentifier (canBeSelf-> false);
-        return if state::instance ().isVersionActive (ident.str) {
-            let (n, _) = self:.readIf (Tokens::LACC);
-            let value = self:.readBlock (n, canBeCatcher-> false);
-            if (!(self:.readIf (Keys::ELSE)._0).isEof ()) {
-                self:.ignoreBlock ();
-            }
-            value
-        } else {
-            self:.ignoreBlock ();
-            if (!(self:.readIf (Keys::ELSE)._0).isEof ()) {
-                let (n, _) = self:.readIf (Tokens::LACC);
-                self:.readBlock (n, canBeCatcher-> false)
-            } else { copy EmptyExpression (loc-> loc) }
-        }
     }
 
     /**
@@ -3382,80 +2889,6 @@ pub class SyntaxVisitor {
         }
     }
 
-
-
-    /**
-     * Read a namepath expression
-     * @verbatim:
-     * =============
-     * namepath_expr := Identifier ('::' Identifier)*
-     * =============
-     */
-    fn readPath (mut self) -> &Expression
-        throws ErrorMsg
-    {
-        let fst = self:.readIdentifier (canBeSelf-> false);
-        let mut res : &Expression = copy VarExpr (fst._0);
-        loop {
-            let (next, _) = self:.readIf (Tokens::DCOLON);
-            if (!next.isEof ())  {
-                let af = {
-                    let (x, _) = self:.readIf (Keys::UNDER);
-                    if !x.isEof () { x }
-                    else { self:.readIdentifier (canBeSelf-> false)._0 }
-                }
-                res = copy PathExpr (next, res, copy VarExpr (af));
-            } else break;
-        }
-
-        res
-    }
-
-    /**
-     * Read a complex path
-     * @example:
-     * ====
-     * foo::{bar, baz} => [ foo::bar, foo::baz ]
-     * foo::{bar::{baz, bad::ouch}, fee} ==> [ foo::bar::baz, foo::bar::bad::ouch, foo::fee ]
-     * ====
-     * */
-    fn readComplexPath (mut self, root : &Expression, ref mut result : [mut &Expression])
-        throws ErrorMsg
-    {
-        let mut res = root;
-        loop {
-            let (next, _) = self:.readIf (Tokens::DCOLON);
-            if (!next.isEof ()) {
-                if (!self:.readIf (Tokens::LACC)._0.isEof ()) {
-                    loop {
-                        let (under, _) = self:.readIf (Keys::UNDER);
-                        if (!under.isEof ()) {
-                            result ~= [copy PathExpr (next, res, copy VarExpr (under))];
-                        } else {
-                            let current = copy PathExpr (next, res, copy VarExpr (self:.readIdentifier (canBeSelf-> false)._0));
-                            self:.readComplexPath (current, ref result);
-                        }
-
-                        if (self:.readTokens (Tokens::RACC, Tokens::COMA)._0 == Tokens::RACC) break;
-                    }
-
-                    break;
-                } else {
-                    let (under, _) = self:.readIf (Keys::UNDER);
-                    if (!under.isEof ()) {
-                        result ~= [copy PathExpr (next, res, copy VarExpr (under))];
-                        break;
-                    }
-
-                    res = copy PathExpr (next, res, copy VarExpr (self:.readIdentifier (canBeSelf-> false)._0));
-                }
-            } else {
-                result ~= [res];
-                break;
-            }
-        }
-    }
-
     /**
      * Read an array literal
      * @verbatim:
@@ -3782,45 +3215,75 @@ pub class SyntaxVisitor {
         true
     }
 
-
     /*!
-     * ================================================================================
-     * ================================================================================
-     * =========================        MISCELLANEOUS         =========================
-     * ================================================================================
-     * ================================================================================
+     * ====================================================================================================
+     * ====================================================================================================
+     * ================================          READING HELPERS          =================================
+     * ====================================================================================================
+     * ====================================================================================================
      */
-
-
+    
     /**
      * @returns: the next token inside the lexer, if it is equals to one of the token inside lst
      * @info: if none of lst token is found, the lexer is not incremented
      * @params:
      *    - lst: a list of tokens
      */
-    fn readIf {R...} (mut self, f : [c8], lst : R)-> (&Word, [c8]) {
-        let (x, _) = self._lex.nextNoConsume ();
+    pub fn readIf {R...} (mut self, f : [c8], l : R)-> (&Word, [c8]) {                
+        let (x, _) = self._lex.nextNoConsume ();        
         if (x.isEof ()) return (EOF_WORD, "");
 
-        if (x.str == f) return self._lex:.next ();
-        cte if (R,)::arity > 1 {
-            for i in lst if i == x.str {
-                return self._lex:.next ();
-            }
-        } else {
-            if lst == x.str { return self._lex:.next (); }
+        let tokens = [f, expand (cte if (R,)::arity == 1 { (l,) } else { l })];
+        for i in tokens if i == x.str {
+            return self._lex:.next ();
         }
-
+        
         return (EOF_WORD, "");
     }
 
     /**
+     * Read a succession of tokens, trying to make them match with the list passed in params
+     * @returns:
+     *    - .0: true iif the reading succeeded
+     *    - .1: the list of word read
+     *    - .2: the comments (of each tokens)
+     * */
+    pub fn readIfLst {R...} (mut self, f : [c8], l : R)-> (bool, [&Word], [[c8]]) {
+        let tokens = [f, expand (cte if (R,)::arity == 1 { (l,) } else { l })];        
+        let seek = self._lex.getSeek ();
+        let mut res : [&Word] = [];
+        let mut com : [[c8]] = [];
+            
+        for tok in tokens {
+            let (x, c) = self._lex.nextNoConsume ();
+            if x.isEof () {
+                self._lex:.rewindToSeek (cursor-> seek);
+                return (false, [], []);
+            }
+            
+            if x.str != tok {
+                self._lex:.rewindToSeek (cursor-> seek);
+                return (false, [], []);
+            }
+
+            res ~= [x];
+            com ~= [c];
+            
+            // consume the next token 
+            self._lex:.next ();                            
+        }
+        
+        return (true, res, com)
+    }
+
+    
+    /**
      * @returns: the next token inside the lexer, if it is equals to one of the token inside lst
      * @info: if none of lst token is found, the lexer is not incremented
      * @params:
      *    - lst: a list of tokens
      */
-    fn readIf (mut self, lst : [[c8]])-> (&Word, [c8]) {
+    pub fn readIf (mut self, lst : [[c8]])-> (&Word, [c8]) {
         let (x, _) = self._lex.nextNoConsume ();
         if (x.isEof ()) return (EOF_WORD, "");
 
@@ -3839,7 +3302,7 @@ pub class SyntaxVisitor {
      * @params:
      *    - lst: a list of tokens
      */
-    fn readDirectIf (mut self, lst : [[c8]])-> &Word {
+    pub fn readDirectIf (mut self, lst : [[c8]])-> &Word {
         let x = self._lex:.directNext ();
         if (x.isEof ()) return EOF_WORD;
 
@@ -3860,7 +3323,7 @@ pub class SyntaxVisitor {
      * @params:
      *    - lst: a token
      */
-    fn readIf (mut self, lst : [c8])-> (&Word, [c8]) {
+    pub fn readIf (mut self, lst : [c8])-> (&Word, [c8]) {
         let (x, _) = self._lex.nextNoConsume ();
         if (x.str == lst) return self._lex:.next ();
 
@@ -3873,7 +3336,7 @@ pub class SyntaxVisitor {
      * @params:
      *    - lst: a token
      */
-    fn readDirectIf (mut self, lst : [c8])-> &Word {
+    pub fn readDirectIf (mut self, lst : [c8])-> &Word {
         let x = self._lex:.directNext ();
         if (x.isEof ()) return EOF_WORD;
 
@@ -3890,27 +3353,32 @@ pub class SyntaxVisitor {
      * @params:
      *    - lst: a list of tokens
      */
-    fn readTokens {R...} (mut self, f : [c8], lst : R)-> (&Word, [c8])
+    pub fn readTokens {R...} (mut self, f : [c8], l : R)-> (&Word, [c8])
         throws ErrorMsg
     {
+        let tokens = [f, expand (cte if (R,)::arity == 1 { (l,) } else { l })];        
         let (x, y) = self._lex:.next ();
-        if (x.str == f) return (x, y);
-        cte if (R,)::arity > 1 {
-            for i in lst if i == x.str {
-                return (x, y);
-            }
-
-            let  err = copy [f] ~ [i for i in (expand lst,)];
-            throw copy ErrorMsg::fatal (x, format (SyntaxErrorMessage::UNEXPECTED_BUT_LST, x.str, err));
-        } else {
-            if lst == x.str { return (x, y); }
-
-            let  err = copy [f] ~ [lst];
-            throw copy ErrorMsg::fatal (x, format (SyntaxErrorMessage::UNEXPECTED_BUT_LST, x.str, err));
+        for j in tokens if x.str == j {
+            return (x, y);            
         }
-
+        
+        throw copy ErrorMsg::fatal (x, format (SyntaxErrorMessage::UNEXPECTED_BUT_LST, x.str, copy tokens));        
     }
 
+    /**
+     * @returns: the next token inside the lexer
+     * */
+    pub fn readToken (mut self)-> (&Word, [c8]) {
+        self._lex:.next ()
+    }
+
+    /**
+     * @returns: the next token in the lexer without making the cursor progress
+     * */
+    pub fn isEof (self)-> bool {
+        self._lex.isEof ()
+    }
+    
     /**
      * @returns: the next token inside the lexer, if it is equals to one of the token inside lst
      * @throws:
@@ -3938,7 +3406,7 @@ pub class SyntaxVisitor {
      * @params:
      *    - lst: a list of tokens
      */
-    fn readDirectTokens (mut self, lst : [[c8]])-> &Word
+    pub fn readDirectTokens (mut self, lst : [[c8]])-> &Word
         throws ErrorMsg
     {
         let x = self._lex:.directNext ();
@@ -3958,24 +3426,16 @@ pub class SyntaxVisitor {
      * @params:
      *    - lst: a list of tokens
      */
-    fn readDirectTokens {R...} (mut self, f : [c8], lst : R)-> &Word
+    pub fn readDirectTokens {R...} (mut self, f : [c8], l : R)-> &Word
         throws ErrorMsg
     {
+        let tokens = [f, expand (cte if (R,)::arity == 1 { (l,) } else { l })];
         let x = self._lex:.directNext ();
-        if x.str == f { return x; }
-        cte if (R,)::arity > 1 {
-            for i in lst if i == x.str {
-                return x;
-            }
-
-            let  err = copy [f] ~ [i for i in (expand lst,)];
-            throw copy ErrorMsg::fatal (x, format (SyntaxErrorMessage::UNEXPECTED_BUT_LST, x.str, err));
+        for i in tokens if i == x.str {
+            return x;
         }
-
-        else {
-            if lst == x.str { return x; }
-            throw copy ErrorMsg::fatal (x, format (SyntaxErrorMessage::UNEXPECTED_BUT_LST, x.str, copy [f] ~ [lst]));
-        }
+        
+        throw copy ErrorMsg::fatal (x, format (SyntaxErrorMessage::UNEXPECTED_BUT_LST, x.str, copy tokens));        
     }
 
 
@@ -3986,7 +3446,7 @@ pub class SyntaxVisitor {
      * @params:
      *    - lst: a token
      */
-    fn readTokens (mut self, lst : [c8])-> (&Word, [c8])
+    pub fn readTokens (mut self, lst : [c8])-> (&Word, [c8])
         throws ErrorMsg
     {
         let (x, y) = self._lex:.next ();
@@ -4002,7 +3462,7 @@ pub class SyntaxVisitor {
      * @params:
      *    - lst: a token
      */
-    fn readDirectTokens (mut self, lst : [c8])-> &Word
+    pub fn readDirectTokens (mut self, lst : [c8])-> &Word
         throws ErrorMsg
     {
         let x = self._lex:.directNext ();
@@ -4011,8 +3471,126 @@ pub class SyntaxVisitor {
         throw copy ErrorMsg::fatal (x, format (SyntaxErrorMessage::UNEXPECTED_BUT_LST, x.str, lst));
     }
 
+    /**
+     * @returns: the next token inside the lexer
+     * */
+    pub fn rewind (mut self) {
+        self._lex:.rewind ()
+    }
+
+    /**
+     * Rewind to the cursor of a word, right before the word
+     * thus self:.readToken () might return the word after that if this is a token
+     * */
+    pub fn rewindToSeek (mut self, loc : &Word) {
+        self._lex:.rewindToSeek (cursor-> loc.seek)
+    }
+
+    /**
+     * Register the location of the lexer to rewind to that location later if the reading failed
+     * @example:
+     * ```
+     * context:.registerTry (); // Store a recoverable state
+     * {    
+     *     self:.readTokens (Tokens::NOT);
+     *     self:.readTokens (Tokens::LACC);
+     *     self:.forgetTry (); // all succeeded, no need to keep it
+     * } catch {
+     *     _ => {
+     *        // '!' may be read, or not, but it's not important, we got back to the start as if the block was never executed
+     *        context:.recover (); 
+     *     }
+     * }
+     * ```
+     * */
+    pub fn registerTry (mut self) {
+        self._recoveringStates:.push (self._lex.getSeek ());
+    }
+
+    /**
+     * Forget the last registered try
+     * */
+    pub fn forgetTry (mut self) {
+        self._recoveringStates:.pop ();
+    }
+    
+    /**
+     * Recover the last registered try (and forget it)
+     * */
+    pub fn recover (mut self) {
+        let s = self._recoveringStates.back ();
+        self._lex:.rewindToSeek (s);
+        self._recoveringStates:.pop ();
+    }
 
 
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ===============================          COMPLEX BRANCHING          ================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    
+    pub fn readEither {T, Z over T, FN...} (mut self, f : dg (dmut &SyntaxVisitor)-> (Z)?, l : FN)-> T
+        throws ErrorMsg
+    {        
+        let mut errors : [&ErrorMsg] = [];
+        if let Ok (v) = self:.tryFunc!{T} (f, ref errors) {
+            return v;
+        }
+
+        cte if (FN,)::arity > 1 {
+            cte for i in l {
+                if let Ok (v) = self:.tryFunc!{T} (i, ref errors) {
+                    return v;
+                }            
+            }
+        } else {
+            if let Ok (v) = self:.tryFunc!{T} (l, ref errors) {
+                return v;
+            }            
+        }
+
+        if errors.len != 0 {
+            throw copy ErrorMsg::list (errors);
+        }
+
+        let (n, _) = self._lex.nextNoConsume ();
+        throw copy ErrorMsg::fatal (n, format (SyntaxErrorMessage::UNEXPECTED, n));         
+    }
+
+
+    fn tryFunc {T, Z} (mut self, f : dg (dmut &SyntaxVisitor)-> (Z)?, ref mut errors : [&ErrorMsg])-> (T)? {
+        self:.registerTry ();
+        let value = f (alias self);
+        
+        if let Ok (z) = value {
+            self:.forgetTry ();
+            return (z)?
+        }
+
+        self:.recover ();
+        if let Err (e : &ErrorMsg) = value {
+            errors ~= [e];
+        }
+
+        none
+    }
+    
+    // fn readEitherDecl {F, FN...} (dmut self, func : F, funcs : FN)-> &Declaration
+    //     throws ErrorMsg
+    // {
+        
+    // }    
+
+    // fn readEitherDecl {F, FN...} (dmut self, func : F, funcs : FN)-> &Expression
+    //     throws ErrorMsg
+    // {
+        
+    // }        
+    
     /*!
      * ================================================================================
      * ================================================================================
