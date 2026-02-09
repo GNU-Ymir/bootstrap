@@ -1,452 +1,791 @@
+/*
+ * @Package: ymirc        
+ * @Module: ymirc::lexing::lexer
+ * @File: ymirc/lexing/lexer.yr
+ *
+ * @Purpose:
+ *   Module in charge of the definition of the class SrcLexer.
+ *   The lexer cuts the string containing Ymir source into a list of tokens.
+ *   It also defines a list of tools to traverse the list of tokens once cut down.
+ *
+ * @Author(s):
+ *   - Emile Cadorel ecadorel@gmail.com
+ *
+ * @Created (YYYY-MM-DD): 2021-11-12 
+ *
+ * @Copyright (C) 2021–2026 GNU-Ymir
+ *
+ * ```text
+ * This file is part of the Ymir language project.
+ *
+ * Ymir is free software: you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * Ymir is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with Ymir.  If not, see <https://www.gnu.org/licenses/>.
+ * ```
+ */
+
 in lexer;
     
-use ymirc::lexing::{word, tokens};
-use ymirc::utils::list;
+use ymirc::lexing::_;
+use ymirc::errors::message;
+use ymirc::utils::format;
 
-use std::syntax::tokenizer;
 use std::{stream, io};
+use std::algorithm::comparison;
 
 /**
- * The lexer is the class responsible of cutting a source code string into a list of tokens
- * Unlike simple tokenizer, the lexer has context information, and switch (allowing to ignore parts of the source code, or not depending of the context)
+ * The lexer is responsible for cutting a source string into a sequence of tokens.
+ * Unlike a simple tokenizer, it maintains contextual state and can switch modes,
+ * allowing it to ignore or include parts of the input depending on the current
+ * lexical context.
+ *
+ * The Lexer also provides navigation utilities (forward, backtrack, lookahead)
+ * to support the syntax visitor and other compiler stages.
+ *
+ * @info:
+ *   The lexer does not open files itself. It is constructed from a string, but
+ *   stores a filename so that the Words it produces can be annotated with proper
+ *   source locations.
+ *
+ * @example:
+ * ```
+ * let content = {
+ *     let dmut file = File::open (path);
+ *     file:.readAll ()
+ * }; // File is an entity, therefore closed here
+ * 
+ * let dmut lex = copy SrcLexer ("file.yr", content);
+ *
+ * // All words are already cut; now we can traverse them
+ * while let (tok, comm) = lex:.next () && !tok of EofWord {
+ *     println ("Token : ", tok);
+ *     println ("Comment above the token : ", comm);
+ * }
+ * ```
  */
+
 @final
-pub class Lexer {
-    
-    // The name of the file that the lexer is reading
-    let _filename : [c8];
+pub class SrcLexer {
 
-    // The content of the file, that is tokenized
-    let _content : [c8];
+    /*! Immutable fields **/
+    prv {
+        // The name of the file that the lexer is reading
+        let _filename : [c8];
 
-    // Does the lexer has to skip comments
-    let mut _doComments : bool = true;
-
-    // The position of the cursor
-    let mut _cursor : usize = 0us;
-
-    // The current word that is being read
-    let mut _wordCursor : usize = 0us;
-
-    // The list of words infos
-    let mut _wordInfos : [(usize, bool, [c8])] = [];
-
-    // The end comments that are found
-    let dmut _commentEnds : [usize => (usize, usize)] = copy [];
-
-    // The list of allocated words found in the files (the tokens basically)
-    let mut _words : [&Word] = [] ;
-    
-    // The position of the (cursors, line, col, lineSeek) of the previous read words
-    let dmut _rewinders : &List!{(usize, usize)} = copy List!{(usize, usize)} ();
-
-    // Set to true, when nothing is left to read (iif _cursor >= _content.len)
-    let mut _eof : bool = false;
-
-    // The word returns when the lexer is eof
-    let _eofWord : &Word;
-
-    let _initLine : u64;
-    let _initCol : u64;
-    let _initLineSeek : usize;
-
-    /**
-     * Create a new lexer, ready to split content
-     * @params: 
-     *    - content: the content to split
-     *    - tokens: the list of tokens that split the string, (cf. Tokenizer)
-     *    - comments: the list of tokens that start a comment line (by default [])
-     *    - skips: the list of tokens that will be omitted by the lexer when reading (by default [" ", "\n", "\t", "\r"])
-     * @warning: if the skips and comments token are not in tokens, they are added, so they split the content 
-     */
-    pub self (filename : [c8], content : [c8], tokens: [[c8]], comments : [([c8], [c8])], skips: [[c8]], addLine : u64 = 1u64, addCol : u64 = 1u64, lineSeek : usize = 0us)
-        with _filename = filename
-        , _content = content
-        , _eofWord = copy Word::eof (filename-> filename)
-        , _initLine = addLine
-        , _initCol = addCol
-        , _initLineSeek = lineSeek
-    {
-        self._rewinders:.push ((self._cursor, self._wordCursor));
-
-        let mut tzer = Tokenizer!{c8} (tokens-> tokens);
-        for i in comments {
-            tzer:.insert (i._0, isComment-> i._1);
-        }
-
-        for i in skips {
-            tzer:.insert (i, isSkip-> true);
-        }
-
-        self:.readAll (tzer);
-    }        
-
-    /**
-     * Read the next word in the lexer, and returns it, with the documentation read before it
-     * @returns:
-     *   - .0: the next word in the lexer
-     *   - .1: the associated comments
-     */
-    pub fn next (mut self)-> (&Word, [c8]) {
-        if (self._eof) return (self._eofWord, "");
-
-        self._rewinders:.push ((self._cursor, self._wordCursor));
-        let mut start_com = 0us;
-        let mut end_com = 0us;
-
-        while (self._wordCursor < self._wordInfos.len) {
-            let (wd, isSkip, isComment) = self._wordInfos [self._wordCursor];
-            self._wordCursor += 1us;
-            self._cursor += wd;
-            if (!isSkip) {
-                if (isComment != "") {
-                    let begin_com = self._wordCursor - 1;
-                    start_com = self._cursor;
-                    self:.gotoNextToken (isComment, self._words [self._wordCursor - 1].str);
-                    end_com = self._cursor - isComment.len;
-                    if (self._words [begin_com] == (CommentTokens::MULTILINE_NO_DOC)._0) { start_com = end_com; }
-                } else {
-                    return (self._words [self._wordCursor - 1us], self._content [start_com .. end_com]);
-                }
-            }
-        }
-
-        self._eof = true;
-        return (self._eofWord, "");
-    }
-
-    /**
-     * Read the next word in the lexer, and returns it, with the documentation read before it
-     * @returns:
-     *   - .0: the next word in the lexer
-     *   - .1: the associated comments
-     */
-    pub fn nextNoConsume (self)-> (&Word, [c8]) {
-        if (self._eof) return (self._eofWord, "");
-        let mut start_com = 0us;
-        let mut end_com = 0us;
-
-        let mut saveWC = self._wordCursor, mut saveC = self._cursor;
-        while (saveWC < self._wordInfos.len) {
-            let (wd, isSkip, isComment) = self._wordInfos [saveWC];
-
-            saveWC += 1us;
-            saveC += wd;
-            if (!isSkip) {
-                if (isComment != "") {
-                    let begin_com = saveWC - 1;
-                    start_com = saveC;
-                    let (postWC, postC) = self.gotoNextTokenNoConsume (isComment, self._words [saveWC - 1].str, saveWC, saveC);
-                    saveWC = postWC;
-                    saveC = postC;
-                    end_com = saveC - isComment.len;
-                    if (self._words [begin_com] == (CommentTokens::MULTILINE_NO_DOC)._0) { start_com = end_com; }
-                } else {
-                    return (self._words [saveWC - 1us], self._content [start_com .. end_com]);
-                }
-            }
-        }
-
-        return (self._eofWord, "");
-    }
-
-    /**
-     * @returns: the next word, without taking into account skips, and comments
-     */
-    pub fn directNext (mut self)-> &Word {
-        if (self._eof) return self._eofWord;
+        // The content of the file, that is tokenized
+        let _content : [c8];
         
-        self._rewinders:.push ((self._cursor, self._wordCursor));
-        if (self._wordCursor < self._wordInfos.len) {
-            self._wordCursor += 1us;
-            self._cursor += self._wordInfos [self._wordCursor - 1us]._0;
-            self._words [self._wordCursor - 1us]
-        } else {
-            self._eof = true;
-            self._eofWord
-        }
-    }
-    
-    /**
-     * Got to the end of a string disabling skip tokens
-     * @params: 
-     *    - closing: the token closing the string
-     * @returns: 
-     *   - .0 : the content of the string literal
-     *   - .1 : the closing word
-     */
-    pub fn getString (mut self, closing : [c8], opening : [[c8]] = [], escaping : bool = false)-> ([c8], &Word) {
-        let start = self._cursor;
-        let mut nb = 1us;
-        let mut currentEscape = false;
-        while (self._wordCursor < self._wordInfos.len) {
-            let (wd, _, _) = self._wordInfos [self._wordCursor];
-
-            let ret = self._content [self._cursor .. self._cursor + wd];
-            self._wordCursor += 1us;
-            self._cursor += wd;
-                
-            if (ret == closing && !currentEscape) {
-                nb -= 1us;
-                if (nb == 0us) {
-                    return (self._content [start .. self._cursor - wd], self._words [self._wordCursor - 1us]);
-                }
-            } else if (!currentEscape) {
-                for j in opening {
-                    if ret == j {
-                        nb += 1us;
-                        break;
-                    }
-                }
-            }
-
-            currentEscape = escaping && !currentEscape && (ret == Tokens::ANTI);
-        }
-
-        self._eof = true;
-        return (self._content [start .. $], self._eofWord);
     }
 
+    /*! Mutable fields */
+    prv {
+        // The current word that is being read
+        let mut _cursor : usize = 0us;
 
-    /**
-     * @returns:
-     *    - .0: the string that was read so far as the location of the current word cursor
-     *    - .1: the rest of the string that was not yet read
-     * */
-    pub fn getCutContent (self)-> ([c8], [c8]) {
-        let beg = self._content [0us .. self._cursor];
-        let end = self._content [self._cursor .. $];
+        // The comments about a word
+        let mut _wordComms : [[c8]] = [];
 
-        (beg, end)
-    }
+        // The list of allocated words found in the files (the tokens basically)
+        let mut _words : [&Word] = [] ;
 
-    /**
-     * @returns: true if we reached the end of the lexer
-     * */
-    pub fn isEof (self)-> bool {
-        let (n, _) = self.nextNoConsume ();
-        return n.isEof ()
+        // The word returns when the lexer is eof
+        let mut _eofWord : &Word;
     }
     
     /*!
-     * ================================================================================
-     * ================================================================================
-     * =========================            REWIND            =========================
-     * ================================================================================
-     * ================================================================================
+     * ====================================================================================================
+     * ====================================================================================================
+     * =====================================          CTORS          ======================================
+     * ====================================================================================================
+     * ====================================================================================================
      */
     
     /**
-     * Rewind to a previous location in the file
-     * Each time the function next is called, the lexer saves the cursor position
-     * This function rewind go to that cursor position, so if we rewind 10 times, we will get the last 10 next calls
-     * @warning: 
-     * ===============
-     * when toggeling skips, and doComment, the rewind does not garantee, that the lexer will return at least nb tokens
-     * ===============
+     * Creates a new lexer ready to split the given content.
+     *
+     * @params:
+     *   - content:   the string to cut into lexical words          
+     *
+     * @warning:
+     *   If skip or comment tokens are not present in `tokens`, they are automatically
+     *   added so that they correctly participate in splitting the content.
+     *
+     * @info:
+     *   The constructor immediately cuts the entire string into a list of `Word`
+     *   instances. Pre‑cutting the full sequence has proven significantly more
+     *   efficient than tokenizing on demand. All traversal methods operate solely
+     *   on this precomputed collection, no further tokenization occurs after
+     *   construction.
      */
+    pub self (filename : [c8], content : [c8])        
+        with _filename = filename
+        , _content = content
+        , _eofWord = copy EofWord (filename-> filename)
+
+        throws ErrorMsg
+    {        
+        self:.tokenizeAll (__SRC_TOKENIZER__);
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * =====================================          USAGE          ======================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Returns the word being pointed by cursor and make the cursor move forward
+     *
+     * @info
+     *   EOF word is returned if we reached the end of the collection
+     *
+     * @returns:
+     *    - .0: the word
+     *    - .1: the comment attached to the word
+     * */
+    pub fn next (mut self)-> (&Word, [c8]) {                         
+        self._cursor += 1;
+        if (self._cursor >= self._words.len) {
+            self._cursor = self._words.len;            
+            return (self._eofWord, "");            
+        }
+
+        return (self._words [self._cursor - 1], self._wordComms [self._cursor - 1]);
+    }
+
+    /**
+     * Returns the word pointed by the cursor without making the cursor move forward
+     *
+     * @info
+     *    EOF is returned if we reached the end of the collection
+     *
+     * @returns: the word pointed by the cursor     
+     * */
+    pub fn peek (self)-> &Word {                
+        if (self._cursor >= self._words.len) {            
+            return self._eofWord;            
+        }
+
+        return self._words [self._cursor];
+    }
+
+    /**
+     * Move the cursor back by one
+     * 
+     * @info
+     *   Do nothing if we are already at the start of the collection
+     * */
     pub fn rewind (mut self) {
-        if (self._eof) {
-            self._rewinders:.pop ();
-            self._eof = false;
-        }
+        if self._cursor == 0
+            return;
 
-        let (x, h) = self._rewinders.back ();
-        self._cursor = x;
-        self._wordCursor = h;
-
-        self._rewinders:.pop ();
-        if (self._rewinders.isEmpty ()) {
-            self._rewinders:.push ((self._cursor, self._wordCursor));
-        }
+        self._cursor -= 1;        
     }
 
     /**
-     * Rewind to a previous location in the file, moving the c8 cursor
-     * @params: 
-     *   - cursor: the c8 seek cursor to go to 
-     */
-    pub fn rewindToSeek (mut self, cursor : usize) {
-        if (self._eof) {
-            self._rewinders:.pop ();
-            self._eof = false;
+     * Move the cursor back to the seek of a given word
+     *
+     * @panic
+     *    Panic if we try to make the cursor move forward (i.e. self.getSeek () < seek)
+     *    
+     * @info
+     *   if the seek is not an exact word, move to the word whose .seek < seek
+     *   
+     * @params:
+     *    - seek: the seek of the word to rewind to
+     *
+     * */
+    pub fn rewindToSeek (mut self, seek : usize) {        
+
+        // rewindToSeek must not be used to go forward 
+        if self.getSeek () < seek {
+            eprintln ("internal lexer error: rewinding forward");            
+            panic; 
         }
 
-        while self._rewinders.len > 0 {
-            let (x, h) = self._rewinders.back ();
-            self._cursor = x;
-            self._wordCursor = h;
-            self._rewinders:.pop ();
-            if (x <= cursor) break;
-        }
-
-        if (self._rewinders.len == 0us) {
-            self._rewinders:.push ((self._cursor, self._wordCursor));
-        }
-    }
-
-    /***
-     * ============================================================================
-     * ============================================================================
-     * =========================          GETTERS        ==========================
-     * ============================================================================
-     * ============================================================================
-     */
-    
-    /**
-     * @returns: the counter of previous "self:.next" calls
-     * @info: this information can be usefull to go back rapidely
-     * @example: 
-     * =================
-     * let dmut lex : &Lexer = ...
-     * let read_Nb : u64 = ...
-     * let cursor = lex.getSeek ();
-     * for i in 0 .. read_Nb {
-     *     println (lex:.next ()._0);
-     * }
-     * lex:.rewindToSeek (cursor); // go back of number of valid read done
-     * // so the lexer will be reset, as if the for loop never executed
-     * =================
-     */
-    pub fn getSeek (self)-> usize {
-        self._cursor
-    }
-
-    /***
-     * ============================================================================
-     * ============================================================================
-     * =========================          PRIVATE        ==========================
-     * ============================================================================
-     * ============================================================================
-     */
-    
-    /**
-     * Move the cursor (and counters) to the next token == end
-     */
-    prv fn gotoNextToken (mut self, end : [c8], opening : [c8])-> void {
-        let start = self._wordCursor;
-        if let Ok (x) = self._commentEnds [self._wordCursor] {
-            self._wordCursor = x._0;
-            self._cursor = x._1;
+        // rewind to end, and already at end
+        if seek == self._content.len {
+            self._cursor = self._words.len;
             return;
         }
-
-        if tokens::isMultipleLineComment (opening) {
-            let mut finish = 0us;
-            while (self._wordCursor < self._wordInfos.len) {
-                let (wd, _, _) = self._wordInfos [self._wordCursor];
-                let ret = self._content [self._cursor .. self._cursor + wd];
-                self._wordCursor += 1us;
-                self._cursor += wd;
-
-                if (ret == end) {
-                    if (finish == 0us) {
-                        self._commentEnds [start] = (self._wordCursor, self._cursor);
-                        return;
-                    } else finish -= 1us;
-                } else if ret == opening {
-                    finish += 1us;
-                }
-            }
-        } else {
-            while (self._wordCursor < self._wordInfos.len) {
-                let (wd, _, _) = self._wordInfos [self._wordCursor];
-                let ret = self._content [self._cursor .. self._cursor + wd];
-                self._wordCursor += 1us;
-                self._cursor += wd;
-
-                if (ret == end) {
-                    self._commentEnds [start] = (self._wordCursor, self._cursor);
-                    return;
-                }
-            }
-        }
-
-        self._commentEnds [start] =  (self._wordCursor, self._cursor);
-    }
-
-    /**
-     * Move the cursor (and counters) to the next token == end
-     */
-    prv fn gotoNextTokenNoConsume (self, end : [c8], opening : [c8], wordCursor : usize, cursor : usize)-> (usize, usize) {
-        if let Ok (x) = self._commentEnds [wordCursor] {
-            return (x._0, x._1);
-        }
-
-        let mut saveWC = wordCursor, mut saveC = cursor;
-        if tokens::isMultipleLineComment (opening) {
-            let mut finish = 0us;
-            while (saveWC < self._wordInfos.len) {
-                let (wd, _, _) = self._wordInfos [saveWC];
-                let ret = self._content [saveC .. saveC + wd];
-                saveWC += 1us;
-                saveC += wd;
-
-                if (ret == end) {
-                    if (finish == 0us) {
-                        return (saveWC, saveC);
-                    } else finish -= 1us;
-                } else if ret == opening && isMultipleLineComment (opening) {
-                    finish += 1us;
-                }
-            }
-        } else {
-            while (saveWC < self._wordInfos.len) {
-                let (wd, _, _) = self._wordInfos [saveWC];
-                let ret = self._content [saveC .. saveC + wd];
-                saveWC += 1us;
-                saveC += wd;
-
-                if (ret == end) {
-                    return (saveWC, saveC);
-                }
-            }
-        }
-
-        return (saveWC, saveC);
-    }
-
-    /**
-     * Read the content to lex, and store the words
-     */
-    prv fn readAll (mut self, tzer : Tokenizer!{c8}) {
-        let mut tzerCursor = 0us;
-        let mut lineSeek = self._initLineSeek;
-        let mut line = self._initLine;
-        let mut col = self._initCol;
-
-        let dmut wordInfos = copy List!{(usize, bool, [c8])} ();
-        let dmut words = copy List!{dmut &Word} ();
-
+        
         loop {
-            let (len, isSkip, isComment) = tzer.next (self._content [tzerCursor .. $]);
-            if (len == 0us) break;
+            // First word break
+            if self._cursor == 0
+                return;
+            
+            // Current word is seek are before it
+            if self._cursor < self._words.len && self._words [self._cursor].seek <= seek
+                return;
 
-            let ret = self._content [tzerCursor  .. tzerCursor + len];
-            wordInfos:.push ((len, isSkip, isComment));
-            words:.push (copy Word (ret, filename-> self._filename, fileContent-> self._content, line, col, tzerCursor, lineSeek));
-            tzerCursor += len;
-
-            if (ret [0us] == '\n'c8) {
-                lineSeek = lineSeek + cast!usize (col);
-                line += 1u64;
-                col = 1u64;
-            } else { col += cast!u64 (len); }
+            // Rewind by one
+            self._cursor -= 1;
         }
-
-        self._wordInfos = wordInfos:[];
-        self._words = words:[];
     }
 
-    /***
-     * ==================================================================================
-     * ==================================================================================
-     * =========================          MISCELLANEOUS        ==========================
-     * ==================================================================================
-     * ==================================================================================
+    /**
+     * @returns: the seek of the word pointed by the cursor of the collection
+     * 
+     * @info
+     *   if EOF returns the seek of the EOF word
+     * */
+    pub fn getSeek (self)-> usize {
+        if self._cursor >= self._words.len // End of file returns the seek past last word 
+            return self._content.len;
+
+        // returns the seek of the current word
+        self._words [self._cursor].seek        
+    }
+
+    /**
+     * @returns: true iif we reached the end of the collection
+     * */
+    @field
+    pub fn isEof (self)-> bool {
+        self._cursor >= self._words.len                                
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ==================================          TOKENIZATION          ==================================
+     * ====================================================================================================
+     * ====================================================================================================
      */
+
+    /**
+     * Tokenize the content of the lexer into a list of words
+     * @params:
+     *    - tzer: the word tokenizer used to split the words     
+     *
+     * @info
+     *   Fill self._words collection
+     * */
+    prv fn tokenizeAll (mut self, tzer : SrcTokenizer)                        
+        throws ErrorMsg
+    {
+        let mut cursor      = SrcCursor (self._filename, self._content);                                           
+        let mut currentComm = "";
+        
+        while cursor.seek < self._content.len {
+            let slc = tzer.next (self._content [cursor.seek .. $]);
+            
+            // EOF
+            if slc.tok.len == 0us
+                break;
+
+            if slc.isSkip {
+                if slc.tok == "\n" { 
+                    cursor:.newLine (); // only skip contain line returns                            
+                } else {
+                    cursor:.forward (slc.tok.len);                        
+                }
+            } 
+            
+            else if slc.isString {
+                let (close, mult, suff, ident) = tzer.stringInfo (slc.tok);
+                let lst = tzer.openList (close);
+                
+                let word = self:.tokenizeString (tzer, slc.tok, close, lst, suff, mult, ident, ref cursor);
+                
+                self._words ~= [word];
+                self._wordComms ~= [currentComm];
+                currentComm = [];                
+            }
+
+            else if slc.isComment {
+                let (close, mult, doc) = tzer.commentInfo (slc.tok);
+                let lst = tzer.openList (close);                
+
+                currentComm ~= self:.tokenizeComment (tzer, slc.tok, close, lst, mult, doc, ref cursor)                
+            }
+
+            else if slc.isKeyword {
+                self._words ~= [cursor.instantiateKey (slc.tok)];
+                self._wordComms ~= [currentComm];
+                currentComm = [];
+                cursor:.forward (slc.tok.len);
+            }
+
+            else if slc.isToken {
+                self._words ~= [cursor.instantiateTok (slc.tok)];
+                self._wordComms ~= [currentComm];
+                currentComm = [];
+                cursor:.forward (slc.tok.len);
+            }
+
+            else {
+                let word = self:.tokenizeWord (tzer, slc.tok, ref cursor);
+                self._words ~= [word];
+                self._wordComms ~= [currentComm];
+            }                        
+        }
+        
+        self._eofWord = cursor.instantiateEof ();
+    }
+
+    /**
+     * Tokenize a string
+     * @params:
+     *   - tzer: the string tokenizer
+     *   - tok: the opening token
+     *   - close: the expected closing token of the string
+     *   - opens: the nested strings (with the same closing)
+     *   - mult: true iif the string can be written on multiple lines
+     *   - cursor: the cursor of the lexer to make forward
+     *  
+     * */
+    prv fn tokenizeString (mut self, tzer : SrcTokenizer, tok : [c8], close : [c8], opens : [[c8] => ()], suffixes : [[c8]], mult : bool, ident : bool, ref mut cursor : SrcCursor)-> &Word
+        throws ErrorMsg
+    {        
+        let mut startCursor   = cursor;        
+        cursor:.forward (tok.len);
+        
+        let mut depth = 1;
+        while cursor.seek < self._content.len {        
+            let ret = tzer.next (self._content [cursor.seek .. $]).tok;
+            if ret.len == 0us 
+                break;            
+                        
+            if ret == close { // reaching a close
+                cursor:.forward (ret.len);
+                depth -= 1;
+                if depth == 0 { // it's not a nested, it's the real close                    
+                    return self.finalizeString (tzer, tok, close, suffixes, mult, ident, ref startCursor, ref cursor);                
+                }
+            }
+            
+            else if ret == Tokens::ANTI { // escaping the next char
+                self.checkEscapeNothing (tok, startCursor, cursor, true);
+                self.checkEscapeReturn (tok, startCursor, cursor, true);
+                cursor:.forward (ret.len + 1);
+            }
+
+            else if ret == Tokens::RETURN { // New line
+                self.checkReturnMult (tok, startCursor, cursor, mult, true);                                
+                cursor:.newLine ();
+            }
+
+            else if ret in opens { // Nested string
+                depth += 1;
+                cursor:.forward (ret.len);        
+            }
+
+            else { // just a token
+                cursor:.forward (ret.len);
+            }                                            
+        }
+
+        // If here, means depth never was equal to 0
+        // Create a location token for the error message
+        let loc = startCursor.instantiateTok (tok);
+        throw copy ErrorMsg::fatal (loc, format (LexingErrorMessage::UNTERMINATED_STRING, close));        
+    }    
+
+
+    /**
+     * Finalize the string token
+     * @params:
+     *    - open:        the opening token
+     *    - close:       the closing token
+     *    - startCursor: the cursor at the opening location
+     *    - endCursor:   the cursor at the closing location
+     *    - mult:        true iif it's a multiline string (and therefore will be trimmed)
+     * */
+    fn finalizeString (self, tzer : SrcTokenizer, open : [c8], close : [c8], suffixes : [[c8]], mult : bool, ident : bool, ref mut startCursor : SrcCursor, ref mut endCursor : SrcCursor)-> &Word {            
+        let s = startCursor.seek + open.len;
+        let e = endCursor.seek - close.len;
+
+        if ident { // Not a string but an identifier `ident`
+            startCursor:.forward (open.len);
+            return startCursor.instantiateName (self._content [s .. e]);
+        }
+
+        let mut suffix = EOF_WORD;
+        if suffixes.len != 0 { // read the suffix if the string can have a suffix
+            let slice = tzer.next (self._content [endCursor.seek .. $]);
+            let mut isSuff = false;
+            for f in suffixes if slice.tok == f {
+                isSuff = true;
+                break;
+            }
+            
+            if isSuff {
+                suffix = endCursor.instantiateTok (slice.tok);
+                endCursor:.forward (slice.tok.len);
+            }
+        }
+        
+        let (finalStr, trimmed, skip) = if mult { // trim if multiline string
+            self.trimString (self._content [s .. e])
+        } else { // or as is
+            (self._content [s .. e], 0, false)
+        };
+
+        let startWord = startCursor.instantiateTok (open);
+        let endWord   = endCursor.instantiateTok (close);
+
+        // skip means the first line of the trim was empty
+        if skip {
+            startCursor:.newLine ();
+        } 
+        else { // it wasn't so the string is on the same line but past the opening word            
+            startCursor:.forward (open.len);
+        } 
+        
+        return startCursor.instantiateStr (finalStr, startWord, endWord, trimmed, suffix);
+    }
+
+    /**
+     * Tokenize a comment block
+     * @params:
+     *   - tzer:   the string tokenizer
+     *   - tok:    the opening token
+     *   - close:  the expected closing token of the string
+     *   - opens:  the nested strings (with the same closing)        
+     *   - mult:   true iif the string can be written on multiple lines
+     *   - doc:    true iif we are reading a documentation comment
+     *   - cursor: the cursor of the lexer to make forward
+     *  
+     * */
+    fn tokenizeComment (mut self, tzer : SrcTokenizer, tok : [c8], close : [c8], opens : [[c8] => ()], mult : bool, doc : bool, ref mut cursor : SrcCursor)-> [c8]
+        throws ErrorMsg
+    {
+        let mut startCursor   = cursor;        
+        cursor:.forward (tok.len);
+        
+        let mut depth = 1;
+        while cursor.seek < self._content.len {        
+            let ret = tzer.next (self._content [cursor.seek .. $]).tok;
+            if ret.len == 0us // EOF 
+                break;            
+                        
+            if ret == close { // closing token found
+                cursor:.forward (ret.len);
+                depth -= 1;
+                if depth == 0 { // not in nested                    
+                    return self.finalizeComment (tok, ret, mult, doc, startCursor, cursor);                                                                                                            
+                }
+            }
+            
+            else if ret == Tokens::ANTI { // Escaping
+                self.checkEscapeNothing (tok, startCursor, cursor, false);
+                self.checkEscapeReturn (tok, startCursor, cursor, false);                                
+                cursor:.forward (ret.len + 1);
+            }
+
+            else if ret == Tokens::RETURN { // New line
+                self.checkReturnMult (tok, startCursor, cursor, mult, false);                                
+                cursor:.newLine ();
+            }
+
+            else if ret in opens { // Nested comment
+                depth += 1;
+                cursor:.forward (ret.len);        
+            }
+
+            else { // move the cursor foward, just a part of the comment
+                cursor:.forward (ret.len);
+            }                                            
+        }
+
+        // We reached EOF but the comment is not closed
+        // Create a location token for the error message
+        let loc = startCursor.instantiateTok (tok);
+        throw copy ErrorMsg::fatal (loc, format (LexingErrorMessage::UNTERMINATED_COMMENT, close));        
+    }
+
+    /**
+     * Finalize a comment
+     * @params:
+     *    - open:        the opening token
+     *    - close:       the closing token
+     *    - startCursor: the cursor at the opening location
+     *    - endCursor:   the cursor at the closing location
+     *    - mult:        true iif it's a multiline comment (and therefore will be trimmed)
+     *    
+     * */
+    fn finalizeComment (self, open: [c8], close: [c8], mult: bool, doc: bool, startCursor: SrcCursor, endCursor: SrcCursor)-> [c8] {
+        if !doc return ""; // not documentation, simply ignoring the comment
+        
+        let s = startCursor.seek + open.len;
+        let e = endCursor.seek - close.len;
+        
+        if mult { // multiline comments are trimmed
+            return self.trimComment (self._content [s .. e]);    
+        } else {
+            // Skipping the first space in comment if there is one
+            if s < self._content.len && self._content [s] == ' ' {
+                return self._content [s + 1 .. e];    
+            }
+            
+            return self._content [s .. e];                         
+        }
+    }
+    
+    /**
+     * Tokenize a word that is neither a string, not a comment
+     * @params:
+     *    - tzer:   the tokenizer
+     *    - tok:    the token being tokenized
+     *    - cursor: the cursor to move
+     * */
+    fn tokenizeWord (mut self, tzer : SrcTokenizer, tok : [c8], ref mut cursor : SrcCursor)-> &Word
+        throws ErrorMsg
+    {
+        tzer;
+        
+        let word = cursor.instantiateName (tok);
+        cursor:.forward (tok.len);
+        
+        throw copy ErrorMsg::fatal (word, "");
+         
+        // return word;
+        
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ===================================          CHECKINGS          ====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Check if the escape escaped something in a string or comment, throw an
+     * error if nothing is escaped
+     * 
+     * @params:
+     *    - tok:    the token that started the string/comment
+     *    - start:  the location of the start of the string/comment
+     *    - cursor: the location of the escape char
+     *    - str:    true iif escaping in a string
+     *    
+     * */
+    fn checkEscapeNothing (self, tok : [c8], start : SrcCursor, cursor : SrcCursor, str : bool)
+        throws ErrorMsg
+    {
+        if cursor.seek + 2 >= self._content.len { // escaping nothing                                    
+            let loc = start.instantiateTok (tok);
+            let anti = cursor.instantiateTok (Tokens::ANTI);
+            
+            let msg = if str {
+                LexingErrorMessage::ESCAPE_AT_END_OF_STRING
+            } else {
+                LexingErrorMessage::ESCAPE_AT_END_OF_COMMENT
+            };
+            
+            throw copy ErrorMsg::fatal (loc, end-> anti, format (msg));
+        }
+    }
+
+    /**
+     * Check if the escape escaped a line return in a string or comment, throw
+     * an error if it did
+     * 
+     * @params:
+     *    - tok:    the token that started the string/comment
+     *    - start:  the location of the start of the string/comment
+     *    - cursor: the location of the escape char
+     *    - str:    true iif escaping in a string
+     *    
+     * */
+    fn checkEscapeReturn (self, tok : [c8], start : SrcCursor, cursor : SrcCursor, str : bool)
+        throws ErrorMsg
+    {
+        // escaping line return                                    
+        if cursor.seek + 2 < self._content.len && self._content [cursor.seek + 1] == '\n' { 
+            let loc = start.instantiateTok (tok);
+            let anti = cursor.instantiateTok (Tokens::ANTI);
+            
+            let msg = if str {
+                LexingErrorMessage::ESCAPE_RETURN_PROHIBITED_STRING
+            } else {
+                LexingErrorMessage::ESCAPE_RETURN_PROHIBITED_COMMENT
+            };
+            
+            throw copy ErrorMsg::fatal (loc, end-> anti, format (msg));
+        }
+    }
+
+    /**
+     * Check if the escape escaped a line return in a string or comment, throw
+     * an error if it did
+     * 
+     * @params:
+     *    - tok:    the token that started the string/comment
+     *    - start:  the location of the start of the string/comment
+     *    - cursor: the location of the escape char
+     *    - str:    true iif escaping in a string
+     *    
+     * */
+    fn checkReturnMult (self, tok : [c8], start : SrcCursor, cursor : SrcCursor, mult : bool, str : bool)
+        throws ErrorMsg
+    {
+        if !mult {
+            let loc = start.instantiateTok (tok);
+            let ret = cursor.instantiateTok ("\\n");
+            
+            let msg = if str {
+                LexingErrorMessage::RETURN_IN_SINGLE_LINE_STRING
+            } else {
+                LexingErrorMessage::RETURN_IN_SINGLE_LINE_COMMENT
+            };
+            
+            throw copy ErrorMsg::fatal (loc, end-> ret, format (msg));
+        }
+    }
+    
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          TRIMMING          ====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+    
+    /**
+     * Trim the paragraph string by removing the leading line‑return and
+     * trimming indentation to the line that is indented the least (i.e., the
+     * leftmost indentation).
+     *
+     * @params
+     *    - str: the string to trim left
+     *    - removeStar: (for comments remove the star at the beginning of line comment)
+     * @returns:
+     *    - .0: the trimmed function
+     *    - .1: the amount of left trim
+     *    - .2: true if the first line was removed
+     * */
+    fn trimString (self, str : [c8])-> ([c8], usize, bool) {
+        // Split into lines
+        let mut lines = self.splitLines (str);
+        
+        // Remove the first line if empty
+        let mut skipFst = true;         
+        if lines.len > 0 && lines [0] == Tokens::RETURN { 
+            lines = lines [1 .. $];
+            skipFst = true;
+        } else if lines.len > 0 && lines [0] == Tokens::RRETURN_CMP { 
+            lines = lines [1 .. $];
+            skipFst = true;
+        }        
+        
+        if lines.len == 0 
+            return ("", 0, skipFst);
+        
+        // Compute the left trimming of the last line (aligning to it by default)
+        // Unlike other lines, a blank trimming is considered = 0
+        let mut minIndent = lines [$ - 1].len - 1;
+        for i in 0 .. lines [$ - 1].len {
+            if lines[$ - 1][i] != ' ' {
+                break;
+            }
+            else minIndent = i + 1;
+        }
+
+        // compute the left trimming of every lines
+        // A blank line trimming doesn't count (even if = 0, doesn't change the min)
+        for line in lines [0 .. $ - 1] {            
+            for i in 0 .. min (line.len, minIndent) {
+                if (line [i] != ' ' || line [i] == '\n') { // Blank lines don't count
+                    break;
+                } else {                    
+                    minIndent = i + 1;
+                }
+            }
+        }
+
+        // Join all lines
+        let mut result = "";
+        for line in lines [0 .. $] {
+            if line.len > minIndent {
+                result ~= line [minIndent .. $]; // no need to add \n, already in the line
+            } else { // blank lines, here even the last line being blank is treated as any lines
+                result ~= "\n";
+            }
+        }
+                
+        (result, minIndent, skipFst)
+    }
+
+    /**
+     * Trim a comment by removing all entabing of every lines
+     * unlike trimString we don't care who has the minIndent
+     *
+     * @params:
+     *    - str:        the string to trim
+     *    - removeStar: true for multiline comments, we remove the stars
+     *                  at the begin of each line
+     * */
+    fn trimComment (self, str : [c8])-> [c8] {
+        let mut lines = self.splitLines (str);
+        let mut result = "";
+        for line in lines {
+            for i, c in line match c {
+                ' ' => {} // continue
+                '*' => { // A line starting by a star, remove it                   
+                    result ~= line [i + 1 .. $];
+                    break;
+                }
+                _ => { // A line starting by something else
+                    result ~= line [i .. $];
+                    break;
+                }
+            }                            
+        }
+
+        // Add a line return at the end of comment if not empty
+        if result.len > 0 && result [$ - 1] != '\n' 
+            return result ~ "\n";
+        
+        result        
+    }
+    
+    /**
+     * Split a string by lines
+     * 
+     * @params:
+     *    - str: the string to split
+     *    
+     * @returns: the splitted lines (each line contains the '\n')
+     * */
+    fn splitLines (self, str : [c8])-> [[c8]] {
+        let mut result : [[c8]] = [];
+        let mut start = 0us;
+        for i, c in str if c == '\n' {
+            result ~= [str [start .. i + 1]]; // keep the '\n' in the line
+            start = i + 1;            
+        }
+
+        // Add remaning if the last line doesn't end with a \n
+        if start != str.len {
+            result ~= [str [start .. $]];
+        }
+        
+        result
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * =================================          MISCELLANEOUS          ==================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */    
     
     impl Streamable;
-    
     
 }
