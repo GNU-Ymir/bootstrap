@@ -6,8 +6,25 @@ use ymirc::syntax::{_,
                     declaration::_,
                     expression::{_, literal::_, macro_::_, operator::_, template::_}};
 
-use ymirc::lexing::{word, tokens};
+use ymirc::lexing::{word, tokens, keys};
 use ymirc::utils::_;
+
+
+lazy __SPECIAL_GLOBAL__ = SpecialGlobal ();
+
+pub record SpecialGlobal {
+    
+    pub let listKeys                : [[c8]] = copy GlobalDeclKeys::__members__;    
+    pub let listKeysExtern          : [[c8]];    
+    pub let listKeysExternPubPrvUse : [[c8]];    
+    pub let listKeysExternUse       : [[c8]];
+
+    pub self ()
+        with listKeysExtern = self.listKeys ~ [Keys::EXTERN]
+        ,listKeysExternUse = self.listKeysExtern ~ [Keys::USE]
+        ,listKeysExternPubPrvUse = self.listKeysExternUse ~ [Keys::PUBLIC, Keys::PRIVATE]
+    {}
+}
 
 /**
  * Syntax visitor to read global symbol declaration
@@ -15,14 +32,7 @@ use ymirc::utils::_;
  * */
 pub record GlobalVisitor {
 
-    // The keywords that can appear in a global extern block
-    let _globalLstProtectedExtern : [[c8]] = copy GlobalDeclKeys::__members__;
-
-    // The keywords that can appear in a global protection block
-    let _globalLstProtected       : [[c8]];
-
-    // The keywords that can appear in a global block
-    let _globalLstAll             : [[c8]];
+    let _special : SpecialGlobal = __SPECIAL_GLOBAL__;
     
     /*!
      * ====================================================================================================
@@ -32,10 +42,7 @@ pub record GlobalVisitor {
      * ====================================================================================================
      */
 
-    pub self ()
-        with _globalLstProtected = self._globalLstProtectedExtern ~ [Keys::EXTERN]
-        , _globalLstAll = self._globalLstProtected ~ [Keys::PUBLIC, Keys::PRIVATE, Keys::USE]
-    {}
+    pub self () {}            
 
     /*!
      * ====================================================================================================
@@ -82,18 +89,21 @@ pub record GlobalVisitor {
      * @verbatim:
      * ```
      * decl_block :=   protection_block
-                     | extern_decl_block
+     *               | 'use' complex_path ';' 
+     *               | extern_decl_block
      *               | (attributes? declaration)*
      *
      * protection_block := (attributes)? (Keys::PUBLIC | Keys::PRIVATE) declaration
      *                     | (Keys::PUBLIC | Keys::PRIVATE) '{' protected_decl_block '}'
      *                     | (Keys::PUBLIC | Keys::PRIVATE) extern_decl_block     
      *
-     * extern_decl_block := (attributes)? Keys::EXTERN declaration     
+     * extern_decl_block := (attributes)? Keys::EXTERN Lang? declaration     
      * 
      * protected_decl_block :=   extern_decl_block
      *                         | (attributes? declaration)*
      *
+     * Lang :=   '(' 'C' ')'
+     *         | '(' 'Y' (',' Path)? ')' 
      * ```
      * */
     fn readBlock (self, dmut context : &SyntaxVisitor, loc : &Word, comm : [c8], closing : bool, inProtection : bool)-> &BlockDecl
@@ -105,7 +115,7 @@ pub record GlobalVisitor {
                 // Read attributes for the next declaration
                 let (attrLoc, attribs, attrComm) = self.readAttributes (alias context);
 
-                let (tok, comm_) = context:.readIf (Tokens::RACC, Keys::PRIVATE, Keys::PUBLIC, Keys::USE, Keys::EXTERN);                                
+                let (tok, comm_) = context:.readToken ();                                                            
                 match tok.str {
                     Keys::PUBLIC | Keys::PRIVATE => {
                         if inProtection throw copy ErrorMsg::fatal (tok, format (SyntaxErrorMessage::UNEXPECTED, tok));                         
@@ -128,16 +138,17 @@ pub record GlobalVisitor {
                         self.checkNoAttributes (tok, attrLoc, attribs);
                         break;
                     }
-                    _ => {
+                    _ => {                        
                         // We read nothing, because there's nothing to read
-                        if context.isEof () {
-                            if closing throw copy ErrorMsg::fatal (loc, SyntaxErrorMessage::BLOCK_NEVER_CLOSED);
+                        if tok.isEof {
+                            if closing throw copy ErrorMsg::fatal (loc, end-> tok, SyntaxErrorMessage::BLOCK_NEVER_CLOSED);
                             self.checkNoAttributes (tok, attrLoc, attribs);
                             break;
                         }
 
+                        context:.rewind ();
                         // Or a declaration
-                        let expected = if inProtection { self._globalLstProtected } else { self._globalLstAll };
+                        let expected = if inProtection { self._special.listKeysExtern } else { self._special.listKeysExternPubPrvUse };
                         decls ~= [self.readDeclaration (alias context,
                                                         comm-> comm ~ attrComm ~ comm_,
                                                         attribs-> (attrLoc, attribs),
@@ -147,7 +158,7 @@ pub record GlobalVisitor {
             }
         } catch {
             err => {
-                if (!loc.isEof ()) {
+                if (!loc.isEof) {
                     throw copy ErrorMsg::note (loc, SyntaxErrorMessage::IN_DECL_BLOCK, notes-> copy [err]);
                 } else {
                     throw err;
@@ -157,12 +168,13 @@ pub record GlobalVisitor {
         
         copy BlockDecl (loc, comm, decls, protection-> Protection::PRIVATE)        
     }
-        
+    
     /**
      * Read a protection block
      * @verbatim:
      * ```
-     * * protection_block := (attributes)? (Keys::PUBLIC | Keys::PRIVATE) declaration
+     * protection_block :=   (attributes)? (Keys::PUBLIC | Keys::PRIVATE) declaration
+     *                     | (attributes)? (Keys::PUBLIC | Keys::PRIVATE) Keys::EXTERN Lang? declaration
      *                     | (Keys::PUBLIC | Keys::PRIVATE) '{' protected_decl_block '}'
      * ```
      */
@@ -175,22 +187,30 @@ pub record GlobalVisitor {
             Protection::PUBLIC
         };
         
-        let (tok, _) = context:.readIf (Tokens::LACC);
-        // No '{' then it's a single declaration
-        let decls = if (tok.isEof ()) {
-            copy [self.readDeclaration (alias context,
-                                        comm-> comm ~ attribs.2,
-                                        attribs-> (attribs.0, attribs.1),
-                                        expected-> self._globalLstProtected)]                                                    
-        } else {
-            // Or a protected block
-            self.checkNoAttributes (tok, attribs._0, attribs._1);
-            let blk = self.readBlock (alias context,
-                                      loc,
-                                      comm,
-                                      closing-> true,
-                                      inProtection-> true);
-            blk.getDeclarations ()
+        let (tok, _) = context:.readToken ();
+        let decls = match tok.str {
+            Tokens::LACC => {
+                self.checkNoAttributes (tok, attribs._0, attribs._1);
+                let blk = self.readBlock (alias context,
+                                          loc,
+                                          "",
+                                          closing-> true,
+                                          inProtection-> true);
+                blk.getDeclarations ()
+            }
+            Keys::EXTERN => {
+                copy [self.readExternBlock (alias context,
+                                            loc-> tok,
+                                            comm-> comm,
+                                            attribs-> attribs)]                
+            }
+            _ => {
+                context:.rewind ();
+                copy [self.readDeclaration (alias context,
+                                            comm-> comm,
+                                            attribs-> (attribs._0, attribs._1),
+                                            expected-> self._special.listKeysExtern)]    
+            }
         }
         
         copy BlockDecl (loc, comm, decls, protection-> protection)
@@ -214,10 +234,10 @@ pub record GlobalVisitor {
         throws ErrorMsg
     {
         let (fst, _) = context:.readIf (Tokens::LPAR);
- 
-        let (lang, space) = if !fst.isEof () {
+        
+        let (lang, space) = if !fst.isEof {
             let (ln, _) = context:.readTokens (Keys::CLANG, Keys::YLANG);
-            let space = if ln == Keys::YLANG && !context:.readIf (Tokens::COMA)._0.isEof () {
+            let space = if ln == Keys::YLANG && !context:.readIf (Tokens::COMA)._0.isEof {
                 self.readPath (alias context) 
             } else {
                 EMPTY_EXPR
@@ -226,13 +246,13 @@ pub record GlobalVisitor {
             context:.readTokens (Tokens::RPAR);
             (ln, space)
         } else {
-            (copy Word (Keys::YLANG, loc), EMPTY_EXPR)
+            (loc.locate (Keys::YLANG), EMPTY_EXPR)
         };
-                        
+        
         let content = self.readDeclaration (alias context,
                                             comm-> comm ~ attribs._2,
                                             attribs-> (attribs._0, attribs._1),
-                                            expected-> self._globalLstProtectedExtern);                                                    
+                                            expected-> self._special.listKeys);                                                    
 
         copy ExternBlockDecl (loc, comm, lang, space, content)
     }    
@@ -258,16 +278,16 @@ pub record GlobalVisitor {
         throws ErrorMsg
     {
         let (hasTest, test) = context:.readTemplateTest ();
-        if !hasTest.isEof () { // a template local module
-            let (ident, _) = context:.readIdentifier (canBeSelf-> false);
+        if !hasTest.isEof { // a template local module
+            let (ident, _) = context:.readIdentifier ();
             return self.readTemplateLocalModule (alias context, comm, ident, ifLoc-> hasTest, test);
         }
         
         let (isSub, _) = context:.readIf (Tokens::DCOLON, Tokens::DOT);        
-        let (ident, _) = context:.readIdentifier (canBeSelf-> false);
+        let (ident, _) = context:.readIdentifier ();
 
         let (isEnd, _) = context:.readIf (Tokens::SEMI_COLON);        
-        if isSub.isEof () && isEnd.isEof () { // mod Ident '{' decl_block '}'
+        if isSub.isEof && isEnd.isEof { // mod Ident '{' decl_block '}'
             return self.readLocalModule (alias context, comm, ident); 
         }
 
@@ -285,24 +305,16 @@ pub record GlobalVisitor {
     pub fn readLocalModule (self, dmut context : &SyntaxVisitor, comm : [c8], ident : &Word)-> &Declaration
         throws ErrorMsg
     {
-        let readNormal = copy |dmut ctx : &SyntaxVisitor| => {
-            let (start, comm_) = ctx:.readTokens (Tokens::LACC);
-            let content = self.readBlock (alias ctx, start, comm_, closing-> true, inProtection-> false);
-            copy ModuleDecl (ident,
-                             EOF_WORD,
-                             comm,
-                             content,
-                             isGlobal-> false)
-        }?;
-            
-        let readTemplate = copy |dmut ctx : &SyntaxVisitor| => {
-            self.readTemplateLocalModule (alias ctx, comm, ident, EOF_WORD, EMPTY_EXPR)
-        }?;
+        let (templates, _) = context:.readTemplateParameters (ifLoc-> EOF_WORD, force-> false);
+        let (start, comm_) = context:.readTokens (Tokens::LACC);
 
-        // It may or may not have templates, we test without templates,
-        // and if it fails, we test with templates
-        return context:.readEither!{&Declaration} (readNormal,
-                                                   readTemplate);                                            
+        let content = self.readBlock (alias context, start, comm_, closing-> true, inProtection-> false);
+        if (templates.len != 0) {
+            copy TemplateDecl (ident, comm, templates, test-> EMPTY_EXPR,
+                               copy ModuleDecl (ident, EOF_WORD, comm, content, isGlobal-> false))       
+        } else {
+            copy ModuleDecl (ident, EOF_WORD, comm, content, isGlobal-> false)       
+        }                
     }   
 
     /**
@@ -344,14 +356,14 @@ pub record GlobalVisitor {
         let mut res : [mut &Expression] = [];
         
         let (isRoot, _) = context:.readIf (Tokens::DCOLON);        
-        let (fst, _) = context:.readIdentifier (canBeSelf-> false);
+        let (fst, _) = context:.readIdentifier ();
 
         self.readComplexPath (alias context, copy VarExpr (fst), ref res);
 
         
         context:.readTokens (Tokens::SEMI_COLON);
 
-        copy [copy UseDecl (loc, comm, i, isRoot-> !isRoot.isEof ()) for i in res]                        
+        copy [copy UseDecl (loc, comm, i, isRoot-> !isRoot.isEof) for i in res]                        
     }
 
     
@@ -364,17 +376,60 @@ pub record GlobalVisitor {
      */
 
     /**
-     * Read a declaration inside a 
+     * Read a declaration inside a local block (i.e. inside a function)
+     * @verbatim:
+     * ```
+     * local_declaration :=  'use' complex_path ';' 
+     *                      | extern_decl_block                            
+     *                      | declaration
+     * ```
      * */
-    pub fn readDeclaration (self, dmut context : &SyntaxVisitor)-> &Declaration
+    pub fn readLocalDeclaration (self, dmut context : &SyntaxVisitor)-> &Declaration
         throws ErrorMsg
     {
-        let (attrLoc, attribs, attrComm) = self.readAttributes (alias context);
-        self.readDeclaration (alias context,
-                              attrComm,
-                              attribs-> (attrLoc, attribs),
-                              expected-> self._globalLstProtectedExtern)
-    }                                                                  
+        let (n, _) = context:.readIf (Keys::USE, Keys::EXTERN);
+        {
+            match n.str {
+                Keys::USE => {
+                    let decls = self.readUse (alias context,
+                                              loc-> n,
+                                              comm-> "");      
+                    copy BlockDecl (n, "", decls, protection-> Protection::PRIVATE, isSet-> true)
+                }
+                Keys::EXTERN => {
+                    self.readExternBlock (alias context,
+                                          loc-> n,
+                                          comm-> "",
+                                          attribs-> (EOF_WORD, [], ""))
+                }
+                _ => {
+                    let (attrLoc, attribs, attrComm) = self.readAttributes (alias context);
+                    self.readDeclaration (alias context,
+                                          attrComm,
+                                          attribs-> (attrLoc, attribs),
+                                          expected-> self._special.listKeysExternUse)        
+                }                
+            }
+        } catch {
+            err => {
+                let prevNotes = err.getNotes ();
+                let nNote = copy ErrorMsg::note (EOF_WORD, format (SyntaxErrorMessage::READING_LOCAL_DECLARATION));
+                throw err.withNote (copy [nNote] ~ prevNotes);
+            }
+        }
+    }                                                                   
+
+    /**
+     * @returns: true if the next token starts a local declaration
+     * */
+    pub fn isLocalDeclaration (self, context : &SyntaxVisitor)-> bool {
+        let n = context.peekToken ();
+        for z in self._special.listKeysExternUse if z == n.str {
+            return true;
+        }
+        
+        false
+    }
     
     /**
      * Read a declaration
@@ -417,7 +472,7 @@ pub record GlobalVisitor {
             Keys::ENTITY   => { return context:.readClass (tok, comm ~ postComm, attribs-> attribs._1, isEntity-> true); }
             Keys::UNION    => { return context:.readClass (tok, comm ~ postComm, attribs-> attribs._1,  isUnion-> true); }
         }
-                    
+        
         // Global without attributes
         self.checkNoAttributes (tok, attribs._0, attribs._1);
         match tok.str {
@@ -429,7 +484,7 @@ pub record GlobalVisitor {
             Keys::TRAIT    => { return context:.readTrait (tok, comm ~ postComm); }
             Keys::UNITTEST => { return context:.readUnitTest (tok, comm ~ postComm); }                        
         }                          
-                
+        
         throw copy ErrorMsg::fatal (tok, format (SyntaxErrorMessage::UNEXPECTED_BUT_LST, tok.str, expected));
     }
     
@@ -459,7 +514,7 @@ pub record GlobalVisitor {
     {
         // All attributes start with Tokens::AT '@'
         let (next, comm) = context:.readIf (Tokens::AT);
-        if (next.isEof ()) return (EOF_WORD, [], []);
+        if (next.isEof) return (EOF_WORD, [], []);
 
         // List starts with '@' '{
         let (open, _) = context:.readIf (Tokens::LACC);
@@ -477,13 +532,13 @@ pub record GlobalVisitor {
                 vec ~= [AttributeWord (identifier, id)];                    
                 break;            
             }
-                        
+            
 
             // Only one, not a list (not read '{')
-            if (open.isEof ()) {
+            if (open.isEof) {
                 // But they can be chained with another '@'
                 let (at,_) = context:.readIf (Tokens::AT);
-                if (at.isEof ()) break;
+                if (at.isEof) break;
             } else {
                 // multiple, either ',' or '}'
                 let (close, _) = context:.readTokens (Tokens::COMA, Tokens::RACC);
@@ -504,10 +559,10 @@ pub record GlobalVisitor {
     pub fn checkNoAttributes (self, loc : &Word, attrLoc : &Word, attribs : [AttributeWord])
         throws ErrorMsg
     {        
-        if (attrLoc.isEof ()) return;
+        if (attrLoc.isEof) return;
         
         let mut notes : [&ErrorMsg] = [];
-        if !loc.isEof () {
+        if !loc.isEof {
             notes = copy [copy ErrorMsg::note (loc, "")];
         }                
         
@@ -534,16 +589,16 @@ pub record GlobalVisitor {
     pub fn readPath (self, dmut context : &SyntaxVisitor) -> &Expression
         throws ErrorMsg
     {
-        let (fst, _) = context:.readIdentifier (canBeSelf-> false);
+        let (fst, _) = context:.readIdentifier ();
         let mut res : &Expression = copy VarExpr (fst);
-        while let (colon, _) = context:.readIf (Tokens::DCOLON) && !colon.isEof () {            
+        while let (colon, _) = context:.readIf (Tokens::DCOLON) && !colon.isEof {            
             let (next, _) = context:.readIf (Keys::UNDER);
             match next.str {
                 Keys::UNDER => {
                     return copy PathExpr (colon, res, copy VarExpr (next));
                 }
                 _ => {
-                    let (ident, _) = context:.readIdentifier (canBeSelf-> false);
+                    let (ident, _) = context:.readIdentifier ();
                     res = copy PathExpr (colon, res, copy VarExpr (ident));
                 }
             }
@@ -569,7 +624,7 @@ pub record GlobalVisitor {
         throws ErrorMsg
     {
         let mut res = root;        
-        while let (colon, _) = context:.readIf (Tokens::DCOLON) && !colon.isEof () {
+        while let (colon, _) = context:.readIf (Tokens::DCOLON) && !colon.isEof {
             let (next, _) = context:.readIf (Tokens::LACC, Keys::UNDER);
             match next.str {
                 Tokens::LACC => {
@@ -583,12 +638,12 @@ pub record GlobalVisitor {
                     break;
                 }
                 _ => {                    
-                    let (ident, _) = context:.readIdentifier (canBeSelf-> false);
+                    let (ident, _) = context:.readIdentifier ();
                     res = copy PathExpr (next, res, copy VarExpr (ident));
                 }
             }
         }
-                             
+        
         result ~= [res];        
     }
 
@@ -611,7 +666,7 @@ pub record GlobalVisitor {
                     result ~= [copy PathExpr (next, root, copy VarExpr (next))];
                 }
                 _ => {                    
-                    let (ident, _) = context:.readIdentifier (canBeSelf-> false);
+                    let (ident, _) = context:.readIdentifier ();
                     let current = copy PathExpr (colon, root, copy VarExpr (ident));
                     self.readComplexPath (alias context, current, ref result);
                 }
@@ -621,6 +676,6 @@ pub record GlobalVisitor {
             if (end == Tokens::RACC) break;
         }
     }
-                
+    
     
 } 
