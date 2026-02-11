@@ -1,0 +1,1091 @@
+/*
+ * Declares the syntax visitor in charge of reading a class declaration
+ *
+ * <hr>
+ * 
+ * @Package: ymirc        
+ * @Module: ymirc::syntax::visitor::class_
+ * @File: ymirc/syntax/visitor/class_.yr
+ * @Author(s):
+ *   - Emile Cadorel <ecadorel@gmail.com>
+ *
+ * @Created (YYYY-MM-DD): 2026-02-11
+ * @Copyright (C) 2021–2026 GNU-Ymir
+ * @License
+ *   ```text
+ *   This file is part of the Ymir language project.
+ *
+ *   Ymir is free software: you can redistribute it and/or modify it
+ *   under the terms of the GNU General Public License as published by
+ *   the Free Software Foundation, either version 3 of the License, or
+ *   (at your option) any later version.
+ *
+ *   Ymir is distributed in the hope that it will be useful,
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *   GNU General Public License for more details.
+ *
+ *   You should have received a copy of the GNU General Public License
+ *   along with Ymir.  If not, see <https://www.gnu.org/licenses/>.
+ *   ```
+ */
+
+in class_;
+
+use ymirc::errors::_;
+use ymirc::syntax::{_,
+                    visitor::_,
+                    declaration::_,
+                    expression::empty};
+
+
+use ymirc::lexing::{word, tokens, keys};
+use ymirc::utils::_;
+
+use std::io;
+
+
+/**
+ * The global syntax visitor responsible for reading a class declaration.
+ * */
+pub record ClassVisitor {
+
+    // Store declaration list for error management
+    let _special: SpecialClass = __SPECIAL_CLASS__;
+    
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ======================================          CTOR          ======================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    pub self () {}
+
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * =================================          IMPLEMENTATION          =================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Read a class declaration
+     * 
+     * @params:
+     *   - context: the context of the reading
+     *   - loc:     the location of the (class|union, etc.) keyword
+     *   - comm:    the comment attached to the class
+     *   - attribs: the list of attributes defined in the class
+     *   
+     * @grammar
+     * 
+     * ```
+     * ClassDecl :=
+     *     TemplateClassDecl
+     *   | NormalClassDecl
+     *
+     * TemplateClassDecl :=
+     *   TemplateTest? Identifier TemplateParams '{' ClassDeclarations '}'
+     *
+     * NormalClassDecl :=
+     *   Identifier '{' ClassDeclarations '}'
+     *   
+     * ```
+     * */
+    pub fn read (self, dmut context: &SyntaxVisitor, loc: &Word, comm: [c8], attribs: [AttributeWord])-> &Declaration
+        throws ErrorMsg
+    {
+        let (isUnion, isEntity, isRecord) =
+        {
+            match loc.str {
+                Keys::RECORD => { (false, false, true) }
+                Keys::UNION  => { (true, false, false) }
+                Keys::ENTITY => { (false, true, false) }
+                _            => { (false, false, false) }
+            }
+        };
+        
+        let tryTemplateLoc = context.getSeek ();
+        let mut normErr : (&ErrorMsg)? = none;
+        let mut templateErr : (&ErrorMsg)? = none;
+
+        { // Try to read a normal class                        
+            return self.readNormalClass (alias context,
+                                         loc,
+                                         comm,
+                                         attribs,
+                                         isEntity-> isEntity,
+                                         isUnion-> isUnion,
+                                         isRecord-> isRecord);
+        } catch {
+            err => {
+                normErr = (err)?;
+            }
+        }
+
+        // 
+        context:.rewindToSeek (tryTemplateLoc);
+        { // Read a template class
+            return self.readTemplateClass (alias context,
+                                           loc,
+                                           comm,
+                                           attribs,
+                                           isEntity-> isEntity,
+                                           isUnion-> isUnion,
+                                           isRecord-> isRecord);         
+        }  catch {
+            err => {
+                normErr = (err)?;
+            }
+        }
+
+        // Both failed, throwing the error
+        if let (Ok (ne), Ok (te)) = (normErr, templateErr) {
+            throw copy ErrorMsg::list (copy [ne, te]);
+        }
+
+        eprint ("internal class syntax visitor: empty error messages");
+        panic;
+    }
+
+    /**
+     * Read a class without template parameters
+     *
+     * @params:
+     *   - context:  the context of the reading
+     *   - loc:      the location of the keyword introducing the class
+     *   - comm:     the comment on top of the class
+     *   - attribs:  the list of attributes in the class
+     *   - isEntity: true iif declaring an entity
+     *   - isRecord: true iif declaring an entity
+     *   - isUnion:  true iif declaring an entity
+     *     
+     * */
+    fn readNormalClass (self, dmut context: &SyntaxVisitor, _: &Word, comm: [c8], attribs: [AttributeWord], isEntity: bool, isRecord: bool, isUnion: bool)-> &ClassDecl
+        throws ErrorMsg
+    {
+        let (ident, _) = context:.readIdentifier ();
+        let ancestor = self.readAncestor (alias context, isUnion || isEntity || isRecord);
+        let (open, _) = context:.readTokens (Tokens::LACC);
+
+        let decls = if (isUnion || isEntity || isRecord) {
+            self.readStructDeclBlockTop (alias context, open)
+        } else {
+            self.readClassDeclBlockTop (alias context, open)
+        };
+
+        return copy ClassDecl (ident,
+                               comm,
+                               decls,
+                               attrs-> attribs,
+                               ancestor-> ancestor,
+                               isEntity-> isEntity,
+                               isRecord-> isRecord,
+                               isUnion-> isUnion);   
+    }
+            
+    /**
+     * Read a class with template parameters
+     *
+     * @params:
+     *   - context:  the context of the reading
+     *   - loc:      the location of the keyword introducing the class
+     *   - comm:     the comment on top of the class
+     *   - attribs:  the list of attributes in the class
+     *   - isEntity: true iif declaring an entity
+     *   - isRecord: true iif declaring an entity
+     *   - isUnion:  true iif declaring an entity
+     *     
+     * */
+    fn readTemplateClass (self, dmut context: &SyntaxVisitor, _: &Word, comm: [c8], attribs: [AttributeWord], isEntity: bool, isRecord: bool, isUnion: bool)-> &TemplateDecl
+        throws ErrorMsg
+    {
+        let (ifLoc, test) = context:.readTemplateTest ();
+        let (ident, _) = context:.readIdentifier ();
+        let templates = context:.readTemplateParameters (ifLoc-> ifLoc);
+        
+        let ancestor = self.readAncestor (alias context, isUnion || isEntity || isRecord);
+        let (open, _) = context:.readTokens (Tokens::LACC);
+
+        let decls = if (isUnion || isEntity || isRecord) {
+            self.readStructDeclBlockTop (alias context, open)
+        } else {
+            self.readClassDeclBlockTop (alias context, open)
+        };
+        
+        let cl = copy ClassDecl (ident,
+                                 comm,
+                                 decls,
+                                 attrs-> attribs,
+                                 ancestor-> ancestor,
+                                 isEntity-> isEntity,
+                                 isRecord-> isRecord,
+                                 isUnion-> isUnion);
+        
+        return copy TemplateDecl (ident, comm, templates, cl, test-> test);
+    }    
+
+    /**
+     * Reads the ancestor part of a class declaration
+     *
+     * @params:
+     *    - context: the context of the reading
+     *    - isStruct: true iif not a class (therefore declaring an ancestor is forbiden)
+     *
+     * @grammar:
+     * ```
+     * Ancestor := ('over' Expression(0))?
+     * ```
+     * */
+    fn readAncestor (self, dmut context: &SyntaxVisitor, isStruct: bool)-> &Expression
+        throws ErrorMsg
+    {        
+        let (has, _) = context:.readIf (Keys::OVER);
+        if has.isEof
+            return EMPTY_EXPR;
+
+        if isStruct { // Ancestor on a struct 
+            throw copy ErrorMsg::fatal (has, format (SyntaxErrorMessage::UNEXPECTED, has.str));
+        }
+
+        return context:.readExpression ();        
+    }
+    
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ==================================          CLASS BLOCK          ===================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Read declaration that can be found inside a class
+     *
+     * @params:
+     *    - context: the context of the reading
+     *    - loc:     the token introducing the block reading
+     *    
+     * @grammar:
+     * ```
+     * ClassDeclTop :=
+     *    ClassDeclItem*
+     *
+     * ClassDeclItem :=
+     *      ClassProtectionBlock
+     *    | ClassIfBlock
+     *    | UseDecl
+     *    | ClassImplBlock
+     *    | ClassCtor
+     *    | ClassDtor
+     *    | ClassMethod
+     *    | ClassVar
+     *    
+     * ```
+     * */
+    fn readClassDeclBlockTop (self, dmut context: &SyntaxVisitor, loc: &Word)-> [&Declaration]
+        throws ErrorMsg
+    {
+        let mut decls: [mut &Declaration] = [];
+        {
+            loop {
+                let (attrLoc, attribs, attrComm) = context:.readAttributes ();
+                let (tok, tokComm) = context:.readToken ();
+
+                match tok.str {
+                    Keys::PRIVATE | Keys::PUBLIC | Keys::PROTECTED => {
+                        decls ~= [self.readClassProtectionBlock (alias context, tok, attrComm ~ tokComm, attribs-> (attrLoc, attribs))];
+                    }
+                    Keys::CTE => {
+                        context.checkNoAttributes (tok, attrLoc, attribs);
+                        decls ~= [self.readClassIfBlock (alias context, tok, tokComm)];
+                    }
+                    Keys::USE => {
+                        context.checkNoAttributes (tok, attrLoc, attribs);                        
+                        decls ~= context.getGlobalVisitor ().readUse (alias context, tok, tokComm);
+                    }
+                    Keys::IMPL => {
+                        context.checkNoAttributes (tok, attrLoc, attribs);                        
+                        decls ~= [self.readClassImpl (alias context, tok, tokComm)];
+                    }
+                    Keys::LET => {
+                        context.checkNoAttributes (tok, attrLoc, attribs);
+                        decls ~= [self.readCommonVarDecl (alias context, tok, tokComm)];                        
+                    }
+                    Keys::SELF => {
+                        decls ~= [self.readCommonCtor (alias context, tok, tokComm, attribs-> (attrLoc, attribs))];                        
+                    }
+                    Keys::FUNCTION | Keys::OVER => {
+                        decls ~= [self.readCommonMethod (alias context, tok, tokComm, attribs-> (attrLoc, attribs))];
+                    }
+                    Keys::DTOR => {
+                        context.checkNoAttributes (tok, attrLoc, attribs);                        
+                        decls ~= [self.readCommonDtor (alias context, tok, tokComm)];                        
+                    }
+                    Tokens::RACC => {
+                        context.checkNoAttributes (tok, attrLoc, attribs);
+                        break;
+                    }
+                    _ => {
+                        if tok.isEof {
+                            throw copy ErrorMsg::fatal (loc, end-> tok, SyntaxErrorMessage::BLOCK_NEVER_CLOSED);                            
+                        }
+                        
+                        throw copy ErrorMsg::fatal (tok, format (SyntaxErrorMessage::UNEXPECTED_BUT_LST, self._special.classDeclTop));
+                    }
+                }                
+            }
+        }  catch {
+            err => {                
+                throw copy ErrorMsg::note (loc, SyntaxErrorMessage::IN_DECL_BLOCK, notes-> copy [err]);                
+            }
+        }
+
+        decls
+    }
+
+    /**
+     * Read a class conditional block
+     *
+     * @params:
+     *     - context: the context of the reading
+     *     - loc:     the location of the `cte` keyword
+     *     - comm:    the comment above the cte if
+     *
+     * @grammar:
+     * ```
+     * ClassIfBlock :=
+     *   'if' Expression(0) '{' ClassDeclTop '}' ClassIfFollow?
+     *
+     * ClassIfFollow :=
+     *     'else' ClassIfBlock
+     *   | 'else' '{' ClassDeclTop '}'
+     *     
+     * ```
+     * */
+    fn readClassIfBlock (self, dmut context: &SyntaxVisitor, loc: &Word, comm: [c8])-> &Declaration
+        throws ErrorMsg
+    {
+        // At least one if block is mandatory after reading 'cte'
+        let (_, _) = context:.readTokens (Keys::IF);
+        let test = context:.readExpression ();
+        let (open, _) = context:.readTokens (Tokens::LACC);
+        let declsFst = self.readClassDeclBlockTop (alias context, open);
+        
+        let mut blocks : [(&Word, &Expression, [&Declaration], [c8])] = copy [(loc, test, declsFst, comm)];        
+
+        // We create a list of else blocks
+        while let (next, nextComm) = context:.readIf (Keys::ELSE) && !next.isEof {
+            let (nextIf, _) = context:.readIf (Keys::IF);
+            if nextIf.isEof {
+                let (nextOpen, _) = context:.readTokens (Tokens::LACC);
+                let declsElse = self.readClassDeclBlockTop (alias context, nextOpen);
+                
+                blocks ~= [(next, EMPTY_EXPR, declsElse, nextComm)];
+                break;
+            }
+
+            let nextTest = context:.readExpression ();
+            let (nextOpen, _) = context:.readTokens (Tokens::LACC);
+            let declsElse = self.readClassDeclBlockTop (alias context, nextOpen);
+                
+            blocks ~= [(nextIf, nextTest, declsElse, nextComm)];            
+        }  
+
+        // And we wrap them in reverse order to build the conditional tree
+        let mut resultBlock = if blocks [$ - 1]._1 of EmptyExpression {
+            copy BlockDecl (blocks [$ - 1]._0, blocks [$ - 1]._3, blocks [$ - 1]._2)
+        } else {
+            copy CondBlockDecl (blocks [$ - 1]._0, blocks [$ - 1]._3, blocks [$ - 1]._2, blocks [$ - 1]._1)
+        };
+        
+        blocks = blocks [0 .. $ - 1];        
+        for i in blocks.len .. 0 {
+            resultBlock = copy CondBlockDecl (blocks [i - 1]._0,
+                                              blocks [i - 1]._3,                                              
+                                              blocks [i - 1]._2,
+                                              blocks [$ - 1]._1,
+                                              else_-> resultBlock);            
+        } 
+
+        resultBlock
+    }
+
+    
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ================================          CLASS PROTECTION          ================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+    
+    /**
+     * Read a block introduced by a protection inside a class declaration
+     *
+     * @params:
+     *    - context: the context of the reading
+     *    - loc:     the location of the protection keyword
+     *    - comm:    the comment above the protection
+     *    - attribs: the list of attributes above the protection keyword
+     *
+     * @grammar:
+     * ```
+     * ClassProtectionBlock :=
+     *    '{' ClassProtectedDeclaration* '}'
+     *    | ClassProtectedDeclaration
+     *
+     * ClassProtectedDeclaration :=
+     *   | ClassCtor
+     *   | ClassMethod
+     *   | ClassVar
+     * ```
+     * */        
+    fn readClassProtectionBlock (self, dmut context: &SyntaxVisitor, loc: &Word, comm: [c8], attribs: (&Word, [AttributeWord]))-> &BlockDecl
+        throws ErrorMsg
+    {
+        let protection = context.toProtection (loc.str);
+        let (open, _) = context:.readIf (Tokens::LACC);
+
+        if !open.isEof { // a protected block
+
+            // @attrib pub { ... } is not allowed           
+            context.checkNoAttributes (open, attribs._0, attribs._1);            
+            let decls = self.readClassProtectedBlock (alias context);
+            return copy BlockDecl (loc, comm, decls, protection-> protection);
+        }
+
+        // A single protection
+        let decls = copy [self.readClassProtectedSingle (alias context, loc, comm, attribs)];            
+        return copy BlockDecl (loc, "", decls, protection-> protection);                
+    }
+
+    /**
+     * Read a block of declaration protected by a protection keyword
+     *
+     * @params:
+     *   - context: the context of the reading
+     *   - open:    the location of the opening '{'
+     *
+     * @grammar:
+     * ```
+     * ClassProtectedBlock :=
+     *    '{' ClassProtectedDeclaration* '}'
+     * ```
+     * */
+    fn readClassProtectedBlock (self, dmut context: &SyntaxVisitor)-> [&Declaration]
+        throws ErrorMsg
+    {
+        let mut decls: [mut &Declaration] = [];
+        loop {
+            let (attrLoc, attribs, attrComm) = context:.readAttributes ();
+            let (tok, tokComm) = context:.readToken ();
+            if tok == Tokens::RACC {
+                break;
+            }
+            
+            decls ~= [self.readClassProtectedSingle (alias context, tok, attrComm ~ tokComm, attribs-> (attrLoc, attribs))];
+        }
+
+        decls
+    }
+
+    /**
+     * Read a single declaration protected by a protection keyword
+     *
+     * @params:
+     *    - context: the context of the reading
+     *    - tok:     the declaration to read
+     *    - comm:    the comments above the declaration
+     *    - attribs: the list of attributes on top of the declaration
+     *
+     *
+     * */
+    fn readClassProtectedSingle (self, dmut context: &SyntaxVisitor, tok: &Word, comm: [c8], attribs: (&Word, [AttributeWord]))-> &Declaration
+        throws ErrorMsg
+    {
+        match tok.str {
+            Keys::LET => {
+                context.checkNoAttributes (tok, attribs._0, attribs._1);
+                return self.readCommonVarDecl (alias context, tok, comm);                        
+            }
+            Keys::SELF => {
+                return self.readCommonCtor (alias context, tok, comm, attribs-> attribs);                        
+            }
+            Keys::FUNCTION | Keys::OVER => {
+                return self.readCommonMethod (alias context, tok, comm, attribs-> attribs);
+            }
+            _ => {
+                throw copy ErrorMsg::fatal (tok, format (SyntaxErrorMessage::UNEXPECTED_BUT_LST, self._special.classDeclProtected))
+            }
+        }
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ===================================          CLASS IMPL          ===================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Read an implementation block, in a class declaration block
+     *
+     * @params:
+     *    - context: the context of the reading
+     *    - tok:     the location of the impl token
+     *    - comm:    the comment above the impl token
+     * 
+     * @grammar:
+     * ```
+     * ClassImplDecl :=
+     *     Expression(0) ';'
+     *   | Expression(0) '{' ClassImplDeclBlock* '}'
+     *
+     * ClassImplDeclBlock :=
+     *     Method
+     *   | ProtectionKw ClassProtectionImplBlock
+     *
+     *
+     * ClassProtectionImplBlock :=
+     *   Method
+     *   | '{' Method* '}'
+     * ```
+     * 
+     * 
+     * */
+    fn readClassImpl (self, dmut context: &SyntaxVisitor, tok: &Word, comm: [c8])-> &ImplDecl
+        throws ErrorMsg
+    {
+        let who = context:.readExpression ();
+        let (next, _) = context:.readTokens (Tokens::SEMI_COLON, Tokens::LACC);
+
+        let mut decls: [&Declaration] = [];        
+        if next == Tokens::LACC { // Contains a block
+            loop {
+                let (attrLoc, attribs, attrComm) = context:.readAttributes ();
+                let (intok, tokComm) = context:.readToken ();
+                match intok.str {
+                    Tokens::RACC => {
+                        context.checkNoAttributes (intok, attrLoc, attribs);
+                        break;
+                    }
+                    Keys::PRIVATE | Keys::PUBLIC | Keys::PROTECTED => {
+                        decls ~= [self.readClassImplProtectionBlock (alias context, intok, attrComm ~ tokComm, attribs-> (attrLoc, attribs))];
+                    }
+                    Keys::OVER => {
+                        decls ~= [self.readCommonMethod (alias context, intok, attrComm ~ tokComm, attribs-> (attrLoc, attribs))];
+                    }
+                    _ => {
+                        throw copy ErrorMsg::fatal (intok, format (SyntaxErrorMessage::UNEXPECTED_BUT_LST,
+                                                                   copy [Keys::PRIVATE, Keys::PUBLIC, Keys::OVER]));
+                    }
+                }                                
+            }        
+        }
+
+        return copy ImplDecl (tok, comm, who, content-> decls);        
+    }
+
+    /**
+     * Read a block introduced by a protection inside a impl of a class declaration
+     *
+     * @params:
+     *    - context: the context of the reading
+     *    - loc:     the location of the protection keyword
+     *    - comm:    the comment above the protection
+     *    - attribs: the list of attributes above the protection keyword
+     *
+     * @grammar:
+     * ```
+     * ClassImplProtectionBlock :=
+     *    '{' Method* '}'
+     *    | Method
+     *     
+     * ```
+     * */        
+    fn readClassImplProtectionBlock (self, dmut context: &SyntaxVisitor, loc: &Word, comm: [c8], attribs: (&Word, [AttributeWord]))-> &BlockDecl
+        throws ErrorMsg
+    {
+        let protection = context.toProtection (loc.str);
+        let (open, openComm) = context:.readTokens (Tokens::LACC, Keys::OVER);
+
+        let mut decls: [mut &Declaration] = [];
+        
+        if !open.isEof { // a protected block
+            // @attrib pub { ... } is not allowed           
+            context.checkNoAttributes (loc, attribs._0, attribs._1);
+            loop {
+                let tokAttribs = context:.readAttributes ();
+                let (intok, tokComm) = context:.readToken ();
+                match intok.str {
+                    Tokens::RACC => {
+                        context.checkNoAttributes (intok, tokAttribs._0, tokAttribs._1);
+                        break;
+                    }
+                    Keys::OVER => {
+                        decls ~= [self.readCommonMethod (alias context, intok, tokAttribs._2 ~ tokComm, attribs-> (tokAttribs._0, tokAttribs._1))];
+                    }
+                    _ => {
+                        throw copy ErrorMsg::fatal (intok, format (SyntaxErrorMessage::UNEXPECTED_BUT_LST, copy [Keys::OVER]));
+                    }
+                }
+            }
+        } else {
+            decls ~= [self.readCommonMethod (alias context, open, comm ~ openComm, attribs-> attribs)];            
+        }           
+        
+        // A single protection            
+        return copy BlockDecl (loc, "", decls, protection-> protection);                
+    }
+
+
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          STRUCTS          =====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+    
+    /**
+     * Read declaration that can be found inside a struct
+     *
+     * @params:
+     *    - context: the context of the reading
+     *    - loc:     the token introducing the block reading
+     *    
+     * @grammar:
+     * ```
+     * StructDeclTop :=
+     *    StructDeclItem*
+     *
+     * StructDeclItem :=
+     *      StructProtectionBlock
+     *    | StructIfBlock
+     *    | UseDecl
+     *    | StructImplBlock
+     *    | StructCtor
+     *    | StructDtor
+     *    | StructMethod
+     *    | StructVar
+     *    
+     * ```
+     * */
+    fn readStructDeclBlockTop (self, dmut context: &SyntaxVisitor, loc: &Word)-> [&Declaration]
+        throws ErrorMsg
+    {
+        let mut decls: [mut &Declaration] = [];
+        {
+            loop {
+                let (attrLoc, attribs, attrComm) = context:.readAttributes ();
+                let (tok, tokComm) = context:.readToken ();
+
+                match tok.str {
+                    Keys::PRIVATE | Keys::PUBLIC => {
+                        decls ~= [self.readStructProtectionBlock (alias context, tok, attrComm ~ tokComm, attribs-> (attrLoc, attribs))];
+                    }
+                    Keys::CTE => {
+                        context.checkNoAttributes (tok, attrLoc, attribs);
+                        decls ~= [self.readStructIfBlock (alias context, tok, tokComm)];
+                    }
+                    Keys::USE => {
+                        context.checkNoAttributes (tok, attrLoc, attribs);                        
+                        decls ~= context.getGlobalVisitor ().readUse (alias context, tok, tokComm);
+                    }
+                    Keys::IMPL => {
+                        context.checkNoAttributes (tok, attrLoc, attribs);                        
+                        decls ~= [self.readStructImpl (alias context, tok, tokComm)];
+                    }
+                    Keys::LET => {
+                        context.checkNoAttributes (tok, attrLoc, attribs);
+                        decls ~= [self.readCommonVarDecl (alias context, tok, tokComm)];                        
+                    }
+                    Keys::SELF => {
+                        decls ~= [self.readCommonCtor (alias context, tok, tokComm, attribs-> (attrLoc, attribs))];                        
+                    }
+                    Keys::FUNCTION => {
+                        decls ~= [self.readCommonMethod (alias context, tok, tokComm, attribs-> (attrLoc, attribs))];
+                    }
+                    Keys::DTOR => {
+                        context.checkNoAttributes (tok, attrLoc, attribs);                        
+                        decls ~= [self.readCommonDtor (alias context, tok, tokComm)];                        
+                    }
+                    Tokens::RACC => {
+                        context.checkNoAttributes (tok, attrLoc, attribs);
+                        break;
+                    }
+                    _ => {
+                        if tok.isEof {
+                            throw copy ErrorMsg::fatal (loc, end-> tok, SyntaxErrorMessage::BLOCK_NEVER_CLOSED);                            
+                        }
+                        
+                        throw copy ErrorMsg::fatal (tok, format (SyntaxErrorMessage::UNEXPECTED_BUT_LST, self._special.structDeclTop));
+                    }
+                }                
+            }
+        }  catch {
+            err => {                
+                throw copy ErrorMsg::note (loc, SyntaxErrorMessage::IN_DECL_BLOCK, notes-> copy [err]);                
+            }
+        }
+
+        decls
+    }
+
+    /**
+     * Read a struct conditional block
+     *
+     * @params:
+     *     - context: the context of the reading
+     *     - loc:     the location of the `cte` keyword
+     *     - comm:    the comment above the cte if
+     *
+     * @grammar:
+     * ```
+     * StructIfBlock :=
+     *   'if' Expression(0) '{' StructDeclTop '}' StructIfFollow?
+     *
+     * StructIfFollow :=
+     *     'else' StructIfBlock
+     *   | 'else' '{' StructDeclTop '}'
+     *     
+     * ```
+     * */
+    fn readStructIfBlock (self, dmut context: &SyntaxVisitor, loc: &Word, comm: [c8])-> &Declaration
+        throws ErrorMsg
+    {
+        // At least one if block is mandatory after reading 'cte'
+        let (_, _) = context:.readTokens (Keys::IF);
+        let test = context:.readExpression ();
+        let (open, _) = context:.readTokens (Tokens::LACC);
+        let declsFst = self.readStructDeclBlockTop (alias context, open);
+        
+        let mut blocks : [(&Word, &Expression, [&Declaration], [c8])] = copy [(loc, test, declsFst, comm)];        
+
+        // We create a list of else blocks
+        while let (next, nextComm) = context:.readIf (Keys::ELSE) && !next.isEof {
+            let (nextIf, _) = context:.readIf (Keys::IF);
+            if nextIf.isEof {
+                let (nextOpen, _) = context:.readTokens (Tokens::LACC);
+                let declsElse = self.readStructDeclBlockTop (alias context, nextOpen);
+                
+                blocks ~= [(next, EMPTY_EXPR, declsElse, nextComm)];
+                break;
+            }
+
+            let nextTest = context:.readExpression ();
+            let (nextOpen, _) = context:.readTokens (Tokens::LACC);
+            let declsElse = self.readStructDeclBlockTop (alias context, nextOpen);
+            
+            blocks ~= [(nextIf, nextTest, declsElse, nextComm)];            
+        }  
+
+        // And we wrap them in reverse order to build the conditional tree
+        let mut resultBlock = if blocks [$ - 1]._1 of EmptyExpression {
+            copy BlockDecl (blocks [$ - 1]._0, blocks [$ - 1]._3, blocks [$ - 1]._2)
+        } else {
+            copy CondBlockDecl (blocks [$ - 1]._0, blocks [$ - 1]._3, blocks [$ - 1]._2, blocks [$ - 1]._1)
+        };
+        
+        blocks = blocks [0 .. $ - 1];        
+        for i in blocks.len .. 0 {
+            resultBlock = copy CondBlockDecl (blocks [i - 1]._0,
+                                              blocks [i - 1]._3,                                              
+                                              blocks [i - 1]._2,
+                                              blocks [$ - 1]._1,
+                                              else_-> resultBlock);            
+        } 
+
+        resultBlock
+    }
+
+    
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ================================          STRUCT PROTECTION          ================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+    
+    /**
+     * Read a block introduced by a protection inside a struct declaration
+     *
+     * @params:
+     *    - context: the context of the reading
+     *    - loc:     the location of the protection keyword
+     *    - comm:    the comment above the protection
+     *    - attribs: the list of attributes above the protection keyword
+     *
+     * @grammar:
+     * ```
+     * StructProtectionBlock :=
+     *    '{' StructProtectedDeclaration* '}'
+     *    | StructProtectedDeclaration
+     *
+     * StructProtectedDeclaration :=
+     *   | StructCtor
+     *   | StructMethod
+     *   | StructVar
+     * ```
+     * */        
+    fn readStructProtectionBlock (self, dmut context: &SyntaxVisitor, loc: &Word, comm: [c8], attribs: (&Word, [AttributeWord]))-> &BlockDecl
+        throws ErrorMsg
+    {
+        let protection = context.toProtection (loc.str);
+        let (open, _) = context:.readIf (Tokens::LACC);
+
+        if !open.isEof { // a protected block
+
+            // @attrib pub { ... } is not allowed           
+            context.checkNoAttributes (open, attribs._0, attribs._1);            
+            let decls = self.readStructProtectedBlock (alias context);
+            return copy BlockDecl (loc, comm, decls, protection-> protection);
+        }
+
+        // A single protection
+        let decls = copy [self.readStructProtectedSingle (alias context, loc, comm, attribs)];            
+        return copy BlockDecl (loc, "", decls, protection-> protection);                
+    }
+
+    /**
+     * Read a block of declaration protected by a protection keyword
+     *
+     * @params:
+     *   - context: the context of the reading
+     *   - open:    the location of the opening '{'
+     *
+     * @grammar:
+     * ```
+     * StructProtectedBlock :=
+     *    '{' StructProtectedDeclaration* '}'
+     * ```
+     * */
+    fn readStructProtectedBlock (self, dmut context: &SyntaxVisitor)-> [&Declaration]
+        throws ErrorMsg
+    {
+        let mut decls: [mut &Declaration] = [];
+        loop {
+            let (attrLoc, attribs, attrComm) = context:.readAttributes ();
+            let (tok, tokComm) = context:.readToken ();
+            if tok == Tokens::RACC {
+                break;
+            }
+            
+            decls ~= [self.readStructProtectedSingle (alias context, tok, attrComm ~ tokComm, attribs-> (attrLoc, attribs))];
+        }
+
+        decls
+    }
+
+    /**
+     * Read a single declaration protected by a protection keyword
+     *
+     * @params:
+     *    - context: the context of the reading
+     *    - tok:     the declaration to read
+     *    - comm:    the comments above the declaration
+     *    - attribs: the list of attributes on top of the declaration
+     *
+     *
+     * */
+    fn readStructProtectedSingle (self, dmut context: &SyntaxVisitor, tok: &Word, comm: [c8], attribs: (&Word, [AttributeWord]))-> &Declaration
+        throws ErrorMsg
+    {
+        match tok.str {
+            Keys::LET => {
+                context.checkNoAttributes (tok, attribs._0, attribs._1);
+                return self.readCommonVarDecl (alias context, tok, comm);                        
+            }
+            Keys::SELF => {
+                return self.readCommonCtor (alias context, tok, comm, attribs-> attribs);                        
+            }
+            Keys::FUNCTION => {
+                return self.readCommonMethod (alias context, tok, comm, attribs-> attribs);
+            }
+            _ => {
+                throw copy ErrorMsg::fatal (tok, format (SyntaxErrorMessage::UNEXPECTED_BUT_LST, self._special.structDeclProtected))
+            }
+        }
+    }
+
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ==================================          STRUCT IMPL          ===================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+
+    /**
+     * Read an implementation block, in a struct declaration block
+     *
+     * @params:
+     *    - context: the context of the reading
+     *    - tok:     the location of the impl token
+     *    - comm:    the comment above the impl token
+     * 
+     * @grammar:
+     * ```
+     * StructImplDecl :=
+     *     Expression(0) ';'
+     *   | Expression(0) '{' StructImplDeclBlock* '}'
+     *
+     * StructImplDeclBlock :=
+     *     Method
+     *   | ProtectionKw StructProtectionImplBlock
+     *
+     *
+     * StructProtectionImplBlock :=
+     *   Method
+     *   | '{' Method* '}'
+     * ```
+     * 
+     * 
+     * */
+    fn readStructImpl (self, dmut context: &SyntaxVisitor, tok: &Word, comm: [c8])-> &ImplDecl
+        throws ErrorMsg
+    {
+        let who = context:.readExpression ();
+        let (next, _) = context:.readTokens (Tokens::SEMI_COLON, Tokens::LACC);
+
+        let mut decls: [&Declaration] = [];        
+        if next == Tokens::LACC { // Contains a block
+            loop {
+                let (attrLoc, attribs, attrComm) = context:.readAttributes ();
+                let (intok, tokComm) = context:.readToken ();
+                match intok.str {
+                    Tokens::RACC => {
+                        context.checkNoAttributes (intok, attrLoc, attribs);
+                        break;
+                    }
+                    Keys::PRIVATE | Keys::PUBLIC => {
+                        decls ~= [self.readStructImplProtectionBlock (alias context, intok, attrComm ~ tokComm, attribs-> (attrLoc, attribs))];
+                    }
+                    Keys::OVER => {
+                        decls ~= [self.readCommonMethod (alias context, intok, attrComm ~ tokComm, attribs-> (attrLoc, attribs))];
+                    }
+                    _ => {
+                        throw copy ErrorMsg::fatal (intok, format (SyntaxErrorMessage::UNEXPECTED_BUT_LST,
+                                                                   copy [Keys::PRIVATE, Keys::PUBLIC, Keys::OVER]));
+                    }
+                }                                
+            }        
+        }
+
+        return copy ImplDecl (tok, comm, who, content-> decls);        
+    }
+
+    /**
+     * Read a block introduced by a protection inside a impl of a struct declaration
+     *
+     * @params:
+     *    - context: the context of the reading
+     *    - loc:     the location of the protection keyword
+     *    - comm:    the comment above the protection
+     *    - attribs: the list of attributes above the protection keyword
+     *
+     * @grammar:
+     * ```
+     * StructImplProtectionBlock :=
+     *    '{' Method* '}'
+     *    | Method
+     *     
+     * ```
+     * */        
+    fn readStructImplProtectionBlock (self, dmut context: &SyntaxVisitor, loc: &Word, comm: [c8], attribs: (&Word, [AttributeWord]))-> &BlockDecl
+        throws ErrorMsg
+    {
+        let protection = context.toProtection (loc.str);
+        let (open, openComm) = context:.readTokens (Tokens::LACC, Keys::OVER);
+
+        let mut decls: [mut &Declaration] = [];
+        
+        if !open.isEof { // a protected block
+            // @attrib pub { ... } is not allowed           
+            context.checkNoAttributes (loc, attribs._0, attribs._1);
+            loop {
+                let tokAttribs = context:.readAttributes ();
+                let (intok, tokComm) = context:.readToken ();
+                match intok.str {
+                    Tokens::RACC => {
+                        context.checkNoAttributes (intok, tokAttribs._0, tokAttribs._1);
+                        break;
+                    }
+                    Keys::OVER => {
+                        decls ~= [self.readCommonMethod (alias context, intok, tokAttribs._2 ~ tokComm, attribs-> (tokAttribs._0, tokAttribs._1))];
+                    }
+                    _ => {
+                        throw copy ErrorMsg::fatal (intok, format (SyntaxErrorMessage::UNEXPECTED_BUT_LST, copy [Keys::OVER]));
+                    }
+                }
+            }
+        } else {
+            decls ~= [self.readCommonMethod (alias context, open, comm ~ openComm, attribs-> attribs)];            
+        }           
+        
+        // A single protection            
+        return copy BlockDecl (loc, "", decls, protection-> protection);                
+    }
+
+    
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * =====================================          COMMON          =====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    fn readCommonVarDecl (self, dmut context: &SyntaxVisitor, loc: &Word, comm: [c8])-> &Declaration
+        throws ErrorMsg
+    {
+        context;
+        loc;
+        comm;
+        throw copy ErrorMsg::fatal (loc, "TODO");
+    }
+
+    
+    fn readCommonDtor (self, dmut context: &SyntaxVisitor, loc: &Word, comm: [c8])-> &Declaration
+        throws ErrorMsg
+    {
+        context;
+        loc;
+        comm;
+        throw copy ErrorMsg::fatal (loc, "TODO");
+    }
+
+
+    
+    fn readCommonMethod (self, dmut context: &SyntaxVisitor, loc: &Word, comm: [c8], attribs: (&Word, [AttributeWord]))-> &Declaration
+        throws ErrorMsg
+    {
+        context;
+        loc;
+        comm;
+        attribs;
+        throw copy ErrorMsg::fatal (loc, "TODO");
+    }
+
+    fn readCommonCtor (self, dmut context: &SyntaxVisitor, loc: &Word, comm: [c8], attribs: (&Word, [AttributeWord]))-> &Declaration
+        throws ErrorMsg
+    {
+        context;
+        loc;
+        comm;
+        attribs;
+        throw copy ErrorMsg::fatal (loc, "TODO");
+    }
+
+    
+}
