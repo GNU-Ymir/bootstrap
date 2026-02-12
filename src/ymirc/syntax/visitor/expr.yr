@@ -1,0 +1,678 @@
+/*
+ * Declares the value visitor in charge of reading value expressions
+ *
+ * <hr>
+ * 
+ * @Package: ymirc        
+ * @Module: ymirc::syntax::visitor::value
+ * @File: ymirc/syntax/visitor/value.yr
+ * @Author(s):
+ *   - Emile Cadorel <ecadorel@gmail.com>
+ *
+ * @Created (YYYY-MM-DD): 2026-02-11
+ * @Copyright (C) 2021–2026 GNU-Ymir
+ * @License
+ *   ```text
+ *   This file is part of the Ymir language project.
+ *
+ *   Ymir is free software: you can redistribute it and/or modify it
+ *   under the terms of the GNU General Public License as published by
+ *   the Free Software Foundation, either version 3 of the License, or
+ *   (at your option) any later version.
+ *
+ *   Ymir is distributed in the hope that it will be useful,
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *   GNU General Public License for more details.
+ *
+ *   You should have received a copy of the GNU General Public License
+ *   along with Ymir.  If not, see <https://www.gnu.org/licenses/>.
+ *   ```
+ */
+
+in expr;
+
+use ymirc::syntax::errors;
+use ymirc::errors::_;
+use ymirc::syntax::{_,
+                    visitor::_,
+                    declaration::_,
+                    expression::{_, literal::_, macro_::_, operator::_, template::_}};
+
+use ymirc::lexing::_;
+use ymirc::utils::_;
+use ymirc::global::state;
+
+use std::io;
+
+pub record ExpressionVisitor {
+
+    // Holding operators precedence
+    let _specials: SpecialKeysAndTokens = __SPECIAL_TOKENS__;
+    
+    
+    pub self () {}
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * =================================          IMPLEMENTATION          =================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+    
+    /**
+     * Read a top level expression
+     *
+     * @params:
+     *   - context: the context of the reading
+     *
+     * @grammar:
+     * ```
+     * readInstrOrExpr :=
+     *    ExpressionComplex(0)
+     *  | Instruction
+     *
+     * Instruction :=
+     *    Assert
+     *  | Break
+     *  | Let
+     *  | Return
+     *  | Throw
+     *  | Panic
+     * 
+     * ExpressionComplex(level) :=
+     *    ExpressionComplex(level + 1) (BinaryOperators(level) ExpressionComplex(level + 1))*
+     *     
+     * ExpressionComplex(10) :=
+     *    OperandComplex(0)
+     *    
+     * ```     
+     * 
+     * */
+    pub fn readInstrOrExpr (self, dmut context: &SyntaxVisitor)-> &Expression
+        throws ErrorMsg
+    {
+        let (tok, _) = context:.readToken (); 
+        match tok { // Top level expression that cannot be found inside an binary operator            
+            Keys::ASSERT   => { // assert (Test (, message)?)
+                return self.readAssert (alias context, tok);
+            }
+            Keys::BREAK    => { // break X;
+                return self.readBreak (alias context, tok);
+            }            
+            Keys::LET      => { // let (var,...) = expression(0);
+                return self.readVarDeclaration (alias context, tok);
+            }
+            Keys::RETURN   => { // return expression(0);
+                return self.readReturn (alias context, tok);
+            }            
+            Keys::THROW    => { // throw expression(0);
+                return self.readThrow (alias context, tok);
+            }            
+            Keys::PANIC    => { // panic;
+                return self.readPanic (alias context, tok);
+            }            
+        }
+
+        context:.rewind ();        
+        self:.readExpressionComplex (alias context, level-> 0)
+    }    
+
+    /**
+     * Read an expression of level `level`, with complex inner operations (such as loops, blocks, etc.)
+     *
+     * @params:
+     *    - context: the context of the reading
+     *    - level:   the level of the expression
+     * 
+     * */
+    pub fn readExpressionComplex (self, dmut context: &SyntaxVisitor, level: u32)-> &Expression
+        throws ErrorMsg
+    {
+        if level == self._specials.binaryOperators.len {
+            return self.readOperandComplex0 ();
+        }
+
+        let mut left = self:.readExpressionComplex (alias context, level + 1);
+
+        // While we find an operator following the expression, we append a right operand to it
+        while let (op, _) = context:.readIf (self._specials.binaryOperators [level]) && !op.isEof {        
+            let right = self:.readExpressionComplex (alias context, level + 1);
+            left = copy BinaryExpr (op, left, right);
+        }
+        
+        left
+    }
+    
+    /**
+     * Read an complex operand of level 1
+     *
+     * @params:
+     *    - context: the context of the syntax reader
+     *
+     * @grammar
+     * ```
+     * OperandComplex(0) :=
+     *      ComplexOperation
+     *    | MemoryOperation
+     *    | DecoratedOperand
+     *    | OperandSimple(1) 
+     *     
+     *
+     * ComplexOperation :=
+     *      Loop
+     *    | While
+     *    | '{' Value* '}'
+     *    | IfElse
+     *    | DoWhile
+     *    | For
+     *    | Match
+     *    | Fptr
+     *    | DgPtr
+     *    | Future
+     *    | Pragma
+     *    | Unsafe
+     *    | Version     
+     *    | Future
+     *    | Lambda
+     *    | Cast
+     *    | TemplateChecker
+     *    | CteComplex
+     *
+     * DecoratedExpr := MutableKw OperandSimple(0)
+     * MutableKw := 'mut' | 'dmut'
+     *
+     * MemoryOperation :=
+     *    MemoryOperatorKw OperandSimple(0)
+     *
+     * MemoryOperatorKw :=
+     *     'copy'
+     *   | 'dcopy'
+     *   | 'expand'
+     *   | 'alias'
+     *   | 'ref'
+     *   | 'move'
+     * 
+     *    
+     * ```
+     * */
+    fn readOperandComplex0 (self, dmut context: &SyntaxVisitor)-> &Expression
+        throws ErrorMsg
+    {
+        // Test if it's a complex operand
+        let (tok, _) = self:.readToken ();        
+        match tok {
+            Keys::LOOP => // loop { ... } | COMPLEX
+                return self.readLoop (alias context, tok);            
+            Keys::WHILE =>  // while Expression(0) { ... }
+                return self.readWhile (alias context, tok);            
+            Tokens::LACC => // { ... } block 
+                return self.readBlock (alias context, tok);        
+            Keys::IF => // if { ... } (else if { ... })  
+                return self.readIfExpression (alias context, tok);                    
+            Keys::DO => // do { ... } while X 
+                return self.readDoWhile (alias context, tok);            
+            Keys::FOR => // for vars... in X { ... }
+                return self.readFor (alias context, tok);            
+            Keys::MATCH => // match X { ... }
+                return self.readMatch (alias context, tok);                    
+            Keys::FUNCTION => // fn (X...)-> X
+                return self.readFunctionType (alias context, tok);            
+            Keys::DELEGATE => // dg (X...) -> X
+                return self.readFunctionType (alias context, tok);            
+            Keys::FUTURE => // future-> X
+                return self.readFutureType (alias context, tok);
+            Keys::SPAWN => // spawn { ... }
+                return self.readSpawn (alias context, tok);
+            Keys::LAZY => // lazy { ... }
+                return self.readLazy (alias context, tok);            
+            Keys::PRAGMA => // __pragma!X (....)
+                return self.readPragma (alias context, tok);            
+            Keys::ATOMIC => // atomic X { ... }
+                return self.readAtomic (alias context, tok);            
+            Keys::UNSAFE => // unsafe { ... }
+                return self.readUnsafe (alias context, tok);                        
+            Keys::VERSION  => // __version { ... }
+                return self.readVersion (alias context, tok);
+            Tokens::PIPE | Tokens::DPIPE => // |vars...| => X, |vars...| { ... }
+                return self.readLambda (alias context, tok);
+            Keys::CAST => // cast!{T} (X)
+                return self.readCast (alias context, tok);
+            Keys::NOT_IS | Keys::IS => // is!{T...}{U...}, !is!{T...}{U...}
+                return self.readTemplateChecker (alias context, tok);            
+            Keys::CTE => // cte if, cte for, cte X
+                return self.readCteComplex (alias context, tok);
+            Keys::MUTABLE | Keys::DMUTABLE => // mut X, dmut X
+                return copy DecoratedExpr (tok, self.readOperandSimple1 (alias context));
+            Keys::TYPEOF => // typeof (X) 
+                return copy TypeofExpr (tok, self.readOperandSimple1 (alias context));
+            Tokens::DDOT => { // ..i32 is a range type                
+                return copy RangeTypeExpr (token, self.readOperandSimple1 (alias context));
+            }
+        }
+
+        // Maybe a memory operation?
+        for i in self._specials.memoryKeys if tok.str == i {
+            let operand = self.readOperandSimple0 (alias context);
+            return copy MemoryExpr (tok, context.toMemoryOperator (tok.str), operand);            
+        }
+                
+        // If not it's a second level operand
+        context:.rewind ();        
+        return self:.readOperandSimple1 ();
+    }
+
+    /**
+     * Read a expression introduced by the keyword `cte` in a complex operand
+     *
+     * @params:
+     *    - context: the context of the reading
+     *    - loc:     the location of the `cte` keyword
+     *
+     * @grammar:
+     * ```
+     * CteComplex :=
+     *     If
+     *   | For
+     *   | OperandSimple(4)     
+     * ```
+     *  
+     * */
+    fn readCteComplex (self, dmut context: &SyntaxVisitor, loc: &Word)-> &Expression
+        throws ErrorMsg
+    {
+        let (op, _) = context:.readIf (Keys::IF, Keys::FOR);
+        match op.str {
+            Keys::IF => {
+                return self.readIf (alias context, op, isCte-> true);
+            }
+            Keys::FOR => {
+                return self.readFor (alias context, op, isCte-> true);
+            }
+        };
+
+        let operand = self.readOperandSimple1 (alias context);
+        copy CteValue (loc, operand)        
+    }
+    
+    
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ===============================          SIMPLE EXPRESSION          ================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+    
+    /**
+     * Read an expression of level `level`, forbidding complex construction (loops, let, match, and even blocks, etc.)
+     * To return to a complex context, expression has to be enclosed with parentheses
+     *
+     * @params:
+     *    - context: the context of the reading
+     *    - level:   the level of the expression
+     * 
+     * */
+    pub fn readExpressionSimple (self, dmut context: &SyntaxVisitor, level: u32)-> &Expression
+        throws ErrorMsg
+    {
+        if level == self._specials.binaryOperators.len
+            return self.readOperandSimple0 ();
+
+
+        let mut left = self:.readExpressionSimple (alias context, level + 1);
+
+        // While we find an operator following the expression, we append a right operand to it
+        while let (op, _) = context:.readIf (self._specials.binaryOperators [level]) && !op.isEof {        
+            let right = self:.readExpressionSimple (alias context, level + 1);
+            left = copy BinaryExpr (op, left, right);
+        }
+        
+        left
+    }
+
+
+    /**
+     * Read a simple operand of level 0, unlike complex operands operand(0) is
+     * way simpler, but operand1 and follow up are similar.     
+     *
+     * @params:
+     *    - context: the context of the syntax reader
+     *
+     * @grammar
+     * ```
+     * OperandSimple(0) :=
+     *      SimpleOperation
+     *    | MemoryOperation
+     *    | DecoratedOperand
+     *    | OperandSimple(1) 
+     *     
+     *
+     * SimpleOperation :=          
+     *    | Pragma     
+     *    | Version     
+     *    | Cast
+     *    | TemplateChecker
+     *     
+     *    
+     * ```
+     * */
+    fn readOperandSimple0 (self, dmut context: &SyntaxVisitor)-> &Expression
+        throws ErrorMsg
+    {
+        // Test if it's a complex operand
+        let (tok, _) = self:.readToken ();        
+        match tok {
+            Keys::PRAGMA  => // __pragma!{T} ( ... )
+                return self.readPragma (alias context, tok);
+            Keys::VERSION  => // __version!{ID}
+                return self.readVersion (alias context, tok);
+            Keys::CAST => // cast!{T} (X)
+                return self.readCast (alias context, tok);
+            Keys::NOT_IS | Keys::IS => // is!{T...}{U...}, !is!{T...}{U...}
+                return self.readTemplateChecker (alias context, tok);
+            Keys::MUTABLE | Keys::DMUTABLE => // mut X, dmut X
+                return copy DecoratedExpr (tok, self.readOperandSimple1 (alias context));
+            Keys::CTE => // cte if, cte for, cte X
+                return copy CteValue (tok, self.readOperandSimple1 (alias context));
+            Tokens::DDOT => { // ..i32 is a range type                
+                return copy RangeTypeExpr (token, self.readOperandSimple1 (alias context));
+            }
+        }
+
+        // Maybe a memory operation?
+        for i in self._specials.memoryKeys if tok.str == i {
+            let operand = self.readOperandSimple0 (alias context);
+            return copy MemoryExpr (tok, context.toMemoryOperator (tok.str), operand);            
+        }
+        
+        // If not it's a second level operand
+        context:.rewind ();        
+        return self:.readOperandSimple1 ();
+    }
+
+    /**
+    
+     *
+     * To return to a complex operand context, parentheses have to be used, i.e.
+     * '(' complex ')' is a simple operand
+     * 
+     * @params:
+     *    - context: the context of the reading     
+     *
+     * @grammar:
+     * ```
+     * OperandSimple(1) :=
+     *      UnaryOp OperandSimple(2)
+     *    | OperandSimple(2) '?'
+     *    | OperandSimple(2)
+     *
+     * UnaryOp :=
+     *      '+'
+     *    | '-'
+     *    | '*'
+     *    | '!'
+     * ```
+     * 
+     * */
+    fn readOperandSimple1 (self, dmut context: &SyntaxVisitor)-> &Expression
+        throws ErrorMsg
+    {
+        // Try to read an unary operator
+        let (tok, _) = context:.readIf (self._specials.unaryOperators);
+        let operand = self.readOperandSimple2 (); // read the operand
+
+        if !tok.isEof { // an unary operator was found
+            return copy UnaryExpr (tok, operand);
+        }
+
+        // -10? is not allowed, (-10)? has to be written to avoid confusion
+        let (post, _) = context:.readIf (Tokens::INTEG);
+        if !post.isEof { // an option operator was found
+            return copy TryExpr (post, operand);
+        }
+
+        return operand;
+    }
+    
+    /**
+     * Read a second level operand in a simple
+     *
+     * @grammar
+     * ```
+     * OperandSimple(2) :=
+     *    OperandSimple(3) OperandSimpleFollow?
+     *     
+     * OperandSimpleFollow :=
+     *      '[' (ExpressionSimple(0) (',' ExpressionSimple(0))* ']' OperandSimpleFollow?
+     *    | '.' OperandSimple(4) OperandSimpleFollow?
+     *    | ':.' OperandSimple(4) OperandSimpleFollow?
+     *    | MacroCall
+     *
+     * ```
+     * 
+     * */
+    fn readOperandSimple2 (self, dmut context: &SyntaxVisitor)-> &Expression
+        throws ErrorMsg
+    {
+        let mut left = self.readOperandSimple3 (alias context);
+        
+        loop {
+            let (open, _) = context:.readToken ();
+            match open.str {
+                Tokens::LPAR | Tokens::LCRO | Tokens::LCRO_AND => { // left (...), left [...], left :[...]                   
+                    let (params, end) = self.readArgumentList (open);
+                    left = copy MultOperatorExpr (open, end, left, params);
+                }
+                Tokens::DOT | Tokens::DOT_AND => { // left.right, left:.right
+
+                    // an operand4 because left.A::B is...meh, which would be valid with operand3,
+                    // write left.(A::B) instead, in any case it'd be rejected by semantic, but filtering here seems better anyway
+                    // 
+                    let right = self.readOperandSimple4 (alias context); 
+                    left = copy BinaryExpr (open, left, right);
+                }                
+                _ => {
+                    if let str: &StringWord = open match str.open { // left #{...}
+                        Tokens::MACRO_ACC | Tokens::MACRO_PAR | Tokens::MACRO_CRO => {
+
+                            // Macro call is already a full read token from Lexer
+                            left = copy MacroCallExpr (str.open, str.close, str.str);
+                            break; // break to consume open
+                        }
+                    }
+
+                    // rewind fallback, nothing interesting read
+                    context:.rewind (); 
+                    break; 
+                }
+                
+            }
+        }
+
+        left
+    }
+
+    /**
+     * Read a simple operand of level 3, with is a list of template calls and '::' linking operand4
+     *
+     * @params:
+     *    - context: the context syntax visitor of the reading
+     *
+     * @grammar:
+     * ```
+     * OperandSimple(3) :=
+     *    OperandSimple(4) ('!' templates)? OperandSimple3Follow
+     *
+     * OperandSimple3Follow := '::' OperandSimple(3)     
+     * ```
+     * */
+    fn readOperandSimple3 (self, dmut context: &SyntaxVisitor)-> &Expression
+        throws ErrorMsg
+    {
+        // First operand that might be followed: operand3 ('!' templates)?
+        let mut left = self.readOperandSimple4 ();
+        let (not, _) = context:.readIf (Tokens::NOT);
+        if !not.isEof {
+            let lst = self.readTemplateCallList (alias context, not);
+            left = copy TemplateCallExpr (n, var, lst);
+        }
+        
+        // Reading the followings '::' operand4 ('!' templates)?
+        while let (colon, _) = context:.readIf (Tokens::DCOLON) && !colon.isEof {
+            let right = self.readOperandSimple4 ();
+            left = copy BinaryExpr (colon, left, right);
+
+            let (not, _) = context:.readIf (Tokens::NOT);
+            if !not.isEof {
+                let lst = self.readTemplateCallList (alias context, not);
+                left = copy TemplateCallExpr (n, var, lst);
+            }            
+        }
+        
+        left
+    }
+
+    /**
+     * Read a simple operand of level 4, which defines literals, e.g. ints, floats, arrays, tuples, etc.
+     *
+     * @params:
+     *    - context: the context of the reading
+     *
+     * @grammar:
+     * ```
+     *
+     * OperandSimple(4) :=
+     *      Tuple
+     *    | Array
+     *    | Literal
+     *    | Var
+     *    
+     * ```
+     * */
+    fn readOperandSimple4 (self, dmut context: &SyntaxVisitor)-> &Expression
+        throws ErrorMsg
+    {
+        let (tok, _) = context:.readToken ();
+        if tok == Tokens::LPAR // ( ... )
+            return self.readTuple (alias context, tok);
+
+        if tok == Tokens::LCRO // [ ... ]
+            return self.readArray (alias context, tok);
+
+        if tok.isName || tok.isKey && token == Keys::SELF { // ident | self
+            return copy VarExpr (tok);
+        }
+
+        // anything else
+        return self.readLiteral (tok);
+    }
+    
+    
+    /**
+     * Read a literal expression, final level of recurive reading of complex or simple operands.
+     * We don't need context, literals are written in one token from the Lexer.
+     *
+     * @params:     
+     *    - tok: the token that had been read
+     *  
+     * */
+    fn readLiteral (self, tok: &Word)-> &Expression
+        throws ErrorMsg
+    {
+        if let str: &StringWord = token { // String literal            
+            match str.open {
+                Tokens::SQUOTE => {
+                    return copy CharExpr (str.open, str.close, str.str, suffix-> str.suffix);                    
+                }
+                Tokens::DQUOTE | Tokens::TRIPLE_DQUOTE => {
+                    return copy StringExpr (str.open, str.close, str.str, suffix-> str.suffix);                    
+                }
+            }
+            
+            throw copy ErrorMsg::fatal (str.open, format (SyntaxErrorMessage::UNEXPECTED, str.open.str));
+        }
+
+        if let num: &NumericWord = token {
+            return copy FixedExpr (num, suffix-> num.suffix);
+        }
+
+        if let fl: &FloatWord = token {
+            return copy FloatExpr (fl.dot,
+                                   prePart-> fl,
+                                   decPart-> fl.dec,
+                                   suffix-> fl.suffix,
+                                   exp-> fl.exp,
+                                   expPositive-> (fl.sign.isEof || sl.sign == Tokens::PLUS),
+                                   isHex-> (fl.notation == FloatNotation::HEX));
+        }
+        
+        match token {
+            Keys::TRUE | Keys::FALSE => {
+                return copy BoolExpr (token);    
+            }
+            Keys::NULL => {
+                return copy NullExpr (token);    
+            }
+            Keys::NONE => {
+                return copy NoneExpr (token);    
+            }
+            Tokens::DOLLAR => {
+                return copy DollarExpr (token);    
+            }            
+        }
+        
+        throw copy ErrorMsg::fatal (token, format (SyntaxErrorMessage::UNEXPECTED, token.str));    
+    }
+
+    
+    /**
+     * Read a list of template calls values (after a '!' was encountered within a Operand2)
+     * @returns: the list of template values that where read
+     *
+     * @grammar:
+     * ```
+     * 
+     * ```
+     * */
+    fn readTemplateCallList (self, dmut context: &SyntaxVisitor, loc: &Word)-> [&Expression]
+        throws ErrorMsg
+    {
+        // Template inside a simple template call is not allowed
+        if let inTemplate = context.isInNoAccTemplate () && !inTemplate.isEof {
+            throw copy ErrorMsg::fatal (loc, format (SyntaxErrorMessage::UNEXPECTED, loc.str),
+                                        notes-> copy [copy ErrorMsg::note (inTemplate, format (SyntaxErrorMessage::MISSING_TEMPLATE_ACC))]);
+        }
+        
+        let (open, _) = context:.readTokens (Tokens::LACC);
+        if open.isEof { // simple operand value 
+            // To avoid recursive A!B!C or A!B!{C} -> A!{B!C}
+            context:.setInTemplate (loc);
+            let ret = {
+                self.readOperandSimple4 (); // tuples, arrays, vars, literals                
+            } exit {
+                context:.setInTemplate (EOF_WORD);
+            };
+
+            return copy [ret];
+        }
+
+        // We don't set in template, A!{B!C} is allowed
+        
+        let dmut values: [&Expression] = [];                
+        loop {
+            let value = self.readExpressionSimple (alias context, level-> 0);
+            values ~= [value];
+
+            let (close, _) = context:.readTokens (Tokens::COMA, Tokens::RACC);
+            if close == Tokens::RACC {
+                break;
+            }
+        }
+
+        values        
+    }
+    
+    
+}
