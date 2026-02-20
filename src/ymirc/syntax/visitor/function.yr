@@ -1,0 +1,300 @@
+/*
+ * Declares the syntax visitor in charge of reading functions
+ *
+ * <hr>
+ * 
+ * @Package: ymirc        
+ * @Module: ymirc::syntax::visitor::function
+ * @File: ymirc/syntax/visitor/function.yr
+ * @Author(s):
+ *   - Emile Cadorel <ecadorel@gmail.com>
+ *
+ * @Created (YYYY-MM-DD): 2026-02-20
+ * @Copyright (C) 2021–2026 GNU-Ymir
+ * @License
+ *   ```text
+ *   This file is part of the Ymir language project.
+ *
+ *   Ymir is free software: you can redistribute it and/or modify it
+ *   under the terms of the GNU General Public License as published by
+ *   the Free Software Foundation, either version 3 of the License, or
+ *   (at your option) any later version.
+ *
+ *   Ymir is distributed in the hope that it will be useful,
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *   GNU General Public License for more details.
+ *
+ *   You should have received a copy of the GNU General Public License
+ *   along with Ymir.  If not, see <https://www.gnu.org/licenses/>.
+ *   ```
+ */
+
+in function;
+
+use ymirc::errors::_;
+use ymirc::syntax::{_,
+                    visitor::_,
+                    declaration::_,
+                    expression::{empty, instruction}};
+
+
+use ymirc::lexing::{word, tokens, keys};
+use ymirc::utils::_;
+
+use std::io;
+
+
+/**
+ * Visitor in charge of reading functions
+ * */
+pub record FunctionVisitor {
+    pub self () {}
+    
+    /**
+     * Read a function declaration
+     *
+     * @params:
+     *    - context: the context of the reading
+     *    - loc:     the location of the keyword introducing the function
+     *    - comm:    the comment above the function
+     *    - attrs:   the list of attributes describing the function
+     *
+     * @grammar
+     * ```
+     * FunctionDecl :=
+     *     NormalFunction
+     *   | TemplateFunction
+     *
+     * NormalFunction :=
+     *   'fn' Identifier FunctionPrototype NormalBody
+     *
+     * TemplateFunction :=
+     *   'fn' TemplateTest? Identifier TemplateParams FunctionPrototype Block (withGuards = true)
+     *
+     * FunctionPrototype :=  
+     *    '(' ParamList? ')' ReturnType? Throwers?
+     *    
+     * ParamList :=
+     *   ParamDecl (',' ParamDecl)*
+     *
+     * ParamDecl :=
+     *    VariableModifier? Identifier ':' OperandSimple(0) ('=' ExpressionSimple (BOOL_LOGIC))
+     *
+     *
+     * ReturnType := '->' OperandSimple(0)
+     * Throwers :=
+     *   'throws' OperandSimple(0) (',' OperandSimple(0))
+     *
+     * NormalBody :=
+     *    Block (withGuards = true)
+     *  | ';'
+     *  
+     * ```
+     * */
+    pub fn read (self, dmut context: &SyntaxVisitor, loc: &Word, comm: [c8], attrs: [AttributeWord])-> &Declaration
+        throws ErrorMsg
+    {
+        let tryTemplateLoc = context.getSeek ();
+        let mut normErr: (&ErrorMsg)? = none;
+        let mut templateErr: (&ErrorMsg)? = none;
+
+        { // Try to read a normal function
+            return self.readNormalFunction (alias context, loc, comm, attrs);
+        } catch {
+            err => {
+                normErr = (err)?;
+            }
+        }
+
+        // Rewind to the start of the reading
+        context:.rewindToSeek (tryTemplateLoc);
+        { // Try to read a template function
+            return self.readTemplateFunction (alias context, loc, comm, attrs);
+        } catch {
+            err => {
+                templateErr = (err)?;
+            }
+        }
+
+        if let (Ok (ne), Ok (te)) = (normErr, templateErr) {
+            throw copy ErrorMsg::list (copy [ne, te]);
+        }
+
+        eprintln ("internal function syntax visitor: empty errors");
+        panic;
+    }
+    
+    /**
+     * Read a function with no template parameters
+     *     
+     * @params:
+     *    - context: the context of the reading
+     *    - loc:     the location of the keyword introducing the function
+     *    - comm:    the comment above the function
+     *    - attrs:   the list of attributes describing the function
+     *
+     * @grammar: cf. `self.read`
+     * */
+    fn readNormalFunction (self, dmut context: &SyntaxVisitor, loc: &Word, comm: [c8], attrs: [AttributeWord])-> &Declaration
+        throws ErrorMsg
+    {
+        let (ident, _) = context:.readIdentifier ();
+        let (proto, throwLoc, throwers) = self.readFunctionPrototype (alias context);
+
+        let mut body: &Expression = EMPTY_EXPR;
+        let (open, _) = context:.readTokens (Tokens::LACC, Tokens::SEMI_COLON);
+        if open == Tokens::LACC {
+            body = context.getExpressionVisitor ().readBlock (alias context, open, withGuards-> true);
+        }
+        
+        return copy FunctionDecl (loc-> loc,
+                                  comm-> comm,
+                                  name-> ident,
+                                  proto-> proto,
+                                  body-> body,
+                                  attrs-> attrs,
+                                  throwers-> throwers,
+                                  throwerLoc-> throwLoc,
+                                  isOver-> false);
+    }
+
+    /**
+     * Read a function with template parameters
+     *     
+     * @params:
+     *    - context: the context of the reading
+     *    - loc:     the location of the keyword introducing the function
+     *    - comm:    the comment above the function
+     *    - attrs:   the list of attributes describing the function
+     *
+     * @grammar: cf. `self.read`
+     * */
+    fn readTemplateFunction (self, dmut context: &SyntaxVisitor, loc: &Word, comm: [c8], attrs: [AttributeWord])-> &Declaration
+        throws ErrorMsg
+    {
+        let (ifLoc, test) = context:.readTemplateTest ();
+        let (ident, _) = context:.readIdentifier ();
+        let templates = context:.readTemplateParameters (ifLoc-> ifLoc);
+        
+        let (proto, throwLoc, throwers) = self.readFunctionPrototype (alias context);
+        
+        let (open, _) = context:.readTokens (Tokens::LACC);        
+        let body = context.getExpressionVisitor ().readBlock (alias context, open, withGuards-> true);            
+
+        let func = copy FunctionDecl (loc-> loc,
+                                      comm-> comm,
+                                      name-> ident,
+                                      proto-> proto,
+                                      body-> body,
+                                      attrs-> attrs,
+                                      throwers-> throwers,
+                                      throwerLoc-> throwLoc,
+                                      isOver-> false);
+
+        return copy TemplateDecl (loc, comm, templates, test, func);
+    }
+
+    /**
+     * Read the prototype of a function declaration
+     *
+     * @params:
+     *    - context: the context of the reading
+     *    
+     * @returns:
+     *    - .0: the prototype
+     *    - .1: the location of the `throws` keyword, or EOF
+     *    - .2: the list of throwers
+     * */
+    fn readFunctionPrototype (self, dmut context: &SyntaxVisitor)-> (FunctionPrototype, &Word, [&Expression])
+        throws ErrorMsg
+    {
+        context:.readTokens (Tokens::LPAR);
+        let mut params: [&VarDeclExpr] = [];
+
+        
+        let (mut end, _) = context:.readIf (Tokens::RPAR);
+        while end != Tokens::RPAR {
+            let (isLazyOrRef, isMutOrDmut) = context:.readVariableModifiers ();
+            let (ident, _) = context:.readIdentifier ();
+            
+            // ':' type is mandatory
+            context:.readTokens (Tokens::COLON);
+            let type = context.getExpressionVisitor ().readOperandSimple0 (alias context);
+
+            // '=' value is optional
+            let mut value: &Expression = EMPTY_EXPR;
+            let (hasValue, _) = context:.readIf (Tokens::EQUAL);
+            if !hasValue.isEof {
+                value = context.getExpressionVisitor ().readExpressionSimple (alias context, level-> BinaryOperatorsLevelNames::BOOL_LOGIC);
+            }
+
+            let nparam = copy VarDeclExpr (loc-> ident, // no `let`
+                                           name-> ident,
+                                           isLazyOrRef-> isLazyOrRef,
+                                           isMutOrDmut-> isMutOrDmut,
+                                           type-> type,
+                                           value-> value);
+
+            params ~= [nparam];
+
+            end = context:.readTokens (Tokens::COMA, Tokens::RPAR)._0;
+        }
+
+        // Read return type
+        let mut type: &Expression = EMPTY_EXPR;        
+        let (arrow, _) = context:.readIf (Tokens::ARROW);
+        if !arrow.isEof {
+            type = context.getExpressionVisitor ().readOperandSimple0 (alias context);
+        }
+
+        // Read the throwers
+        let mut throwers: [&Expression] = [];
+        let (throwLoc, _) = context:.readIf (Keys::THROWS);
+        if !throwLoc.isEof {
+            loop { // throws X, Y, Z
+                throwers ~= [context.getExpressionVisitor ().readOperandSimple0 (alias context)];
+
+                let (coma, _) = context:.readIf (Tokens::COMA);
+                if coma.isEof
+                    break;
+            }
+        }
+
+        return (FunctionPrototype (params, type, false), throwLoc, throwers);
+    }
+
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          UNITTEST          ====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Read an unittest declaration introduce by the keyword `__test`
+     *
+     * @params:
+     *    - context: the context of the reading
+     *    - loc:     the location of the `__test` keyword
+     *    - comm:    the comment above the unittest
+     *
+     * @grammar
+     * ```
+     * UnittestDecl :=
+     *    `__test` Block(withGuards = false)
+     * ```
+     * */
+    pub fn readUnittest (self, dmut context: &SyntaxVisitor, loc: &Word, comm: [c8])-> &Declaration
+        throws ErrorMsg
+    {
+        let (open, _) = context:.readTokens (Tokens::LACC);        
+        let body = context.getExpressionVisitor ().readBlock (alias context, open, withGuards-> false);
+
+        return copy UnittestDecl (loc, comm, body);
+    }
+    
+    
+}

@@ -1,0 +1,471 @@
+/*
+ * Declares the syntax visitor in charge of reading traits.
+ *
+ * <hr>
+ * 
+ * @Package: ymirc        
+ * @Module: ymirc::syntax::visitor::trait_
+ * @File: ymirc/syntax/visitor/trait_.yr
+ * @Author(s):
+ *   - Emile Cadorel <ecadorel@gmail.com>
+ *
+ * @Created (YYYY-MM-DD): 2026-02-20
+ * @Copyright (C) 2021–2026 GNU-Ymir
+ * @License
+ *   ```text
+ *   This file is part of the Ymir language project.
+ *
+ *   Ymir is free software: you can redistribute it and/or modify it
+ *   under the terms of the GNU General Public License as published by
+ *   the Free Software Foundation, either version 3 of the License, or
+ *   (at your option) any later version.
+ *
+ *   Ymir is distributed in the hope that it will be useful,
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *   GNU General Public License for more details.
+ *
+ *   You should have received a copy of the GNU General Public License
+ *   along with Ymir.  If not, see <https://www.gnu.org/licenses/>.
+ *   ```
+ */
+
+in trait_;
+
+
+use ymirc::errors::_;
+use ymirc::syntax::{_,
+                    visitor::_,
+                    declaration::_,
+                    expression::{empty, instruction}};
+
+
+use ymirc::lexing::{word, tokens, keys};
+use ymirc::utils::_;
+
+use std::io;
+
+
+/**
+ * Visitor in charge of reading traits
+ * */
+pub record TraitVisitor {
+
+
+    let _special: SpecialTrait = __SPECIAL_TRAIT__;
+    
+    pub self () {}
+
+    /**
+     * Read a trait declaration introduced by the keyword `trait`
+     *
+     * @params:
+     *    - context: the context of the reading
+     *    - loc:     the location of the `trait` keyword
+     *    - comm:    the comments above the trait
+     *
+     * @grammar
+     * ```
+     * TraitDecl :=
+     *     TemplateTraitDecl
+     *   | NormalTraitDecl
+     *
+     * TemplateTraitDecl :=
+     *    `trait` TemplateTest? Identifier TemplateParams '{' TraitDeclarations '}'
+     *
+     * NormalTraitDecl :=
+     *    `trait` Identifier '{' TraitDeclarations '}'
+     * ```
+     * */
+    pub fn read (self, dmut context: &SyntaxVisitor, loc: &Word, comm: [c8])-> &Declaration
+        throws ErrorMsg
+    {
+        let tryTemplateLoc = context.getSeek ();
+        let mut normErr: (&ErrorMsg)? = none;
+        let mut templateErr: (&ErrorMsg)? = none;
+
+        { // Try to read a normal trait                        
+            return self.readNormalTrait (alias context, loc, comm);                                         
+        } catch {
+            err => {
+                normErr = (err)?;
+            }
+        }
+
+        // Go back to the `trait` keyword
+        context:.rewindToSeek (tryTemplateLoc);
+        { // Read a template trait
+            return self.readTemplateTrait (alias context, loc, comm);                                                                                               
+        }  catch {
+            err => {
+                normErr = (err)?;
+            }
+        }
+
+        // Both failed, throwing the error
+        if let (Ok (ne), Ok (te)) = (normErr, templateErr) {
+            throw copy ErrorMsg::list (copy [ne, te]);
+        }
+
+        eprint ("internal trait syntax visitor: empty error messages");
+        panic;
+    }
+
+
+    /**
+     * Read a trait without template parameters
+     *
+     * @params:
+     *   - context:  the context of the reading
+     *   - loc:      the location of the keyword introducing the trait
+     *   - comm:     the comment on top of the trait     
+     *     
+     * */
+    fn readNormalTrait (self, dmut context: &SyntaxVisitor, loc: &Word, comm: [c8])-> &TraitDecl
+        throws ErrorMsg
+    {
+        let (ident, _) = context:.readIdentifier ();                        
+        let (open, _) = context:.readTokens (Tokens::LACC);
+
+        let decls = self.readDeclBlockTop (alias context, open);
+        
+        return copy TraitDecl (loc,
+                               name-> ident,
+                               comm-> comm,
+                               decls);                                 
+    }
+    
+    /**
+     * Read a trait with template parameters
+     *
+     * @params:
+     *   - context:  the context of the reading
+     *   - loc:      the location of the keyword introducing the trait
+     *   - comm:     the comment on top of the trait
+     *     
+     * */
+    fn readTemplateTrait (self, dmut context: &SyntaxVisitor, loc: &Word, comm: [c8])-> &TemplateDecl
+        throws ErrorMsg
+    {
+        let (ifLoc, test) = context:.readTemplateTest ();
+        let (ident, _) = context:.readIdentifier ();
+        let templates = context:.readTemplateParameters (ifLoc-> ifLoc);
+        
+        let (open, _) = context:.readTokens (Tokens::LACC);
+
+        let decls = self.readDeclBlockTop (alias context, open);        
+        
+        let tr = copy TraitDecl (loc,
+                                 name-> ident,
+                                 comm-> comm,
+                                 decls);                              
+        
+        
+        return copy TemplateDecl (loc-> ident,
+                                  comm-> comm,
+                                  params-> templates,
+                                  decl-> tr,
+                                  guard-> test);
+    }    
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ==================================          TRAIT BLOCK          ===================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Read a list of declaration inside a trait
+     *
+     * @params
+     *    - context: the context of the reading
+     *    - loc:     the token introducing the block reading
+     *
+     * @grammar
+     * ```
+     * TraitDeclTop :=
+     *    '{' TraitDeclItem* '}'
+     *
+     * TraitDeclItem :=
+     *      TraitProtectionBlock
+     *    | TraitIfBlock
+     *    | UseDecl
+     *    | Method
+     * 
+     * ```
+     * */
+    fn readDeclBlockTop (self, dmut context: &SyntaxVisitor, loc: &Word)-> [&Declaration]
+        throws ErrorMsg
+    {
+        let mut decls: [&Declaration] = [];
+        {
+            loop {
+                let (attrLoc, attrs, attrComm) = context:.readAttributes ();
+                let (tok, tokComm) = context:.readToken ();
+
+                match tok.str {
+                    Keys::PRIVATE | Keys::PUBLIC | Keys::PROTECTED  => {
+                        decls ~= [self.readProtectionBlock (alias context, tok, attrComm ~ tokComm, attrs-> (attrLoc, attrs))];
+                    }                    
+                    Keys::CTE => {
+                        context.checkNoAttributes (tok, attrLoc, attrs);
+                        decls ~= [self.readIfBlock (alias context, tok, tokComm)];
+                    }
+                    Keys::USE => {
+                        context.checkNoAttributes (tok, attrLoc, attrs);                        
+                        decls ~= context.getGlobalVisitor ().readUse (alias context, tok, tokComm);
+                    }                    
+                    Keys::FUNCTION => {
+                        decls ~= [self.readMethod (alias context, tok, tokComm, attrs-> attrs)];
+                    }                    
+                    Tokens::RACC => {
+                        context.checkNoAttributes (tok, attrLoc, attrs);
+                        break;
+                    }
+                    _ => {
+                        if tok.isEof {
+                            throw copy ErrorMsg::fatal (loc, end-> tok, SyntaxErrorMessage::BLOCK_NEVER_CLOSED);                            
+                        }
+
+                        throw copy ErrorMsg::fatal (tok, format (SyntaxErrorMessage::UNEXPECTED_BUT_LST, self._special.traitDeclTop));
+                    }
+                }
+            }
+        } catch {
+            err => {                
+                throw copy ErrorMsg::note (loc, SyntaxErrorMessage::IN_DECL_BLOCK, notes-> copy [err]);                
+            }
+        }
+
+        decls
+    }
+
+    /**
+     * Read a trait conditional block
+     *
+     * @params:
+     *     - context: the context of the reading
+     *     - loc:     the location of the `cte` keyword
+     *     - comm:    the comment above the cte if
+     *
+     * @grammar:
+     * ```
+     * TraitIfBlock :=
+     *   'if' ExpressionSimple(BOOL_LOGIC) '{' TraitDeclTop '}' TraitIfFollow?
+     *
+     * TraitIfFollow :=
+     *     'else' TraitIfBlock
+     *   | 'else' '{' TraitDeclTop '}'
+     *     
+     * ```
+     * */
+    fn readIfBlock (self, dmut context: &SyntaxVisitor, loc: &Word, comm: [c8])-> &Declaration
+        throws ErrorMsg
+    {
+        // At least one if block is mandatory after reading 'cte'
+        let (_, _) = context:.readTokens (Keys::IF);
+        let test = context.getExpressionVisitor ().readExpressionSimple (alias context, BinaryOperatorsLevelNames::BOOL_LOGIC);
+        let (open, _) = context:.readTokens (Tokens::LACC);
+        let declsFst = self.readDeclBlockTop (alias context, open);
+        
+        let mut blocks: [(&Word, &Expression, [&Declaration], [c8])] = copy [(loc, test, declsFst, comm)];        
+
+        // We create a list of else blocks
+        while let (next, nextComm) = context:.readIf (Keys::ELSE) && !next.isEof {
+            let (nextIf, _) = context:.readIf (Keys::IF);
+            if nextIf.isEof {
+                let (nextOpen, _) = context:.readTokens (Tokens::LACC);
+                let declsElse = self.readDeclBlockTop (alias context, nextOpen);
+                
+                blocks ~= [(next, EMPTY_EXPR, declsElse, nextComm)];
+                break;
+            }
+
+            let nextTest = context.getExpressionVisitor ().readExpressionSimple (alias context, BinaryOperatorsLevelNames::BOOL_LOGIC);
+            let (nextOpen, _) = context:.readTokens (Tokens::LACC);
+            let declsElse = self.readDeclBlockTop (alias context, nextOpen);
+            
+            blocks ~= [(nextIf, nextTest, declsElse, nextComm)];            
+        }  
+
+        // And we wrap them in reverse order to build the conditional tree
+        let mut resultBlock = if blocks [$ - 1]._1 of EmptyExpr {
+            copy BlockDecl (loc-> blocks [$ - 1]._0,
+                            comm-> blocks [$ - 1]._3,
+                            decls-> blocks [$ - 1]._2,
+                            protection-> Protection::PRIVATE,
+                            isSet-> true)
+        } else {
+            copy CondBlockDecl (loc-> blocks [$ - 1]._0,
+                                comm-> blocks [$ - 1]._3,
+                                decls-> blocks [$ - 1]._2,
+                                test-> blocks [$ - 1]._1)                                
+        };
+        
+        blocks = blocks [0 .. $ - 1];        
+        for i in blocks.len .. 0 {
+            resultBlock = copy CondBlockDecl (loc-> blocks [i - 1]._0,
+                                              comm-> blocks [i - 1]._3,                                              
+                                              decls-> blocks [i - 1]._2,
+                                              test-> blocks [$ - 1]._1,
+                                              else_-> resultBlock);            
+        } 
+
+        resultBlock
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ===================================          PROTECTION          ===================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+
+    /**
+     * Read a block introduced by a protection inside a trait declaration
+     *
+     * @params:
+     *    - context: the context of the reading
+     *    - loc:     the location of the protection keyword
+     *    - comm:    the comment above the protection
+     *    - attrs: the list of attributes above the protection keyword
+     *
+     * @grammar:
+     * ```
+     * TraitProtectionBlock :=
+     *    '{' TraitMethodDecl* '}'
+     *    | TraitMethodDecl
+     *     
+     * ```
+     * */        
+    fn readProtectionBlock (self, dmut context: &SyntaxVisitor, loc: &Word, comm: [c8], attrs: (&Word, [AttributeWord]))-> &BlockDecl
+        throws ErrorMsg
+    {
+        let protection = block::toProtection (loc.str);
+        let (open, _) = context:.readTokens (Tokens::LACC, Keys::FUNCTION);
+
+        if !open.isEof { // a protected block
+
+            // @attrib pub { ... } is not allowed           
+            context.checkNoAttributes (open, attrs._0, attrs._1);            
+            let decls = self.readProtectedBlock (alias context);
+            return copy BlockDecl (loc-> loc,
+                                   comm-> comm,
+                                   decls-> decls,
+                                   protection-> protection,
+                                   isSet-> false);
+        }
+
+        // A single protection
+        let decls = copy [self.readMethod (alias context, open, comm, attrs-> attrs._1)];                    
+        return copy BlockDecl (loc-> loc,
+                               comm-> "",
+                               decls-> decls,
+                               protection-> protection,
+                               isSet-> false);                
+    }
+
+    /**
+     * Read a block of declaration protected by a protection keyword
+     *
+     * @params:
+     *   - context: the context of the reading
+     *   - open:    the location of the opening '{'
+     *
+     * @grammar:
+     * ```
+     * TypeProtectedBlock :=
+     *    '{' TraitMethodDecl* '}'
+     * ```
+     * */
+    fn readProtectedBlock (self, dmut context: &SyntaxVisitor)-> [&Declaration]
+        throws ErrorMsg
+    {
+        let mut decls: [mut &Declaration] = [];
+        loop {
+            let (attrLoc, attrs, attrComm) = context:.readAttributes ();
+            let (tok, tokComm) = context:.readTokens (Tokens::RACC, Keys::FUNCTION);
+            match tok.str {
+                Tokens::RACC => {
+                    context.checkNoAttributes (tok, attrLoc, attrs);
+                    break;
+                }
+                Keys::FUNCTION => {
+                    decls ~= [self.readMethod (alias context, tok, attrComm ~ tokComm, attrs-> attrs)];        
+                }                                
+            }                        
+        }
+
+        decls
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * =====================================          METHOD          =====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+    
+    /**
+     * Read a method inside a trait
+     *
+     * @params:
+     *    - context: the context of the reading
+     *    - loc:     the location of the `fn` or `over` keyword
+     *    - comm:    the comments above the method declaration
+     *    - attrs: the list of attributes above the method declaration
+     *     
+     * @grammar
+     * ```
+     * TraitMethodDecl :=     
+     *    'fn' Identifier MethodPrototype MethodBody
+     *
+     * MethodPrototype :=
+     *     '(' MutKw? 'self' (',' ParamDecl)* ')' MethodReturnType? MethodThrowers? 
+     *          
+     * ParamDecl :=
+     *   VariableModifier? Identifier ':' OperandSimple(0) ('=' ExpressionSimple (BOOL_LOGIC))
+     *   
+     * MethodReturnType := '->' OperandSimple(0)
+     *
+     * MethodThrowers :=
+     *    'throws' OperandSimple(0) (',' OperandSimple(0)) 
+     *
+     * MethodBody :=
+     *      Block(withGuards = true)
+     *    | ';'
+     * 
+     * MutKw := 'mut'          
+     * ```
+     * 
+     * */
+    fn readMethod (self, dmut context: &SyntaxVisitor, loc: &Word, comm: [c8], attrs: [AttributeWord])-> &Declaration
+        throws ErrorMsg
+    {
+        let (ident, _) = context:.readIdentifier ();
+        
+        let (proto, throwLoc, throwers) = context.getTypeVisitor ().readMethodPrototype (alias context);
+
+        let mut body: &Expression = EMPTY_EXPR;
+        let (open, _) = context:.readTokens (Tokens::LACC, Tokens::SEMI_COLON);
+        if open == Tokens::LACC {
+            body = context.getExpressionVisitor ().readBlock (alias context, open, withGuards-> true);
+        }        
+
+        return copy FunctionDecl (loc-> loc,
+                                  comm-> comm,
+                                  name-> ident,
+                                  proto-> proto,
+                                  body-> body,
+                                  attrs-> attrs,
+                                  throwers-> throwers,
+                                  throwerLoc-> throwLoc,
+                                  isOver-> false);        
+    }
+
+}
