@@ -1,164 +1,253 @@
+/*
+ * Declares the TupleType class.
+ *
+ * This module defines the native tuple type used by the Ymir semantic
+ * generator. A TupleType represents a fixed-size, ordered collection of
+ * heterogeneous values. Each element has its own static type, and tuples
+ * preserve both order and arity. Tuples are value types: they store their
+ * elements directly and participate in mutability, compatibility, and borrowing
+ * rules according to their components.
+ * 
+ * <hr>
+ * 
+ * @Package: ymirc        
+ * @Module: ymirc::semantic::generator::type::native::compound::tuple
+ * @File: ymirc/semantic/generator/type/native/compound/tuple.yr
+ * @Author(s):
+ *   - Emile Cadorel <ecadorel@gmail.com>
+ *
+ * @Created (YYYY-MM-DD): 2021-11-20
+ * @Copyright (C) 2021–2026 GNU-Ymir
+ * @License
+ *   ```text
+ *   This file is part of the Ymir language project.
+ *
+ *   Ymir is free software: you can redistribute it and/or modify it
+ *   under the terms of the GNU General Public License as published by
+ *   the Free Software Foundation, either version 3 of the License, or
+ *   (at your option) any later version.
+ *
+ *   Ymir is distributed in the hope that it will be useful,
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *   GNU General Public License for more details.
+ *
+ *   You should have received a copy of the GNU General Public License
+ *   along with Ymir.  If not, see <https://www.gnu.org/licenses/>.
+ *   ```
+ */
+
 in tuple;
 
-use ymirc::lexing::{word, tokens};
-use ymirc::utils::format;
+use ymirc::lexing::{word, tokens, keys};
+use ymirc::utils::{format, comparison};
+
 use std::stream;
 use ymirc::errors::message;
 use ymirc::semantic::validator::errors;
 
-use ymirc::semantic::generator::type::custom::enum_;
+use ymirc::semantic::generator::type::custom;
 
 /**
- * Tuple type
+ * Native tuple type.
+ *
+ * A TupleType represents a fixed-size, ordered collection of heterogeneous
+ * values. Each element has its own static type, and tuples preserve both
+ * order and arity. Tuples are value types: they store their elements directly
+ * and do not borrow data unless one of their components does.
+ *
+ * The `inners` array contains the element types in order:
+ *   - inners[0] = type of the first element
+ *   - inners[1] = type of the second element
+ *   - ...
+ *
+ * Tuples:
+ *   - may contain any non-movable types,
+ *   - derive mutability from the tuple itself and from each element,
+ *   - borrow data if any element type borrows data,
+ *   - participate in structural compatibility: two tuples are compatible only
+ *     if they have the same arity and each corresponding element type is
+ *     compatible.
+ * 
  */
 @final
 pub class TupleType over CompoundType {
 
     /**
-     * @params: 
-     *    - loc: the location of the type
-     *    - inner: the inner type of the tuple
+     * Construct a tuple type.
+     *
+     * @params:
+     *   - loc:       source location of the type expression
+     *   - inners:    ordered list of element types
+     *   - isMutable: true iff the tuple itself is mutable
+     *
+     * Tuples cannot contain movable types. Each element is stored directly and
+     * participates in the tuple’s mutability and borrowing behavior.
      */
-    pub self (loc : &Word, inners : [&Type], isMutable : bool = false)
-        with super (loc, inners-> inners, isMutable-> isMutable)
+    pub self (loc: &Word, inners: [&Type], isMutable: bool)
+        with super (loc, inners-> inners, isMutable-> isMutable)        
         throws ErrorMsg
     {
         for inner in inners {
-            if inner.isMovable () {
-                throw copy ErrorMsg::fatal (loc, end-> inner.getLoc (), format (ValidateErrorMessage::CONTAIN_MOVABLE_TYPE, inner),
+            if inner.isMovable {
+                throw copy ErrorMsg::fatal (loc, end-> inner.loc, format (ValidateErrorMessage::CONTAIN_MOVABLE_TYPE, inner),
                                             notes-> copy [copy ErrorMsg::note (loc, format (ValidateErrorMessage::CONTAIN_MOVABLE_TYPE_NOTE), oneLine-> true)]);
             }
         }
     }
 
-    /*!
-     * ================================================================================
-     * ================================================================================
-     * ===========================          GETTERS          ==========================
-     * ================================================================================
-     * ================================================================================
+    /**
+     * A tuple is deeply mutable iff:
+     *   - the tuple itself is mutable, and
+     *   - every element type is deeply mutable.
      */
-
+    @field
     pub over isDeeplyMutable (self)-> bool {
-        if (!self._isMutable) return false;
-        for i in self._inners {
-            if (!i.isDeeplyMutable ()) return false;
+        if (!self.isMutable) return false;
+        for i in self.inners {
+            if (!i.isDeeplyMutable) return false;
         }
 
         true
     }
 
-    pub over needExplicitAlias (self)-> bool {
-        if (!self._isMutable) return false;
-
-        for i in self._inners {
-            if (i.needExplicitAlias ()) return true;
-        }
-
-        false
-    }
-
-    pub over borrowDatas (self)-> bool {
-        for s in self._inners {
-            if s.borrowDatas () { return true; }
-        }
-
-        false
-    }
-
-    /*!
-     * ================================================================================
-     * ================================================================================
-     * =========================          COMPARISON          =========================
-     * ================================================================================
-     * ================================================================================
+    /**
+     * Tuples require explicit aliasing only when:
+     *   - the tuple is mutable, and
+     *   - at least one element type requires explicit aliasing.
      */
+    @field
+    pub over needsExplicitAlias (self)-> bool {
+        if (!self.isMutable) return false;
 
-    pub over opEquals (self, o : &Generator)-> bool {
-        match o {
-            s : &TupleType => { self._inners == s._inners }
-            _ => { false }
+        for i in self.inners {
+            if (i.needsExplicitAlias) return true;
         }
+
+        false
     }
 
-    pub over isCompatible (self, o : &Type)-> bool {
+    /**
+     * A tuple borrows data iff any of its element types borrow data.
+     */
+    @field
+    pub over borrowsData (self)-> bool {
+        for s in self.inners {
+            if s.borrowsData { return true; }
+        }
+
+        false
+    }
+
+    /**
+     * Tuples are compatible when:
+     *   - they have the same number of elements, and
+     *   - each corresponding element type is compatible.
+     */
+    pub over isCompatible (self, o: &Type)-> bool {        
+        if let s: &TupleType = o {
+            if (self.inners.len != s.inners.len) return false;
+            for i in 0us .. self.inners.len {
+                if (!self.inners [i].isCompatible (s.inners [i])) return false;
+            }
+
+            return true;
+        }
+
+        return false;
+    }
+
+    /**
+     * Mutability fitting for tuples.
+     *
+     * Rules:
+     *   - immutable tuples fit into mutable ones only if borrowing rules allow it,
+     *   - each element type must also satisfy mutability fitting,
+     *   - tuples must have the same arity.
+     *
+     * EnumType proxies are handled transparently.
+     */
+    pub over mutabilityFit (self, o: &Type, borrowed: bool)-> bool {
         match o {
-            s : &TupleType => {
-                if (self._inners.len != s._inners.len) return false;
-                for i in 0us .. self._inners.len {
-                    if (!self._inners [i].isCompatible (s._inners [i])) return false;
+            t: &TupleType => {
+                if (self.inners.len != t.inners.len) panic;
+                if (!t.isMutable) return true; // other is const, even if it borrows it is always ok
+                if (borrowed && !self.isMutable) return false;
+
+                for i in 0us .. self.inners.len {
+                    if (!self.inners [i].mutabilityFit (t.inners [i], borrowed-> borrowed)) return false;
                 }
 
                 true
             }
-            _ => {
-                false
-            }
-        }
-    }
-
-    pub over mutabilityFit (self, o : &Type, borrowed : bool)-> bool {
-        match o {
-            t : &TupleType => {
-                if (self._inners.len != t._inners.len) panic;
-                if (!t._isMutable) return true; // other is const, even if it borrows it is always ok
-                if (borrowed && !self._isMutable) return false;
-
-                for i in 0us .. self._inners.len {
-                    if (!self._inners [i].mutabilityFit (t._inners [i], borrowed-> borrowed)) return false;
-                }
-
-                true
-            }
-            en : &EnumType => {
+            en: &EnumType => {
                 return self.mutabilityFit (en.getLastLevelProxy (), borrowed)
             }
             _ => panic;
         }
     }
 
-    pub over mutabilityDistance (self, o : &Type, borrowed : bool)-> u32 {
+    /**
+     * Compute the mutability distance for tuples.
+     *
+     * Tuple distance is the sum of:
+     *   - 1 if the outer tuple mutability is lost when borrowed, and
+     *   - the mutability distance of each element type.
+     *
+     * This reflects how many mutability capabilities must be discarded to make
+     * this tuple fit the target.
+     */
+    pub over mutabilityDistance (self, o: &Type, borrowed: bool)-> u32 {
         match o {
-            t : &TupleType => {
-                if (self._inners.len != t._inners.len) panic;
+            t: &TupleType => {
+                if (self.inners.len != t.inners.len) panic;
                 let mut sum = 0u32;
-                if (borrowed && !t._isMutable) sum = 1u32;
+                if (borrowed && !t.isMutable) sum = 1u32;
 
-                for i in 0us .. self._inners.len {
-                    sum += self._inners [i].mutabilityDistance (t._inners [i], borrowed-> borrowed);
+                for i in 0us .. self.inners.len {
+                    sum += self.inners [i].mutabilityDistance (t.inners [i], borrowed-> borrowed);
                 }
 
                 sum
             }
-            en : &EnumType => {
+            en: &EnumType => {
                 return self.mutabilityDistance (en.getLastLevelProxy (), borrowed)
             }
             _ => panic;
         }
     }
 
-
-    pub over maxMutabilityDistance (self, borrowed : bool)-> u32 {
+    /**
+     * Maximum mutability distance for tuples:
+     *   - 1 for the outer tuple layer when borrowed,
+     *   - plus the maximum mutability distance of each element type.
+     */    
+    pub over computeMaxMutabilityDistance (self, borrowed: bool)-> u32 {
         let mut sum = 0u32;
         if (borrowed) sum += 1u32;
-        for i in self._inners {
-            sum += i.maxMutabilityDistance (borrowed-> borrowed);
+        for i in self.inners {
+            sum += i.computeMaxMutabilityDistance (borrowed-> borrowed);
         }
 
         sum
     }
 
-    pub over sameMutability (self, o : &Type)-> bool {
+    /**
+     * Tuples have the same mutability iff:
+     *   - their outer mutability matches, and
+     *   - each corresponding element type has the same mutability.
+     */
+    pub over sameMutability (self, o: &Type)-> bool {
         match o {
-            t : &TupleType => {
-                if (self._isMutable != o._isMutable) return false;
-                for i in 0us .. self._inners.len {
-                    if (!self._inners [i].sameMutability (t._inners [i])) return false;
+            t: &TupleType => {
+                if (self.isMutable != o.isMutable) return false;
+                for i in 0us .. self.inners.len {
+                    if (!self.inners [i].sameMutability (t.inners [i])) return false;
                 }
 
                 return true;
             }
-            en : &EnumType => {
+            en: &EnumType => {
                 return self.sameMutability (en.getLastLevelProxy ())
             }
         }
@@ -166,40 +255,45 @@ pub class TupleType over CompoundType {
         panic;
     }
 
-    /*!
-     * ================================================================================
-     * ================================================================================
-     * =========================           CLONING            =========================
-     * ================================================================================
-     * ================================================================================
+    /**
+     * Clone the tuple type with a given mutability level.
+     *
+     * Each element type receives one fewer mutability level than the tuple.
      */
-
-    pub over clone (self, mutLevel : u32)-> &Type {
+    pub over clone (self, mutLevel: u32)-> &Type {
         let innerLevel = if (mutLevel >= 1u32) { mutLevel - 1u32 } else { 0u32 };
 
-        let res : [&Type] = copy [i.clone (innerLevel) for i in self._inners];
+        let res: [&Type] = copy [i.clone (innerLevel) for i in self.inners];
 
         {
-            copy TupleType (self._loc, res, isMutable-> (mutLevel != 0u32))
+            copy TupleType (self.loc, res, isMutable-> (mutLevel != 0u32))
         } catch {
             _ => panic;
         }
     }
 
-    pub over clone (self, pattern : &Type)-> &Type {
+    /**
+     * Clone the tuple type to match the mutability pattern of another type.
+     *
+     * If the pattern is a tuple of the same arity, each element is cloned
+     * according to the corresponding element of the pattern. Otherwise, all
+     * elements are cloned as immutable and the tuple adopts the pattern’s
+     * outer mutability.
+     */
+    pub over clone (self, pattern: &Type)-> &Type {
         match pattern {
-            t : &TupleType if (self._inners.len == t._inners.len) => {
-                let res = copy [self._inners [i].clone (t._inners [i]) for i in 0 .. self._inners.len];
+            t: &TupleType if (self.inners.len == t.inners.len) => {
+                let res = copy [self.inners [i].clone (t.inners [i]) for i in 0 .. self.inners.len];
                 {
-                    copy TupleType (self._loc, res, isMutable-> t._isMutable)
+                    copy TupleType (self.loc, res, isMutable-> t.isMutable)
                 } catch {
                     _ => panic;
                 }
             }
             _ => {
-                let res = copy [self._inners [i].clone (0) for i in 0 .. self._inners.len];
+                let res = copy [self.inners [i].clone (0) for i in 0 .. self.inners.len];
                 {
-                    copy TupleType (self._loc, res, isMutable-> pattern._isMutable)
+                    copy TupleType (self.loc, res, isMutable-> pattern.isMutable)
                 } catch {
                     _ => panic;
                 }
@@ -207,44 +301,54 @@ pub class TupleType over CompoundType {
         }
     }
 
-    pub over cloneMutableTilBorrow (self)-> &Type {
-        let inners = copy [i.cloneMutableTilBorrow () for i in self._inners];
+    /**
+     * Clone the tuple, making it mutable until a borrow is encountered.
+     *
+     * Each element is cloned using its own cloneMutableUntilBorrow rules.
+     */
+    pub over cloneMutableUntilBorrow (self)-> &Type {
+        let inners = copy [i.cloneMutableUntilBorrow () for i in self.inners];
 
         {
-            copy TupleType (self._loc, inners, isMutable-> true)
+            copy TupleType (self.loc, inners, isMutable-> true)
         } catch {
             _ => panic;
         }
     }
 
+    /**
+     * Produce a deeply mutable version of the tuple.
+     *
+     * All element types become deeply mutable.
+     */
     pub over toDeeplyMutable (self)-> &Type {
-        let res = copy [i.toDeeplyMutable () for i in self._inners];
+        let res = copy [i.toDeeplyMutable () for i in self.inners];
 
         {
-            copy TupleType (self._loc, res, isMutable-> true)
+            copy TupleType (self.loc, res, isMutable-> true)
         } catch {
             _ => panic;
         }
     }
     
-    /*!
-     * ================================================================================
-     * ================================================================================
-     * =========================        MISCELLANEOUS         =========================
-     * ================================================================================
-     * ================================================================================
-     */
 
+    impl Comparable!{&Type};
     impl Streamable;
     impl Formattable {
 
-        pub over format (self, dmut stream : &Formatter) {
+        /**
+         * Format the tuple type using the syntax:
+         *     (T1, T2, ..., Tn)
+         *
+         * A trailing comma is printed for single-element tuples.
+         * */
+        pub over format (self, dmut stream: &Formatter) {
             stream:.write (Tokens::LPAR);
-            for i, j in self._inners {
+            for i, j in self.inners {
                 if (i != 0us) stream:.write (", ");
                 j.format (alias stream);
             }
-            if (self._inners.len == 1us) stream:.write (",");
+            if (self.inners.len == 1us) stream:.write (",");
             stream:.write (Tokens::RPAR);
         }                
     }
