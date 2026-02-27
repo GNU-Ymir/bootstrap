@@ -1,149 +1,207 @@
+/*
+ * Declares the TryFinallyValue class.
+ *
+ * TryFinallyValue represents a `try` / `finally` construct in the generator IR.
+ * The `try` block is evaluated first, and the `finally` block is *always*
+ * executed when the `try` block is exited — whether the exit occurs normally,
+ * through a thrown exception, through a return, or through a break.
+ *
+ * The `finally` block is assumed to be safe: it cannot return, break, or throw
+ * (except for panic), and therefore does not influence the control-flow
+ * metadata of the construct. All return, break, and throw information is taken
+ * exclusively from the `try` block.
+ *
+ * <hr>
+ * 
+ * @Package: ymirc        
+ * @Module: ymirc::semantic::generator::value::scope::tryfin
+ * @File: ymirc/semantic/generator/value/scope/tryfin.yr
+ * @Author(s):
+ *   - Emile Cadorel <ecadorel@gmail.com>
+ *
+ * @Created (YYYY-MM-DD): 2021-12-06
+ * @Copyright (C) 2021–2026 GNU-Ymir
+ * @License
+ *   ```text
+ *   This file is part of the Ymir language project.
+ *
+ *   Ymir is free software: you can redistribute it and/or modify it
+ *   under the terms of the GNU General Public License as published by
+ *   the Free Software Foundation, either version 3 of the License, or
+ *   (at your option) any later version.
+ *
+ *   Ymir is distributed in the hope that it will be useful,
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *   GNU General Public License for more details.
+ *
+ *   You should have received a copy of the GNU General Public License
+ *   along with Ymir.  If not, see <https://www.gnu.org/licenses/>.
+ *   ```
+ */
+
 in tryfin;
 
-use ymirc::lexing::{word, tokens};
-use ymirc::utils::format;
-use ymirc::lexing::keys;
+use ymirc::lexing::{word, tokens, keys};
+use ymirc::utils::{format, comparison};
+
 use std::stream;
+
 use ymirc::semantic::generator::type;
-use ymirc::semantic::generator::value::literal::unit;
+use ymirc::semantic::generator::value::literal;
+
+/**
+ * Represents a `try` / `finally` construct in the generator IR.
+ *
+ * A TryFinallyValue evaluates the `try` block and guarantees that the `finally`
+ * block is executed afterward, regardless of how the `try` block is exited:
+ *
+ *   - normal completion,
+ *   - thrown exception,
+ *   - return from the function,
+ *   - break from a loop.
+ *
+ * The `finally` block is assumed to be safe: it cannot break, return, or throw
+ * exceptions (other than panic). As a result, all control-flow metadata
+ * (returnLoc, breakLoc, throwers) is inherited exclusively from the `try`
+ * block.
+ *
+ * The `failVar` is a synthetic variable used to record whether the `try` block
+ * completed normally (`true`) or failed (`false`). This allows the `finally`
+ * block to conditionally execute cleanup logic depending on success or failure.
+ *
+ * TryFinallyValue:
+ *   - is always an rvalue,
+ *   - delegates all control-flow metadata to the try-block,
+ *   - always executes the finally-block,
+ *   - is never an lvalue.
+ */
 
 @final
 pub class TryFinallyValue over ScopeValue {
 
-    // The content of the try part
-    let _tryBl : &Value;
+    pub {
+        // The block executed inside the `try` section.
+        let tryBlock: &Value;
+        
+        /**
+         * The block executed after the try-block, regardless of how it exits.
+         *
+         * This block is assumed to be safe: it cannot break, return, or throw.
+         */
+        let finalBlock: &Value;
+        
+        /**
+         * True iff the try-block can throw an exception.
+         *
+         * This is determined by checking whether the try-block has any throwers.
+         */
+        let canThrow: bool;
 
-    // The content of the finally part
-    let _finally : &Value;
+        /**
+         * A synthetic variable set to `true` when the try-block completes normally,
+         * and to `false` when it exits through an exception.
+         *
+         * The finally-block may use this variable to perform conditional cleanup.
+         */
+        let failVar: &Value;
+    }
 
-    // true iif the try part can throw an exception
-    let _canThrow : bool;
-
-    // The declaration of the variable to set to true, if the try succeeds
-    let _failVar : &Value;
-
-    pub self (loc : &Word, type : &Type, tryP : &Value, finP : &Value, failVar : &Value, isReduced : bool = false)
-        with super (loc, type, isReduced-> isReduced)
-        , _failVar = failVar
-        , _tryBl = tryP
-        , _finally = finP
-        , _canThrow = (tryP.getThrowers ().len != 0us)
+    /**
+     * Construct a try/finally expression.
+     *
+     * @params:
+     *   - loc:        source location of the construct
+     *   - type:       resulting type of the try/finally expression
+     *   - tryBlock:   the block executed inside the `try`
+     *   - finalBlock: the block executed after the try-block
+     *   - failVar:    the variable tracking success/failure of the try-block
+     *   - isReduced:  true iff the construct is already reduced
+     *
+     * Control-flow metadata (returnLoc, breakLoc, throwers) is inherited from the
+     * try-block. The finally-block is assumed not to influence control flow.
+     * 
+     */
+    pub self (loc:        &Word,
+              type:       &Type,
+              tryBlock:   &Value,
+              finalBlock: &Value,
+              failVar:    &Value,
+              isReduced:  bool = false)
+        
+        with super (loc, type,
+                    returnLoc-> tryBlock.returnLoc,
+                    breakLoc-> tryBlock.breakLoc,
+                    throwers-> tryBlock.throwers,
+                    isReduced-> isReduced,
+                    isLvalue-> false)
+        
+        , failVar = failVar
+        , tryBlock = tryBlock
+        , finalBlock = finalBlock
+        , canThrow = (tryBlock.throwers.len != 0us)
     {
-        self._breakLoc = self._tryBl._breakLoc;
-        self._returnLoc = self._tryBl._returnLoc;
-        self._throwers = self._tryBl.getThrowers ();
-
         // finally part cannot break, or return, nor can it throw exceptions
     }
 
-    /*!
-     * ================================================================================
-     * ================================================================================
-     * =========================           GETTERS            =========================
-     * ================================================================================
-     * ================================================================================
+
+    /**
+     * Create a deep copy of the try/finally construct.
+     *
+     * All sub-expressions (try-block, finally-block, and fail variable) are cloned,
+     * and a new TryFinallyValue is constructed with identical metadata.
      */
-
-    /**
-     * @returns: the try part of the try finally block
-     * */
-    pub fn getTryPart (self)-> &Value {
-        self._tryBl
-    }
-
-    /**
-     * @returns: the finally part of the try finally block
-     * */
-    pub fn getFinallyPart (self)-> &Value {
-        self._finally
-    }
-
-    /**
-     * @returns: true if the try part can throw an exception
-     * */
-    pub fn canTryThrow (self)-> bool {
-        self._canThrow
-    }
-
-    /**
-     * @returns: the variable that is check in case of failure/success scope guards
-     * */
-    pub fn getFailVar (self)-> &Value {
-        self._failVar
-    }
-
-    /*!
-     * ================================================================================
-     * ================================================================================
-     * =========================          COMPARISON          =========================
-     * ================================================================================
-     * ================================================================================
-     */
-
-    pub over opEquals (self, o : &Generator)-> bool {
-        if (!self.super.opEquals (o)) return false;
-
-        match o {
-            p : &TryFinallyValue => {
-                if (p._tryBl != self._tryBl) return false;
-                if (p._finally != self._finally) return false;
-                if (p._failVar != self._failVar) return false;
-
-                true
-            }
-            _ => { false }
-        }
-    }
-
-    /*!
-     * ====================================================================================================
-     * ====================================================================================================
-     * ====================================          CLONING          =====================================
-     * ====================================================================================================
-     * ====================================================================================================
-     */
-
-    /**
-     * Create an exact copy of the value with a different uniqId
-     * */
     pub over clone (self)-> &Value {
-        copy TryFinallyValue (self._loc, self._type,
-                              self._tryBl.clone (),
-                              self._finally.clone (),
-                              self._failVar.clone (),
-                              isReduced-> self._isReduced)
+        return copy TryFinallyValue (self.loc,
+                                     self.type,
+                                     self.tryBlock.clone (),
+                                     self.finalBlock.clone (),
+                                     self.failVar.clone (),
+                                     isReduced-> self.isReduced);
     }
 
-    /*!
-     * ================================================================================
-     * ================================================================================
-     * =========================             MISC             =========================
-     * ================================================================================
-     * ================================================================================
-     */
 
+    impl Comparable!{&Generator};
+    
     impl Streamable;
     impl Formattable {
 
-        pub over format (self, dmut stream : &Formatter) {
+        /**
+         * Write the try/finally construct to the formatter.
+         *
+         * The printed form is:
+         *
+         *     try {
+         *         <failVar?>
+         *         <try-block>
+         *     } finally {
+         *         <finally-block>
+         *     }
+         *
+         * The fail variable is printed only when it is not `unit`. When formatting for
+         * parameter contexts (`forParams`), the construct is printed as `_` to avoid
+         * expanding its contents.
+         */
+        pub over format (self, dmut stream: &Formatter) {
             if (stream.tags.forParams) {
                 stream:.write ("_");
-            } else {
-                stream:.write ("try {\n");
-                stream:.entabing ();
-                if (self._failVar !of UnitValue) {
-                    self._failVar.format (alias stream);
-                    stream:.write ("\n");
-                }
+                return;
+            } 
 
-                self._tryBl.format (alias stream);
-                stream:.detabing ();
-                stream:.write ("\n} finally {\n");
-                stream:.entabing ();
-                self._finally.format (alias stream);
-                stream:.detabing ();
-                stream:.write ("\n}");
+            stream:.write ("try {\n");
+            stream:.entabing ();
+            if (self.failVar !of UnitValue) {
+                self.failVar.format (alias stream);
+                stream:.write ("\n");
             }
+
+            self.tryBlock.format (alias stream);
+            stream:.detabing ();
+            stream:.write ("\n} finally {\n");
+            stream:.entabing ();
+            self.finalBlock.format (alias stream);
+            stream:.detabing ();
+            stream:.write ("\n}");            
         }
     }
 

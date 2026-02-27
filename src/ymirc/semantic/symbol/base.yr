@@ -1,0 +1,892 @@
+/*
+ * Declares the Symbol class, ancestor of all symbols.
+ *
+ * <hr>
+ * 
+ * @Package: ymirc        
+ * @Module: ymirc::semantic::symbol::base
+ * @File: ymirc/semantic/symbol/base.yr
+ * @Author(s):
+ *   - Emile Cadorel <ecadorel@gmail.com>
+ *   - Emile Cadorel <emile.cadorel@davidson.fr>
+ *
+ * @Created (YYYY-MM-DD): 2021-11-26
+ * @Copyright (C) 2021–2026 GNU-Ymir
+ * @License
+ *   ```text
+ *   This file is part of the Ymir language project.
+ *
+ *   Ymir is free software: you can redistribute it and/or modify it
+ *   under the terms of the GNU General Public License as published by
+ *   the Free Software Foundation, either version 3 of the License, or
+ *   (at your option) any later version.
+ *
+ *   Ymir is distributed in the hope that it will be useful,
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *   GNU General Public License for more details.
+ *
+ *   You should have received a copy of the GNU General Public License
+ *   along with Ymir.  If not, see <https://www.gnu.org/licenses/>.
+ *   ```
+ */
+
+in base;
+
+mod .format;
+
+use ymirc::lexing::{word, tokens, keys};
+use ymirc::syntax::declaration::{module, block};
+
+use ymirc::semantic::validator::template::mapper;
+
+use ymirc::utils::{format, comparison};
+
+use std::{fs::path, stream};
+
+use ymirc::semantic::generator;
+use ymirc::utils::string;
+
+
+/**
+ * Base class for all symbols.
+ *
+ * A Symbol represents any named entity declared in a Ymir program: modules,
+ * classes, functions, variables, templates, enum members, and so on. Every
+ * symbol owns a symbol table that stores its children, enabling hierarchical
+ * name resolution. Symbols form the backbone of semantic analysis, providing:
+ *
+ *   - hierarchical scoping and lookup,
+ *   - protection and visibility rules,
+ *   - template specialization tracking,
+ *   - external language bindings,
+ *   - generator association,
+ *   - unittest and import management,
+ *   - symbol linking and weak/strong resolution.
+ *
+ * A Symbol may have a referent (its parent in the symbol tree), and its full
+ * name is computed from this hierarchy. Weak symbols participate in linking
+ * and may be replaced by stronger definitions.
+ *
+ * Symbol is an abstract class; concrete subclasses define the semantics of
+ * specific declarations (modules, classes, functions, etc.).
+ */
+@abstract
+pub class Symbol {
+
+    pub {
+        // The location of the symbol
+        let loc: &Word;
+
+        // The comments about the symbol
+        let comm: [c8];
+
+        // This protection of the symbol
+        let protection: Protection;
+    }
+
+    prot {        
+        // The parent of the symbol
+        let dmut _referent: (&Symbol)?;
+
+        // True if this is a weak symbol (can be replaced by another strong/weak symbol, in symbol linking)
+        let mut _isWeak: bool;
+
+        // The external language of the symbol
+        let mut _externLang: [c8] = "";
+
+        // The full name of the symbol (depends on self._referent)
+        let mut _fullName: &SymbolPath;
+
+        // The list of used packets (set during validation)
+        let mut _used: [dmut &Symbol] = [];
+
+        // The list of core module used by this symbol
+        let mut _coreModules: [dmut &Symbol] = [];
+
+        // The list of unittest declared in the symbol
+        let mut _unittest: [dmut &Symbol] = [];
+
+        // The list of use declaration (set during declaration)
+        let mut _useDecls: [mut &UseDecl] = [];
+
+        // The content table of the symbol
+        let dmut _table: &Table;
+
+        // The template mapper used for the symbol if it was generate by a template specialization
+        let mut _templateMapper: (TemplateMapper)? = none;
+
+        // The list of generators associated with the symbol
+        let mut _generators: [mut &Generator] = [];
+
+        // True if the symbol is a core module
+        let mut _isCoreModule: bool = false;
+    }
+    
+    /**
+     * Construct a symbol.
+     *
+     * @params:
+     *   - loc:        source location of the symbol
+     *   - comm:       documentation comments attached to the symbol
+     *   - isWeak:     true iff the symbol is weak (may be replaced during linking)
+     *   - protection: visibility of the symbol (public, private, etc.)
+     *
+     * The constructor initializes:
+     *   - the referent to none,
+     *   - the full name to the symbol's own identifier,
+     *   - an empty symbol table,
+     *   - empty lists for imports, core modules, unittests, generators, and
+     *     template metadata.
+     */
+    pub self (loc:        &Word,
+              comm:       [c8],
+              isWeak:     bool,
+              protection: Protection)
+        
+        with loc = loc
+        , comm = comm
+        , protection = protection
+        , _referent = none
+        , _fullName = copy SymbolPath (loc.str)        
+        , _isWeak = isWeak
+        , _table = copy Table ()
+    {}
+
+
+    /**
+     * @returns the parent symbol in the hierarchy.
+     *
+     * If the symbol has no parent, returns EMPTY_SYMBOL.
+     */
+    @field
+    pub fn referent (self)-> &Symbol {        
+        if let Ok (x: _) = self._referent {
+            return x;
+        }
+        
+        return EMPTY_SYMBOL;        
+    }
+
+    /**
+     * @returns the parent symbol in the hierarchy.
+     *
+     * If the symbol has no parent, returns EMPTY_SYMBOL.
+     */
+    @field
+    pub fn referent (mut self)-> dmut &Symbol {
+        if let Ok (dmut x) = alias self._referent {
+            return alias x;
+        }
+
+        return alias EMPTY_SYMBOL;
+    }
+
+    /**
+     * @returns true iff the symbol is weak.
+     *
+     * Weak symbols may be replaced by stronger definitions during symbol linking.
+     */
+    @field
+    pub fn isWeak (self)-> bool {
+        self._isWeak
+    }
+
+    /**
+     * @returns the full hierarchical path of the symbol.
+     *
+     * The path is recomputed whenever the referent or template state changes.
+     */
+    @field
+    pub fn path (self)-> &SymbolPath {
+        self._fullName
+    }
+
+    /**
+     * @returns the list of modules imported via `use` declarations.
+     */
+    @field
+    pub fn used (mut self)-> dmut [&Symbol] {
+        alias self._used
+    }
+    
+    /**
+     * @returns the list of modules imported via `use` declarations.
+     */
+    @field
+    pub fn useDecls (self)-> [&UseDecl] {
+        self._useDecls
+    }    
+
+    /**
+     * @returns the external language associated with the symbol.
+     *
+     * Used for symbols declared inside `extern` blocks (e.g., C, Ymir).
+     */
+    @field
+    pub fn externLang (self)-> [c8] {
+        self._externLang
+    }
+
+    /**
+     * @returns true iff the symbol belongs to the Ymir core package.
+     */
+    @field
+    pub fn isCoreModule (self)-> bool {
+        self._isCoreModule
+    }
+
+    /**
+     * @returns the template mapper used to generate this symbol, if any.
+     *
+     * A symbol is considered a template specialization when it has a mapper.
+     */
+    @field
+    pub fn templateMapper (self)-> (TemplateMapper)? {
+        self._templateMapper
+    }
+
+    /**
+     * @returns: true iff the symbol was generated by a template specialization
+     * */
+    @field
+    pub fn isTemplate (self)-> bool {
+        match self._templateMapper {
+            Ok () => { true }
+            _ => { false }
+        }
+    }
+    
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ================================          TABLE INSERTION          =================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+
+    /**
+     * Register an externally declared symbol for lookup.
+     *
+     * Called during validation to allow `use`d modules to participate in name
+     * resolution.
+     */
+    @final
+    pub fn useModule (mut self, _: Path, dmut sym: &Symbol) {
+        self._used ~= [alias sym];
+    }
+
+
+    /**
+     * Set the list of core modules used by this symbol.
+     *
+     * Core modules behave like imports but are tracked separately.
+     */
+    @final
+    pub fn setUsedCore (mut self, dmut cores: [&Symbol]) {
+        self._coreModules = alias cores;
+    }
+
+    /**
+     * Insert a unittest symbol into this symbol's unittest list.
+     */
+    @final
+    pub fn insertUnitTest (mut self, dmut sym: &Symbol) {
+        self._unittest ~= [alias sym];
+    }
+    
+    /**
+     * Insert a child symbol into the symbol table.
+     *
+     * If the symbol is a template specialization, it is inserted into the
+     * template table instead. Otherwise:
+     *   - its referent is set to this symbol,
+     *   - it is inserted under its declared name,
+     *   - existing symbols may be replaced if `replace` is true.
+     */
+    @final
+    pub fn insert (mut self, dmut sym: &Symbol, replace: bool = false) {
+        match sym._templateMapper {
+            Ok () => {
+                self:.insertTemplate (alias sym);
+            }
+            _ => {
+                sym:.setReferent (alias self);
+                self._table:.insert (sym.loc.str, alias sym, replace-> replace);
+            }
+        }
+    }
+
+    /**
+     * Remove a symbol from the symbol table.
+     *
+     * Does nothing if the symbol is not present.
+     */
+    @final
+    pub fn remove (mut self, dmut sym: &Symbol) {
+        self._table:.remove (sym.loc.str, alias sym);
+    }
+
+
+    /**
+     * Insert a symbol under an alias name.
+     *
+     * Does not modify the symbol's referent.
+     */
+    @final
+    pub fn insertAs (mut self, name: [c8], dmut sym: &Symbol, replace: bool = false) {
+        self._table:.insert (name, alias sym, replace-> replace);
+    }
+    
+    /**
+     * Insert a template specialization into the template table.
+     *
+     * Template symbols are stored separately and resolved differently during
+     * lookup.
+     */
+    @final
+    pub fn insertTemplate (mut self, dmut sym: &Symbol) {
+        sym:.setReferent (alias self);
+        self._table:.insertTemplate (alias sym);
+    }
+    
+    /**
+     * Register a `use` declaration encountered during parsing.
+     */
+    @final
+    pub fn insertUse (mut self, sym: &UseDecl) {
+        self._useDecls ~= [sym];
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ==================================          TABLE SEARCH          ==================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Find the templates symbols in the table
+     * @returns: all the inserted template symbols
+     */
+    @{final, field}
+    pub fn templates (self)-> [&Symbol] {
+        self._table.templates
+    }
+
+    /**
+     * @returns: the list of unittest in the symbol
+     * */
+    @{final, field}
+    pub fn unitTests (mut self)-> dmut [&Symbol] {
+        return alias self._unittest;
+    }
+
+    /**
+     * Look up symbols by name.
+     *
+     * Lookup rules:
+     *   - search parent symbols unless disabled,
+     *   - search local table with appropriate protection,
+     *   - search imported modules,
+     *   - search core modules,
+     *   - include template symbols when appropriate.
+     *
+     * Returns either immutable or mutable symbol lists depending on overload.
+     */
+    pub fn getSymbols (self, name: [c8], protection: Protection = Protection::PUBLIC, fromUsed: bool = false, dmut res: &ImutSymbolList = copy ImutSymbolList ())-> dmut &ImutSymbolList {
+        match self._referent {
+            Ok (x: &Symbol) => {
+                // We don't use the use statement of parent module, if it is another file than self
+                x.getSymbols (name, protection-> protection, fromUsed-> (fromUsed || !x.inSameFile (self)), res-> alias res);
+            }
+
+        }
+
+        if (fromUsed)
+            self.getSymbolsInTable (name, protection-> protection, syms-> alias res);
+        else {
+            self.getSymbolsInTable (name, protection-> Protection::PRIVATE, syms-> alias res);
+            for module in self._used {
+                module.getSymbols (name, protection-> protection, fromUsed-> true, res-> alias res);
+            }
+            for module in self._coreModules {
+                module.getSymbols (name, protection-> protection, fromUsed-> true, res-> alias res);
+            }
+        }
+
+        alias res
+    }
+
+    /**
+     * Look up symbols by name.
+     *
+     * Lookup rules:
+     *   - search parent symbols unless disabled,
+     *   - search local table with appropriate protection,
+     *   - search imported modules,
+     *   - search core modules,
+     *   - include template symbols when appropriate.
+     *
+     * Returns either immutable or mutable symbol lists depending on overload.
+     */
+    pub fn getSymbols (mut self, name: [c8], protection: Protection = Protection::PUBLIC, fromUsed: bool = false, dmut res: &SymbolList = copy SymbolList ())-> dmut &SymbolList {
+        if let Ok (dmut x) = alias self._referent {
+            // We don't use the use statement of parent module, if it is another file than self
+            x:.getSymbols (name, protection-> protection, fromUsed-> (fromUsed || !x.inSameFile (self)), res-> alias res);
+        }
+
+        if (fromUsed)
+            self:.getSymbolsInTable (name, protection-> protection, syms-> alias res);
+        else {
+            self:.getSymbolsInTable (name, protection-> Protection::PRIVATE, syms-> alias res);
+            for i in 0us .. self._used.len {
+                let dmut module = alias (self._used [i]);
+                module:.getSymbols (name, protection-> protection, fromUsed-> true, res-> alias res);
+            }
+
+            for i in 0us .. self._coreModules.len  {
+                let dmut module = alias (self._coreModules [i]);
+                module:.getSymbols (name, protection-> protection, fromUsed-> true, res-> alias res);
+            }
+        }
+
+        alias res
+    }
+
+
+    /**
+     * Look up symbols whose names are within a Levenshtein distance.
+     *
+     * Used for error recovery and suggestions.
+     */
+    pub fn getCloseSymbols (self, name: [c8], distance: usize, protection: Protection = Protection::PUBLIC, fromUsed: bool = false, dmut res: &ImutSymbolList = copy ImutSymbolList ())-> dmut &ImutSymbolList {
+        match self._referent {
+            Ok (x: &Symbol) => {
+                // We don't use the use statement of parent module, if it is another file than self
+                x.getCloseSymbols (name, distance, protection-> protection, fromUsed-> (fromUsed || !x.inSameFile (self)), res-> alias res);
+            }
+        }
+
+        if (fromUsed)
+            self.getCloseSymbolsInTable (name, distance, protection-> protection, syms-> alias res);
+        else {
+            self.getCloseSymbolsInTable (name, distance, protection-> Protection::PRIVATE, syms-> alias res);
+            for module in self._used {
+                module.getCloseSymbols (name, distance, protection-> protection, fromUsed-> true, res-> alias res);
+            }
+
+            for module in self._coreModules {
+                module.getCloseSymbols (name, distance, protection-> protection, fromUsed-> true, res-> alias res);
+            }
+        }
+
+        alias res
+    }
+
+    /**
+     * Look up symbols by name.
+     *
+     * Lookup rules:     
+     *   - search local table with appropriate protection,     
+     *
+     * Returns either immutable or mutable symbol lists depending on overload.
+     */
+    pub fn getLocalSymbols (self, name: [c8], protection: Protection = Protection::PUBLIC)-> dmut &ImutSymbolList {
+        let dmut res = copy ImutSymbolList ();
+        self.getSymbolsInTable (name, protection, alias res, callParent-> false);
+        alias res
+    }
+
+    /**
+     * Look up symbols by name.
+     *
+     * Lookup rules:     
+     *   - search local table with appropriate protection,     
+     *
+     * Returns either immutable or mutable symbol lists depending on overload.
+     */
+    pub fn getLocalSymbols (mut self, name: [c8], protection: Protection = Protection::PUBLIC)-> dmut &SymbolList {
+        let dmut res = copy SymbolList ();
+        self:.getSymbolsInTable (name, protection, alias res, callParent-> false);
+        alias res
+    }
+
+    /**
+     * Look up symbols whose names are within a Levenshtein distance.
+     *
+     * Used for error recovery and suggestions.
+     */
+    pub fn getCloseLocalSymbols (self, name: [c8], distance: usize, protection: Protection = Protection::PUBLIC)-> dmut &ImutSymbolList {
+        let dmut res = copy ImutSymbolList ();
+        self.getCloseSymbolsInTable (name, distance, protection-> protection, syms-> alias res, callParent-> false);
+        alias res
+    }
+    
+
+    /**
+     * @returns all symbols declared directly inside this symbol.
+     *
+     * Can return public-only or all symbols, optionally sorted by name.
+     */
+    pub fn getAllLocalSymbols (self, protection: Protection = Protection::PUBLIC, sorted: bool = false)-> [&Symbol] {
+        let mut res: [mut &Symbol] = [];
+        if (protection == Protection::PRIVATE) {
+            if sorted {
+                let mut local: [mut ([c8], [&Symbol])] = copy [(i, j) for i, j in self._table.content];                
+                std::algorithm::sorting::sort (alias local, |x, y| => { x.0 < y.0 });                                
+                for _, v in local {
+                    res ~= v._1;
+                }                
+            } else {
+                for _, v in self._table.content {
+                    res ~= v;
+                }                
+            }                        
+        } else {            
+            if sorted {
+                let mut local: [mut ([c8], [&Symbol])] = copy [(i, j) for i, j in self._table.publicContent];                                             
+                std::algorithm::sorting::sort (alias local, |x, y| => { x.0 < y.0 });
+                for _, v in local {
+                    res ~= v._1;
+                }
+                
+            } else {
+                for _, v in self._table.publicContent {
+                    res ~= v;
+                }                
+            };                                                
+        }
+        
+        return res;
+    }
+
+
+    /**
+     * Get all local symbols
+     * @info: don't ask parents
+     * @params:
+     *  - protection: the protection access (e.g. public-> access only public symbols, private-> access all)
+     * @returns: a list of symbols
+     */
+    pub fn getAllLocalSymbols (mut self, protection: Protection = Protection::PUBLIC, sorted: bool = false)-> dmut [&Symbol] {
+        let dmut res: [&Symbol] = [];
+        
+        if (protection == Protection::PRIVATE) {
+            if sorted {
+                let mut local: [mut (mut [c8], dmut [&Symbol])] = copy [(i, alias j) for i, dmut j in alias self._table.content];                
+                std::algorithm::sorting::sort (alias local, |x, y| => { x.0 < y.0 });                                
+                for _, mut v: (mut [c8], dmut [&Symbol]) in alias local {
+                    res ~= alias v._1;
+                }                
+            } else {
+                for _, dmut v in alias self._table.content {
+                    res ~= alias v;
+                }                
+            }                        
+        } else {            
+            if sorted {
+                let mut local: [mut (mut [c8], dmut [&Symbol])] = copy [(i, alias j) for i, dmut j in alias self._table.publicContent];                
+                std::algorithm::sorting::sort (alias local, |x, y| => { x.0 < y.0 });
+                for _, mut v: (mut [c8], dmut [&Symbol]) in alias local {
+                    res ~= alias v._1;
+                }
+                
+            } else {
+                for _, dmut v in alias self._table.publicContent {
+                    res ~= alias v;
+                }                
+            };                                                
+        }
+        
+        return alias res;
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ===================================          HIERARCHY          ====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */    
+
+    /**
+     * @returns true iff both symbols originate from the same file.
+     *
+     * Symbols with empty filenames are treated as matching.
+     */
+    pub fn inSameFile (self, o: &Symbol)-> bool {
+        if (self.loc.filename == o.loc.filename) return true;
+        if (self.loc.filename == "") return true;
+        if (o.loc.filename == "") return true;
+
+        false
+    }
+    
+    /**
+     * Set the parent symbol and recompute the full name.
+     */
+    pub fn setReferent (mut self, dmut parent: &Symbol) {
+        self._referent = (alias parent)?;
+        self._fullName = self.computeFullName ();
+    }
+
+    /**
+     * Set the external language associated with this symbol.
+     */
+    pub fn setExternLang (mut self, lang: [c8]) {
+        self._externLang = lang;        
+    }
+
+    /**
+     * Mark the symbol as generated from a template specialization.
+     *
+     * Effects:
+     *   - mark the symbol as weak,
+     *   - store the template mapper,
+     *   - recompute the full name,
+     *   - propagate template status to all children,
+     *   - remove the symbol from the parent's normal table,
+     *   - reinsert it into the parent's template table.
+     *   
+     */
+    pub fn setFromTemplate (mut self, mapper: TemplateMapper) {
+        self._isWeak = true;
+
+        self._templateMapper = mapper?;
+        self._fullName = self.computeFullName ();
+
+        let dmut local = self._table.content; // need to change the name of the inner symbols, and set them to weak
+        for _, dmut v in alias local {
+            for s in 0us .. v.len {
+                v [s]:.setParentIsTemplate ();
+            }
+        }
+
+        if let Ok (dmut sym) = alias self._referent {
+            sym:.remove (alias self); // template symbols are not accessible from the symbol table
+            sym:.insertTemplate (alias self); // Don't forget to insert a template so the symbol can be still found but differently
+        }
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ===================================          GENERATORS          ===================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+    
+    /**
+     * Manage code generators associated with this symbol.
+     *
+     * Generators may be attached to symbols during semantic analysis and are
+     * collected recursively through the symbol hierarchy.
+     */
+    pub fn insertGenerator (mut self, gen: &Generator) {
+        self._generators ~= [gen];
+    }
+
+    /**
+     * Get all the generators associated to the symbol, and to its childrens
+     * */
+    @field
+    pub fn generators (self)-> [&Generator] {
+        let mut res: [mut &Generator] = [];
+        self.getGenerators (ref res);
+
+        res
+    }
+
+    /**
+     * @returns: the list of generators associated to the symbols, but not to the childrens
+     * */
+    @field
+    pub fn localGenerators (self)-> [&Generator] {
+        self._generators
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ================================          IMPLEMENTATIONS          =================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    impl Comparable!{&Symbol} {            
+        
+        /**
+         * Symbols are equal when they are the same object.
+         *
+         * Symbol identity is pointer identity.
+         */
+        pub over opEquals (self, o: &Symbol) -> bool {
+            self is o
+        }
+    }
+    
+    impl symbol::format::AdvanceSymFormatting;
+    impl Streamable;
+
+    impl Formattable {
+        
+        /**
+         * Format the symbol using its full path.
+         */
+        pub over format (self, dmut stream: &Formatter) {
+            stream:.write (self._fullName.toStr ());
+        }
+    }
+
+    impl Hashable {
+        
+        /**
+         * Compute a hash for the symbol based on its memory identity.
+         *         
+         */
+        pub over toHash (self)-> u64 {
+            core::types::hash::__hash (ymirc::utils::memory::Runtime!{&Symbol, *void}::_yrt_unsafe_cast (self))
+        }
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ==================================          PRIVATE MISC          ==================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+    
+    /**
+     * Get all the symbols in the table, and the table of the parent
+     * @params:
+     *   - name: the name of the symbols to find
+     *   - protection: the protection of the symbols to get
+     *   - syms: the result set
+     *   - callParent: true iif recursevily call parent symbols
+     * @returns: in params syms
+     */
+    prv fn getSymbolsInTable (self, name: [c8], protection: Protection, dmut syms: &ImutSymbolList, callParent: bool = true) {
+        let x = self._table.find (name, protection-> protection);
+        for i in x { syms:.insert (i); }
+
+        if (callParent) {
+            if (name == self.loc.str) {
+                match self._templateMapper {
+                    Err () => { syms:.insert (self); }
+                }
+            }
+
+            if let Ok (r) = self._referent {
+                r.getSymbolsInTable (name, protection-> protection, alias syms);
+            }
+        }
+    }
+
+    /**
+     * Get all the symbols in the table, and the table of the parent
+     * @params:
+     *   - name: the name of the symbols to find
+     *   - protection: the protection of the symbols to get
+     *   - syms: the result set
+     *   - callParent: true iif recursevily call parent symbols
+     * @returns: in params syms
+     */
+    prv fn getSymbolsInTable (mut self, name: [c8], protection: Protection, dmut syms: &SymbolList, callParent: bool = true) {
+        let dmut x = self._table:.find (name, protection-> protection);
+        for i in 0us .. x.len { syms:.insert (alias x[i]); }
+
+        if (callParent) {
+            if (name == self.loc.str) {
+                match self._templateMapper {
+                    Err () => { syms:.insert (alias self); }
+                }
+            }
+
+            if let Ok (dmut r) = alias self._referent {
+                r:.getSymbolsInTable (name, protection-> protection, alias syms);
+            }
+        }
+    }
+
+    /**
+     * Get all the symbols in the table, and the table of the parent
+     * @params:
+     *   - name: the name of the symbols to find
+     *   - protection: the protection of the symbols to get
+     *   - syms: the result set
+     *   - callParent: true iif recursevily call parent symbols
+     * @returns: in params syms
+     */
+    prv fn getCloseSymbolsInTable (self, name: [c8], distance: usize, protection: Protection, dmut syms: &ImutSymbolList, callParent: bool = true) {
+        if (name.len <= distance) return {};
+
+        let x = self._table.findClose (name, distance, protection-> protection);
+        for i in 0us .. x.len { syms:.insert (x [i]); }
+
+        if (callParent) {
+            let n = self.loc.str;
+            if (n.len > distance + 1us && string::levenshteinDistance (n, name) <= distance) {
+                syms:.insert (self);
+            }
+
+            if let Ok (r) = self._referent {
+                r.getCloseSymbolsInTable (name, distance, protection-> protection, alias syms);
+            }
+        }
+    }
+
+    /**
+     * Compute the full name of the symbol
+     */
+    prot fn computeFullName (self) -> &SymbolPath {
+        let p = match self._referent {
+            Ok (x: _) => {
+                x.path
+            }
+            _ => { copy SymbolPath ("") }
+        }
+
+        p.push (self.loc.str, tmpls-> self._templateMapper)
+    }
+
+    /**
+     * Set the symbol as a weak symbol, as one of the ancestor of this symbol is a template symbol
+     */
+    prv fn setParentIsTemplate (mut self) {
+        self._isWeak = true;
+        self._fullName = self.computeFullName ();
+
+        let dmut local = self._table.content;
+        for _, dmut v in alias local {
+            for s in 0us .. v.len {
+                v [s]:.setParentIsTemplate ();
+            }
+        }
+    }
+
+    /**
+     * Get all the generators associated to the symbol, and to its childrens
+     * @params:
+     *    - res: the vector to fill
+     * */    
+    prv fn getGenerators (self, ref mut res: [mut &Generator]) {
+        for i in self._generators {
+            res ~= [i];
+        }
+
+        for _, v in self._table.content {
+            for s in v {
+                s.getGenerators (ref res);
+            }
+        }
+
+        for _, v in self._table.templates {
+            v.getGenerators (ref res);
+        }
+    }
+
+}
