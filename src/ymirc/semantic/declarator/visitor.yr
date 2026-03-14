@@ -1,3 +1,54 @@
+/*
+ * Declares the Declarator class.
+ * 
+ * The Declarator is responsible for transforming syntactic declarations
+ * (modules, imports, classes, functions, traits, enums, variables, etc.) into
+ * the compiler’s symbol tree. It operates directly on the AST and produces an
+ * unvalidated symbol structure that will later be consumed by the semantic
+ * validator.
+ *
+ * This phase performs:
+ *   - module construction (global, nested, and foreign),
+ *   - import resolution (direct, lazy, sibling/child modules),
+ *   - symbol insertion and shadowing checks,
+ *   - class/record/trait/type declaration,
+ *   - template declaration,
+ *   - attribute validation (abstract/final, packed/overlaid),
+ *   - construction of the foreign symbol tree for imported packages,
+ *   - implicit insertion of core modules.
+ *
+ * The Declarator does *not* perform type checking or semantic validation.
+ * It only builds the structural symbol graph required by later phases.
+ *
+ * <hr>
+ * 
+ * @Package: ymirc        
+ * @Module: ymirc::semantic::declarator::visitor
+ * @File: ymirc/semantic/declarator/visitor.yr
+ * @Author(s):
+ *   - Emile Cadorel <ecadorel@gmail.com>
+ *
+ * @Created (YYYY-MM-DD): 2021-11-29
+ * @Copyright (C) 2021–2026 GNU-Ymir
+ * @License
+ *   ```text
+ *   This file is part of the Ymir language project.
+ *
+ *   Ymir is free software: you can redistribute it and/or modify it
+ *   under the terms of the GNU General Public License as published by
+ *   the Free Software Foundation, either version 3 of the License, or
+ *   (at your option) any later version.
+ *
+ *   Ymir is distributed in the hope that it will be useful,
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *   GNU General Public License for more details.
+ *
+ *   You should have received a copy of the GNU General Public License
+ *   along with Ymir.  If not, see <https://www.gnu.org/licenses/>.
+ *   ```
+ */
+
 in visitor;
 
 use std::{io, stream, fs::_};
@@ -15,40 +66,148 @@ use ymirc::syntax::visitor;
 use ymirc::utils::{format, memory, list};
 
 /**
- * The declarator transforms a syntaxic decl element into a symbol tree
- * The nodes of the tree are not validated, and have to be passed to a validator
+ * Builds the symbol tree from syntactic declarations.
+ *
+ * The Declarator walks the AST and creates the corresponding symbol structures,
+ * inserting them into the appropriate module or scope. It handles all
+ * declaration-time responsibilities:
+ *
+ *   - creating module symbols (global, nested, foreign),
+ *   - resolving imports and constructing lazy modules,
+ *   - inserting symbols while enforcing shadowing rules,
+ *   - declaring classes, records, traits, enums, functions, macros,
+ *     templates, variables, and use-declarations,
+ *   - validating declaration-level attributes (abstract, final, packed,
+ *     overlaid),
+ *   - computing implicit core module imports,
+ *   - maintaining package context during multi-file traversal.
+ *
+ * The Declarator produces a *raw* symbol tree: names, scopes, and structural
+ * relationships are established, but no semantic validation is performed. The
+ * resulting tree must be passed to the validator for type checking, inheritance
+ * validation, overload resolution, and other semantic rules.
+ *
+ * @note
+ *   Declarator errors are fatal for the compilation unit. Most errors
+ *   include contextual notes (import locations, shadowing origins, etc.)
+ *   to help the user understand the source of the conflict.
  */
+@final
 pub class Declarator {
 
-    // Path to the root directory of the package
-    let  _packageDir : Path;
+    pub {
+        /**
+         * Absolute path to the root directory of the package currently being compiled.
+         *
+         * This directory is used as the base for resolving module files, import
+         * statements, and sibling/child module paths. It remains constant for the
+         * entire compilation unit and identifies the package to which the current
+         * source file belongs.
+         */        
+        let packageDir: Path;
+    }
 
-    // The root of all declarations
-    let dmut _root : &ModuleSymbol = copy ModuleSymbol (EOF_WORD, EOF_WORD, "", isGlobal-> true);
+    prv {
+        /**
+         * Root symbol of all declarations belonging to the current package.
+         *
+         * This module symbol represents the top-level namespace of the package
+         * being compiled. All modules declared through the file structure
+         * (via `module` declarations or implicit module roots) are inserted
+         * under this symbol.
+         *
+         * @note
+         *   This root contains only *local* declarations. Modules from other
+         *   packages (imported via `-I`) never appear here.
+         */
+        let dmut _root: &ModuleSymbol = copy ModuleSymbol (loc-> EOF_WORD,
+                                                           importLoc-> EOF_WORD,
+                                                           comm-> "",
+                                                           isExtern-> false,
+                                                           isGlobal-> true,
+                                                           protection-> Protection::PRIVATE);
 
-    // The root of all foreign declaration (imported packages)
-    let dmut _foreignRoot : &ModuleSymbol = copy ModuleSymbol (EOF_WORD, EOF_WORD, "", isGlobal-> true);
+        /**
+         * Root symbol for all declarations originating from *foreign packages*.
+         *
+         * Foreign packages are not imported through the language itself, but
+         * through the compiler command line (`-I <path>`). Once a package is
+         * made available this way, its modules become accessible through the
+         * `use` syntax.
+         *
+         * The Declarator inserts all symbols belonging to these external
+         * packages under this root. This ensures:
+         *   - clear separation between local and foreign symbols,
+         *   - correct resolution of `use` declarations,
+         *   - consistent handling of lazy module loading.
+         */
+        let dmut _foreignRoot: &ModuleSymbol = copy ModuleSymbol (loc-> EOF_WORD,
+                                                                  importLoc-> EOF_WORD,
+                                                                  comm-> "",
+                                                                  isExtern-> true,
+                                                                  isGlobal-> true,
+                                                                  protection-> Protection::PRIVATE);
+        
+        /**
+         * List of core modules implicitly inserted into every module declaration.
+         *
+         * These symbols correspond to the compiler’s built-in modules (e.g.,
+         * primitives, intrinsic utilities). They are computed once from the
+         * core module tree and injected into each module during finalization.
+         *
+         * This ensures that core functionality is always available without
+         * requiring explicit `use` declarations in user code.
+         */
+        let mut _coreModules: [dmut &Symbol] = [];
 
-    // The list of core use declaration, to insert in module symbols
-    let mut _coreModules : [dmut &Symbol] = [];
-
-    // The package being declared (root directory)
-    let dmut _currentPackDir : &List!{Path} = copy List!{Path} ();
-
+        /**
+         * Stack of package directories currently being processed.
+         *
+         * This stack tracks the directory context during nested module
+         * declarations and lazy module resolution. Each call to
+         * `declareGlobal` or `declareExtern` pushes the active package
+         * directory, and the corresponding `exit` block pops it.
+         *
+         * This is required to:
+         *   - resolve `ImportDecl` (sub-module declarations) relative to the
+         *     current module’s directory,
+         *   - detect recursive imports inside the same package,
+         *   - apply import-filtering rules for modules belonging to the same
+         *     package.
+         *
+         * @note
+         *   This has nothing to do with cross-package imports. Those are handled
+         *   entirely by the compiler’s `-I` mechanism and appear under
+         *   `_foreignRoot`.
+         */
+        let dmut _currentPackDir: &List!{Path} = copy List!{Path} ();
+    }
+    
     /**
-     * Create a new empty declarator
+     * Creates a new declarator for a specific package.
+     *
+     * @params:
+     *   - packageDir: absolute path to the root directory of the package being compiled.
      */
-    pub self (packageDir : Path) with
-        _packageDir = packageDir
+    pub self (packageDir: Path) with
+        packageDir = packageDir
     {}
 
+
     /**
-     * Transform a declaration syntax into a symbol tree
-     * @params: 
-     *    - root: the root to declare
-     * @throws: &ErrorMsg
+     * Declares all top-level symbols of the current package.
+     *
+     * @params:
+     *   - root:       the syntactic declaration to process
+     *   - packageDir: directory of the package containing this file
+     *
+     * @returns:
+     *   The package root symbol.
+     *     
+     * @throws:
+     *   ErrorMsg on malformed or conflicting declarations.
      */
-    pub fn declareGlobal (mut self, root : &Declaration, packageDir : Path)-> dmut &Symbol
+    pub fn declareGlobal (mut self, root: &Declaration, packageDir: Path)-> dmut &Symbol
         throws ErrorMsg
     {
         self._currentPackDir:.push (packageDir);
@@ -60,12 +219,25 @@ pub class Declarator {
     }
 
     /**
-     * Transform a declaration syntax into a symbol tree, that won't be validated but is accessible during validation
+     * Declares top-level symbols belonging to a foreign package.
+     *
      * @params:
-     *    - root: the root to declare
-     * @throws: &ErrorMsg
-     * */
-    pub fn declareExtern (mut self, root : &Declaration, packageDir : Path)-> dmut &Symbol
+     *   - root:       the syntactic declaration to process
+     *   - packageDir: directory of the foreign package being loaded
+     *
+     * @returns:
+     *   The foreign-package root symbol.
+     *
+     * @behavior:
+     *   Processes the declarations contained in `root` as belonging to an
+     *   externally imported package. These symbols become visible to the
+     *   current compilation unit but are not considered part of the local
+     *   package.
+     *     
+     * @throws:
+     *   ErrorMsg on malformed or conflicting declarations.
+     */
+    pub fn declareExtern (mut self, root: &Declaration, packageDir: Path)-> dmut &Symbol
         throws ErrorMsg
     {
         self._currentPackDir:.push (packageDir);
@@ -76,9 +248,17 @@ pub class Declarator {
     }
 
     /**
-     * Compute the list of use decl to implicitely insert during module declaration
-     * This list is the list of core modules computed from the core module tree
-     * */
+     * Computes the list of core modules implicitly available to all modules.
+     *
+     * @behavior:
+     *   Loads and prepares the compiler’s built-in core modules so they can be
+     *   automatically inserted during module finalization. This ensures that
+     *   essential language facilities are always available without requiring
+     *   explicit `use` declarations.
+     *
+     * @throws:
+     *   ErrorMsg if the core module set is malformed or cannot be processed.
+     */
     pub fn computeCoreUseDecls (mut self)
         throws ErrorMsg
     {
@@ -87,8 +267,8 @@ pub class Declarator {
                 self._coreModules ~= self:.finalizeUse (alias self._foreignRoot, p, EMPTY_EXPR, false);
             }
         } catch {
-            err : &ErrorMsg => {
-                let mut notes : [mut &ErrorMsg] = copy [err];
+            err: &ErrorMsg => {
+                let mut notes: [mut &ErrorMsg] = copy [err];
                 notes ~= copy [copy ErrorMsg::note (EOF_WORD, format (DeclareErrorMessage::EXPECT_CORE_MODULES, p.toStr (sep-> "::")), oneLine-> true)
                                for p in global::core_::UseCoreModules::members];
 
@@ -100,110 +280,132 @@ pub class Declarator {
     }
 
     /**
-     * Finalize the symbols declared within the extern foreign module
-     * */
-    pub fn finalizeExternDeclaration (mut self)
-        throws ErrorMsg
-    {
-        self:.finalizeDeclaration (alias self._foreignRoot);
-    }
-
-    /**
-     * Transform a declaration syntax into a symbol tree
-     * @params: 
-     *    - root: the root to declare
-     * @throws: &ErrorMsg
+     * Declares a syntactic element into the symbol tree.
+     *
+     * @params:
+     *   - root:       the declaration to process
+     *   - parent:     the symbol under which the declaration is inserted
+     *   - protection: default protection applied when the declaration does not
+     *                 specify one explicitly
+     *
+     * @returns:
+     *   The symbol created for this declaration, or an empty symbol when the
+     *   declaration does not introduce a new named entity.         
+     *
+     * @throws:
+     *   - ErrorMsg: if the declaration is invalid or cannot be inserted into the
+     *   symbol tree.
      */
-    pub fn declare (mut self, root : &Declaration, dmut parent : &Symbol, protection : Protection = Protection::PRIVATE)-> dmut &Symbol
+    pub fn declare (mut self, root: &Declaration, dmut parent: &Symbol, protection: Protection = Protection::PRIVATE)-> dmut &Symbol
         throws ErrorMsg
     {
         match root {
-            m : &ModuleDecl => {
+            m: &ModuleDecl => {
                 return self:.declareModule (m, alias parent, protection-> protection);
             }
-            block : &BlockDecl => {
-                let inProt = if (block.isSet ()) { protection } else { block.getProtection () };
-                for i in block.getDeclarations () {
+            block: &BlockDecl => {
+                let inProt = if (block.isSet) { protection } else { block.protection };
+                for i in block.decls {
                     // If block is just a set, then protection has no meaning
                     self:.declare (i, alias parent, protection-> inProt);
                 }
                 return alias EMPTY_SYMBOL;
             }
-            im : &ImportDecl => {
+            im: &ImportDecl => {
                 return self:.declareImport (im, alias parent, protection-> protection);
             }
-            cl : &ClassDecl => {
+            cl: &TypeDecl => {
                 return self:.declareClass (cl, alias parent, protection-> protection);
             }
-            t : &TemplateDecl => {
+            t: &TemplateDecl => {
                 return self.declareTemplate (t, alias parent, protection-> protection);
             }
-            ex : &ExternBlockDecl => {
+            ex: &ExternBlockDecl => {
                 return self.declareExternBlock (ex, alias parent, protection-> protection);
             }
-            f : &FunctionDecl => {
+            f: &FunctionDecl => {
                 return self.declareFunction (f, alias parent, protection-> protection, isMethod-> false);
             }
-            m : &MacroDecl => {
+            m: &MacroDecl => {
                 return self.declareMacro (m, alias parent, protection-> protection);
             }
-            en : &EnumDecl => {
+            en: &EnumDecl => {
                 return self.declareEnum (en, alias parent, protection-> protection);
             }
-            ak : &AkaDecl => {
-                return self.declareAka (ak, alias parent, protection-> protection);
+            un: &UnionDecl => {
+                return self.declareUnion (un, alias parent, protection-> protection);
             }
-            tr : &TraitDecl => {
+            de: &DefDecl => {
+                return self.declareDef (de, alias parent, protection-> protection);
+            }
+            tr: &TraitDecl => {
                 return self:.declareTrait (tr, alias parent, protection-> protection);
             }
-            gl : &GlobalDecl => {
-                return self.declareGlobal (gl, alias parent, protection-> protection);
+            gl: &GlobalVarDecl => {
+                return self.declareGlobalVar (gl, alias parent, protection-> protection);
             }
-            u : &UseDecl => {
+            u: &UseDecl => {
                 return self.declareUse (u, alias parent);
             }
-            u : &UnitTestDecl => {
+            u: &UnitTestDecl => {
                 return self.declareUnitTest (u, alias parent);
             }
             _ => {
-                throw copy ErrorMsg::fatal (root.getLoc (), DeclareErrorMessage::UNEXPECTED_IN_MODULE);
+                throw copy ErrorMsg::fatal (root.loc, DeclareErrorMessage::UNEXPECTED_IN_MODULE);
             }
         }
     }
 
     /*!
-     * ================================================================================
-     * ================================================================================
-     * =========================            MODULE            =========================
-     * ================================================================================
-     * ================================================================================
+     * ====================================================================================================
+     * ====================================================================================================
+     * =====================================          MODULE          =====================================
+     * ====================================================================================================
+     * ====================================================================================================
      */
-
+    
     /**
-     * Declare a module (global or not)
-     * @params: 
-     *   - module: the module to declare
-     *   - parent: the parent symbol that is declaring the module
-     * @info: self._imported is updated if the module is global, as well a self._root
+     * Declares a module and inserts it into the symbol tree.
+     *
+     * @params:
+     *   - module:     the module declaration to process
+     *   - parent:     the symbol under which the module is created
+     *   - protection: the protection applied to the module
+     *   - importLoc:  location of the import that triggered this declaration,
+     *                 when the module originates from an external file
+     *   - withInner:  whether the module’s inner declarations should be processed
+     *
+     * @returns:
+     *   The symbol representing the declared module.
+     *
+     * @behavior:
+     *   Creates a module symbol, checks for naming conflicts, and optionally
+     *   declares its inner contents. This function is used both for modules
+     *   defined in the current file structure and for modules loaded from
+     *   external files.
+     *
+     * @throws:
+     *   - ErrorMsg: if the module is invalid, conflicts with an existing declaration,
+     *   or cannot be inserted into the symbol tree.
      */
-    fn declareModule (mut self, module : &ModuleDecl, dmut parent : &Symbol, protection : Protection = Protection::PRIVATE, importLoc : &Word = EOF_WORD, withInner : bool = true)-> dmut &ModuleSymbol
+    fn declareModule (mut self, module: &ModuleDecl, dmut parent: &Symbol, protection: Protection = Protection::PRIVATE, importLoc: &Word = EOF_WORD, withInner: bool = true)-> dmut &ModuleSymbol
         throws ErrorMsg
     {
-        let name = if (module.isGlobal ()) {
-            if (module.getPath ().isEof) {
-                Path (module.getLoc ().filename).stripExtension ().file ()
+        let name = if (module.isGlobal) {
+            if (module.name.isEof) {
+                Path (module.loc.filename).stripExtension ().file ()
             } else {
-                module.getPath ().str
+                module.name.str
             }
         } else {
-            module.getLoc ().str
+            module.loc.str
         };
 
-        let dmut ret = copy ModuleSymbol (module.getLoc ().locate (name), importLoc-> importLoc, module.getComments (), isExtern-> false, isGlobal-> module.isGlobal (), protection-> protection);
-        if (module.isGlobal ()) {
-            let fileLoc = Path (module.getLoc ().filename).stripExtension ().file ();
+        let dmut ret = copy ModuleSymbol (module.loc.locate (name), importLoc-> importLoc, module.comm, isExtern-> false, isGlobal-> module.isGlobal, protection-> protection);
+        if (module.isGlobal) {
+            let fileLoc = Path (module.loc.filename).stripExtension ().file ();
             if (fileLoc != name) {
-                throw copy ErrorMsg::fatal (module.getPath (), format (DeclareErrorMessage::WRONG_MODULE_NAME, module.getPath (), Path (name).addExtension (CommonVars::YMIR_EXTENSION).toStr ()));
+                throw copy ErrorMsg::fatal (module.name, format (DeclareErrorMessage::WRONG_MODULE_NAME, module.name, Path (name).addExtension (CommonVars::YMIR_EXTENSION).toStr ()));
             }
         }
 
@@ -213,22 +415,22 @@ pub class Declarator {
         let already = parent.getLocalSymbols (name, protection-> Protection::PRIVATE);
         for a in already[] {
             match a {
-                m : &ModuleSymbol => { // a module with the same name is already present in the referent
+                m: &ModuleSymbol => { // a module with the same name is already present in the referent
                     if (name != Keys::LIB_ROOT) {
-                        let mut notes : [mut &ErrorMsg] = [];
+                        let mut notes: [mut &ErrorMsg] = [];
                         if (!importLoc.isEof) {
                             notes ~= [copy ErrorMsg::note (importLoc, format (DeclareErrorMessage::IN_IMPORT, importLoc.str))];
                         }
 
-                        if (!m.getImportLoc ().isEof) {
-                            notes ~= [copy ErrorMsg::note (m.getImportLoc (), format (DeclareErrorMessage::IN_IMPORT, m.getImportLoc ().str))];
+                        if (!m.importLoc.isEof) {
+                            notes ~= [copy ErrorMsg::note (m.importLoc, format (DeclareErrorMessage::IN_IMPORT, m.importLoc.str))];
                         } else {
-                            notes ~= [copy ErrorMsg::note (m.getLoc (), DeclareErrorMessage::DECLARED_HERE)];
+                            notes ~= [copy ErrorMsg::note (m.loc, DeclareErrorMessage::DECLARED_HERE)];
                         }
 
-                        throw copy ErrorMsg::fatal (ret.getLoc (), format (DeclareErrorMessage::SHADOWING_DECL, ret.getLoc ().str), notes-> notes);
+                        throw copy ErrorMsg::fatal (ret.loc, format (DeclareErrorMessage::SHADOWING_DECL, ret.loc.str), notes-> notes);
                     } else {
-                        if let dmut z : &ModuleSymbol = self:.getMutableSymbol (m) {
+                        if let dmut z: &ModuleSymbol = self:.getMutableSymbol (m) {
                             ret = alias z;
                         } else panic;
 
@@ -243,7 +445,7 @@ pub class Declarator {
         }
 
         if (withInner) {
-            for i in module.getDeclarations () {
+            for i in module.decls {
                 self:.declare (i, alias ret);
             }
         }
@@ -252,45 +454,76 @@ pub class Declarator {
     }
 
     /**
-     * Declare a use declaration
+     * Declares a `use` statement.
+     *
      * @params:
-     *    - use_: the declaration
-     *    - parent: the current context
-     * */
-    fn declareUse (self, use_ : &UseDecl, dmut parent : &Symbol)-> dmut &Symbol {
+     *   - use_:   the `use` declaration to process
+     *   - parent: the symbol into which the imported module is introduced
+     *
+     * @returns: EMPTY_SYMBOL
+     * 
+     * @behavior:
+     *   Registers a `use` declaration under the given parent symbol. The actual
+     *   resolution of the imported module is performed later during the
+     *   finalization phase.
+     *
+     */
+    fn declareUse (self, use_: &UseDecl, dmut parent: &Symbol)-> dmut &Symbol {
         parent:.insertUse (use_);
         alias EMPTY_SYMBOL
     }
 
     /*!
-     * ================================================================================
-     * ================================================================================
-     * =========================            IMPORT            =========================
-     * ================================================================================
-     * ================================================================================
+     * ====================================================================================================
+     * ====================================================================================================
+     * =====================================          IMPORT          =====================================
+     * ====================================================================================================
+     * ====================================================================================================
      */
-
+    
     /**
-     * Declare an importation statement
-     * @params: 
-     *   - im: the importation to declare
-     *   - parent: the parent of the importation (module that is making the import)
-     *   - protection: the protection of the importation
+     * Declares an `mod` importation of a submodule belonging to the same package.
+     *
+     * @params:
+     *   - im:         the import declaration to process
+     *   - parent:     the symbol into which the imported submodule is introduced
+     *   - protection: protection applied to the imported module symbol
+     *
+     * @returns:
+     *   The symbol representing the imported submodule, or an empty symbol when
+     *   the import is deferred.
+     *
+     * @behavior:
+     *   Validates that the import appears at the package’s global scope, checks
+     *   for recursive or conflicting imports, and determines whether the imported
+     *   submodule should be loaded immediately or deferred.
+     *
+     *   When an import is deferred, the compiler creates a *lazy module*: a
+     *   placeholder symbol that records the module’s identity without loading its
+     *   contents. Lazy modules are resolved only when needed — either during the
+     *   finalization phase or later during validation if the module is actually
+     *   referenced. This avoids loading unused modules, especially in external
+     *   packages where many submodules may never be touched.
+     *
+     * @throws:
+     *   - ErrorMsg: if the import is invalid, recursive, out of scope, or conflicts
+     *   with an existing declaration.
      */
-    fn declareImport (mut self, im : &ImportDecl, dmut parent : &Symbol, protection : Protection)-> dmut &Symbol
+    fn declareImport (mut self, im: &ImportDecl, dmut parent: &Symbol, protection: Protection)-> dmut &Symbol
         throws ErrorMsg
     {
-        let importLoc = im.getModuleName ();
-        let name = im.getModuleName ().str;
-        let global = if let parentModule : &ModuleSymbol = parent {
-            parentModule.isGlobal ()
+        let importLoc = im.name;
+        let name = im.name.str;
+        
+        let global = if let parentModule: &ModuleSymbol = parent {
+            parentModule.isGlobal 
         } else { false };
 
         if (!global) throw copy ErrorMsg::fatal (importLoc, format (DeclareErrorMessage::IN_IMPORT, importLoc.str),
                                                  notes-> copy [copy ErrorMsg::note (importLoc, DeclareErrorMessage::IMPORT_OUT_GLOBAL, oneLine-> true)]);
 
         let (importPath, isSibling) = self.selectImportFile (im, parent);
-        let selfImport = (isSibling && importPath == Path (parent.getLoc ().filename));
+        let selfImport = (isSibling && importPath == Path (parent.loc.filename));
 
         if (selfImport) throw copy ErrorMsg::fatal (importLoc, format (DeclareErrorMessage::IN_IMPORT, importLoc.str),
                                                     notes-> copy [copy ErrorMsg::note (importLoc, DeclareErrorMessage::IMPORT_RECURSIVE, oneLine-> true)]);
@@ -299,30 +532,30 @@ pub class Declarator {
         let already = parent.getLocalSymbols (name, protection-> Protection::PRIVATE);
         for a in already[] {
             match a {
-                m : &ModuleSymbol => { // a module with the same name is already present in the referent
-                    let mut notes : [mut &ErrorMsg] = [];
+                m: &ModuleSymbol => { // a module with the same name is already present in the referent
+                    let mut notes: [mut &ErrorMsg] = [];
                     if (!importLoc.isEof) {
                         notes ~= [copy ErrorMsg::note (importLoc, format (DeclareErrorMessage::IN_IMPORT, importLoc.str))];
                     }
 
-                    if (!m.getImportLoc ().isEof) {
-                        notes ~= [copy ErrorMsg::note (m.getImportLoc (), format (DeclareErrorMessage::IN_IMPORT, m.getImportLoc ().str))];
+                    if (!m.importLoc.isEof) {
+                        notes ~= [copy ErrorMsg::note (m.importLoc, format (DeclareErrorMessage::IN_IMPORT, m.importLoc.str))];
                     } else {
-                        notes ~= [copy ErrorMsg::note (m.getLoc (), DeclareErrorMessage::DECLARED_HERE)];
+                        notes ~= [copy ErrorMsg::note (m.loc, DeclareErrorMessage::DECLARED_HERE)];
                     }
 
                     throw copy ErrorMsg::fatal (importLoc, format (DeclareErrorMessage::SHADOWING_DECL, importLoc.str), notes-> notes);
                 }
-                m : &LazyModuleSymbol => {
-                    let mut notes : [mut &ErrorMsg] = [];
+                m: &LazyModuleSymbol => {
+                    let mut notes: [mut &ErrorMsg] = [];
                     if (!importLoc.isEof) {
                         notes ~= [copy ErrorMsg::note (importLoc, format (DeclareErrorMessage::IN_IMPORT, importLoc.str))];
                     }
 
-                    if (!m.getImportLoc ().isEof) {
-                        notes ~= [copy ErrorMsg::note (m.getImportLoc (), format (DeclareErrorMessage::IN_IMPORT, m.getImportLoc ().str))];
+                    if (!m.importLoc.isEof) {
+                        notes ~= [copy ErrorMsg::note (m.importLoc, format (DeclareErrorMessage::IN_IMPORT, m.importLoc.str))];
                     } else {
-                        notes ~= [copy ErrorMsg::note (m.getLoc (), DeclareErrorMessage::DECLARED_HERE)];
+                        notes ~= [copy ErrorMsg::note (m.loc, DeclareErrorMessage::DECLARED_HERE)];
                     }
 
                     throw copy ErrorMsg::fatal (importLoc, format (DeclareErrorMessage::SHADOWING_DECL, importLoc.str), notes-> notes);
@@ -331,12 +564,12 @@ pub class Declarator {
         }
 
         let symPath = if isSibling {
-            parent:.getReferent ().getPath ().push (importLoc.str)
+            parent.referent.path.push (importLoc.str)
         } else {
-            parent.getPath ().push (importLoc.str)
+            parent.path.push (importLoc.str)
         };
 
-        let pass = if self._currentPackDir.back () == self._packageDir {
+        let pass = if (self._currentPackDir.back == self.packageDir) {
             if (self.checkPassFilter (importPath)) {
                 true
             } else {
@@ -347,16 +580,16 @@ pub class Declarator {
         };
 
         if (!pass) {
-            let packageLoc = self._currentPackDir.back ();
+            let packageLoc = self._currentPackDir.back;
             let dmut lazyMod = copy LazyModuleSymbol (name, importLoc, importPath, protection-> protection, packageDir-> packageLoc);
             if isSibling {
-                parent:.getReferent ():.insert (alias lazyMod, replace-> false);
+                parent.referent:.insert (alias lazyMod, replace-> false);
             } else {
                 parent:.insert (alias lazyMod, replace-> false);
             }
         } else {
             if isSibling {
-                return self:.declareImportDirect (name, importPath, alias parent:.getReferent (), protection, importLoc);
+                return self:.declareImportDirect (name, importPath, alias parent.referent, protection, importLoc);
             } else {
                 return self:.declareImportDirect (name, importPath, alias parent, protection, importLoc);
             }
@@ -366,42 +599,56 @@ pub class Declarator {
     }
 
     /**
-     * Select the path of the module to import
+     * Resolves the file corresponding to an `import` declaration.
+     *
      * @params:
-     *    - im: the importation decl
-     *    - parent: the parent of the import
+     *   - im:     the import declaration
+     *   - parent: the symbol representing the module performing the import
+     *
      * @returns:
-     *    - .0: the path of the imported module
-     *    - .1: true if the declared module is a sibling
-     * */
-    fn selectImportFile (self, im : &ImportDecl, parent : &Symbol)-> (Path, bool)
+     *   A pair `(path, isSibling)` where:
+     *     - `path` is the resolved file path of the imported module
+     *     - `isSibling` indicates whether the module is located in the parent’s
+     *       sibling directory rather than its child directory
+     *
+     * @behavior:
+     *   Determines the file that an `import` refers to by checking the possible
+     *   module locations relative to the importing module. The function enforces
+     *   the language’s import rules, detects ambiguous or conflicting module
+     *   layouts, and reports missing modules with precise diagnostics.
+     *
+     * @throws:
+     *   - ErrorMsg: if the imported module cannot be found, if multiple candidate
+     *   files exist, or if the import refers to an invalid location.
+     */
+    fn selectImportFile (self, im: &ImportDecl, parent: &Symbol)-> (Path, bool)
         throws ErrorMsg
     {
-        let packageLoc = self._currentPackDir.back ();
-        if (im.isChild ()) {
-            let child = packageLoc.push (parent.getPath ().asStdPath ()).push (im.getModuleName ().str).addExtension (CommonVars::YMIR_EXTENSION);
+        let packageLoc = self._currentPackDir.back;
+        if (im.isChild) {
+            let child = packageLoc.push (parent.path.asStdPath ()).push (im.name.str).addExtension (CommonVars::YMIR_EXTENSION);
             if (!fs::sys::isFile (child)) {
-                throw copy ErrorMsg::fatal (im.getModuleName (),
-                                            end-> im.getSubLoc (), format (DeclareErrorMessage::NO_SUCH_FILE_ONE, child.toStr (sep-> "/")));
+                throw copy ErrorMsg::fatal (im.name,
+                                            end-> im.root, format (DeclareErrorMessage::NO_SUCH_FILE_ONE, child.toStr (sep-> "/")));
             }
 
             return (child, false);
-        } else if (im.isSibling ()) {
-            let sibling = packageLoc.push (parent.getPath ().asStdPath ().parent ()).push (im.getModuleName ().str).addExtension (CommonVars::YMIR_EXTENSION);
+        } else if (im.isSibling) {
+            let sibling = packageLoc.push (parent.path.asStdPath ().parent ()).push (im.name.str).addExtension (CommonVars::YMIR_EXTENSION);
             if (!fs::sys::isFile (sibling)) {
-                throw copy ErrorMsg::fatal (im.getModuleName (),
-                                       end-> im.getSubLoc (), format (DeclareErrorMessage::NO_SUCH_FILE_ONE, sibling.toStr (sep-> "/")));
+                throw copy ErrorMsg::fatal (im.name,
+                                            end-> im.root, format (DeclareErrorMessage::NO_SUCH_FILE_ONE, sibling.toStr (sep-> "/")));
             }
 
             return (sibling, true);
         } else {
-            let child = packageLoc.push (parent.getPath ().asStdPath ()).push (im.getModuleName ().str).addExtension (CommonVars::YMIR_EXTENSION);
-            let sibling = packageLoc.push (parent.getPath ().asStdPath ().parent ()).push (im.getModuleName ().str).addExtension (CommonVars::YMIR_EXTENSION);
+            let child = packageLoc.push (parent.path.asStdPath ()).push (im.name.str).addExtension (CommonVars::YMIR_EXTENSION);
+            let sibling = packageLoc.push (parent.path.asStdPath ().parent ()).push (im.name.str).addExtension (CommonVars::YMIR_EXTENSION);
 
             if (fs::sys::isFile (sibling) && fs::sys::isFile (child)) {
-                throw copy ErrorMsg::fatal (im.getModuleName (), format (DeclareErrorMessage::CONFLICT_MODULES, child.toStr (sep-> "/"), sibling.toStr (sep-> "/")));
+                throw copy ErrorMsg::fatal (im.name, format (DeclareErrorMessage::CONFLICT_MODULES, child.toStr (sep-> "/"), sibling.toStr (sep-> "/")));
             } else if (!fs::sys::isFile (sibling) && !fs::sys::isFile (child)) {
-                throw copy ErrorMsg::fatal (im.getModuleName (), format (DeclareErrorMessage::NO_SUCH_FILE, child.toStr (sep-> "/"), sibling.toStr (sep-> "/")));
+                throw copy ErrorMsg::fatal (im.name, format (DeclareErrorMessage::NO_SUCH_FILE, child.toStr (sep-> "/"), sibling.toStr (sep-> "/")));
             }
 
             return if fs::sys::isFile (sibling) {
@@ -410,20 +657,31 @@ pub class Declarator {
         }
     }
 
-
     /**
-     * Finalize the declaration of a lazy module
+     * Finalizes a lazy module created by an `import` declaration.
+     *
      * @params:
-     *    - parent: the parent module containing the import
-     *    - lazyMod: the module being imported (and addressed)
-     * @returns: an empty symbol
-     * */
-    pub fn finalizeImportDecl (mut self, lazyMod : &LazyModuleSymbol)-> dmut &ModuleSymbol
+     *   - lazyMod: the lazy module symbol to resolve
+     *
+     * @returns:
+     *   The fully initialized module symbol corresponding to the imported file.
+     *
+     * @behavior:
+     *   Converts a previously deferred (lazy) module into a fully declared module.
+     *   If the module has already been finalized, the existing symbol is returned.
+     *   Otherwise, the module is loaded, its declarations are processed, and the
+     *   resulting module symbol replaces the lazy placeholder.
+     *     
+     *
+     * @throws:
+     *   ErrorMsg if the module cannot be loaded or contains invalid declarations.
+     */
+    pub fn finalizeImportDecl (mut self, lazyMod: &LazyModuleSymbol)-> dmut &ModuleSymbol
         throws ErrorMsg
     {
-        match lazyMod.getFinalized () { // already finalized
-            m : &ModuleSymbol => {
-                if let dmut ret : &ModuleSymbol = self:.getMutableSymbol (m) {
+        match lazyMod.finalized { // already finalized
+            m: &ModuleSymbol => {
+                if let dmut ret: &ModuleSymbol = self:.getMutableSymbol (m) {
                     return alias ret;
                 }
 
@@ -431,7 +689,7 @@ pub class Declarator {
             }
         }
 
-        if let dmut lM : &LazyModuleSymbol = self:.getMutableSymbol (lazyMod) {
+        if let dmut lM: &LazyModuleSymbol = self:.getMutableSymbol (lazyMod) {
             return alias self:.finalizeImportDeclNotFinalize (alias lM);
         }
 
@@ -439,36 +697,49 @@ pub class Declarator {
     }
 
     /**
-     * Finalize the declaration of a lazy module
+     * Loads and finalizes a module referenced by a lazy import.
+     *
      * @params:
-     *    - parent: the parent module containing the import
-     *    - lazyMod: the module being imported (and addressed)
-     * @returns: an empty symbol
-     * */
-    fn finalizeImportDeclNotFinalize (mut self, dmut lazyMod : &LazyModuleSymbol, useCore : bool = true)-> dmut &ModuleSymbol
+     *   - lazyMod: the lazy module symbol to resolve
+     *   - useCore: whether core modules should be implicitly applied
+     *
+     * @returns:
+     *   The fully declared and finalized module symbol.
+     *
+     * @behavior:
+     *   Loads the source file associated with a deferred (lazy) module, reports
+     *   file‑loading errors with contextual notes, and replaces the lazy module
+     *   with a real module symbol. The module’s declarations are then processed
+     *   and its symbol tree is finalized.    
+     *
+     * @throws:
+     *   ErrorMsg if the module file cannot be read or if its declarations are
+     *   invalid.
+     */
+    fn finalizeImportDeclNotFinalize (mut self, dmut lazyMod: &LazyModuleSymbol, useCore: bool = true)-> dmut &ModuleSymbol
         throws ErrorMsg
     {
-        let dmut referent = alias lazyMod:.getReferent ();
+        let dmut referent = alias lazyMod.referent;
         let module = {
-            (copy SyntaxVisitor (lazyMod.getImportPath ())):.read ()
+            (copy SyntaxVisitor (lazyMod.importPath)):.read ()
         } catch {
-            err : &ErrorMsg => {
-                throw err.withNote (copy [copy ErrorMsg::note (lazyMod.getImportLoc (), format (DeclareErrorMessage::IN_IMPORT, lazyMod.getModuleName ()))]);
+            err: &ErrorMsg => {
+                throw err.withNote (copy [copy ErrorMsg::note (lazyMod.importLoc, format (DeclareErrorMessage::IN_IMPORT, lazyMod.moduleName))]);
             }
             _ => {
-                throw copy ErrorMsg::fatal (lazyMod.getImportLoc (), format (DeclareErrorMessage::NO_SUCH_FILE_ONE, lazyMod.getImportPath ().toStr (sep-> "::")),
-                                            notes-> copy [copy ErrorMsg::note (lazyMod.getImportLoc (), format (DeclareErrorMessage::IN_IMPORT, lazyMod.getModuleName ()))]);
+                throw copy ErrorMsg::fatal (lazyMod.importLoc, format (DeclareErrorMessage::NO_SUCH_FILE_ONE, lazyMod.importPath.toStr (sep-> "::")),
+                                            notes-> copy [copy ErrorMsg::note (lazyMod.importLoc, format (DeclareErrorMessage::IN_IMPORT, lazyMod.moduleName))]);
             }
         }
 
-        lazyMod:.getReferent ():.remove (alias lazyMod);
+        lazyMod.referent:.remove (alias lazyMod);
         {
-            self._currentPackDir:.push (lazyMod.getPackageDir ());
-            let dmut ret = self:.declareModule (module, alias referent, protection-> lazyMod.getProtection (), importLoc-> lazyMod.getImportLoc (), withInner-> false);
-            lazyMod:.setFinalized (ret);
+            self._currentPackDir:.push (lazyMod.packageDir);
+            let dmut ret = self:.declareModule (module, alias referent, protection-> lazyMod.protection, importLoc-> lazyMod.importLoc, withInner-> false);
+            lazyMod.finalized = ret;
 
             // we need to set finalized before declaring the inside of the module to avoid loop, or undefined inner references
-            for i in module.getDeclarations () {
+            for i in module.decls {
                 self:.declare (i, alias ret);
             }
 
@@ -480,23 +751,40 @@ pub class Declarator {
     }
 
     /**
-     * Declare a module that is directly imported without passing through a lazy module
-     * these module will be validated thus reading them directly is preferable to keep the symbol tree consistent before validation time
+     * Immediately loads and declares a submodule referenced by an `import`.
+     *
      * @params:
-     *   - modName: the name of the module that is imported
-     *   - importPath: the path of the file to read
-     *   - parent: the parent of the newly declared module
-     *   - protection: the protection of the module
-     *   - importLoc: the location of the import
-     * @returns: the new module
-     * */
-    fn declareImportDirect (mut self, modName : [c8], importPath : Path, dmut parent : &Symbol, protection : Protection, importLoc : &Word)-> dmut &Symbol
+     *   - modName:    the name of the imported module
+     *   - importPath: the resolved file path of the module
+     *   - parent:     the symbol into which the module is inserted
+     *   - protection: the protection applied to the imported module symbol
+     *   - importLoc:  the source location of the `import` declaration
+     *
+     * @returns:
+     *   The symbol representing the fully declared module.
+     *
+     * @behavior:
+     *   Loads the module file referenced by the import, reports file‑loading
+     *   errors with contextual notes, and declares the module directly under
+     *   the given parent. Unlike deferred imports, this function performs an
+     *   immediate load: the module’s contents are parsed and its inner
+     *   declarations are processed at once.
+     *
+     *   This is used when the compiler determines that the imported module
+     *   must be loaded eagerly (for example, when it belongs to the current
+     *   package and is required for the current compilation unit). 
+     *
+     * @throws:
+     *   ErrorMsg if the module file cannot be read or contains invalid
+     *   declarations.
+     */
+    fn declareImportDirect (mut self, modName: [c8], importPath: Path, dmut parent: &Symbol, protection: Protection, importLoc: &Word)-> dmut &Symbol
         throws ErrorMsg
     {
         let module = {
             (copy SyntaxVisitor (importPath)):.read ()
         } catch {
-            err : &ErrorMsg => {
+            err: &ErrorMsg => {
                 throw err.withNote (copy [copy ErrorMsg::note (importLoc, format (DeclareErrorMessage::IN_IMPORT, modName))]);
             }
             _ => {
@@ -509,42 +797,61 @@ pub class Declarator {
     }
 
     /*!
-     * ================================================================================
-     * ================================================================================
-     * =========================            CLASS             =========================
-     * ================================================================================
-     * ================================================================================
+     * ====================================================================================================
+     * ====================================================================================================
+     * =====================================          CLASS          ======================================
+     * ====================================================================================================
+     * ====================================================================================================
      */
 
     /**
-     * Declare the symbol of a class
+     * Declares a class or record type and inserts it into the symbol tree.
+     *
      * @params:
-     *   - cl: the class to declare
-     *   - parent: the module that is declaring the class
-     *   - protection: the protection of the class
+     *   - cl:          the class or record declaration
+     *   - parent:      the symbol under which the type is created
+     *   - protection:  the protection applied to the declared type
+     *   - fromTemplate: whether the declaration originates from template expansion
+     *
+     * @returns:
+     *   The symbol representing the declared class or record.
+     *
+     * @behavior:
+     *   Checks for name conflicts within the parent scope and reports shadowing
+     *   errors unless the declaration is a valid instantiation of a template.
+     *   Validates class attributes (such as `abstract`, `final`, `packed`,
+     *   `overlaid`) and creates the corresponding type symbol. The class is then
+     *   inserted into the parent scope, and its inner declarations are processed
+     *   with protected visibility.
+     *
+     * @throws:
+     *   ErrorMsg if the declaration conflicts with an existing symbol, contains
+     *   invalid attributes, or cannot be inserted into the symbol tree.
      */
-    pub fn declareClass (mut self, cl : &ClassDecl, dmut parent : &Symbol, protection : Protection, fromTemplate : bool = false)-> dmut &Symbol
+    pub fn declareClass (mut self, cl: &TypeDecl, dmut parent: &Symbol, protection: Protection, fromTemplate: bool = false)-> dmut &Symbol
         throws ErrorMsg
     {
-        let syms = parent.getLocalSymbols (cl.getLoc ().str, protection-> Protection::PRIVATE);
+        let syms = parent.getLocalSymbols (cl.name.str, protection-> Protection::PRIVATE);
         for s in syms[] match s {
-            ModuleSymbol () => {}
+            ModuleSymbol ()   => {}
             TemplateSymbol () => {}
             _ => {
                 if (!fromTemplate || s !of ClassSymbol) {
-                    throw copy ErrorMsg::fatal (cl.getLoc (),
-                                                format (DeclareErrorMessage::SHADOWING_DECL, cl.getLoc ().str),
-                                                notes-> copy [copy ErrorMsg::note (s.getLoc (), "")]);
+                    throw copy ErrorMsg::fatal (cl.name,
+                                                format (DeclareErrorMessage::SHADOWING_DECL, cl.name.str),
+                                                notes-> copy [copy ErrorMsg::note (s.loc, "")]);
                 }
             }
         }
         
-        let (isAbstract, isFinal) = self.validateAbstractFinal (cl.getLoc (), cl.getAttributes (), cl.isClass ());
-        let (isPacked, isOverlaid) = self.validatePackedOverlaid (cl.getLoc (), cl.getAttributes (), cl.isRecord ());
+        let (isAbstract, isFinal) = self.validateAbstractFinal (cl.loc, cl.attrs, cl.isClass);
+        let (isPacked, isOverlaid) = self.validatePackedOverlaid (cl.loc, cl.attrs, cl.isRecord);
         
-        let dmut clSym = copy ClassSymbol (cl.getLoc (), cl.getComments (), ancestor-> cl.getAncestor (),
-                                           isEntity-> cl.isEntity (),
-                                           isRecord-> cl.isRecord (),
+        let dmut clSym = copy ClassSymbol (cl.loc,
+                                           cl.comm,
+                                           ancestor-> cl.ancestor,
+                                           isEntity-> cl.isEntity,
+                                           isRecord-> cl.isRecord,
                                            isPacked-> isPacked,
                                            isOverlaid-> isOverlaid,
                                            isAbstract-> isAbstract,
@@ -553,28 +860,36 @@ pub class Declarator {
 
         parent:.insert (alias clSym, replace-> false);
 
-        for d in cl.getDeclarations () {
+        for d in cl.decls {
             self:.declareInnerClass (d, alias clSym, protection-> Protection::PROTECTED);
         }
 
         alias clSym
     }
 
-
     /**
-     * Validate the custom attributes of a class definition
-     * 
+     * Validates the `abstract` and `final` attributes of a class or record.
+     *
      * @params:
-     *   - attributes: the list of custom attributes of the class
-     *   
+     *   - loc:        location of the type declaration
+     *   - attributes: list of attribute words attached to the declaration
+     *   - isClass:    whether the declaration represents a class (as opposed to a record)
+     *
      * @returns:
-     *   - .0: isAbstract
-     *   - .1: isFinal
-     *   
+     *   A pair `(isAbstract, isFinal)` indicating whether the type is declared
+     *   abstract and/or final.
+     *
+     * @behavior:
+     *   Ensures that `abstract` and `final` are used only on class declarations,
+     *   rejects attributes that are not permitted for classes, and reports
+     *   conflicts such as declaring a type both abstract and final. Attribute
+     *   errors are reported with precise source locations and contextual notes.
+     *
      * @throws:
-     *   - ErrorMsg: if (isAbstract && isFinal), or if an attributes is not defined for class
+     *   ErrorMsg if an attribute is invalid for the declaration or if incompatible
+     *   attributes (such as `abstract` and `final`) are used together.
      */
-    fn validateAbstractFinal (self, loc : &Word, attributes : [AttributeWord], isClass: bool)-> (bool, bool)
+    fn validateAbstractFinal (self, loc: &Word, attributes: [AttributeWord], isClass: bool)-> (bool, bool)
         throws ErrorMsg
     {
         let mut isAbstract = false, mut isFinal = false;
@@ -593,7 +908,7 @@ pub class Declarator {
                 }
                 Attributes::FINAL => {
                     if (!isClass) throw copy ErrorMsg::fatal (a.loc, format (DeclareErrorMessage::UNDEFINED_ATTRIBUTE_NO_CLASS, a.attr),
-                                                                          notes-> copy [copy ErrorMsg::note (loc, "")]);
+                                                              notes-> copy [copy ErrorMsg::note (loc, "")]);
 
                     isFinal = true;
                     finalLoc = a.loc;
@@ -602,7 +917,7 @@ pub class Declarator {
                 }                
                 _ => {
                     if (isClass) throw copy ErrorMsg::fatal (a.loc, format (DeclareErrorMessage::UNDEFINED_ATTRIBUTE_FOR_CLASS, a.attr),
-                                                              notes-> copy [copy ErrorMsg::note (loc, "")]);                    
+                                                             notes-> copy [copy ErrorMsg::note (loc, "")]);                    
                 }
             }
         }
@@ -611,19 +926,28 @@ pub class Declarator {
     }
 
     /**
-     * Validate the custom attributes of a record definition
-     * 
+     * Validates the `packed` and `overlaid` attributes of a record type.
+     *
      * @params:
-     *   - attributes: the list of custom attributes of the record
-     *   
+     *   - loc:        location of the type declaration
+     *   - attributes: list of attribute words attached to the declaration
+     *   - isRecord:   whether the declaration represents a record
+     *
      * @returns:
-     *   - .0: isPacked
-     *   - .1: isOverlaid
-     *   
+     *   A pair `(isPacked, isOverlaid)` indicating whether the record is declared
+     *   packed and/or overlaid.
+     *
+     * @behavior:
+     *   Ensures that `packed` and `overlaid` are used only on record declarations,
+     *   rejects attributes that are not permitted for records, and reports
+     *   conflicts such as declaring a record both packed and overlaid. Attribute
+     *   errors are reported with precise source locations and contextual notes.
+     *
      * @throws:
-     *   - ErrorMsg: if (isAbstract && isFinal), or if an attributes is not defined for class
+     *   ErrorMsg if an attribute is invalid for the declaration or if incompatible
+     *   attributes (such as `packed` and `overlaid`) are used together.
      */
-    fn validatePackedOverlaid (self, loc : &Word, attributes : [AttributeWord], isRecord: bool)-> (bool, bool)
+    fn validatePackedOverlaid (self, loc: &Word, attributes: [AttributeWord], isRecord: bool)-> (bool, bool)
         throws ErrorMsg
     {
         let mut isPacked = false, mut isOverlaid = false;
@@ -632,7 +956,7 @@ pub class Declarator {
             match a.attr {
                 Attributes::OVERLAID => {
                     if (!isRecord) throw copy ErrorMsg::fatal (a.loc, format (DeclareErrorMessage::UNDEFINED_ATTRIBUTE_NO_RECORD, a.attr),
-                                                              notes-> copy [copy ErrorMsg::note (loc, "")]);
+                                                               notes-> copy [copy ErrorMsg::note (loc, "")]);
 
                     isOverlaid = true;
                     overLoc = a.loc;
@@ -655,123 +979,169 @@ pub class Declarator {
             }
         }
 
-        (isAbstract, isFinal)
+        (isPacked, isOverlaid)
     }
 
-
     /**
-     * Declare the content of a class
+     * Declares a member inside a class or record.
+     *
      * @params:
-     *   - d: the declaration to transform into symbol
-     *   - cl: the class symbol that is filled
-     *   - protection: the current protection of the symbol to declare
+     *   - current:     the inner declaration to process
+     *   - cl:          the class symbol receiving the member
+     *   - protection:  the protection applied to members declared in this context
+     *
+     * @behavior:
+     *   Processes all declarations that may legally appear inside a class or
+     *   record, including constructors, fields, methods, templates, destructors,
+     *   implementations, conditional blocks, assertions, and `use` statements.
+     *   Nested blocks are traversed recursively, propagating or overriding
+     *   protection as required by the language rules.
+     *
+     *   Any declaration that is not permitted inside a class triggers an error
+     *   with precise source-location diagnostics.
+     *
+     * @throws:
+     *   ErrorMsg if the declaration is invalid in a class body or cannot be
+     *   inserted into the class symbol.
      */
-    pub fn declareInnerClass (mut self, current : &Declaration, dmut cl : &ClassSymbol, protection : Protection)
+    pub fn declareInnerClass (mut self, current: &Declaration, dmut cl: &ClassSymbol, protection: Protection)
         throws ErrorMsg
     {
         match current {
-            dl : &BlockDecl => {
-                let inProt = if (dl.isSet ()) { protection } else { dl.getProtection () };
-                for i in dl.getDeclarations () {
+            dl: &BlockDecl => {
+                let inProt = if (dl.isSet) { protection } else { dl.protection };
+                for i in dl.decls {
                     self:.declareInnerClass (i, alias cl, protection-> inProt);
                 }
             }
-            cstr : &ConstructorDecl => {
-                self.declareConstructor (cstr, alias cl, protection-> protection);
+            
+            // protected
+            cstr: &CtorDecl => {
+                self.declareCtor (cstr, alias cl, protection-> protection);
             }
-            dtor : &DestructorDecl => {
-                self.declareDestructor (dtor, alias cl);
-            }
-            im : &ImplDecl => {
-                self:.declareImpl (im, alias cl, protection-> protection);
-            }
-            gl : &GlobalDecl => {
+            gl: &GlobalVarDecl => {
                 self.declareFieldClass (gl, alias cl, protection-> protection);
             }
-            t : &TemplateDecl => {
+            t: &TemplateDecl => {
                 self.declareTemplate (t, alias cl, protection-> protection);
             }
-            c : &CondBlockDecl => {
-                self.declareCondBlockClass (c, alias cl);
-            }
-            wrap : &ExpressionWrapperDecl => {
-                self.declareAssertClass (wrap, alias cl);
-            }
-            im : &ImportDecl => {
-                self:.declareImport (im, alias cl, protection-> protection);
-            }
-            f : &FunctionDecl => {
+            f: &FunctionDecl => {
                 self.declareFunction (f, alias cl, protection-> protection, isMethod-> true);
             }
-            u : &UseDecl => {
+
+            // global
+            dtor: &DtorDecl => {
+                self.declareDtor (dtor, alias cl);
+            }
+            im: &ImplDecl => {
+                self:.declareImpl (im, alias cl);
+            }            
+            c: &CondBlockDecl => {
+                self.declareCondBlockClass (c, alias cl);
+            }
+            a: &AssertDecl => {
+                self.declareAssertClass (a, alias cl);
+            }
+            u: &UseDecl => {
                 self.declareUse (u, alias cl);
             }
             _ => {
-                throw copy ErrorMsg::fatal (current.getLoc (), DeclareErrorMessage::UNEXPECTED_IN_CLASS);
+                throw copy ErrorMsg::fatal (current.loc, DeclareErrorMessage::UNEXPECTED_IN_CLASS);
             }
         }
     }
 
     /**
-     * Declare a class constructor
+     * Declares a constructor inside a class or record.
+     *
      * @params:
-     *   - cstr: the constructor to declare
-     *   - cl: the parent class
-     *   - protection: the protection of the constructor
+     *   - ctor:       the constructor declaration
+     *   - cl:         the class symbol receiving the constructor
+     *   - protection: the protection applied to the constructor
+     *
+     * @returns:
+     *   The symbol representing the declared constructor.
+     *
+     * @behavior:
+     *   Validates constructor attributes (such as `unsafe`), creates the
+     *   corresponding constructor symbol, and inserts it into the class scope.
+     *   Constructors are always treated as class members and follow the
+     *   protection rules of the surrounding context.
+     *
+     * @throws:
+     *   ErrorMsg if the constructor is invalid or cannot be inserted into the
+     *   class symbol.
      */
-    pub fn declareConstructor (self, cstr : &ConstructorDecl, dmut cl : &ClassSymbol, protection : Protection)-> dmut &ConstructorSymbol
+    pub fn declareCtor (self, ctor: &CtorDecl, dmut cl: &ClassSymbol, protection: Protection)-> dmut &CtorSymbol
         throws ErrorMsg
     {
-        let isUnsafe = self.validateUnsafeCtor (cstr.getAttributes ());
+        let isUnsafe = self.validateUnsafeCtor (ctor.attrs);
 
-        let dmut cstrSym = copy ConstructorSymbol (cstr.getLoc (), cstr.getComments (), cstr, alias cl, protection-> protection, isUnsafe-> isUnsafe);
-        cl:.insert (alias cstrSym, replace-> false);
+        let dmut ctorSym = copy CtorSymbol (ctor.loc, ctor.comm, ctor, alias cl, protection-> protection, isUnsafe-> isUnsafe);
+        cl:.insert (alias ctorSym, replace-> false);
 
-        alias cstrSym
+        alias ctorSym
     }
 
     /**
-     * Declare the destructor of the class
+     * Declares a destructor inside a class.
+     *
      * @params:
-     *   - dtor: the destructor
-     *   - cl: the parent class
+     *   - dtor: the destructor declaration
+     *   - cl:   the class symbol receiving the destructor
+     *
+     * @returns:
+     *   The symbol representing the declared destructor.
+     *
+     * @behavior:
+     *   Ensures that the class defines at most one destructor and rejects
+     *   destructors declared inside records. When valid, creates the destructor
+     *   symbol and attaches it to the class. Destructors are always global within
+     *   the class body and do not participate in protection-based overloading.
+     *
      * @throws:
-     *    - &ErrorMsg: if there are multiple destructor
+     *   ErrorMsg if multiple destructors are declared, if a destructor appears
+     *   inside a record, or if the destructor cannot be inserted into the class.
      */
-    pub fn declareDestructor (self, dtor : &DestructorDecl, dmut cl : &ClassSymbol)-> dmut &DestructorSymbol
+    pub fn declareDtor (self, dtor: &DtorDecl, dmut cl: &ClassSymbol)-> dmut &DtorSymbol
         throws ErrorMsg
     {
-        match cl.getDestructor () {
+        match cl.dtor {
             EmptySymbol () => {}
             _ => {
-                throw copy ErrorMsg::fatal (dtor.getLoc (), DeclareErrorMessage::MULTIPLE_DESTRUCTOR,
-                                            notes-> copy [copy ErrorMsg::note (cl.getDestructor ().getLoc (), "")]);
+                throw copy ErrorMsg::fatal (dtor.loc, DeclareErrorMessage::MULTIPLE_DESTRUCTOR,
+                                            notes-> copy [copy ErrorMsg::note (cl.dtor.loc, "")]);
             }
         }
 
-        if (cl.isRecord ()) {
-            throw copy ErrorMsg::fatal (cl.getLoc (), end-> dtor.getLoc (), DeclareErrorMessage::DTOR_IN_RECORD);
+        if (cl.isRecord) {
+            throw copy ErrorMsg::fatal (cl.loc, end-> dtor.loc, DeclareErrorMessage::DTOR_IN_RECORD);
         }
-
-        if (cl.isUnion ()) {
-            throw copy ErrorMsg::fatal (cl.getLoc (), end-> dtor.getLoc (), DeclareErrorMessage::DTOR_IN_UNION);
-        }
-
-
-        let dmut dtorSym = copy DestructorSymbol (dtor.getLoc (), dtor.getComments (), dtor, alias cl);
-        cl:.setDestructor (alias dtorSym);
+        
+        let dmut dtorSym = copy DtorSymbol (dtor.loc, dtor.comm, dtor, alias cl);
+        cl.dtor = alias dtorSym;
 
         alias dtorSym
     }
 
     /**
-     * Validate the custom attributes of a ctor definition
+     * Validates the `unsafe` attribute on a constructor.
+     *
      * @params:
-     *    - attributes: the list of custom attributes of the ctor
-     * @returns: true if the ctor is unsafe
-     * @throws: if an attribute is undefined for ctor
-     * */
-    fn validateUnsafeCtor (self, attributes : [AttributeWord])-> bool
+     *   - attributes: list of attribute words attached to the constructor
+     *
+     * @returns:
+     *   `true` if the constructor is marked `unsafe`, otherwise `false`.
+     *
+     * @behavior:
+     *   Ensures that constructors only use the `unsafe` attribute and rejects any
+     *   other attribute as invalid in this context. Attribute errors are reported
+     *   with precise source-location diagnostics.
+     *
+     * @throws:
+     *   ErrorMsg if an attribute other than `unsafe` is applied to a constructor.
+     */
+    fn validateUnsafeCtor (self, attributes: [AttributeWord])-> bool
         throws ErrorMsg
     {
         let mut isUnsafe = false;
@@ -786,18 +1156,30 @@ pub class Declarator {
 
         isUnsafe
     }
-
+    
     /**
-     * Declare an implementation
+     * Declares an `impl` block inside a class or record.
+     *
      * @params:
-     *   - impl: the implementation to declare
-     *   - cl: the parent class
+     *   - im: the implementation block declaration
+     *   - cl: the class symbol receiving the implementation
+     *
+     * @behavior:
+     *   Creates an implementation symbol for the `impl` block and processes all
+     *   declarations contained within it. Members of an `impl` block are treated
+     *   as protected class members and are declared using the same rules as
+     *   regular class members. Once populated, the implementation symbol is
+     *   inserted into the class scope.     
+     *
+     * @throws:
+     *   ErrorMsg if any declaration inside the `impl` block is invalid or cannot
+     *   be inserted into the class.
      */
-    fn declareImpl (mut self, im : &ImplDecl, dmut cl : &ClassSymbol, protection : Protection)
+    fn declareImpl (mut self, im: &ImplDecl, dmut cl: &ClassSymbol)
         throws ErrorMsg
     {
-        let dmut implSym = copy ImplSymbol (im.getLoc (), im.getComments (), im, protection-> protection);
-        for i in im.getDeclarations () {
+        let dmut implSym = copy ImplSymbol (im.loc, im.comm, im);
+        for i in im.decls {
             self:.declareInnerImpl (i, alias implSym, alias cl, protection-> Protection::PROTECTED);
         }
 
@@ -805,84 +1187,129 @@ pub class Declarator {
     }
 
     /**
-     * Declare the content of an implementation
+     * Declares a member inside an `impl` block.
+     *
      * @params:
-     *   - current: the declaration to transform
-     *   - im: the implementation that is being declared
-     *   - protection: the protection of the implementation
+     *   - current:     the inner declaration to process
+     *   - im:          the implementation symbol receiving the member
+     *   - cl:          the class symbol to which the implementation belongs
+     *   - protection:  the protection applied to members declared in this context
+     *
+     * @behavior:
+     *   Processes all declarations that may legally appear inside an `impl`
+     *   block. Nested blocks are traversed recursively, inheriting or overriding
+     *   protection as specified by the block. Only function declarations are
+     *   permitted as members of an `impl` block; any other kind of declaration
+     *   triggers an error.    
+     *
+     * @throws:
+     *   ErrorMsg if the declaration is not allowed inside an `impl` block or
+     *   cannot be inserted into the implementation symbol.
      */
-    fn declareInnerImpl (mut self, current : &Declaration, dmut im : &ImplSymbol, dmut cl : &ClassSymbol, protection : Protection)
+    fn declareInnerImpl (mut self, current: &Declaration, dmut im: &ImplSymbol, dmut cl: &ClassSymbol, protection: Protection)
         throws ErrorMsg
     {
         match current {
-            dl : &BlockDecl => {
-                for i in dl.getDeclarations () {
-                    self:.declareInnerImpl (i, alias im, alias cl, protection-> dl.getProtection ());
+            dl: &BlockDecl => {
+                for i in dl.decls {
+                    self:.declareInnerImpl (i, alias im, alias cl, protection-> dl.protection);
                 }
             }
-            f : &FunctionDecl => {
+            f: &FunctionDecl => {
                 self.declareFunction (f, alias im, protection-> protection, isMethod-> true);
-            }
-            wrap : &ExpressionWrapperDecl => {
-                self.declareAssertClass (wrap, alias cl);
-            }
-            imp : &ImportDecl => {
-                self:.declareImport (imp, alias cl, protection-> protection);
-            }
+            }            
             _ => {
-                throw copy ErrorMsg::fatal (current.getLoc (), DeclareErrorMessage::UNEXPECTED_IN_IMPL);
+                throw copy ErrorMsg::fatal (current.loc, DeclareErrorMessage::UNEXPECTED_IN_IMPL);
             }
         }
     }
 
     /**
-     * Declare a field in a class
+     * Declares a field inside a class or record.
+     *
      * @params:
-     *   - field: the field to declare
-     *   - cl: the class symbol
-     *   - protection: the protection of the field
+     *   - field:      the field (global‑variable) declaration
+     *   - cl:         the class symbol receiving the field
+     *   - protection: the protection applied to the field
+     *
+     * @behavior:
+     *   Creates a field entry inside the class using the variable declaration
+     *   provided. The field inherits the protection of the surrounding context
+     *   and is added to the class layout in declaration order.
+     *
+     * @throws:
+     *   ErrorMsg if the field cannot be inserted into the class symbol or violates
+     *   class‑body declaration rules.
      */
-    fn declareFieldClass (self, field : &GlobalDecl, dmut cl : &ClassSymbol, protection : Protection)
+    fn declareFieldClass (self, field: &GlobalVarDecl, dmut cl: &ClassSymbol, protection: Protection)
     {
-        cl:.addField (field.getContent (), field.getComments (), protection-> protection)
+        cl:.addField (field.var, field.comm, protection-> protection)
     }
 
     /**
-     * Declare an assertion in a class
+     * Declares an assertion inside a class or record.
+     *
      * @params:
-     *    - wrap: the assertion to declare
-     *    - cl: the class symbol
+     *   - a:   the assertion declaration
+     *   - cl:  the class symbol receiving the assertion
+     *
+     * @behavior:     
+     *   Registers the assertion as part of the class body. Class‑level
+     *   assertions are preserved for later semantic validation and may
+     *   participate in compile‑time checks. The assertion is added without
+     *   altering class layout or member visibility.
+     *
+     * @throws:
+     *   ErrorMsg if the assertion cannot be attached to the class symbol.
      */
-    fn declareAssertClass (self, wrap : &ExpressionWrapperDecl, dmut cl : &ClassSymbol) {
-        cl:.addAssertion (wrap.getContent (), wrap.getComments ());
+    fn declareAssertClass (self, a: &AssertDecl, dmut cl: &ClassSymbol) {
+        cl:.addAssertion (a);
     }
 
     /**
-     * Declare a conditional block in a class
+     * Declares a conditional block inside a class or record.
+     *
      * @params:
-     *    - c: the conditional to declare
-     *    - cl: the class symbol
+     *   - c:   the conditional‑block declaration
+     *   - cl:  the class symbol receiving the conditional block
+     *
+     * @behavior:
+     *   Registers the conditional block as part of the class body. Conditional
+     *   blocks are preserved for later semantic evaluation, where their
+     *   conditions determine which enclosed declarations become active. The
+     *   block does not immediately introduce members or alter class layout; it
+     *   simply records the conditional structure for deferred processing.
+     *
+     * @throws:
+     *   ErrorMsg if the conditional block cannot be attached to the class symbol.
      */
-    fn declareCondBlockClass (self, c : &CondBlockDecl, dmut cl : &ClassSymbol) {
-        cl:.addCondBlock (c);
+    fn declareCondBlockClass (self, c: &CondBlockDecl, dmut cl: &ClassSymbol) {
+        cl:.addCondBlockDecl (c);
     }
 
     /*!
-     * ================================================================================
-     * ================================================================================
-     * =========================          UNITTEST           ==========================
-     * ================================================================================
-     * ================================================================================
+     * ====================================================================================================
+     * ====================================================================================================
+     * ===================================          UNITTESTS          ====================================
+     * ====================================================================================================
+     * ====================================================================================================
      */
-
+    
     /**
-     * Declare a unittest
+     * Declares a unit test inside a module.
+     *
      * @params:
-     *    - u: the unittest to declare
-     *    - parent: the parent of the declaration
-     * */
-    fn declareUnitTest (self, u : &UnitTestDecl, dmut parent : &Symbol)-> dmut &Symbol {
-        let dmut unitSym = copy UnitTestSymbol (u.getLoc (), u.getComments (), u);
+     *   - u:      the unit‑test declaration
+     *   - parent: the symbol receiving the unit test
+     *
+     * @returns:
+     *   The symbol representing the declared unit test.
+     *          
+     * @throws:
+     *   ErrorMsg if the unit test cannot be inserted into the parent symbol.
+     */
+    fn declareUnitTest (self, u: &UnitTestDecl, dmut parent: &Symbol)-> dmut &Symbol {
+        let dmut unitSym = copy UnitTestSymbol (u.loc, u.comm, u);
         parent:.insertUnitTest (alias unitSym);
         unitSym:.setReferent (alias parent);
 
@@ -890,114 +1317,199 @@ pub class Declarator {
     }
 
     /*!
-     * ================================================================================
-     * ================================================================================
-     * =========================          FUNCTIONS           =========================
-     * ================================================================================
-     * ================================================================================
+     * ====================================================================================================
+     * ====================================================================================================
+     * ===================================          FUNCTIONS          ====================================
+     * ====================================================================================================
+     * ====================================================================================================
      */
 
     /**
-     * Declare a function declaration
+     * Declares a function or method inside a module, class, or implementation block.
+     *
      * @params:
-     *   - func: the function to declare
-     *   - parent: the parent of the declaration
-     *   - protection: the protection of the declaration
+     *   - func:       the function declaration
+     *   - parent:     the symbol receiving the function
+     *   - protection: the protection applied to the function
+     *   - isMethod:   whether the function is a method of a class or impl block
+     *   - isExtern:   whether the function is declared as `extern`
+     *   - lang:       the external language identifier (e.g., `"C"`)
+     *
+     * @returns:
+     *   The symbol representing the declared function.
+     *
+     * @behavior:
+     *   Ensures that the function does not shadow an existing declaration in the
+     *   same scope. Validates function attributes such as `final` and `unsafe`,
+     *   and applies special rules for external functions. In particular, C-style
+     *   variadic functions are permitted only for `extern` declarations targeting
+     *   the C language. The resulting function symbol records method status,
+     *   overriding behavior, safety, variadicity, and protection.
+     *
+     *   Once validated, the function symbol is inserted into the parent scope.
+     *
+     * @throws:
+     *   ErrorMsg if the function shadows an existing declaration, uses invalid or
+     *   incompatible attributes, declares an unsupported variadic signature, or
+     *   cannot be inserted into the symbol tree.
      */
-    fn declareFunction (self, func : &FunctionDecl, dmut parent : &Symbol, protection : Protection, isMethod : bool, isExtern : bool = false, lang : [c8] = "")-> dmut &Symbol
+    fn declareFunction (self, func: &FunctionDecl, dmut parent: &Symbol, protection: Protection, isMethod: bool, isExtern: bool = false, lang: [c8] = "")-> dmut &Symbol
         throws ErrorMsg
     {
-        self.validateShadowingFunction (func.getLoc (), parent);
-        let (isFinal, isUnsafe_) = self.validateFinalUnsafeFunction (func.getAttributes ());
-        let isCVariadic = func.getFunctionProto ().isVariadic ();
+        self.validateShadowingFunction (func.loc, parent);
+        let (isFinal, isUnsafe_, isInline, isField) = self.validateFunctionAttrs (func.attrs, isMethod);
+
+        let isCVariadic = func.proto.isVariadic;
         if (isCVariadic && (!isExtern || lang != Keys::CLANG)) {
-            throw copy ErrorMsg::fatal (func.getLoc (), DeclareErrorMessage::DECL_VARIADIC_FUNC);
+            throw copy ErrorMsg::fatal (func.loc, DeclareErrorMessage::DECL_VARIADIC_FUNC);
         }
 
         let isUnsafe = if (isExtern && lang == Keys::CLANG) {
             true
         } else { isUnsafe_ };
 
-        let dmut funcSym = copy FunctionSymbol (func.getLoc (), func.getComments (), func, isMethod, isOver-> func.isOver (), isFinal-> isFinal, isUnsafe-> isUnsafe, isCVariadic-> isCVariadic, protection-> protection);
+        let dmut funcSym = copy FunctionSymbol (func.loc,
+                                                func.comm,
+                                                func,
+                                                isMethod,
+                                                isOver-> func.isOver,
+                                                isFinal-> isFinal,
+                                                isField-> isField,
+                                                isInline-> isInline,
+                                                isUnsafe-> isUnsafe,
+                                                isCVariadic-> isCVariadic,
+                                                protection-> protection);
+        
         parent:.insert (alias funcSym, replace-> false);
 
         alias funcSym
     }
 
     /**
-     * Validate that the function is not shadowing another declaration of a different type
+     * Validates that a function declaration does not illegally shadow an existing symbol.
+     *
      * @params:
-     *   - loc: the location of the function decl
-     *   - parent: the parent symbol in which the function will be declared
+     *   - loc:    the location of the function name
+     *   - parent: the symbol table in which the function is being declared
+     *
+     * @behavior:
+     *   Checks whether a symbol with the same name already exists in the parent
+     *   scope. Functions, modules, and templates may coexist under the same name
+     *   according to the language’s overloading and namespace rules. Any other
+     *   kind of symbol (such as a type, field, or constant) would be shadowed by
+     *   the function declaration and is therefore rejected.
+     *
+     *   If an illegal shadowing situation is detected, an error is reported with
+     *   precise diagnostics pointing to both the new declaration and the existing
+     *   conflicting symbol.
+     *
+     * @throws:
+     *   ErrorMsg if the function would shadow a non‑function symbol in the same
+     *   scope.
      */
-    fn validateShadowingFunction (self, loc : &Word, parent : &Symbol)
+    fn validateShadowingFunction (self, loc: &Word, parent: &Symbol)
         throws ErrorMsg
     {
         let syms = parent.getLocalSymbols (loc.str, protection-> Protection::PRIVATE);
         for s in syms[] match s {
             FunctionSymbol () => {}
-            ModuleSymbol () => {}
+            ModuleSymbol ()   => {}
             TemplateSymbol () => {}
             _ => {
                 throw copy ErrorMsg::fatal (loc,
                                             format (DeclareErrorMessage::SHADOWING_DECL, loc.str),
-                                            notes-> copy [copy ErrorMsg::note (s.getLoc (), "")]);
+                                            notes-> copy [copy ErrorMsg::note (s.loc, "")]);
             }
         }
     }
 
     /**
-     * Validate the custom attributes of a function definition
+     * Validates all attributes permitted on a function or method declaration.
+     *
      * @params:
-     *   - attributes: the list of custom attributes of the function
-     * @returns: (isFinal, isUnsafe)
+     *   - attrs:     list of attribute words attached to the function
+     *   - isMethod:  whether the function is being declared as a method
+     *
+     * @returns:
+     *   A tuple `(isFinal, isUnsafe, isField, isInline)` indicating which
+     *   attributes were present on the declaration.
+     *
+     * @behavior:
+     *   Processes all attributes applied to the function and accepts only those
+     *   explicitly allowed in this context. The attributes `unsafe` and `inline`
+     *   are always valid. The attributes `final` and `field` are permitted only
+     *   when the function is declared as a method; using them on free functions
+     *   is rejected. Any other attribute is invalid for functions and triggers an
+     *   error with precise source‑location diagnostics.
+     *
      * @throws:
-     *   - ErrorMsg:  if an attributes is not defined for function
+     *   ErrorMsg if an attribute not permitted on functions—or not permitted on
+     *   non‑method functions—is encountered.
      */
-    fn validateFinalUnsafeFunction (self, attributes : [AttributeWord])-> (bool, bool)
+    fn validateFunctionAttrs (self, attrs: [AttributeWord], isMethod: bool)-> (bool, bool, bool, bool)
         throws ErrorMsg
     {
         let mut isFinal = false, mut isUnsafe = false;
-        for a in attributes {
+        let mut isField = false, mut isInline = false;
+        
+        for a in attrs {
             match a.attr {
-                Attributes::FINAL => {
+                Attributes::FINAL if isMethod => {                                        
                     isFinal = true;
                 }
                 Attributes::UNSAFE => {
                     isUnsafe = true;
                 }
-                Attributes::FIELD => {}
-                Attributes::INLINE => {}
+                Attributes::FIELD if isMethod => {                    
+                    isField = true;
+                }
+                Attributes::INLINE => {
+                    isInline = true;
+                }
                 _ => {
                     throw copy ErrorMsg::fatal (a.loc, format (DeclareErrorMessage::UNDEFINED_ATTRIBUTE_FOR_FUNCTION, a.attr));
                 }
             }
         }
         
-        (isFinal, isUnsafe)
+        (isFinal, isUnsafe, isField, isInline)
     }
 
     /*!
-     * ================================================================================
-     * ================================================================================
-     * =========================           TEMPLATE           =========================
-     * ================================================================================
-     * ================================================================================
+     * ====================================================================================================
+     * ====================================================================================================
+     * ===================================          TEMPLATES          ====================================
+     * ====================================================================================================
+     * ====================================================================================================
      */
-    
 
     /**
-     * Declare a template declaration
-     * @params: 
-     *   - tm: the template to declare
-     *   - parent: the parent symbol of the declaration
-     *   - protection: the protection of the declaration
+     * Declares a template inside a module, class, or implementation block.
+     *
+     * @params:
+     *   - tm:         the template declaration
+     *   - parent:     the symbol receiving the template
+     *   - protection: the protection applied to the template symbol
+     *
+     * @returns:
+     *   The symbol representing the declared template.
+     *
+     * @behavior:
+     *   Ensures that the template’s parameters do not shadow one another by
+     *   validating the parameter list before creating the symbol. Constructs a
+     *   template symbol that records the declaration, its parameters, and its
+     *   protection level. The template is then inserted into the parent scope
+     *   without replacing any existing symbol.
+     *
+     * @throws:
+     *   ErrorMsg if template parameters shadow earlier parameters or if the
+     *   template cannot be inserted into the parent symbol.
      */
-    fn declareTemplate (self, tm : &TemplateDecl, dmut parent : &Symbol, protection : Protection)-> dmut &Symbol
+    fn declareTemplate (self, tm: &TemplateDecl, dmut parent: &Symbol, protection: Protection)-> dmut &Symbol
         throws ErrorMsg
     {
-        self.validateShadowingTemplates (tm.getParameters ());
-        let dmut templSym = copy TemplateSymbol (tm.getLoc (), tm.getComments (), tm, protection-> protection);
+        self.validateShadowingTemplates (tm.params);
+        let dmut templSym = copy TemplateSymbol (tm.loc, tm.comm, tm, protection-> protection);
 
         parent:.insert (alias templSym, replace-> false);
 
@@ -1005,83 +1517,129 @@ pub class Declarator {
     }
 
     /**
-     * Verify that there is no shadowing in the name of the template parameters
-     * @params: 
-     *   - params: the template parameters
+     * Validates that template parameters do not shadow one another.
+     *
+     * @params:
+     *   - params: the list of template‑parameter expressions
+     *
+     * @behavior:
+     *   Ensures that all template parameters within the same declaration have
+     *   unique names. The validator extracts the identifier of each parameter
+     *   (whether variadic, `of`‑parameter, plain template variable, or variable
+     *   expression) and checks for duplicates. If two parameters share the same
+     *   name, an error is reported with diagnostics pointing to both the original
+     *   and the shadowing parameter.
+     *
+     *   Parameters that do not carry an identifier are ignored for shadowing
+     *   purposes.
+     *
+     * @throws:
+     *   ErrorMsg if any template parameter shadows a previously declared
+     *   parameter in the same template header.
      */
-    fn validateShadowingTemplates (self, params : [&Expression])
+    fn validateShadowingTemplates (self, params: [&Expression])
         throws ErrorMsg
     {
         if (params.len == 0us) return;
         for i in 0us .. params.len - 1us {
             for j in i + 1us .. params.len {
                 let fst = match params [i] {
-                    v : &TemplateVariadicVarExpr => { v.getLoc ().str }
-                    v : &TemplateOfVarExpr       => { v.getLoc ().str }
-                    v : &TemplateVarExpr         => { v.getLoc ().str }
-                    v : &VarDeclExpr             => { v.getLoc ().str }
-                    v : &VarExpr                 => { v.getLoc ().str }
+                    v: &TemplateVariadicVarExpr => { v.loc.str }
+                    v: &TemplateOfVarExpr       => { v.loc.str }
+                    v: &TemplateVarExpr         => { v.loc.str }
+                    v: &VarDeclExpr             => { v.loc.str }
+                    v: &VarExpr                 => { v.loc.str }
                     _                            => ""
                 };
 
                 let shadow = match params [j] {
-                    v : &TemplateVariadicVarExpr => { v.getLoc ().str == fst }
-                    v : &TemplateOfVarExpr       => { v.getLoc ().str == fst }
-                    v : &TemplateVarExpr         => { v.getLoc ().str == fst }
-                    v : &VarDeclExpr             => { v.getLoc ().str == fst }
-                    v : &VarExpr                 => { v.getLoc ().str == fst }
+                    v: &TemplateVariadicVarExpr => { v.loc.str == fst }
+                    v: &TemplateOfVarExpr       => { v.loc.str == fst }
+                    v: &TemplateVarExpr         => { v.loc.str == fst }
+                    v: &VarDeclExpr             => { v.loc.str == fst }
+                    v: &VarExpr                 => { v.loc.str == fst }
                     _                            => { false }
                 }
                 
                 if (shadow) {
-                    throw copy ErrorMsg::fatal (params [j].getLoc (),
-                                                format (DeclareErrorMessage::SHADOWING_DECL, params [i].getLoc ().str),
-                                                notes-> copy [copy ErrorMsg::note (params [i].getLoc (), "")]);
+                    throw copy ErrorMsg::fatal (params [j].loc,
+                                                format (DeclareErrorMessage::SHADOWING_DECL, params [i].loc.str),
+                                                notes-> copy [copy ErrorMsg::note (params [i].loc, "")]);
                 }                
             }
         }
     }
 
     /*!
-     * ================================================================================
-     * ================================================================================
-     * =========================          EXTERNAL            =========================
-     * ================================================================================
-     * ================================================================================
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          EXTERNAL          ====================================
+     * ====================================================================================================
+     * ====================================================================================================
      */
-
+    
     /**
-     * Declare an external language block
-     * @params: 
-     *   - decl: the block to declare
-     *   - parent: the parent module of the declaration
-     *   - protection: the protection of the declaration
+     * Declares an `extern` block.
+     *
+     * @params:
+     *   - decl:       the external‑block declaration
+     *   - parent:     the symbol receiving the external declarations
+     *   - protection: the protection applied to each declared symbol
+     *
+     * @returns:
+     *   An empty symbol placeholder. `extern` blocks do not introduce a symbol
+     *   of their own.
+     *
+     * @behavior:
+     *   Processes the contents of an `extern` block by delegating to
+     *   `declareInnerExternal`. All declarations inside the block are treated as
+     *   external symbols and tagged with the block’s language identifier. Only
+     *   functions and global variables are permitted; other declarations are
+     *   rejected. The block itself does not create a new scope or symbol.
+     *
+     * @throws:
+     *   ErrorMsg if the block contains an invalid declaration or if any external
+     *   symbol cannot be inserted into the parent scope.
      */
-    fn declareExternBlock (self, decl : &ExternBlockDecl, dmut parent : &Symbol, protection : Protection)-> dmut &Symbol
+    fn declareExternBlock (self, decl: &ExternBlockDecl, dmut parent: &Symbol, protection: Protection)-> dmut &Symbol
         throws ErrorMsg
     {                
-        self.declareInnerExternal (decl.getDeclarations (),
+        self.declareInnerExternal (decl.decls,
                                    alias parent,
                                    protection-> protection,
-                                   lang-> decl.getLanguage ().str);
+                                   lang-> decl.lang.str);
         
         return alias EMPTY_SYMBOL;
     }
 
     /**
-     * Declare the content of an external block
-     * @params: 
-     *    - decl: the inner declaration to declare
-     *    - parent: the parent of the external block
-     *    - protection: the protection of the declaration
-     *    - lang: the language of the extern block
-     *    - path: the path of the extern block
+     * Declares the contents of an `extern` block.
+     *
+     * @params:
+     *   - decls:      the declarations inside the `extern` block
+     *   - parent:     the symbol receiving the external declarations
+     *   - protection: the protection applied to each declared symbol
+     *   - lang:       the external language identifier (e.g., `"C"`)
+     *
+     * @behavior:
+     *   Processes each declaration inside an `extern` block and registers it as an
+     *   external symbol. Only function declarations and global‑variable
+     *   declarations are permitted. Each declared symbol is marked as `extern`
+     *   and tagged with the specified external language. The declarations are
+     *   inserted into the parent scope without replacing existing symbols.
+     *
+     *   Any other kind of declaration is rejected as invalid inside an `extern`
+     *   block.
+     *
+     * @throws:
+     *   ErrorMsg if a declaration is not allowed in an `extern` block or if a
+     *   symbol cannot be inserted into the parent scope.
      */
-    fn declareInnerExternal (self, decls : [&Declaration], dmut parent : &Symbol, protection : Protection, lang : [c8])
+    fn declareInnerExternal (self, decls: [&Declaration], dmut parent: &Symbol, protection: Protection, lang: [c8])
         throws ErrorMsg
     {
         for d in decls match d {            
-            f : &FunctionDecl => {
+            f: &FunctionDecl => {
                 let dmut sym = self.declareFunction (f,
                                                      alias parent,
                                                      protection-> protection,
@@ -1089,56 +1647,72 @@ pub class Declarator {
                                                      isExtern-> true,
                                                      lang-> lang);
 
-                sym:.setExternalLanguage (lang);
+                sym:.setExternLang (lang);
             }            
-            glb : &GlobalDecl => {
-                let dmut sym = self.declareGlobal (glb,
-                                                   alias parent,
-                                                   protection-> protection,
-                                                   isExtern-> true);
+            glb: &GlobalVarDecl => {
+                let dmut sym = self.declareGlobalVar (glb,
+                                                      alias parent,
+                                                      protection-> protection,
+                                                      isExtern-> true);
                 
-                sym:.setExternalLanguage (lang);
+                sym:.setExternLang (lang);
             }
             _ => {
-                throw copy ErrorMsg::fatal (d.getLoc (), DeclareErrorMessage::UNEXPECTED_IN_EXTERN);
+                throw copy ErrorMsg::fatal (d.loc, DeclareErrorMessage::UNEXPECTED_IN_EXTERN);
             }
         }
     }
-    
+
     /*!
-     * ================================================================================
-     * ================================================================================
-     * =========================            MACRO             =========================
-     * ================================================================================
-     * ================================================================================
+     * ====================================================================================================
+     * ====================================================================================================
+     * =====================================          MACRO          ======================================
+     * ====================================================================================================
+     * ====================================================================================================
      */
 
     /**
-     * Declare a macro
-     * @params: 
-     *    - m: the macro to declare
-     *    - parent: the parent module of the declaration
-     *    - protection: the protection of the declaration
+     * Declares a macro inside a module.
+     *
+     * @params:
+     *   - m:         the macro declaration
+     *   - parent:    the symbol receiving the macro
+     *   - protection: the protection applied to the macro symbol
+     *
+     * @returns:
+     *   The symbol representing the declared macro.
+     *
+     * @behavior:
+     *   Ensures that the macro’s name does not shadow an existing symbol that
+     *   cannot legally coexist with a macro. Only modules and templates may share
+     *   the same name; any other symbol triggers a shadowing error with precise
+     *   diagnostics. Once validated, a macro symbol is created and populated by
+     *   recursively declaring each element of the macro body. The completed macro
+     *   is then inserted into the parent scope without replacing existing symbols.
+     *
+     * @throws:
+     *   ErrorMsg if the macro name illegally shadows an existing symbol or if any
+     *   part of the macro body cannot be declared.
      */
-    fn declareMacro (self, m : &MacroDecl, dmut parent : &Symbol, protection : Protection)-> dmut &Symbol
+    fn declareMacro (self, m: &MacroDecl, dmut parent: &Symbol, protection: Protection)-> dmut &Symbol
         throws ErrorMsg
     {
-        let syms = parent.getLocalSymbols (m.getLoc ().str, protection-> Protection::PRIVATE);
+        let syms = parent.getLocalSymbols (m.name.str, protection-> Protection::PRIVATE);
         for s in syms[] {
             match s {
                 ModuleSymbol () => {}
                 TemplateSymbol () => {}
                 _ => {
-                    throw copy ErrorMsg::fatal (m.getLoc (),
-                                                format (DeclareErrorMessage::SHADOWING_DECL, m.getLoc ().str),
-                                                notes-> copy [copy ErrorMsg::note (s.getLoc (), "")]);
+                    throw copy ErrorMsg::fatal (m.name,
+                                                format (DeclareErrorMessage::SHADOWING_DECL, m.name.str),
+                                                notes-> copy [copy ErrorMsg::note (s.loc, "")]);
                 }
             }
         }
         
-        let dmut macroSym = copy MacroSymbol (m.getLoc (), m.getComments (), m, protection-> protection);
-        for d in m.getDeclarations () {
-            self.declareInnerMacro (d, alias macroSym, protection-> Protection::PUBLIC);
+        let dmut macroSym = copy MacroSymbol (m.name, m.comm, m, protection-> protection);
+        for d in m.decls {
+            self.declareInnerMacro (d, alias macroSym);
         }
 
         parent:.insert (alias macroSym, replace-> false);
@@ -1146,148 +1720,232 @@ pub class Declarator {
     }
 
     /**
-     * Declare the content of a macro definition
-     * @params: 
-     *   - decl: the declaration to declare
-     *   - m: the parent macro symbol
-     *   - protection: the protection of the declaration
+     * Declares a single element inside a macro body.
+     *
+     * @params:
+     *   - decl: the declaration appearing inside the macro
+     *   - m:    the macro symbol receiving the declared element
+     *
+     * @behavior:
+     *   Processes one declaration inside a macro body. Macro rules and macro
+     *   constructors are recognized and converted into their corresponding
+     *   symbols (`MacroRuleSymbol` or `MacroCtorSymbol`) before being inserted
+     *   into the macro’s scope. `use` declarations are also permitted and are
+     *   delegated to the regular `declareUse` mechanism.          
+     *
+     * @throws:
+     *   ErrorMsg if the declaration is not permitted inside a macro or if the
+     *   symbol cannot be inserted into the macro scope.
      */
-    fn declareInnerMacro (self, decl : &Declaration, dmut m : &MacroSymbol, protection : Protection)
+    fn declareInnerMacro (self, decl: &Declaration, dmut m: &MacroSymbol)
         throws ErrorMsg
     {
         match decl {
-            bl : &BlockDecl => {
-                for d in bl.getDeclarations () {
-                    self.declareInnerMacro (d, alias m, protection-> bl.getProtection ());
-                }
-            }
-            ctor : &MacroRuleDecl => {
-                if (ctor.isConstructor ()) {
-                    let dmut sym = copy MacroConstructorSymbol (ctor.getLoc (), ctor.getComments (), ctor, protection);
+            ctor: &MacroRuleDecl => {
+                if (ctor.isCtor) {
+                    let dmut sym = copy MacroCtorSymbol (ctor.loc, ctor.comm, ctor);
                     m:.insert (alias sym, replace-> false);
                 } else {
-                    let dmut sym = copy MacroRuleSymbol (ctor.getLoc (), ctor.getComments (), ctor, protection);
+                    let dmut sym = copy MacroRuleSymbol (ctor.loc, ctor.comm, ctor);
                     m:.insert (alias sym, replace-> false);
                 }                
             }
-            u : &UseDecl => {
+            u: &UseDecl => {
                 self.declareUse (u, alias m);
             }
             _ => {
-                throw copy ErrorMsg::fatal (decl.getLoc (), DeclareErrorMessage::UNEXPECTED_IN_MACRO);
+                throw copy ErrorMsg::fatal (decl.loc, DeclareErrorMessage::UNEXPECTED_IN_MACRO);
             }
         }
     }
 
     /*!
-     * ================================================================================
-     * ================================================================================
-     * =========================             ENUM             =========================
-     * ================================================================================
-     * ================================================================================
+     * ====================================================================================================
+     * ====================================================================================================
+     * ===================================          ENUM/UNION          ===================================
+     * ====================================================================================================
+     * ====================================================================================================
      */
-
 
     /**
-     * Declare the symbol of a enumeration
-     * @params: 
-     *   - st: the enum to declare
-     *   - parent: the module that is declaring the enum
-     *   - protection: the protection of the enum
+     * Declares an enum inside a module.
+     *
+     * @params:
+     *   - en:         the enum declaration
+     *   - parent:     the symbol receiving the enum
+     *   - protection: the protection applied to the enum symbol
+     *
+     * @returns:
+     *   The symbol representing the declared enum.
+     *
+     * @behavior:
+     *   Ensures that the enum’s name does not illegally shadow an existing symbol
+     *   in the same scope. Only modules and templates may legally share the same
+     *   name with an enum; any other symbol triggers a shadowing error.
+     *
+     * @throws:
+     *   ErrorMsg if the enum name shadows an incompatible symbol or if the enum
+     *   cannot be inserted into the parent scope.
      */
-    fn declareEnum (self, en : &EnumDecl, dmut parent : &Symbol, protection : Protection)-> dmut &Symbol
+    fn declareEnum (self, en: &EnumDecl, dmut parent: &Symbol, protection: Protection)-> dmut &Symbol
         throws ErrorMsg
     {
-        let syms = parent.getLocalSymbols (en.getLoc ().str, protection-> Protection::PRIVATE);
+        let syms = parent.getLocalSymbols (en.name.str, protection-> Protection::PRIVATE);
         for s in syms[] match s {
             ModuleSymbol () => {}
             TemplateSymbol () => {}
             _ => {
-                throw copy ErrorMsg::fatal (en.getLoc (),
-                                            format (DeclareErrorMessage::SHADOWING_DECL, en.getLoc ().str),
-                                            notes-> copy [copy ErrorMsg::note (s.getLoc (), "")]);
+                throw copy ErrorMsg::fatal (en.name,
+                                            format (DeclareErrorMessage::SHADOWING_DECL, en.name.str),
+                                            notes-> copy [copy ErrorMsg::note (s.loc, "")]);
             }
         }
 
 
-        let dmut enSym = copy EnumSymbol (en.getLoc (), en.getComments (), en, protection);
+        let dmut enSym = copy EnumSymbol (en.name, en.comm, en, protection);
         parent:.insert (alias enSym, replace-> false);
         
         alias enSym
     }
-    
-
-    /*!
-     * ================================================================================
-     * ================================================================================
-     * =========================             AKA              =========================
-     * ================================================================================
-     * ================================================================================
-     */
-
 
     /**
-     * Declare the symbol of an aka
-     * @params: 
-     *   - st: the aka to declare
-     *   - parent: the module that is declaring the aka
-     *   - protection: the protection of the aka
+     * Declares a union inside a module.
+     *
+     * @params:
+     *   - un:         the union declaration
+     *   - parent:     the symbol receiving the union
+     *   - protection: the protection applied to the union symbol
+     *
+     * @returns:
+     *   The symbol representing the declared union.
+     *
+     * @behavior:
+     *   Ensures that the union’s name does not illegally shadow an existing
+     *   symbol in the same scope. Only modules and templates may legally share
+     *   the same name with a union; any other symbol triggers a shadowing error
+     *   with diagnostics pointing to both declarations.
+     *
+     * @throws:
+     *   ErrorMsg if the union name shadows an incompatible symbol or if the
+     *   union cannot be inserted into the parent scope.
      */
-    pub fn declareAka (self, en : &AkaDecl, dmut parent : &Symbol, protection : Protection, fromTemplate : bool = false)-> dmut &Symbol
+    fn declareUnion (self, un: &UnionDecl, dmut parent: &Symbol, protection: Protection)-> dmut &Symbol
         throws ErrorMsg
     {
-        let syms = parent.getLocalSymbols (en.getLoc ().str, protection-> Protection::PRIVATE);
+        let syms = parent.getLocalSymbols (un.name.str, protection-> Protection::PRIVATE);
         for s in syms[] match s {
-            ModuleSymbol () => {}
+            ModuleSymbol ()   => {}
             TemplateSymbol () => {}
             _ => {
-                if (!fromTemplate || s !of AkaSymbol) {
-                    throw copy ErrorMsg::fatal (en.getLoc (),
-                                                format (DeclareErrorMessage::SHADOWING_DECL, en.getLoc ().str),
-                                                notes-> copy [copy ErrorMsg::note (s.getLoc (), "")]);
+                throw copy ErrorMsg::fatal (un.name,
+                                            format (DeclareErrorMessage::SHADOWING_DECL, un.name.str),
+                                            notes-> copy [copy ErrorMsg::note (s.loc, "")]);
+            }
+        }
+
+
+        let dmut unSym = copy UnionSymbol (un.name, un.comm, un, protection);
+        parent:.insert (alias unSym, replace-> false);
+        
+        alias unSym        
+    }    
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ===================================          GLOBAL DEF          ===================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Declares a `def` inside a module.
+     *
+     * @params:
+     *   - de:          the `def` declaration
+     *   - parent:      the symbol receiving the definition
+     *   - protection:  the protection applied to the definition symbol
+     *   - fromTemplate: whether this declaration originates from template expansion
+     *
+     * @returns:
+     *   The symbol representing the declared definition.
+     *
+     * @behavior:
+     *   Ensures that the definition’s name does not illegally shadow an existing
+     *   symbol in the same scope. Only modules and templates may legally share the
+     *   same name with a definition.     
+     *
+     * @throws:
+     *   ErrorMsg if the definition name shadows an incompatible symbol or if the
+     *   definition cannot be inserted into the parent scope.
+     */
+    pub fn declareDef (self, de: &DefDecl, dmut parent: &Symbol, protection: Protection, fromTemplate: bool = false)-> dmut &Symbol
+        throws ErrorMsg
+    {
+        let syms = parent.getLocalSymbols (de.loc.str, protection-> Protection::PRIVATE);
+        for s in syms[] match s {
+            ModuleSymbol ()   => {}
+            TemplateSymbol () => {}
+            _ => {
+                if (!fromTemplate || s !of DefSymbol) {
+                    throw copy ErrorMsg::fatal (de.loc,
+                                                format (DeclareErrorMessage::SHADOWING_DECL, de.loc.str),
+                                                notes-> copy [copy ErrorMsg::note (s.loc, "")]);
                 }
             }
         }
 
-        let dmut enSym = copy AkaSymbol (en.getLoc (), en.getComments (), en, protection);
+        let dmut enSym = copy DefSymbol (de.loc, de.comm, de, protection);
         parent:.insert (alias enSym, replace-> false);
         
         alias enSym
     }
 
-
     /*!
-     * ================================================================================
-     * ================================================================================
-     * =========================            TRAIT             =========================
-     * ================================================================================
-     * ================================================================================
-     */
-
-
+     * ====================================================================================================
+     * ====================================================================================================
+     * =====================================          TRAITS          =====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */    
 
     /**
-     * Declare an implementation 
-     * @params: 
-     *   - impl: the implementation to declare
-     *   - cl: the parent class
+     * Declares a trait inside a module.
+     *
+     * @params:
+     *   - tr:         the trait declaration
+     *   - parent:     the symbol receiving the trait
+     *   - protection: the protection applied to the trait symbol
+     *
+     * @returns:
+     *   The symbol representing the declared trait.
+     *
+     * @behavior:
+     *   Ensures that the trait’s name does not illegally shadow an existing symbol
+     *   in the same scope. Only modules and templates may legally share the same
+     *   name with a trait; any other symbol triggers a shadowing error with
+     *   diagnostics pointing to both declarations.          
+     *
+     * @throws:
+     *   ErrorMsg if the trait name shadows an incompatible symbol or if any
+     *   element of the trait body cannot be declared.
      */
-    fn declareTrait (mut self, tr : &TraitDecl, dmut parent : &Symbol, protection : Protection)-> dmut &Symbol
+    fn declareTrait (mut self, tr: &TraitDecl, dmut parent: &Symbol, protection: Protection)-> dmut &Symbol
         throws ErrorMsg
     {
-        let syms = parent.getLocalSymbols (tr.getLoc ().str, protection-> Protection::PRIVATE);
+        let syms = parent.getLocalSymbols (tr.name.str, protection-> Protection::PRIVATE);
         for s in syms[] match s {
             ModuleSymbol () => {}
             TemplateSymbol () => {}
             _ => {
-                throw copy ErrorMsg::fatal (tr.getLoc (),
-                                       format (DeclareErrorMessage::SHADOWING_DECL, tr.getLoc ().str),
-                                       notes-> copy [copy ErrorMsg::note (s.getLoc (), "")]);
+                throw copy ErrorMsg::fatal (tr.name,
+                                            format (DeclareErrorMessage::SHADOWING_DECL, tr.name.str),
+                                            notes-> copy [copy ErrorMsg::note (s.loc, "")]);
             }
         }
         
-        let dmut traitSym = copy TraitSymbol (tr.getLoc (), tr.getComments (), tr, protection-> protection);
-        for i in tr.getDeclarations () {
+        let dmut traitSym = copy TraitSymbol (tr.name, tr.comm, tr, protection-> protection);
+        for i in tr.decls {
             self:.declareInnerTrait (i, alias traitSym, protection-> Protection::PROTECTED);
         }
 
@@ -1296,97 +1954,162 @@ pub class Declarator {
     }
 
     /**
-     * Declare the content of a trait
-     * @params: 
-     *   - current: the declaration to transform
-     *   - tr: the trait that is being declared
-     *   - protection: the protection of the declaration inside the trait
+     * Declares a single element inside a trait body.
+     *
+     * @params:
+     *   - current:     the declaration appearing inside the trait
+     *   - tr:          the trait symbol receiving the declared element
+     *   - protection:  the protection level applied to members introduced here
+     *
+     * @behavior:
+     *   Processes one declaration inside a trait. Nested blocks (`BlockDecl`)
+     *   are recursively traversed, with each inner declaration using the block’s
+     *   own protection level. Function declarations are treated as trait methods
+     *   and are declared with `isMethod = true`. Trait methods may not be marked
+     *   as overrides; any use of `over` triggers an error with diagnostics
+     *   pointing to the offending method.
+     *
+     *   Assertions and conditional blocks are permitted and delegated to their
+     *   respective trait-specific declaration routines. Any other kind of
+     *   declaration is invalid inside a trait and results in an error.
+     *
+     * @throws:
+     *   ErrorMsg if the declaration is not permitted inside a trait, if a method
+     *   incorrectly uses `over`, or if any symbol cannot be inserted into the
+     *   trait scope.
      */
-    pub fn declareInnerTrait (mut self, current : &Declaration, dmut tr : &TraitSymbol, protection : Protection)
+    pub fn declareInnerTrait (mut self, current: &Declaration, dmut tr: &TraitSymbol, protection: Protection)
         throws ErrorMsg
     {
         match current {
-            dl : &BlockDecl => {
-                for i in dl.getDeclarations () {
-                    self:.declareInnerTrait (i, alias tr, protection-> dl.getProtection ());
+            dl: &BlockDecl => {
+                for i in dl.decls {
+                    self:.declareInnerTrait (i, alias tr, protection-> dl.protection);
                 }
             }
-            f : &FunctionDecl => {
+            f: &FunctionDecl => {
                 let sym = self.declareFunction (f, alias tr, protection-> protection, isMethod-> true);
-                if (f.isOver ()) {
-                    throw copy ErrorMsg::fatal (f.getLoc (), format (DeclareErrorMessage::NOT_OVERRIDE, sym.getPath ().toStr ()));
+                if (f.isOver) {
+                    throw copy ErrorMsg::fatal (f.loc, format (DeclareErrorMessage::NOT_OVERRIDE, sym.path.toStr ()));
                 }
             }
-            wrap : &ExpressionWrapperDecl => {
-                self.declareAssertTrait (wrap, alias tr);
+            a: &AssertDecl => {
+                self.declareAssertTrait (a, alias tr);
             }
-            imp : &ImportDecl => {
-                self:.declareImport (imp, alias tr, protection-> protection);
-            }
-            c : &CondBlockDecl => {
+            c: &CondBlockDecl => {
                 self.declareCondBlockTrait (c, alias tr);
             }
             _ => {
-                throw copy ErrorMsg::fatal (current.getLoc (), DeclareErrorMessage::UNEXPECTED_IN_TRAIT);
+                throw copy ErrorMsg::fatal (current.loc, DeclareErrorMessage::UNEXPECTED_IN_TRAIT);
             }
         }
     }
 
     /**
-     * Declare an assertion in a class
+     * Registers an assertion inside a trait.
+     *
+     * @params:
+     *   - a:   the assertion declaration
+     *   - tr:  the trait symbol receiving the assertion
+     *
+     * @behavior:
+     *   Adds the assertion to the trait’s list of semantic requirements. Trait
+     *   assertions describe conditions that all implementations of the trait must
+     *   satisfy. No symbol is created for the assertion; it is simply recorded in
+     *   the trait symbol for later validation during implementation checking.
+     *
+     * @throws:
+     *   This function does not throw. Any structural or semantic errors in the
+     *   assertion itself are handled elsewhere in the trait‑validation pipeline.
      */
-    fn declareAssertTrait (self, wrap : &ExpressionWrapperDecl, dmut tr : &TraitSymbol) {
-        tr:.addAssertion (wrap.getContent (), wrap.getComments ());
+    fn declareAssertTrait (self, a: &AssertDecl, dmut tr: &TraitSymbol) {
+        tr:.addAssertion (a);
     }
 
     /**
-     * Declare a conditional block in a trait
-     * */
-    fn declareCondBlockTrait (self, c : &CondBlockDecl, dmut tr : &TraitSymbol) {
-        tr:.addCondBlock (c);
+     * Registers a conditional‑block declaration inside a trait.
+     *
+     * @params:
+     *   - c:   the conditional‑block declaration
+     *   - tr:  the trait symbol receiving the conditional block
+     *
+     * @behavior:
+     *   Records a conditional block as part of the trait’s semantic structure.
+     *   Conditional blocks inside traits describe requirements or declarations
+     *   that apply only when certain compile‑time conditions hold. No symbol is
+     *   created for the block; it is simply stored in the trait symbol for later
+     *   evaluation during trait‑implementation checking.
+     *
+     * @throws:
+     *   This function does not throw. Any semantic errors related to the
+     *   conditional block are handled elsewhere in the trait‑validation pipeline.
+     */
+    fn declareCondBlockTrait (self, c: &CondBlockDecl, dmut tr: &TraitSymbol) {
+        tr:.addCondBlockDecl (c);
     }
 
     /*!
-     * ================================================================================
-     * ================================================================================
-     * =========================            GLOBAL            =========================
-     * ================================================================================
-     * ================================================================================
+     * ====================================================================================================
+     * ====================================================================================================
+     * ===================================          GLOBAL VAR          ===================================
+     * ====================================================================================================
+     * ====================================================================================================
      */
 
     /**
-     * Declare a global variable
-     * @params: 
-     *   - gl: the var to declare
-     *   - parent: the parent module declaring the variable
-     *   - protection: the protection of the declaration
+     * Declares a global variable inside a module or implementation block.
+     *
+     * @params:
+     *   - gl:         the global‑variable declaration
+     *   - parent:     the symbol receiving the global variable
+     *   - protection: the protection applied to the variable symbol
+     *   - isExtern:   whether the variable is declared inside an `extern` block
+     *
+     * @returns:
+     *   The symbol representing the declared global variable.
+     *
+     * @behavior:
+     *   Ensures that the variable’s name does not illegally shadow an existing
+     *   symbol in the same scope. Only modules and templates may legally share
+     *   the same name with a global variable; any other conflict triggers a
+     *   shadowing error with diagnostics pointing to both declarations.
+     *
+     *   A global variable may be marked `static` only when declared as `extern`.
+     *   Declaring a non‑extern static global triggers an error. Thread‑local
+     *   attributes are validated through `validateIsThreadLocal`, which enforces
+     *   the rules governing thread‑local storage for global variables.
+     *   
+     * @throws:
+     *   ErrorMsg if the variable name shadows an incompatible symbol, if a
+     *   non‑extern global is declared `static`, if thread‑local attributes are
+     *   invalid, or if the symbol cannot be inserted into the parent scope.
      */
-    fn declareGlobal (self, gl : &GlobalDecl, dmut parent : &Symbol, protection : Protection, isExtern : bool = false)-> dmut &Symbol
+    fn declareGlobalVar (self, gl: &GlobalVarDecl, dmut parent: &Symbol, protection: Protection, isExtern: bool = false)-> dmut &Symbol
         throws ErrorMsg
     {
-        let syms = parent.getLocalSymbols (gl.getContent ().getLoc ().str, protection-> Protection::PRIVATE);
+        let syms = parent.getLocalSymbols (gl.var.name.str, protection-> Protection::PRIVATE);
         for s in syms[] match s {
             ModuleSymbol () => {}
             TemplateSymbol () => {}
             _ => {
-                throw copy ErrorMsg::fatal (gl.getContent ().getLoc (),
-                                       format (DeclareErrorMessage::SHADOWING_DECL, gl.getContent ().getLoc ().str),
-                                       notes-> copy [copy ErrorMsg::note (s.getLoc (), "")]);
+                throw copy ErrorMsg::fatal (gl.var.name,
+                                            format (DeclareErrorMessage::SHADOWING_DECL, gl.var.name.str),
+                                            notes-> copy [copy ErrorMsg::note (s.loc, "")]);
             }
         }
 
-        if (gl.isStatic () && !isExtern) {
-            throw copy ErrorMsg::fatal (gl.getLoc (), DeclareErrorMessage::DECL_GLOB_STATIC_NON_EXTERN);
+        if (gl.isStatic && !isExtern) {
+            throw copy ErrorMsg::fatal (gl.loc, DeclareErrorMessage::DECL_GLOB_STATIC_NON_EXTERN);
         }
 
-        let isThLocal = self.validateIsThreadLocal (gl.getLoc (), gl.getAttributes (), isExtern);
-        let dmut glSym = copy GlobalSymbol (gl.getContent ().getLoc (),
-                                            gl.getComments (),
-                                            gl,
-                                            protection-> protection,
-                                            isExtern-> isExtern,
-                                            isStatic-> gl.isStatic (),
-                                            isThreadLocal-> isThLocal);
+        let isThLocal = self.validateIsThreadLocal (gl.loc, gl.attrs, isExtern);
+        let dmut glSym = copy GlobalVarSymbol (gl.var.name,
+                                               gl.comm,
+                                               gl,
+                                               protection-> protection,
+                                               isExtern-> isExtern,
+                                               isStatic-> gl.isStatic,
+                                               isThreadLocal-> isThLocal);
 
         parent:.insert (alias glSym, replace-> false);
 
@@ -1394,12 +2117,31 @@ pub class Declarator {
     }
 
     /**
-     * @returns: true if the global variable is a thread local
-     * @throws:
-     *    - &ErrorMsg: if the attributes are malformed or not applicable
+     * Validates the `thread` attribute on a global variable.
      *
-     * */
-    fn validateIsThreadLocal (self, loc : &Word, attrs : [AttributeWord], isExtern : bool)-> bool
+     * @params:
+     *   - loc:      the location of the global variable
+     *   - attrs:    the list of attribute words attached to the declaration
+     *   - isExtern: whether the variable is declared inside an `extern` block
+     *
+     * @returns:
+     *   `true` if the global variable is marked as thread‑local, otherwise `false`.
+     *
+     * @behavior:
+     *   Examines the attributes applied to a global variable and determines
+     *   whether it is declared as thread‑local. Only the `thread` attribute is
+     *   permitted on global variables. Any other attribute triggers an error with
+     *   diagnostics pointing to both the attribute and the variable.
+     *
+     *   A thread‑local global variable cannot be declared inside an `extern`
+     *   block. If the `thread` attribute appears on an extern global, an error is
+     *   reported.
+     *
+     * @throws:
+     *   ErrorMsg if an unsupported attribute is used on a global variable or if a
+     *   thread‑local attribute is applied to an extern global.
+     */
+    fn validateIsThreadLocal (self, loc: &Word, attrs: [AttributeWord], isExtern: bool)-> bool
         throws ErrorMsg
     {
         let mut isThread = false;
@@ -1421,34 +2163,63 @@ pub class Declarator {
     }
 
     /*!
-     * ================================================================================
-     * ================================================================================
-     * =========================           FINALIZE           =========================
-     * ================================================================================
-     * ================================================================================
+     * ====================================================================================================
+     * ====================================================================================================
+     * ==================================          FINALIZATION          ==================================
+     * ====================================================================================================
+     * ====================================================================================================
      */
-
+    
     /**
-     * Finalize the declaration of the use decl inside the symbols
-     * It assumes, that everything is declared, thus use decl are valid
-     * @params:
-     *    - sym: the root symbol to finalize
-     * */
-    pub fn finalizeDeclaration (mut self, dmut sym : &Symbol, useCore : bool = true)
+     * Finalizes all declarations belonging to a foreign package.
+     *
+     * @behavior:
+     *   Completes the declaration phase for an externally imported package,
+     *   resolving its `use` declarations, applying implicit core modules when
+     *   appropriate, and preparing its symbol tree for semantic validation.
+     *
+     * @throws:
+     *   ErrorMsg if the foreign package contains invalid or inconsistent
+     *   declarations.
+     */
+    pub fn finalizeExternDeclaration (mut self)
         throws ErrorMsg
     {
-        let mut errors : [mut &ErrorMsg] = [];
-        let uses = sym.getAllUseDecls ();
+        self:.finalizeDeclaration (alias self._foreignRoot);
+    }
+
+    /**
+     * Finalizes a symbol and all its nested declarations.
+     *
+     * @params:
+     *   - sym:     the symbol to finalize
+     *   - useCore: whether core modules should be implicitly applied
+     *
+     * @behavior:
+     *   Completes the declaration phase for `sym` by resolving its pending
+     *   `use` declarations, applying implicit core modules when appropriate,
+     *   and finalizing all of its child symbols. After this step, the symbol
+     *   subtree is structurally complete and ready for semantic validation.
+     *
+     * @throws:
+     *   ErrorMsg if any part of the symbol subtree contains invalid or
+     *   inconsistent declarations.
+     */
+    pub fn finalizeDeclaration (mut self, dmut sym: &Symbol, useCore: bool = true)
+        throws ErrorMsg
+    {
+        let mut errors: [mut &ErrorMsg] = [];
+        let uses = sym.useDecls;
         for i in 0us .. uses.len {
             {
                 self:.finalizeUse (alias sym, uses [i]);
             } catch {
-                err : &ErrorMsg => { errors ~= [err]; }
+                err: &ErrorMsg => { errors ~= [err]; }
             }
         }
 
         // use core only if parent also uses core, not in standalone, and not a core module
-        let useCore_ = useCore && (!state::instance ().isStandalone ()) && (!sym.isCoreModule ());
+        let useCore_ = useCore && (!state::instance ().isStandalone ()) && (!sym.isCoreModule);
         if (useCore_) {
             sym:.setUsedCore (alias self._coreModules);
         }
@@ -1457,25 +2228,44 @@ pub class Declarator {
         for i in 0us .. inner.len {
             self:.finalizeDeclaration (alias inner [i], useCore-> useCore_); // child of core modules don't use core
         } catch {
-            err : &ErrorMsg => { errors ~= [err]; }
+            err: &ErrorMsg => { errors ~= [err]; }
         }
 
         if (errors.len != 0us) throw copy ErrorMsg::list (errors);
     }
 
     /**
-     * Finalize a use declaration
+     * Finalizes a `use` declaration by resolving its path and attaching the
+     * referenced modules to the parent scope.
+     *
      * @params:
-     *    - parent: the parent that declare the use
-     *    - use_: the use declaration to validate
-     * */
-    fn finalizeUse (mut self, dmut parent : &Symbol, use_ : &UseDecl, throwSelf : bool = true)
+     *   - parent:    the symbol receiving the imported modules
+     *   - use_:      the `use` declaration to finalize
+     *   - throwSelf: whether importing the parent itself should trigger an error
+     *
+     * @behavior:
+     *   Converts the syntactic path of the `use` declaration into an internal
+     *   lookup path. The path is then resolved either from the root module
+     *   (`use_.isRoot = true`) or from the current parent scope. Resolution
+     *   yields one or more modules, each of which is attached to the parent via
+     *   `useModule`, making their public members visible in the parent scope.
+     *
+     *   The function delegates the actual resolution to the lower‑level
+     *   `finalizeUse` routine, which performs module lookup, ambiguity handling,
+     *   and self‑import checks. This wrapper only orchestrates root‑vs‑relative
+     *   resolution and registers the resulting modules.
+     *
+     * @throws:
+     *   ErrorMsg if the path cannot be resolved, if the import is invalid, or if
+     *   self‑import is disallowed and `throwSelf` is enabled.
+     */
+    fn finalizeUse (mut self, dmut parent: &Symbol, use_: &UseDecl, throwSelf: bool = true)
         throws ErrorMsg
     {
-        let useP = use_.getModulePath ();
+        let useP = use_.path;
         let p = self.toPath (useP);
 
-        let dmut modules = if (use_.isRoot ()) {
+        let dmut modules = if (use_.isRoot) {
             self:.finalizeUse (alias self._root, p, useP, throwSelf)
         } else {
             self:.finalizeUse (alias parent, p, useP, throwSelf)
@@ -1483,18 +2273,52 @@ pub class Declarator {
 
         for i in 0us .. modules.len {
             let dmut m = alias modules [i];
-            parent:.useModule (m.getPath ().asStdPath (), alias m);
+            parent:.useModule (m.path.asStdPath (), alias m);
         }
     }
 
     /**
-     * Find the list of modules referenced by the path of a use declaration
+     * Resolves a `use` path and returns the list of modules it refers to.
+     *
      * @params:
-     *    - parent: the module in which a use declaration was made
-     *    - path: the path of the use decl
-     *    - throwSelf: true if an exception has to be thrown if using self
-     * */
-    fn finalizeUse (mut self, dmut parent : &Symbol, p : Path, useP : &Expression, throwSelf : bool)-> dmut [&ModuleSymbol]
+     *   - parent:   the symbol from which the path is resolved
+     *   - p:        the normalized lookup path
+     *   - useP:     the syntactic path expression (for diagnostics)
+     *   - throwSelf: whether importing the parent module itself should produce an error
+     *
+     * @returns:
+     *   The list of modules reached by the path. Each module is returned as a
+     *   mutable symbol suitable for registration in the caller.
+     *
+     * @behavior:
+     *   Resolves the path `p` step by step:
+     *   <ul>
+     *   <li> The first component is always resolved as an absolute module name.
+     *     If no such module exists, an absolute‑access error is reported.</li>
+     *
+     *   <li> Subsequent components are resolved relative to each module reached so
+     *     far, enforcing protection rules. Lazy modules are finalized on demand.</li>
+     *
+     *   <li> A trailing `_` imports all immediate submodules of the resolved module.
+     *     In this case, the wildcard import is considered successful even if the
+     *     parent module itself would otherwise be a self‑import.</li>
+     *
+     *   <li> If a path component exists but does not refer to a module, an error is
+     *     reported with diagnostics pointing to the failing segment.</li>
+     *
+     *   <li> Self‑imports are rejected unless they occur through a wildcard import
+     *     or `throwSelf` is disabled. In that case, a warning is issued instead.</li>
+     *   </ul>
+     *   After resolution, all reachable modules are returned as mutable symbols.
+     *   If no module is ultimately selected (and no wildcard was used), the path
+     *   is considered invalid and an error is reported.
+     *
+     * @throws:
+     *   ErrorMsg if any path component cannot be resolved, if a non‑module is
+     *   encountered where a module is required, if protection rules forbid
+     *   access, or if a disallowed self‑import occurs.
+     */
+    fn finalizeUse (mut self, dmut parent: &Symbol, p: Path, useP: &Expression, throwSelf: bool)-> dmut [&ModuleSymbol]
         throws ErrorMsg
     {
         let mut root = self:.getGlobal (p.root (), parent); // absolute access to the root of the path
@@ -1509,15 +2333,15 @@ pub class Declarator {
         for i in 1us .. parts.len {
             let mut found = false;
             if (i == parts.len - 1us && parts [i] == Keys::UNDER) {
-                let mut subMods : [mut &Symbol] = [];
+                let mut subMods: [mut &Symbol] = [];
                 for r in root {
                     let module = match r {
-                        l : &LazyModuleSymbol => { self:.finalizeImportDecl (l) }
-                        m : _ => { m }
+                        l: &LazyModuleSymbol => { self:.finalizeImportDecl (l) }
+                        m: _ => { m }
                     };
 
                     match module {
-                        m : &ModuleSymbol => {
+                        m: &ModuleSymbol => {
                             subMods ~= self.getAllLocalFromContext (parent, m);
                         }
                     }
@@ -1528,16 +2352,16 @@ pub class Declarator {
             } else {
                 for r in root {
                     let module = match r {
-                        l : &LazyModuleSymbol => { self:.finalizeImportDecl (l) }
-                        m : _ => { m }
+                        l: &LazyModuleSymbol => { self:.finalizeImportDecl (l) }
+                        m: _ => { m }
                     };
 
                     match module {
-                        m : &ModuleSymbol => { // there can be only one module with a given name in another module, otherwise error would have been thrown during module declaration
+                        m: &ModuleSymbol => { // there can be only one module with a given name in another module, otherwise error would have been thrown during module declaration
                             root = self.getLocalFromContext (parts [i], parent, m); // relative access, while ensuring protection access
                             if (root.len == 0us) { // no module named parts[i] in current module
                                 let errLoc = self.getPathIndexLoc (useP, i);
-                                throw copy ErrorMsg::fatal (errLoc, format (DeclareErrorMessage::NO_MODULE_NAMED, parts [i], m.getPath ().toStr ()),
+                                throw copy ErrorMsg::fatal (errLoc, format (DeclareErrorMessage::NO_MODULE_NAMED, parts [i], m.path.toStr ()),
                                                             notes-> self.createLocalAccessError (errLoc, parts[i], m, parent));
                             }
 
@@ -1549,27 +2373,27 @@ pub class Declarator {
 
                 // A symbol was found, but it was not a module
                 if (!found) {
-                    throw copy ErrorMsg::fatal (self.getPathIndexLoc (useP, i - 1us), format (DeclareErrorMessage::NO_MODULE_NAMED, parts[i - 1us], current.getPath ().toStr ()));
+                    throw copy ErrorMsg::fatal (self.getPathIndexLoc (useP, i - 1us), format (DeclareErrorMessage::NO_MODULE_NAMED, parts[i - 1us], current.path.toStr ()));
                 }
             }
         }
 
-        let mut modules : [dmut &ModuleSymbol] = [];
+        let mut modules: [dmut &ModuleSymbol] = [];
         for r in root {
             let module = match r {
-                l : &LazyModuleSymbol => { self:.finalizeImportDecl (l) }
-                m : _ => { m }
+                l: &LazyModuleSymbol => { self:.finalizeImportDecl (l) }
+                m: _ => { m }
             };
 
             match module {
-                m : &ModuleSymbol => { // use all the module found at the end of the path
+                m: &ModuleSymbol => { // use all the module found at the end of the path
                     if (parent is m) {
                         if (!all && throwSelf) { // does not throw if using self by referencing {self.parent}::_;
-                                                 // only throws if directly referencing {self.parent}::self;
-                            throw copy ErrorMsg::warn (self.getPathIndexLoc (useP, parts.len - 1us), format (DeclareErrorMessage::SELF_USE, m.getPath ().toStr ()));
+                            // only throws if directly referencing {self.parent}::self;
+                            throw copy ErrorMsg::warn (self.getPathIndexLoc (useP, parts.len - 1us), format (DeclareErrorMessage::SELF_USE, m.path.toStr ()));
                         }
                     } else {
-                        if let dmut mm : &ModuleSymbol = alias self:.getMutableSymbol (m) {
+                        if let dmut mm: &ModuleSymbol = alias self:.getMutableSymbol (m) {
                             modules ~= [alias mm];
                         } else panic;
 
@@ -1582,65 +2406,111 @@ pub class Declarator {
         if (!all) { // all is true if at least one module was used, or '_' was found, meaning use all sub modules from this path
             // if not all, then symbol was found in current, but it was not a module
             throw copy ErrorMsg::fatal (self.getPathIndexLoc (useP, parts.len - 1us),
-                                        format (DeclareErrorMessage::NO_MODULE_NAMED, parts[parts.len - 1us], current.getPath ().toStr ()));
+                                        format (DeclareErrorMessage::NO_MODULE_NAMED, parts[parts.len - 1us], current.path.toStr ()));
         }
 
         return alias modules;
     }
     
     /*!
-     * ================================================================================
-     * ================================================================================
-     * =========================            UTILS             =========================
-     * ================================================================================
-     * ================================================================================
+     * ====================================================================================================
+     * ====================================================================================================
+     * ===================================          UTILITIES          ====================================
+     * ====================================================================================================
+     * ====================================================================================================
      */
-
+    
     /**
-     * Transform an expression into a path
-     * @returns: a path
-     * @panic
+     * Converts a syntactic expression into a lookup path.
+     *
+     * @params:
+     *   - expr: the expression representing a path in a `use` declaration
+     *
+     * @returns:
+     *   A normalized `Path` object suitable for module‑resolution routines.
+     *
+     * @behavior:
+     *   If the expression is a `PathExpr`, its structured components are
+     *   converted into a standard lookup path via `toStdPath()`.
+     *
+     *   Otherwise, the expression is treated as a single‑segment path whose
+     *   name is the textual content of the expression.
+     *          
      */
-    fn toPath (self, expr : &Expression)-> Path {
+    fn toPath (self, expr: &Expression)-> Path {
         match expr {
-            p : &PathExpr => {
+            p: &PathExpr => {
                 p.toStdPath ()
             }
             _ => {
-                Path (expr.getLoc ().str)
+                Path (expr.loc.str)
             }
         }
     }
-
+    
     /**
-     * @returns: the location of the 'index' path element in the path
-     * */
-    fn getPathIndexLoc (self, expr : &Expression, index : usize)-> &Word {
+     * Returns the source location of a specific segment in a path expression.
+     *
+     * @params:
+     *   - expr:   the expression representing a path in a `use` declaration
+     *   - index:  the index of the path segment whose location is requested
+     *
+     * @returns:
+     *   The `Word` corresponding to the location of the `index`‑th segment of
+     *   the path. If the expression is not a `PathExpr`, or if the requested
+     *   index exceeds the number of recorded segment locations, the location of
+     *   the whole expression is returned instead.
+     *
+     * @behavior:
+     *   For `PathExpr`, the function retrieves the list of segment locations
+     *   produced by the parser. If the list contains a location for the given
+     *   index, that location is returned. Otherwise, the function falls back to
+     *   the expression’s own location.
+     *   
+     */
+    fn getPathIndexLoc (self, expr: &Expression, index: usize)-> &Word {
         match expr {
-            p : &PathExpr => {
+            p: &PathExpr => {
                 let locs = p.getLocs ();
-                if (locs.len < index) { expr.getLoc () }
+                if (locs.len < index) { expr.loc }
                 else { locs [index] }
             }
             _ => {
-                expr.getLoc ()
+                expr.loc
             }
         }
     }
 
     /*!
-     * ================================================================================
-     * ================================================================================
-     * =========================           GETTERS            =========================
-     * ================================================================================
-     * ================================================================================
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          GETTERS          =====================================
+     * ====================================================================================================
+     * ====================================================================================================
      */
 
     /**
-     * @returns: the mutable version of a symbol from its immutable address
-     * @panic: if the symbol was not declared nor registered by this declarator
-     * */
-    pub fn getMutableSymbol (mut self, sym : &Symbol)-> dmut &Symbol {
+     * Returns a mutable reference to a symbol.
+     *
+     * @params:
+     *   - sym: the symbol for which mutable access is requested
+     *
+     * @returns:
+     *   A mutable reference to the same symbol.
+     *
+     * @behavior:
+     *   Provides mutable access to a symbol that was originally obtained through
+     *   an immutable reference. Since the declarator owns the symbol table, it
+     *   can safely recover mutability for any symbol that belongs to that table.
+     *   This operation does not change the identity or location of the symbol;
+     *   it merely exposes its mutable view for further updates.
+     *
+     *   The lookup is guaranteed to succeed for all symbols managed by the
+     *   declarator. If the symbol does not belong to the declarator’s symbol
+     *   table, the behavior is undefined and may result in a runtime error.
+     *   
+     */
+    pub fn getMutableSymbol (mut self, sym: &Symbol)-> dmut &Symbol {
         // Since we have access to the declarator, we have access to the symbol table
         // Thus we can find mutable access to the symbol,
         // We do some cheating to go faster, but the result is the same
@@ -1648,14 +2518,14 @@ pub class Declarator {
 
         // let dmut r = self._root:.getMutableSymbol (sym);
         // match alias r {
-        //     Ok (dmut v : _) => return alias v;
+        //     Ok (dmut v: _) => return alias v;
         //     _ => {
 
         //         let dmut forR = self._foreignRoot:.getMutableSymbol (sym);
         //         match alias forR {
-        //             Ok (dmut v : _) => { return alias v; }
+        //             Ok (dmut v: _) => { return alias v; }
         //             _ => {
-        //                 eprintln ("Symbol not found in sym table : ", sym.getPath ().toStr ());
+        //                 eprintln ("Symbol not found in sym table: ", sym.path.toStr ());
         //                 panic;
         //             }
         //         }
@@ -1664,30 +2534,67 @@ pub class Declarator {
     }
 
     /**
-     * @returns: the protection the 'context' has on the symbol 'sym'
-     * */
-    pub fn getProtectionFromContext (self, context : &Symbol, sym : &Symbol)-> Protection {
+     * Determines the effective protection of a symbol relative to a given context.
+     *
+     * @params:
+     *   - context: the symbol from which access is being evaluated
+     *   - sym:     the symbol whose protection is being queried
+     *
+     * @returns:
+     *   `PRIVATE` if `context` is inside `sym` (i.e., `sym` appears in the
+     *   referent chain of `context`), otherwise `PUBLIC`.
+     *
+     * @behavior:
+     *   Walks upward through the referent chain starting from `context`. If the
+     *   walk encounters `sym`, then the access originates from within the symbol
+     *   itself or one of its descendants, and the symbol is considered private.
+     *
+     *   If the walk reaches the top of the chain (`EmptySymbol`) without
+     *   encountering `sym`, then the access originates from outside the symbol’s
+     *   lexical scope, and the symbol is considered public.
+     *
+     *   This provides a fast, structural test for visibility based solely on
+     *   lexical containment, without consulting the symbol table.
+     *
+     */
+    pub fn getProtectionFromContext (self, context: &Symbol, sym: &Symbol)-> Protection {
         let mut current = context;
         loop {
             match current {
                 EmptySymbol () => { break Protection::PUBLIC; }
-                c : _ => {
+                c: _ => {
                     if (c is sym) {
                         break Protection::PRIVATE;
                     }
                 }
             }
-            current = current.getReferent ();
+            current = current.referent;
         }
     }
-
+    
     /**
-     * Get a list of symbol from a global access, where current context is 'context'
+     * Looks up globally visible symbols by name, relative to a given context.
+     *
      * @params:
-     *    - name: the name of the symbol to find
-     *    - context: the context in which symbols is searched
-     * */
-    pub fn getGlobal (mut self, name : [c8], context : &Symbol)-> [&Symbol] {
+     *   - name:    the name of the symbol to search for
+     *   - context: the symbol from which the lookup originates
+     *
+     * @returns:
+     *   The list of symbols matching `name` as seen from `context`. The result
+     *   may contain zero, one, or multiple symbols depending on the structure
+     *   of the module tree.
+     *
+     * @behavior:
+     *   Performs a global lookup for the given name. The search first queries
+     *   the global namespace reachable from `context` via `context.getSymbols`.
+     *   If no symbol is found there, the lookup falls back to the foreign‑root
+     *   namespace, allowing access to symbols imported from external units.
+     *
+     *   No protection checks are performed here; this function only retrieves
+     *   symbols that are globally visible from the declarator’s perspective.
+     *
+     */
+    pub fn getGlobal (mut self, name: [c8], context: &Symbol)-> [&Symbol] {
         let mut root = context.getSymbols (name)[];
         if (root.len  == 0us) {
             root = self._foreignRoot.getSymbols (name)[];
@@ -1697,76 +2604,149 @@ pub class Declarator {
     } 
 
     /**
-     * Get a list of symbol declared locally inside 'sym' from the context 'context' that might have no access to private syms
+     * Performs a context‑sensitive lookup of locally declared symbols inside a module.
+     *
      * @params:
-     *    - name: the name of the symbol to access
-     *    - context: the context of the access
-     *    - sym: the symbol being accessed
-     *    - protection: the protection to apply if symbol only have public access
-     * */
-    pub fn getLocalFromContext (mut self, name : [c8], context : &Symbol, sym : &Symbol, protection : Protection = Protection::PUBLIC)-> dmut [&Symbol] {
+     *   - name:       the name of the symbol to search for
+     *   - context:    the symbol from which access is being evaluated
+     *   - sym:        the module in which the lookup is performed
+     *   - protection: the default protection to apply when the context is outside `sym`
+     *
+     * @returns:
+     *   The list of locally declared symbols in `sym` matching `name`, filtered
+     *   according to the effective protection level.
+     *
+     * @behavior:
+     *   Retrieves a mutable view of the module symbol `sym` and determines the
+     *   effective protection of that module relative to the lookup `context`.
+     *   If the context is inside the module (i.e., `getProtectionFromContext`
+     *   returns `PRIVATE`), private members are visible. Otherwise, the lookup
+     *   uses the caller‑supplied `protection` value, typically `PUBLIC`.
+     *
+     *   The function then queries the module’s local symbol table using the
+     *   computed protection level, returning all matching symbols. No fallback
+     *   to parent scopes is performed; this is strictly a local lookup.
+     *
+     */
+    pub fn getLocalFromContext (mut self, name: [c8], context: &Symbol, sym: &Symbol, protection: Protection = Protection::PUBLIC)-> dmut [&Symbol] {
         let dmut module = self:.getMutableSymbol (sym);
-        let mut contextProt = self.getProtectionFromContext (context, sym);
-        if (contextProt == Protection::PUBLIC) { contextProt = protection; }
 
+        let contextProt = if protection != Protection::PUBLIC {
+            protection
+        } else {
+            self.getProtectionFromContext (context, sym)
+        };
+        
         let dmut res = (module:.getLocalSymbols (name, protection-> contextProt)):[];
         alias res
     }
 
     /**
-     * Get a list of symbol declared locally inside 'sym' from the context 'context' that might have no access to private syms
+     * Performs a context‑sensitive local lookup inside a symbol.
+     *
      * @params:
-     *    - name: the name of the symbol to access
-     *    - context: the context of the access
-     *    - sym: the symbol being accessed
-     *    - protection: the protection to apply if symbol only have public access
-     * */
-    pub fn getLocalFromContext (self, name : [c8], context : &Symbol, sym : &Symbol, protection : Protection = Protection::PUBLIC)-> [&Symbol] {
-        let mut contextProt = self.getProtectionFromContext (context, sym);
-        if (contextProt == Protection::PUBLIC) { contextProt = protection; }
+     *   - name:       the name of the symbol to search for
+     *   - context:    the symbol from which access is being evaluated
+     *   - sym:        the symbol in which the lookup is performed
+     *   - protection: the default protection to apply when the context is
+     *                 outside `sym` (defaults to `PUBLIC`)
+     *
+     * @returns:
+     *   The list of locally declared symbols in `sym` matching `name`,
+     *   filtered according to the effective protection level.
+     *
+     * @behavior:
+     *   Determines the effective protection of `sym` relative to the lookup
+     *   `context` using `getProtectionFromContext`. If the context is inside
+     *   `sym`, private members are visible. Otherwise, the lookup uses the
+     *   caller‑supplied `protection` value.
+     *
+     *   The function then queries `sym.getLocalSymbols` with the computed
+     *   protection level and returns all matching symbols. This is a strictly
+     *   local lookup: no parent scopes or global namespaces are consulted.
+     *
+     */
+    pub fn getLocalFromContext (self, name: [c8], context: &Symbol, sym: &Symbol, protection: Protection = Protection::PUBLIC)-> [&Symbol] {
+        let contextProt = if protection != Protection::PUBLIC {
+            protection
+        } else {
+            self.getProtectionFromContext (context, sym)
+        };
 
         let res = (sym.getLocalSymbols (name, protection-> contextProt))[];
         res
     }
 
     /**
-     * Get the list of symbol declared locally in 'sym' that are reachable from 'context'
+     * Retrieves all locally declared symbols inside `sym` that are visible from
+     * a given context.
+     *
      * @params:
-     *     - context: the context of the access
-     *     - sym: the symbol being accessed
-     *     - protection: the protection to apply if symbol only have public access
-     * */
-    pub fn getAllLocalFromContext (self, context : &Symbol, sym : &Symbol, protection : Protection = Protection::PUBLIC)-> [&Symbol] {
-        let mut contextProt = self.getProtectionFromContext (context, sym);
-        if (contextProt == Protection::PUBLIC) { contextProt = protection; }
+     *   - context:    the symbol from which access is being evaluated
+     *   - sym:        the symbol whose local members are being queried
+     *   - protection: the default protection to apply when the context is
+     *                 outside `sym` (defaults to `PUBLIC`)
+     *
+     * @returns:
+     *   The list of all local symbols declared in `sym` that are accessible
+     *   under the effective protection level.
+     *
+     * @behavior:
+     *   Determines the effective protection of `sym` relative to the lookup
+     *   `context` using `getProtectionFromContext`. If the context is inside
+     *   `sym`, private members are visible. Otherwise, the lookup uses the
+     *   caller‑supplied `protection` value.
+     *
+     *   The function then returns all local symbols of `sym` that satisfy this
+     *   protection level via `sym.getAllLocalSymbols`. Unlike name‑based
+     *   lookups, this returns the entire visible set rather than filtering by
+     *   identifier.
+     *
+     */
+    pub fn getAllLocalFromContext (self, context: &Symbol, sym: &Symbol, protection: Protection = Protection::PUBLIC)-> [&Symbol] {
+        let contextProt = if protection != Protection::PUBLIC {
+            protection
+        } else {
+            self.getProtectionFromContext (context, sym)
+        };
 
         let res = (sym.getAllLocalSymbols (protection-> contextProt));
         res
     }
 
     /**
-     * Get a list of symbol declared locally inside 'sym' from the context 'context' that might have no access to private syms
-     * And whose name are close to 'name' with a distance of 'distance'
+     * Retrieves locally declared symbols inside `sym` whose names are close to
+     * the requested one, for use in error reporting.
+     *
      * @params:
-     *    - name: the name of the symbol to access
-     *    - distance: the distance between the names to seek and the symbols in the module 'sym'
-     *    - context: the context of the access
-     *    - sym: the symbol being accessed
-     *    - protection: the protection to apply if symbol only have public access
-     * */
-    pub fn getCloseLocalFromContext (self, name : [c8], distance : usize = 2us, context : &Symbol, sym : &Symbol, protection : Protection = Protection::PUBLIC)-> [&Symbol] {
-        let mut contextProt = self.getProtectionFromContext (context, sym);
-        if (contextProt == Protection::PUBLIC) { contextProt = protection; }
+     *   - name:       the (possibly misspelled) name being searched
+     *   - distance:   the maximum edit-distance threshold to consider (defaults to 2)
+     *   - context:    the symbol from which access is being evaluated
+     *   - sym:        the symbol in which the lookup is performed
+     *   - protection: the default protection to apply when the context is
+     *                 outside `sym` (defaults to `PUBLIC`)
+     *
+     * @returns:
+     *   A list of symbols declared in `sym` whose names are within the given
+     *   edit-distance of `name`, filtered according to the effective protection
+     *   level.
+     *
+     * @behavior:
+     *   This function is intended for diagnostic assistance. It does not perform
+     *   semantic lookup. Instead, it searches for symbols whose names are *close*
+     *   to the requested identifier, helping the compiler suggest likely intended
+     *   names when a lookup fails.
+     *   
+     */
+    pub fn getCloseLocalFromContext (self, name: [c8], distance: usize = 2us, context: &Symbol, sym: &Symbol, protection: Protection = Protection::PUBLIC)-> [&Symbol] {
+        let contextProt = if protection != Protection::PUBLIC {
+            protection
+        } else {
+            self.getProtectionFromContext (context, sym)
+        };    
 
         let res = (sym.getCloseLocalSymbols (name, distance-> distance, protection-> contextProt))[];
         res
-    }
-
-    /**
-     * @returns: the absolute path of the package being compiled
-     * */
-    pub fn getPackageDir (self)-> Path {
-        self._packageDir
     }
 
     /*!
@@ -1778,14 +2758,39 @@ pub class Declarator {
      */
 
     /**
-     * Create an error message for a global access that was unsuccessful
+     * Constructs a diagnostic describing an invalid global access, optionally
+     * enriched with suggestions for similarly named symbols.
+     *
      * @params:
-     *    - loc: the location of the access
-     *    - name: the name of the symbol being accessed
-     *    - sym: the context of the access
-     * */
-    pub fn createGlobalAccessError (self, loc : &Word, name : [c8], sym : &Symbol)-> &ErrorMsg {
-        let mut notes : [mut &ErrorMsg] = [];
+     *   - loc:  the source location of the invalid access
+     *   - name: the name that was accessed
+     *   - sym:  the symbol in which the lookup was attempted
+     *
+     * @returns:
+     *   A fatal `ErrorMsg` describing the undefined or inaccessible symbol,
+     *   annotated with contextual notes pointing to possible intended symbols.
+     *   The message is allocated and returned but not thrown; the caller is
+     *   responsible for raising it.
+     *
+     * @behavior:
+     *   Attempts to retrieve all symbols named `name` inside `sym` using
+     *   `PRIVATE` visibility. If such symbols exist, the error reports that
+     *   the symbol is private in this context.
+     *
+     *   If no symbol with the exact name exists, the function searches for
+     *   symbols whose names are *close* to `name` (edit‑distance <= 2). This
+     *   is used for typo‑recovery diagnostics, allowing the compiler to emit
+     *   suggestions such as:
+     *
+     *       “Unknown symbol ‘fop’. Did you mean: ‘foo’, ‘pop’?”
+     *
+     *   For each suggested symbol, a note is added showing its location and
+     *   the module or scope it belongs to. Duplicate paths are filtered to
+     *   avoid redundant notes.
+     *     
+     */
+    pub fn createGlobalAccessError (self, loc: &Word, name: [c8], sym: &Symbol)-> &ErrorMsg {
+        let mut notes: [mut &ErrorMsg] = [];
         let mut syms = sym.getSymbols (name, protection-> Protection::PRIVATE)[];
 
         let mut msgFrom = DeclareErrorMessage::PRIVATE_IN_THIS_CONTEXT_FROM_MOD, mut msgNonFrom = DeclareErrorMessage::PRIVATE_IN_THIS_CONTEXT;
@@ -1797,15 +2802,15 @@ pub class Declarator {
             msgNonFrom = DeclareErrorMessage::MAYBE_WAS_MEANT;
         }
 
-        let dmut used : [Path => ()] = copy [];
+        let dmut used: [Path => ()] = copy [];
         for s in syms { // add the notes to the error
-            let stdPath = s.getPath ().asStdPath ();
+            let stdPath = s.path.asStdPath ();
             if (stdPath !in used) {
                 let p = stdPath.parent ().toStr (sep-> "::");
                 if (p.len != 0us) {
-                    notes ~= [copy ErrorMsg::note (s.getLoc (), oneLine-> true, format (msgFrom, stdPath.file (), p))];
+                    notes ~= [copy ErrorMsg::note (s.loc, oneLine-> true, format (msgFrom, stdPath.file (), p))];
                 } else
-                    notes ~= [copy ErrorMsg::note (s.getLoc (), oneLine-> true, format (msgNonFrom, stdPath.file ()))];
+                    notes ~= [copy ErrorMsg::note (s.loc, oneLine-> true, format (msgNonFrom, stdPath.file ()))];
 
                 used [stdPath] = ();
             }
@@ -1816,14 +2821,37 @@ pub class Declarator {
     }
 
     /**
-     * Create an error message for a local access that was unsuccessful
+     * Constructs diagnostic notes describing an invalid local access, optionally
+     * enriched with suggestions for similarly named local symbols.
+     *
      * @params:
-     *    - loc: the location of the access
-     *    - name: the name of the symbol being accessed
-     *    - sym: the context of the access
-     * */
-    pub fn createLocalAccessError (self, _ : &Word, name : [c8], sym : &Symbol, context : &Symbol)-> [&ErrorMsg] {
-        let mut notes : [mut &ErrorMsg] = [];
+     *   - name:    the name that was accessed
+     *   - sym:     the symbol in which the lookup was performed
+     *   - context: the symbol from which access is being evaluated
+     *
+     * @returns:
+     *   A list of `ErrorMsg` notes describing inaccessible or potentially intended
+     *   local symbols. This function does not create the main error itself; it
+     *   only produces the supplementary notes that accompany it.
+     *
+     * @behavior:
+     *   Attempts to retrieve all local symbols named `name` inside `sym` using
+     *   `PRIVATE` visibility. If such symbols exist, the notes describe that the
+     *   symbol is private in this context.
+     *
+     *   If no symbol with the exact name exists, the function searches for local
+     *   symbols whose names are *close* to `name` (edit‑distance <= 2). This is
+     *   used for typo‑recovery diagnostics, allowing the compiler to suggest
+     *   likely intended names when a local lookup fails.
+     *
+     *   For each suggested symbol, a note is added showing its location and the
+     *   module or scope it belongs to. Duplicate paths are filtered to avoid
+     *   redundant notes. The resulting list is returned to be attached to a
+     *   higher‑level error message by the caller.
+     *
+     */
+    pub fn createLocalAccessError (self, _: &Word, name: [c8], sym: &Symbol, context: &Symbol)-> [&ErrorMsg] {
+        let mut notes: [mut &ErrorMsg] = [];
 
         // Search all the local symbols with the same name but that are not accessible
         let mut syms = sym.getLocalSymbols (name, protection-> Protection::PRIVATE)[];
@@ -1837,15 +2865,15 @@ pub class Declarator {
             msgNonFrom = DeclareErrorMessage::MAYBE_WAS_MEANT;
         }
 
-        let dmut used : [Path => ()] = copy [];
+        let dmut used: [Path => ()] = copy [];
         for s in syms { // add the notes to the error
-            let stdPath = s.getPath ().asStdPath ();
+            let stdPath = s.path.asStdPath ();
             if (stdPath !in used) {
                 let p = stdPath.parent ().toStr (sep-> "::");
                 if (p.len != 0us) {
-                    notes ~= [copy ErrorMsg::note (s.getLoc (), oneLine-> true, format (msgFrom, stdPath.file (), p))];
+                    notes ~= [copy ErrorMsg::note (s.loc, oneLine-> true, format (msgFrom, stdPath.file (), p))];
                 } else
-                    notes ~= [copy ErrorMsg::note (s.getLoc (), oneLine-> true, format (msgNonFrom, stdPath.file ()))];
+                    notes ~= [copy ErrorMsg::note (s.loc, oneLine-> true, format (msgNonFrom, stdPath.file ()))];
 
                 used [stdPath] = ();
             }
@@ -1863,12 +2891,36 @@ pub class Declarator {
      */
 
     /**
-     * Check wether the module path is to be compiled by the filter
-     * */
-    pub fn checkPassFilter (self, importPath : Path)-> bool {
+     * Determines whether a module should be compiled based on the active module
+     * filters and the package directory.
+     *
+     * @params:
+     *   - importPath: the path of the module being considered
+     *
+     * @returns:
+     *   `true` if the module passes the filter and should be compiled,
+     *   `false` if it should be skipped (lazy‑loaded or ignored).
+     *
+     * @behavior:
+     *   Computes the absolute module location by stripping the file extension.
+     *   The root module (empty location) always passes.
+     *
+     *   If the module is outside the package directory, it is considered an
+     *   external module and is always treated as lazy; such modules do not pass
+     *   the filter.
+     *
+     *   If no module filters are active, all modules inside the package are
+     *   compiled unconditionally.
+     *
+     *   Otherwise, the module’s path relative to the package directory is
+     *   compared against the active filter list. A module passes only if its
+     *   relative path matches one of the filter entries.
+     *
+     */
+    pub fn checkPassFilter (self, importPath: Path)-> bool {
         let absLoc = importPath.stripExtension ();
         if (absLoc.isEmpty ()) return true; // root module
-        if !self._packageDir.isPrefix (absLoc) { // External module are always lazy
+        if !self.packageDir.isPrefix (absLoc) { // External module are always lazy
             return false;
         }
 
@@ -1877,7 +2929,7 @@ pub class Declarator {
             return true;
         }
 
-        let relLoc = absLoc.removePrefix (self._packageDir);
+        let relLoc = absLoc.removePrefix (self.packageDir);
         for p in state::instance ().getModuleFilters () {
             if p == relLoc { // in the file
                 return true;
@@ -1888,9 +2940,32 @@ pub class Declarator {
     }
 
     /**
-     * Check wether the module being compiled is the parent of a sub module in module filters
-     * */
-    pub fn isParentOfFilter (self, symPath : &SymbolPath)-> bool {
+     * Determines whether a symbol path lies under (is a descendant of) any of the
+     * active module filters.
+     *
+     * @params:
+     *   - symPath: the symbol path being tested
+     *
+     * @returns:
+     *   `true` if `symPath` is a prefix‑match descendant of at least one module
+     *   filter; `false` otherwise.
+     *
+     * @behavior:
+     *   Converts the symbol path to its standard filesystem‑like representation
+     *   and checks whether it begins with any of the active module filter paths.
+     *
+     *   This is used to decide whether a symbol belongs to a module that should
+     *   be compiled when filters are active. A module passes if it is *inside*
+     *   (i.e., a child of) any filter path, even if it is not itself explicitly
+     *   listed.
+     *
+     * @example:
+     *     Filter:   "foo/bar"
+     *     symPath:  "foo/bar/baz/qux"
+     *     Result:   true
+     *
+     */
+    pub fn isParentOfFilter (self, symPath: &SymbolPath)-> bool {
         let mut path = symPath.asStdPath ();
 
         for p in state::instance ().getModuleFilters () {
@@ -1900,21 +2975,43 @@ pub class Declarator {
         false
     }
 
-
     /*!
-     * ================================================================================
-     * ================================================================================
-     * =========================        MISCELLANEOUS         =========================
-     * ================================================================================
-     * ================================================================================
+     * ====================================================================================================
+     * ====================================================================================================
+     * ===================================          FORMATTING          ===================================
+     * ====================================================================================================
+     * ====================================================================================================
      */
 
     impl Formattable {
 
-        pub over format (self, dmut stream : &Formatter) {
-            stream:.write (" LOCAL : \n");
+        /**
+         * Formats the full symbol environment into the provided formatter stream.
+         *
+         * @params:
+         *   - stream: the output formatter receiving the textual representation
+         *
+         * @behavior:
+         *   Writes a human‑readable dump of the symbol environment, consisting of:
+         *
+         *     - the local symbol tree rooted at `_root`
+         *     - the external (foreign) symbol tree rooted at `_foreignRoot`
+         *
+         *   Each tree is printed with a section header ("LOCAL:" and "EXTERNAL:")
+         *   followed by a recursive traversal performed by `formatSymTree`.
+         *
+         *   This function is intended for debugging, logging, and developer‑facing
+         *   inspection of the declarator’s internal state. It does not perform any
+         *   semantic checks and does not modify the symbol environment.
+         *
+         * @throws:
+         *   This function does not throw. All output is written directly to the
+         *   provided formatter.
+         */
+        pub over format (self, dmut stream: &Formatter) {
+            stream:.write (" LOCAL: \n");
             self._root.formatSymTree (alias stream);
-            stream:.write (" EXTERNAL : \n");
+            stream:.write (" EXTERNAL: \n");
             self._foreignRoot.formatSymTree (alias stream);
         }
     }

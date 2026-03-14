@@ -1,0 +1,632 @@
+/*
+ * Implements compile-time reduction logic for integer operators.
+ *
+ * This module is part of the semantic interpreter and provides the full
+ * reduction pipeline for integer expressions. It supports:
+ *
+ *   - bitwise operators (&, |, ^, <<, >>),
+ *   - comparison operators (<, <=, >, >=, ==, !=),
+ *   - arithmetic operators (+, -, *, /, %),
+ *   - special integer operators (DXOR, exponentiation, etc.),
+ *   - overflow detection for all integer operations,
+ *   - computation of representable integer bounds.
+ *
+ * Reduction strategy:
+ *   - Operands are reduced using `reduceInOperator`, which performs lazy,
+ *     context-aware compile-time evaluation.
+ *   - When both operands are IntValue literals, full CTE evaluation is
+ *     performed.
+ *   - When only one operand is a literal, partial evaluation rules are
+ *     applied (e.g., x + 0 → x, x * 1 → x, x * 0 → 0).
+ *   - When no reduction is possible, the operator is reconstructed with
+ *     reduced operands and marked as reduced.
+ *
+ * Overflow handling:
+ *   - All integer operations must respect the representable range of the
+ *     target IntType.
+ *   - Overflow is detected during compile-time evaluation and reported as a
+ *     fatal error.
+ *
+ * Integer bounds:
+ *   - `createIntMaxValue` and `createIntMinValue` compute the maximum and
+ *     minimum representable values for integer types.
+ *   - These functions support both fixed-size integer types and the special
+ *     “size type” whose width depends on the target platform.
+ *
+ * <hr>
+ * 
+ * @Package: ymirc        
+ * @Module: ymirc::semantic::validator::interpret::int
+ * @File: ymirc/semantic/validator/interpret/int.yr
+ * @Author(s):
+ *   - Emile Cadorel <ecadorel@gmail.com>
+ *
+ * @Created (YYYY-MM-DD): 2026-03-13
+ * @Copyright (C) 2021–2026 GNU-Ymir
+ * @License
+ *   ```text
+ *   This file is part of the Ymir language project.
+ *
+ *   Ymir is free software: you can redistribute it and/or modify it
+ *   under the terms of the GNU General Public License as published by
+ *   the Free Software Foundation, either version 3 of the License, or
+ *   (at your option) any later version.
+ *
+ *   Ymir is distributed in the hope that it will be useful,
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *   GNU General Public License for more details.
+ *
+ *   You should have received a copy of the GNU General Public License
+ *   along with Ymir.  If not, see <https://www.gnu.org/licenses/>.
+ *   ```
+ */
+
+in int;
+
+use ymirc::semantic::generator::{_, value::_, type::_};
+use ymirc::global;
+
+use ymirc::semantic::validator::errors;
+use ymirc::errors::message;
+
+use ymirc::utils::{format, bigint};
+use ymirc::lexing::{word, keys};
+
+/**
+ * Integer operator reduction subsystem.
+ *
+ * This module defines the reduction logic for all integer-related operators
+ * encountered during compile-time evaluation. Each operator kind has a
+ * dedicated entry point:
+ *
+ *   - `reduceBit`  : bitwise operators,
+ *   - `reduceCmp`  : comparison operators,
+ *   - `reduceMath` : arithmetic operators,
+ *   - `reduceSpe`  : special integer operators.
+ *
+ * Reduction is attempted whenever operands are compile-time constants. When
+ * only one operand is constant, partial evaluation rules are applied to
+ * simplify the expression. When no reduction is possible, the operator is
+ * reconstructed with reduced operands.
+ *
+ * The module also provides overflow-checking utilities and functions to
+ * compute the representable bounds of integer types.
+ */
+pub mod IntInterpret {
+
+    /**
+     * Reduces a bitwise integer operator.
+     *
+     * Both operands are reduced normally. If both operands are IntValue literals,
+     * the bitwise operation is evaluated at compile time. Otherwise, the operator
+     * is reconstructed with reduced operands.
+     *
+     * Bitwise operations cannot overflow.
+     * 
+     */
+    pub fn reduceBit (dmut context: &CompileTimeInterpreter, bin: &BitwiseIntOperatorValue)-> &Value
+        throws ErrorMsg
+    {
+        return copy BitwiseIntOperatorValue (bin.loc,
+                                             bin.type,
+                                             bin.op,
+                                             context:.reduce (bin.left),
+                                             context:.reduce (bin.right),
+                                             isReduced-> true);
+    }
+
+    /**
+     * Reduces an integer comparison operator.
+     *
+     * Attempts a full compile-time reduction by delegating to the internal
+     * comparison routine. If the internal reducer returns a BoolValue, the
+     * comparison is fully folded. Otherwise, the operator is reconstructed with
+     * reduced operands.
+     *
+     * Parameters:
+     *   - context: the compile-time interpreter instance.
+     *   - bin:     the integer comparison operator.
+     *
+     * Returns:
+     *   A BoolValue when reduction succeeds, or a reduced CmpIntOperatorValue.
+     *
+     * Notes:
+     *   - Literal folding is attempted first.
+     *   - If folding fails, both operands are fully reduced and the operator
+     *     is rebuilt with `isReduced = true`.
+     *     
+     */
+    pub fn reduceCmp (dmut context: &CompileTimeInterpreter, bin: &CmpIntOperatorValue)-> &Value
+        throws ErrorMsg
+    {        
+        if let Ok (r) = IntInterpret::reduceCmp (alias context, bin.loc, bin.op, bin.left, bin.right) {
+            return r;
+        }
+
+        return copy CmpIntOperatorValue (bin.loc,                                         
+                                         bin.op,
+                                         left-> context:.reduce (bin.left),
+                                         right-> context:.reduce (bin.right),
+                                         isReduced-> true);
+    }
+
+    /**
+     * Attempts to reduce an integer comparison at compile time.
+     *
+     * This function performs the full constant-folding logic for integer
+     * comparisons. It handles:
+     *
+     *   • direct literal comparison (both operands IntValue),
+     *   • partial-evaluation rules when only one operand is literal,
+     *   • min/max bound reasoning based on the operand types,
+     *   • literal-equality folding when both operands reduce to identical values.
+     *
+     * Reduction rules:
+     *
+     *   1. Direct literal comparison:
+     *        - <, <=, >, >=, ==, != are evaluated immediately.
+     *
+     *   2. Partial evaluation when only the left operand is literal:
+     *        - If left == max(type) and op is <  → result is false.
+     *        - If left == min(type) and op is <= → result is true.
+     *        - If left == min(type) and op is >  → result is false.
+     *        - If left == max(type) and op is >= → result is true.
+     *
+     *   3. Partial evaluation when only the right operand is literal:
+     *        - If right == min(type) and op is <  → result is false.
+     *        - If right == max(type) and op is <= → result is true.
+     *        - If right == max(type) and op is >  → result is false.
+     *        - If right == min(type) and op is >= → result is true.
+     *
+     *   4. Literal-equality folding:
+     *        If both operands reduce to identical full literals:
+     *           ==  → true
+     *           !=  → false
+     *           <   → false
+     *           >   → false
+     *           <=  → true
+     *           >=  → true
+     *
+     * If none of the above rules apply, the function returns `none`, signaling
+     * that the caller should reconstruct the operator.
+     *
+     * Parameters:
+     *   - context: the compile-time interpreter instance.
+     *   - loc:     source location for error reporting.
+     *   - bop:     the comparison operator.
+     *   - bleft:   left operand.
+     *   - bright:  right operand.
+     *
+     * Returns:
+     *   `Ok(BoolValue)` when reduction succeeds, or `none` when folding is not possible.
+     *   
+     */
+    pub fn reduceCmp (dmut context: &CompileTimeInterpreter, loc: &Word, bop: BinaryOperators, bleft: &Value, bright: &Value)-> (&Value?)
+        throws ErrorMsg
+    {
+        let left = context:.reduceInOperator (bleft, checkCte-> false);
+        let right = context:.reduceInOperator (bright, checkCte-> false);
+        
+        let ritype = if let ri: &IntType = right.type { ri } else { panic; };
+        let litype = if let ri: &IntType = left.type { ri } else { panic; };
+
+        match (left, right) {
+            (l: &IntValue, r: &IntValue) => { // left and right are cte, easy
+                match bop {
+                    BinaryOperators::INF       => { return (copy BoolValue (loc, l.value < r.value))?; }
+                    BinaryOperators::SUP       => { return (copy BoolValue (loc, l.value > r.value))?; }
+                    BinaryOperators::INF_EQUAL => { return (copy BoolValue (loc, l.value <= r.value))?; }
+                    BinaryOperators::SUP_EQUAL => { return (copy BoolValue (loc, l.value >= r.value))?; }
+                    BinaryOperators::NOT_EQUAL => { return (copy BoolValue (loc, l.value != r.value))?; }
+                    BinaryOperators::DEQUAL    => { return (copy BoolValue (loc, l.value == r.value))?; }
+                }
+            }
+            (l: &IntValue, _) => { // only left is cte, but maybe there still s
+                let min = IntInterpret::createIntMinValue (litype);
+                let max = IntInterpret::createIntMaxValue (litype);
+                
+                let v = l.value;
+                match bop {
+                    BinaryOperators::INF => {
+                        if v == max { return (copy BoolValue (loc, false))?; } // max < right (i.e. right > max => false)
+                    }
+                    BinaryOperators::INF_EQUAL => {
+                        if v == min { return (copy BoolValue (loc, true))?; } // min <= right (i.e. right >= min => true)
+                    }
+                    BinaryOperators::SUP => {
+                        if v == min { return (copy BoolValue (loc, false))?; }  // min > right (i.e. right < min => false)
+                    }
+                    BinaryOperators::SUP_EQUAL => {
+                        if v == max { return (copy BoolValue (loc, true))?; } // max >= right (i.e. right <= max => true)
+                    }
+                }
+            }
+            (_, r: &IntValue) => { // only right is cte, but maybe there still things we can know
+                let min = IntInterpret::createIntMinValue (ritype);
+                let max = IntInterpret::createIntMaxValue (ritype);
+                
+                let v = r.value;
+                match bop {
+                    BinaryOperators::INF => {
+                        if v == min { return (copy BoolValue (loc, false))?; } // left < min => false
+                    }
+                    BinaryOperators::INF_EQUAL => {
+                        if v == max { return (copy BoolValue (loc, true))?; } // left <= max => true
+                    }
+                    BinaryOperators::SUP => {
+                        if v == max { return (copy BoolValue (loc, false))?; } // left > max => false
+                    }
+                    BinaryOperators::SUP_EQUAL => {
+                        if v == min { return (copy BoolValue (loc, true))?; }  // left >= min => true
+                    }
+                }
+            }
+        }
+
+        let resLeft = context:.reduce (bleft);
+        let resRight = context:.reduce (bright);
+        
+        if (resLeft is resRight) || (resRight.isFullLiteral && resLeft.isFullLiteral && resRight == resLeft) {
+            match bop {
+                BinaryOperators::DEQUAL    => { return (copy BoolValue (loc, true))?; }
+                BinaryOperators::NOT_EQUAL => { return (copy BoolValue (loc, false))?; }
+                BinaryOperators::SUP       => { return (copy BoolValue (loc, false))?; }
+                BinaryOperators::INF       => { return (copy BoolValue (loc, false))?; }
+                BinaryOperators::INF_EQUAL => { return (copy BoolValue (loc, true))?; }
+                BinaryOperators::SUP_EQUAL => { return (copy BoolValue (loc, true))?; }
+            }
+        }
+
+        return none;        
+    }
+
+    /**
+     * Reduces an integer arithmetic operator.
+     *
+     * Steps:
+     *   1. Reduce both operands using `reduceInOperator`.
+     *   2. If both operands are IntValue literals:
+     *        - evaluate the arithmetic operation,
+     *        - detect division by zero,
+     *        - detect overflow using `verifyOverflowInt`,
+     *        - return an IntValue.
+     *   3. If only one operand is a literal, apply partial evaluation rules:
+     *        - x * 1 → x
+     *        - x * 0 → 0
+     *        - x + 0 → x
+     *        - x - 0 → x
+     *        - 0 - x → -x
+     *        - x / 1 → x
+     *        - detect division by zero early.
+     *   4. Otherwise, reconstruct the operator with reduced operands.
+     *
+     * Returns:
+     *   A reduced IntValue or a reduced MathIntOperatorValue.
+     */
+    pub fn reduceMath (dmut context: &CompileTimeInterpreter, bin: &MathIntOperatorValue)-> &Value
+        throws ErrorMsg
+    {
+        let left = context:.reduceInOperator (bin.left, checkCte-> false);
+        let right = context:.reduceInOperator (bin.right, checkCte-> false);
+        
+        let type = if let t: &IntType = bin.type { t } else { panic; };
+
+        match (left, right) {
+            (l: &IntValue, r: &IntValue) => {
+                let v = match bin.op {
+                    BinaryOperators::PLUS  => { l.value + r.value }
+                    BinaryOperators::MINUS => { l.value - r.value }
+                    BinaryOperators::STAR  => { l.value * r.value }
+                    BinaryOperators::PERCENT => {
+                        if (r.value == 0) {
+                            throw copy ErrorMsg::fatal (bin.loc, ValidateErrorMessage::DIVISION_BY_ZERO);
+                        }
+
+                        {
+                            l.value % r.value
+                        } catch { _ => panic; }
+                    }
+                    BinaryOperators::DIV => {
+                        if (r.value == 0) {
+                            throw copy ErrorMsg::fatal (bin.loc, ValidateErrorMessage::DIVISION_BY_ZERO);
+                        }
+
+                        {
+                            l.value / r.value
+                        } catch { _ => panic; }
+                    }
+                    _ => { // unknown operator ?
+                        return copy MathIntOperatorValue (bin.loc,
+                                                          bin.type,
+                                                          bin.op,
+                                                          context:.reduce (bin.left),
+                                                          context:.reduce (bin.right),
+                                                          isReduced-> true);
+                    }
+                };
+
+                IntInterpret::verifyOverflow (bin.loc, type, v);
+                return copy IntValue (bin.loc, type, v);
+            }
+            (_, r: &IntValue) => {
+                if (bin.op == BinaryOperators::PERCENT || bin.op == BinaryOperators::DIV) {
+                    if (r.value == 0) {
+                        throw copy ErrorMsg::fatal (bin.loc, ValidateErrorMessage::DIVISION_BY_ZERO);
+                    }
+                }
+                if (bin.op == BinaryOperators::STAR && r.value == 1) {
+                    return context:.reduce (bin.left);
+                }
+                if (bin.op == BinaryOperators::STAR && r.value == 0) {
+                    return r;
+                }
+                if (bin.op == BinaryOperators::PLUS && r.value == 0) {
+                    return context:.reduce (bin.left);
+                }
+                if (bin.op == BinaryOperators::MINUS && r.value == 0) {
+                    return context:.reduce (bin.left);
+                }
+                if (bin.op == BinaryOperators::DIV && r.value == 1) {
+                    return context:.reduce (bin.left);
+                }
+            }
+            (l: &IntValue, _) => {
+                if (bin.op == BinaryOperators::STAR && l.value == 1) {
+                    return context:.reduce (bin.right);
+                }
+                if (bin.op == BinaryOperators::STAR && l.value == 0) {
+                    return l;
+                }
+                if (bin.op == BinaryOperators::PLUS && l.value == 0) {
+                    return context:.reduce (bin.right);
+                }
+                if (bin.op == BinaryOperators::MINUS && l.value == 0) {
+                    return copy UnaryOperatorValue (bin.loc, right.type, UnaryOperators::MINUS, context:.reduce (bin.right), isReduced-> true);
+                }
+            }
+        }
+
+        return copy MathIntOperatorValue (bin.loc,
+                                          bin.type,
+                                          bin.op,
+                                          context:.reduce (bin.left),
+                                          context:.reduce (bin.right),
+                                          isReduced-> true);
+    }
+
+    /**
+     * Reduces a special integer operator.
+     *
+     * Special integer operators include DXOR (exponentiation) and other
+     * integer-specific operations requiring custom semantics.
+     *
+     * When both operands are IntValue literals and the operator is DXOR,
+     * exponentiation is performed via `computeBinMathIntPow`. Overflow is
+     * detected and reported.
+     *
+     * Otherwise, the operator is reconstructed with reduced operands and
+     * reduced call arguments.
+     * 
+     */
+    pub fn reduceSpe (dmut context: &CompileTimeInterpreter, bin: &SpecialMathIntOperatorValue)-> &Value
+        throws ErrorMsg
+    {
+        let left = context:.reduceInOperator (bin.left, checkCte-> false);
+        let right = context:.reduceInOperator (bin.right, checkCte-> false);
+        
+        let type = if let t: &IntType = bin.type { t } else { panic; };
+        
+        if let (l: &IntValue, r: &IntValue) = (left, right) && bin.op == BinaryOperators::DXOR {
+            return IntInterpret::computeBinMathIntPow (bin.loc, type, l, r);                 
+        }    
+
+        return copy SpecialMathIntOperatorValue (loc->       bin.loc,
+                                                 type->      bin.type,
+                                                 op->        bin.op,
+                                                 left->      context:.reduce (bin.left),
+                                                 right->     context:.reduce (bin.right),
+                                                 call->      context:.reduce (bin.call),
+                                                 isReduced-> true);
+    }
+
+    /**
+     * Computes integer exponentiation for DXOR.
+     *
+     * Parameters:
+     *   - loc:   source location for error reporting.
+     *   - type:  the target integer type.
+     *   - left:  base value.
+     *   - right: exponent value.
+     *
+     * Throws:
+     *   - ErrorMsg::fatal on overflow or invalid exponentiation.
+     *
+     * Returns:
+     *   A reduced IntValue containing the exponentiation result.
+     */
+    fn computeBinMathIntPow (loc: &Word, type: &IntType, left: &IntValue, right: &IntValue)-> &Value
+        throws ErrorMsg
+    {
+        let r = {
+            left.value ^^ right.value
+        } catch {
+            _ => throw copy ErrorMsg::fatal (loc, format (ValidateErrorMessage::OVERFLOW_CAPACITY, right.type, right, u64::max));
+        }
+
+        IntInterpret::verifyOverflow (loc, type, r);
+
+        return copy IntValue (loc, type, r);
+    }
+
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * =====================================          UNARY          ======================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Reduces a unary operator applied to an integer expression.
+     *
+     * Supported operation:
+     *   • unary minus ( -x )
+     *
+     * Reduction strategy:
+     *   1. The operand is first reduced using `reduceInOperator`, which performs
+     *      context-aware reduction without forcing full CTE evaluation.
+     *
+     *   2. If the operand is an IntValue literal and the operator is MINUS:
+     *        - the negation is computed at compile time,
+     *        - the result is returned as a new IntValue.
+     *
+     *   3. Otherwise, the unary operator is reconstructed with a fully reduced
+     *      operand and marked as reduced.
+     *
+     * Notes:
+     *   - Negation is performed using BigInt arithmetic to preserve precision.     
+     *
+     * Parameters:
+     *   - context: the compile-time interpreter instance.
+     *   - un:      the unary operator to reduce.
+     *
+     * Returns:
+     *   A reduced Value corresponding to the unary operation.
+     *   
+     */
+    pub fn reduceUnary (dmut context: &CompileTimeInterpreter, un: &UnaryOperatorValue)-> &Value
+        throws ErrorMsg
+    {
+        let content = context:.reduceInOperator (un.value, checkCte-> false);        
+        if let (v: &IntValue, it: &IntType) = (content, un.type) && un.op == UnaryOperators::MINUS {
+            return copy IntValue (un.loc, it, copy BigInt (0) - v.value);
+        }
+        
+        return copy UnaryOperatorValue (loc-> un.loc,
+                                        type-> un.type,
+                                        op-> un.op,
+                                        value-> context:.reduce (un.value),
+                                        isReduced-> true);
+    }
+
+    
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * =====================================          CHECKS          =====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */    
+    
+    /**
+     * Verifies that a usize value fits within the representable range of the
+     * given IntType.
+     *
+     * Throws:
+     *   - ErrorMsg::fatal when the value exceeds the type’s capacity.
+     */
+    pub fn verifyOverflow (loc: &Word, type: &IntType, value: usize)
+        throws ErrorMsg
+    {
+        let max = IntInterpret::createIntMaxValue (type);
+        let min = IntInterpret::createIntMinValue (type);
+
+        if (value > max) {
+            throw copy ErrorMsg::fatal (loc, format (ValidateErrorMessage::OVERFLOW_CAPACITY, type, value, max));
+        }
+        if (value < min) {
+            throw copy ErrorMsg::fatal (loc, format (ValidateErrorMessage::OVERFLOW_CAPACITY_MIN, type, value, min));
+        }
+    }
+
+    /**
+     * Verifies that a BigInt value fits within the representable range of the
+     * given IntType.
+     *
+     * Throws:
+     *   - ErrorMsg::fatal when the value exceeds the type’s capacity.
+     */
+    pub fn verifyOverflow (loc: &Word, type: &IntType, value: &BigInt)
+        throws ErrorMsg
+    {
+        let max = IntInterpret::createIntMaxValue (type);
+        let min = IntInterpret::createIntMinValue (type);
+
+        if (value > max) {
+            throw copy ErrorMsg::fatal (loc, format (ValidateErrorMessage::OVERFLOW_CAPACITY, type, value, max));
+        }
+        if (value < min) {
+            throw copy ErrorMsg::fatal (loc, format (ValidateErrorMessage::OVERFLOW_CAPACITY_MIN, type, value, min));
+        }
+    }
+
+    /**
+     * Computes the maximum representable value for the given IntType.
+     *
+     * Supports both fixed-size integer types and the platform-dependent size type.
+     * 
+     */
+    pub fn createIntMaxValue (i: &IntType)-> &BigInt {
+        return IntInterpret::createIntMaxValue (i.size, i.isSigned);
+    }
+    
+    /**
+     * Computes the maximum representable value for an integer type of the given
+     * bit size and signedness.
+     *
+     * Unsigned: (2^size) - 1  
+     * Signed:   (2^(size-1)) - 1
+     */
+    pub fn createIntMaxValue (size: u16, signed: bool)-> &BigInt {
+        match (size, signed) {
+            (0u16, false) => { (copy BigInt (2us) ^^ (global::state::instance ().getSizeTypeSize ()) - 1us) }
+            (0u16, true)  => { (copy BigInt (2us) ^^ (global::state::instance ().getSizeTypeSize () - 1us)) - 1us }
+            (_, false)    => { (copy BigInt (2us) ^^ cast!usize (size) - 1us) }
+            (_, true)     => { (copy BigInt (2us) ^^ cast!usize (size - 1u16)) - 1us }
+            _ => {
+                panic;
+            }
+        }
+    } catch {
+        _: &BigIntError => {
+            panic;
+        }
+    }
+
+    /**
+     * Computes the minimum representable value for the given IntType.
+     *
+     * Unsigned types always have a minimum of 0.
+     * Signed types use two’s complement representation.
+     */
+    pub fn createIntMinValue (i: &IntType)-> &BigInt {
+        return IntInterpret::createIntMinValue (i.size, i.isSigned);
+    }
+
+    /**
+     * Computes the minimum representable value for an integer type of the given
+     * bit size and signedness.
+     *
+     * Unsigned: 0  
+     * Signed:   -2^(size-1)
+     */
+    pub fn createIntMinValue (size: u16, signed: bool)-> &BigInt {
+        match (size, signed) {
+            (0u16, false) => { copy BigInt (0us) }
+            (0u16, true)  => { 0us - (copy BigInt (2us) ^^ (global::state::instance ().getSizeTypeSize () - 1us)) }
+            (_, false)    => { copy BigInt (0us) }
+            (_, true)     => { 0us - (copy BigInt (2us) ^^ cast!usize (size - 1u16)) }
+            _ => {
+                panic;
+            }
+        }
+    } catch {
+        _: &BigIntError => {
+            panic;
+        }
+    }
+
+
+}

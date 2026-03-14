@@ -1,0 +1,465 @@
+/*
+ * Export functions to visit and reduce literal values at compile time.
+ *
+ * This module implements the compile-time literal interpreter used by the
+ * semantic validator. It walks literal trees, evaluates their contents, and
+ * produces reduced Value nodes suitable for constant folding, operator
+ * evaluation, and compile-time execution.
+ *
+ * The interpreter handles:
+ *   - literal constructors (arrays, maps, tuples, structs, ranges, slices),
+ *   - option and error-option literals,
+ *   - primitive literals (bool, int, float, char, string, null, unit, etc.),
+ *   - dynamic vs. static array allocation,
+ *   - operator-context reduction (inOperator mode).
+ *
+ * Reduction is performed recursively and respects the semantics of each literal
+ * type. Values that are already full literals are returned unchanged.
+ * 
+ *
+ * <hr>
+ * 
+ * @Package: ymirc        
+ * @Module: ymirc::semantic::validator::interpret::literal
+ * @File: ymirc/semantic/validator/interpret/literal.yr
+ * @Author(s):
+ *   - Emile Cadorel <ecadorel@gmail.com>
+ *
+ * @Created (YYYY-MM-DD): 2026-03-13
+ * @Copyright (C) 2021–2026 GNU-Ymir
+ * @License
+ *   ```text
+ *   This file is part of the Ymir language project.
+ *
+ *   Ymir is free software: you can redistribute it and/or modify it
+ *   under the terms of the GNU General Public License as published by
+ *   the Free Software Foundation, either version 3 of the License, or
+ *   (at your option) any later version.
+ *
+ *   Ymir is distributed in the hope that it will be useful,
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *   GNU General Public License for more details.
+ *
+ *   You should have received a copy of the GNU General Public License
+ *   along with Ymir.  If not, see <https://www.gnu.org/licenses/>.
+ *   ```
+ */
+
+in literal;
+
+use ymirc::lexing::{word, keys};
+
+use ymirc::semantic::symbol;
+use ymirc::semantic::generator::{_, value::_, type::_};
+
+use ymirc::errors::message;     
+use std::io;
+
+/**
+ * Public entry point for compile-time literal reduction.
+ *
+ * The `reduceLiteral` function delegates to the internal interpreter and
+ * returns a reduced Value. It supports two modes:
+ *
+ *   - normal reduction: full compile-time evaluation,
+ *   - operator-context reduction: used when reducing operands inside an
+ *     operator evaluation, where certain checks (e.g., CTE validation)
+ *     are relaxed.
+ *
+ * Errors raised during reduction are propagated as ErrorMsg.
+ */
+pub mod LiteralInterpret {
+    
+    /**
+     * Dispatches literal reduction based on the concrete literal class.
+     *
+     * Parameters:
+     *   - context:     the compile-time interpreter instance.
+     *   - lit:         the literal to reduce.
+     *   - inOperator:  whether the reduction occurs inside an operator
+     *                  evaluation (affects reduction rules).
+     *
+     * Returns:
+     *   A reduced Value corresponding to the literal.
+     *
+     * Notes:
+     *   - Primitive literals are returned unchanged.
+     *   - Complex literals are delegated to their specific reduction
+     *     functions.
+     *   - Unknown literal types cause an internal panic.
+     *   
+     */
+    pub fn reduce (dmut context: &CompileTimeInterpreter, lit: &LiteralValue, inOperator: bool)-> &Value
+        throws ErrorMsg
+    {
+        return inner::reduce (alias context, lit, inOperator);
+    }
+}
+
+/**
+ * Internal implementation of the literal interpreter.
+ *
+ * This module contains the full reduction logic for every literal class
+ * supported by the semantic generator. Each literal type has a dedicated
+ * reduction function that:
+ *
+ *   - recursively reduces its children,
+ *   - reconstructs a new reduced literal,
+ *   - preserves the original type and location,
+ *   - marks the result as reduced.
+ *
+ * Primitive literals are returned unchanged.
+ *
+ * Unknown literal classes trigger an internal panic, as all literal types must
+ * be explicitly handled.
+ * 
+ */
+mod inner {
+
+    /**
+     * Dispatches literal reduction based on the concrete literal class.
+     *
+     * Parameters:
+     *   - context:     the compile-time interpreter instance.
+     *   - lit:         the literal to reduce.
+     *   - inOperator:  whether the reduction occurs inside an operator
+     *                  evaluation (affects reduction rules).
+     *
+     * Returns:
+     *   A reduced Value corresponding to the literal.
+     *
+     * Notes:
+     *   - Primitive literals are returned unchanged.
+     *   - Complex literals are delegated to their specific reduction
+     *     functions.
+     *   - Unknown literal types cause an internal panic.
+     *   
+     */
+    pub fn reduce (dmut context: &CompileTimeInterpreter, lit: &LiteralValue, inOperator: bool)-> &Value
+        throws ErrorMsg
+    {
+        match lit {
+            // Literal constructions
+            a: &ArrayAllocValue => { return inner::reduceArrayAlloc (alias context, a); }
+            a: &ArrayValue      => { return inner::reduceArray (alias context, a, inOperator); }
+            e: &ErrOptionValue  => { return inner::reduceErrOption (alias context, e, inOperator); }            
+            m: &MapValue        => { return inner::reduceMap (alias context, m); }            
+            o: &OptionValue     => { return inner::reduceOption (alias context, o, inOperator); }            
+            r: &RangeValue      => { return inner::reduceRange (alias context, r, inOperator); }
+            s: &SliceCtorValue  => { return inner::reduceSliceCtor (alias context, s, inOperator); }            
+            s: &StructInitValue => { return inner::reduceStructInit (alias context, s, inOperator); }            
+            t: &TupleValue      => { return inner::reduceTuple (alias context, t, inOperator); }
+
+            // Basic literals
+            b: &BoolValue            => { return b; }
+            c: &CharValue            => { return c; }
+            f: &FakeValue            => { return f; }
+            f: &FloatValue           => { return f; }
+            i: &IntValue             => { return i; }
+            n: &NullValue            => { return n };
+            p: &ProtoFuncPtrValue    => { return p; }
+            s: &StringValue          => { return s; }
+            t: &TemplateDefaultValue => { return t; }            
+            t: &TypeInfoValue        => { return t; }
+            u: &UnitValue            => { return u; }
+
+            // Unknown class
+            _ => {
+                eprintln ("internal literal interpret error : ", lit._typeinfo.name);
+                panic;
+            }
+        }
+    }
+
+    /**
+     * Reduces an ArrayAllocValue literal.
+     *
+     * Steps:
+     *   - reduce the inner value and the length expression,
+     *   - reconstruct a dynamic or static array allocation depending on
+     *     the literal’s type and `isDynamic` flag,
+     *   - mark the result as reduced.
+     *
+     * The function assumes that the literal’s type is either SliceType (dynamic
+     * allocation) or ArrayType (static allocation).
+     * 
+     */
+    fn reduceArrayAlloc (dmut context: &CompileTimeInterpreter, a: &ArrayAllocValue)-> &Value
+        throws ErrorMsg
+    {
+        let inner = context:.reduce (a.value);
+        let len   = context:.reduce (a.len);
+
+        if let t: &SliceType = a.type && a.isDynamic {
+            return copy ArrayAllocValue::dyn (a.loc,
+                                              t,
+                                              inner,
+                                              len,
+                                              isReduced-> true);            
+        }
+
+        if let t: &ArrayType = a.type && !a.isDynamic {
+            return copy ArrayAllocValue::stat (a.loc,
+                                               t,
+                                               inner,
+                                               len,
+                                               isReduced-> true);
+        }
+
+        panic;
+    }
+
+    /**
+     * Reduces an ArrayValue literal.
+     *
+     * Each element is reduced recursively. In operator-context mode,
+     * reduction uses `reduceInOperator` to relax compile-time checks.
+     *
+     * The resulting array literal is reconstructed with the same type
+     * and marked as reduced.
+     */
+    fn reduceArray (dmut context: &CompileTimeInterpreter, arr: &ArrayValue, inOperator: bool)-> &Value
+        throws ErrorMsg
+    {
+        let inners = if (inOperator) {
+            copy [context:.reduceInOperator (i, checkCte-> false) for i in arr.values]
+        } else {
+            copy [context:.reduce (i) for i in arr.values]
+        };
+
+        if let t: &ArrayType = arr.type {
+            return copy ArrayValue (arr.loc,
+                                    t,
+                                    inners,
+                                    isReduced-> true);
+        }
+
+        panic;
+    }
+
+    /**
+     * Reduces an ErrOptionValue literal.
+     *
+     * The error payload is reduced recursively (using operator-context
+     * rules when applicable). The OptionType is preserved.
+     *
+     * Returns a new ErrOptionValue marked as reduced.
+     */
+    fn reduceErrOption (dmut context: &CompileTimeInterpreter, value: &ErrOptionValue, inOperator: bool)-> &Value
+        throws ErrorMsg
+    {
+        let inner = if (inOperator) {
+            context:.reduceInOperator (value.err, checkCte-> false)
+        } else {
+            context:.reduce (value.err)
+        };
+
+        if let o: &OptionType = value.type {
+            return copy ErrOptionValue (value.loc, type-> o, err-> inner, isReduced-> true);
+        }
+
+        panic;
+    }
+
+    /**
+     * Reduces a MapValue literal.
+     *
+     * Both keys and values are reduced element-wise. The resulting map
+     * literal preserves the original MapType and is marked as reduced.
+     * 
+     */
+    fn reduceMap (dmut context: &CompileTimeInterpreter, m: &MapValue)-> &Value
+        throws ErrorMsg
+    {
+        let keys   = copy [context:.reduce (i) for i in m.keys];
+        let values = copy [context:.reduce (i) for i in m.values];
+
+        if let t: &MapType = m.type {
+            return copy MapValue (m.loc,
+                                  t,
+                                  keys,
+                                  values,
+                                  isReduced-> true);
+        }
+
+        panic;
+    }
+
+    /**
+     * Reduces an OptionValue literal.
+     *
+     * The contained value is reduced recursively. Operator-context rules
+     * apply when requested.
+     *
+     * Returns a new OptionValue with the same OptionType and reduced
+     * inner value.
+     * 
+     */
+    fn reduceOption (dmut context: &CompileTimeInterpreter, value: &OptionValue, inOperator: bool)-> &Value
+        throws ErrorMsg
+    {
+        let inner = if (inOperator) {
+            context:.reduceInOperator (value.value, checkCte-> false)
+        } else {
+            context:.reduce (value.value)
+        };
+
+        if let o: &OptionType = value.type {
+            return copy OptionValue (value.loc, o, inner, isReduced-> true);
+        }
+
+        panic;
+    }
+
+    /**
+     * Reduces a RangeValue literal.
+     *
+     * All components (left, right, isFull, step) are reduced. Operator-context
+     * mode uses relaxed reduction rules.
+     *
+     * A new RangeValue is constructed with the same RangeType and marked
+     * as reduced.
+     * 
+     */
+    fn reduceRange (dmut context: &CompileTimeInterpreter, value: &RangeValue, inOperator: bool)-> &Value
+        throws ErrorMsg
+    {
+        if (inOperator) {
+            let left  = context:.reduceInOperator (value.left,   checkCte-> false);
+            let right = context:.reduceInOperator (value.right,  checkCte-> false);
+            let full  = context:.reduceInOperator (value.isFull, checkCte-> false);
+            let step  = context:.reduceInOperator (value.step,   checkCte-> false);
+
+            if let r: &RangeType = value.type {
+                return copy RangeValue (value.loc,
+                                        type-> r,
+                                        left,
+                                        right,
+                                        isFull-> full,
+                                        step-> step,
+                                        isReduced-> true);                
+            }
+            
+        } else {
+            let left  = context:.reduce (value.left);
+            let right = context:.reduce (value.right);
+            let full  = context:.reduce (value.isFull);
+            let step  = context:.reduce (value.step);
+
+            if let r: &RangeType = value.type {
+                return copy RangeValue (value.loc,
+                                        r,
+                                        left,
+                                        right,
+                                        isFull-> full,
+                                        step-> step,
+                                        isReduced-> true);
+            }
+        }
+
+        panic;
+    }
+
+    /**
+     * Reduces a SliceCtorValue literal.
+     *
+     * Reduces the pointer, length, and block expressions. The resulting
+     * slice constructor preserves:
+     *   - the original type,
+     *   - the implicit-alias flag,
+     *   - the reduced length used for both length and capacity.
+     *
+     * Returns a fully reduced SliceCtorValue.
+     * 
+     */
+    fn reduceSliceCtor (dmut context: &CompileTimeInterpreter, s: &SliceCtorValue, inOperator: bool)-> &Value
+        throws ErrorMsg
+    {
+        if inOperator {
+            let ptr = context:.reduceInOperator (s.ptr, checkCte-> false);
+            let len = context:.reduceInOperator (s.len, checkCte-> false);
+            let blk = context:.reduceInOperator (s.blk, checkCte-> false);
+
+            return copy SliceCtorValue (s.loc,
+                                        s.type,
+                                        ptr-> ptr,
+                                        blk-> blk,
+                                        len-> len,                                                                                
+                                        isImplicitAlias-> s.isImplicitAlias,
+                                        isReduced-> true);
+            
+        } else {
+            let ptr = context:.reduce (s.ptr);
+            let len = context:.reduce (s.len);
+            let blk = context:.reduce (s.blk);
+
+            return copy SliceCtorValue (s.loc,
+                                        s.type,
+                                        ptr-> ptr,
+                                        blk-> blk,
+                                        len-> len,                                                                                
+                                        isImplicitAlias-> s.isImplicitAlias,
+                                        isReduced-> true);            
+        }                
+    }
+
+    /**
+     * Reduces a StructInitValue literal.
+     *
+     * All field values are reduced recursively. The field list is preserved
+     * as-is, since it contains only metadata.
+     *
+     * Returns a new StructInitValue with the same ClassPtrType and reduced
+     * field values.
+     * 
+     */
+    fn reduceStructInit (dmut context: &CompileTimeInterpreter, s: &StructInitValue, inOperator: bool)-> &Value
+        throws ErrorMsg
+    {
+        let inners = if (inOperator) {
+            copy [context:.reduceInOperator (i, checkCte-> false) for i in s.values]
+        } else {
+            copy [context:.reduce (i) for i in s.values]
+        };
+
+        if let ty: &ClassPtrType = s.type {
+            return copy StructInitValue (s.loc,
+                                         ty,
+                                         values-> inners,
+                                         fields-> s.fields,
+                                         isReduced-> true);
+        }
+        
+        panic;
+    }
+
+    /**
+     * Reduces a TupleValue literal.
+     *
+     * Each tuple element is reduced recursively. Operator-context rules
+     * apply when requested.
+     *
+     * Returns a new TupleValue with the same TupleType and reduced values.
+     * 
+     */    
+    fn reduceTuple (dmut context: &CompileTimeInterpreter, t: &TupleValue, inOperator: bool)-> &Value
+        throws ErrorMsg
+    {
+        let inners = if (inOperator) {
+            copy [context:.reduceInOperator (i, checkCte-> false) for i in t.values]
+        } else {
+            copy [context:.reduce (i) for i in t.values]
+        };
+
+        if let ty: &TupleType = t.type {
+            return copy TupleValue (t.loc,
+                                    ty,
+                                    inners,
+                                    isReduced-> true);
+        }
+
+        panic;
+    }
+
+}

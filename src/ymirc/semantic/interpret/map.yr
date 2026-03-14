@@ -1,0 +1,253 @@
+/*
+ * Declares the MapInterpret module, used to reduce map related operators at
+ * compile time.
+ *
+ * <hr>
+ * 
+ * @Package: ymirc        
+ * @Module: ymirc::semantic::interpret::map
+ * @File: ymirc/semantic/interpret/map.yr
+ * @Author(s):
+ *   - Emile Cadorel <ecadorel@gmail.com>
+ *
+ * @Created (YYYY-MM-DD): 2026-03-14
+ * @Copyright (C) 2021–2026 GNU-Ymir
+ * @License
+ *   ```text
+ *   This file is part of the Ymir language project.
+ *
+ *   Ymir is free software: you can redistribute it and/or modify it
+ *   under the terms of the GNU General Public License as published by
+ *   the Free Software Foundation, either version 3 of the License, or
+ *   (at your option) any later version.
+ *
+ *   Ymir is distributed in the hope that it will be useful,
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *   GNU General Public License for more details.
+ *
+ *   You should have received a copy of the GNU General Public License
+ *   along with Ymir.  If not, see <https://www.gnu.org/licenses/>.
+ *   ```
+ */
+
+in map;
+
+use ymirc::lexing::{word, keys};
+
+use ymirc::semantic::symbol;
+use ymirc::semantic::generator::{_, value::_, type::_};
+
+use ymirc::errors::message;
+use ymirc::utils::bigint;
+
+use std::io;
+
+/*
+ * Compile-time reduction logic for map operators.
+ *
+ * This module implements the reduction pipeline for all map-related operators
+ * encountered during semantic validation. Map operations include:
+ *
+ *   - key access (map[key])
+ *   - membership tests (key in map / key !in map)
+ *   - insertion (map[key] = value) 
+ *
+ * Reduction strategy:
+ *   - The map expression is reduced using `reduce`.
+ *   - Keys and values are reduced using `reduceInOperator` with CTE checks.
+ *   - When the map is a compile-time MapValue literal, operations such as
+ *     access and membership can be folded into literal results.
+ *   - When reduction is not possible, the operator is reconstructed with
+ *     reduced operands and marked as reduced.
+ *
+ * Special handling:
+ *   - Key comparison uses the generic operator interpreter to ensure that
+ *     all comparable types (ints, chars, strings, tuples, etc.) are supported.
+ *   - Membership tests track whether all comparisons succeeded; if so, the
+ *     result can be folded even when the key is not present.
+ *
+ * This module is invoked by the operator interpreter whenever a map operator
+ * is encountered.
+ */
+pub mod MapInterpret {
+
+    /**
+     * Reduces a map operator.
+     *
+     * Parameters:
+     *   - context:     the compile-time interpreter instance.
+     *   - m:           the map operator to reduce.
+     *   - inOperator:  ignored for map operations.
+     *
+     * Returns:
+     *   A reduced Value corresponding to the map operation.
+     *
+     * Notes:
+     *   - Dispatches to the appropriate reduction routine based on the concrete
+     *     operator class.
+     *   - Map iteration is not reduced; the operator is returned unchanged.
+     */
+    pub fn reduce (dmut context: &CompileTimeInterpreter, m: &MapOperatorValue, inOperator: bool)-> &Value
+        throws ErrorMsg
+    {
+        inOperator; // ignored
+        return inner::reduceMap (alias context, m);
+    }
+
+}
+
+
+mod inner {
+
+    /**
+     * Reduces a map operator.
+     *
+     * Parameters:
+     *   - context:     the compile-time interpreter instance.
+     *   - m:           the map operator to reduce.
+     *   - inOperator:  ignored for map operations.
+     *
+     * Returns:
+     *   A reduced Value corresponding to the map operation.
+     *
+     * Notes:
+     *   - Dispatches to the appropriate reduction routine based on the concrete
+     *     operator class.
+     *   - Map iteration is not reduced; the operator is returned unchanged.
+     */
+    pub fn reduceMap (dmut context: &CompileTimeInterpreter, m: &MapOperatorValue)-> &Value
+        throws ErrorMsg
+    {        
+        match m {
+            a: &MapAccessValue => { return inner::reduceMapAccess (alias context, a); }            
+            c: &MapContainsValue => { return inner::reduceMapContains (alias context, c); }
+            i: &MapInsertValue => { return inner::reduceMapInsert (alias context, i); }
+            i: &MapIteratorValue => { return i };
+            
+            _ => {
+                eprintln ("internal map interpret error : ", m._typeinfo.name);
+                panic;
+            }
+        }
+    }
+
+    /**
+     * Reduces a map key-access operator (map[key]).
+     *
+     * Steps:
+     *   1. Reduce the map expression using `reduce`.
+     *   2. Reduce the key using `reduceInOperator` with CTE checking enabled.
+     *   3. If the map reduces to a MapValue literal:
+     *        - iterate over all keys,
+     *        - compare each key using the generic operator interpreter,
+     *        - return the corresponding value when a match is found.
+     *   4. Otherwise, reconstruct the operator with reduced operands.
+     *
+     * Notes:
+     *   - Key comparison uses `OperatorInterpret::reduceCompare`, which supports
+     *     all comparable literal types.
+     *   - Only literal maps can be folded.
+     *   
+     */
+    fn reduceMapAccess (dmut context: &CompileTimeInterpreter, m: &MapAccessValue)-> &Value
+        throws ErrorMsg
+    {
+        let mp = context:.reduce (m.map);
+        let key = context:.reduceInOperator (m.key, checkCte-> true);
+
+        if let inner: &MapValue = mp {
+            for i in 0us .. inner.keys.len {
+                let eq = operator::OperatorInterpret::reduceCompare (alias context, inner.keys [i], key);
+                if let Ok (b: &BoolValue) = eq && b.isTrue {
+                    return inner.values [i];
+                }
+            }
+        }
+
+        return copy MapAccessValue (m.loc, m.type, map-> mp, key-> key, isReduced-> true);
+    }
+
+    /**
+     * Reduces a map membership test (key in map / key !in map).
+     *
+     * Steps:
+     *   1. Reduce the map expression.
+     *   2. Reduce the key using `reduceInOperator` with CTE checking enabled.
+     *   3. If the map reduces to a MapValue literal:
+     *        - compare the key against all literal keys,
+     *        - if any comparison yields true, return:
+     *             - true  when testing "in"
+     *             - false when testing "!in"
+     *        - if all comparisons succeed and none match, return:
+     *             - false when testing "in"
+     *             - true  when testing "!in"
+     *   4. Otherwise, reconstruct the operator.
+     *
+     * Notes:
+     *   - The `allSuccess` flag tracks whether all comparisons were valid CTE
+     *     comparisons; if any comparison is non-CTE, folding is not possible.
+     *     
+     */
+    fn reduceMapContains (dmut context: &CompileTimeInterpreter, m: &MapContainsValue)-> &Value
+        throws ErrorMsg
+    {
+        let mp = context:.reduce (m.map);
+        let key = context:.reduceInOperator (m.key, checkCte-> true);
+
+        if let inner: &MapValue = mp {
+            let mut allSuccess = true;
+            for i in 0us .. inner.keys.len {                
+                let eq = operator::OperatorInterpret::reduceCompare (alias context, inner.keys [i], key);
+                match eq {
+                    Ok (b: &BoolValue) => {
+                        if b.isTrue return copy BoolValue (m.loc, !m.isNot);                        
+                    }
+                    _ => {
+                        allSuccess = false;
+                    }                    
+                }
+            }
+
+            if allSuccess {
+                return copy BoolValue (m.loc, m.isNot);
+            }
+        }
+
+        return copy MapContainsValue (m.loc,
+                                      m.type,
+                                      map-> mp,
+                                      key-> key,
+                                      isNot-> m.isNot,
+                                      isReduced-> true);        
+    }
+
+    /**
+     * Reduces a map insertion operator (map[key] = value).
+     *
+     * Steps:
+     *   1. Reduce the map expression.
+     *   2. Reduce the key and value using `reduceInOperator` with CTE checking.
+     *   3. Reconstruct the operator with reduced operands.
+     *
+     * Notes:
+     *   - Map insertion is not folded, even when the map is a literal.
+     *   - This operator is preserved for later lowering or runtime execution.
+     *   
+     */
+    fn reduceMapInsert (dmut context: &CompileTimeInterpreter, m: &MapInsertValue)-> &Value
+        throws ErrorMsg
+    {
+        let mp = context:.reduce (m.map);
+        let key = context:.reduceInOperator (m.key, checkCte-> true);
+        let value = context:.reduceInOperator (m.value, checkCte-> true);
+
+        return copy MapInsertValue (loc-> m.loc,
+                                    type-> m.type,
+                                    map-> mp,
+                                    key-> key,
+                                    value-> value,
+                                    isReduced-> true);
+    }
+
+}
