@@ -1,0 +1,293 @@
+/*
+ * Declares the ClassContext record, which manages semantic-validation state
+ * specific to class declarations. This includes tracking recursive validation
+ * depth, scheduling post-validation passes, and handling classes that require
+ * deferred or forced validation depending on the surrounding context.
+ *
+ * The ClassContext is used by the semantic validator to ensure that class
+ * bodies, constructors, methods, and inherited structures are validated in a
+ * consistent and dependency-aware order. It also supports multi-phase
+ * validation for classes whose members depend on symbols not yet available
+ * during the initial pass.    
+ *
+ * <hr>
+ * 
+ * @Package: ymirc        
+ * @Module: ymirc::semantic::validator::context::class_
+ * @File: ymirc/semantic/validator/context/class_.yr
+ * @Author(s):
+ *   - Emile Cadorel <ecadorel@gmail.com>
+ *
+ * @Created (YYYY-MM-DD): 2026-03-18
+ * @Copyright (C) 2021–2026 GNU-Ymir
+ * @License
+ *   ```text
+ *   This file is part of the Ymir language project.
+ *
+ *   Ymir is free software: you can redistribute it and/or modify it
+ *   under the terms of the GNU General Public License as published by
+ *   the Free Software Foundation, either version 3 of the License, or
+ *   (at your option) any later version.
+ *
+ *   Ymir is distributed in the hope that it will be useful,
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *   GNU General Public License for more details.
+ *
+ *   You should have received a copy of the GNU General Public License
+ *   along with Ymir.  If not, see <https://www.gnu.org/licenses/>.
+ *   ```
+ */
+
+in class_;
+
+use ymirc::semantic::symbol;
+
+pub def MAX_RECURSIVE_LEVEL = 3u32;
+
+/**
+ * ClassContext tracks all state required to validate class declarations.
+ *
+ * It maintains:
+ *   - the recursion level of class validation (to detect cycles),
+ *   - the set of classes requiring a second-phase validation pass,
+ *   - the set of classes whose validation must be deferred until the
+ *     surrounding context allows it,
+ *   - and a flag controlling whether precary (partial) validation is forced.
+ *
+ * This context is used by the semantic validator to ensure that classes, their
+ * constructors, methods, inherited members, and template instantiations are
+ * validated in a correct and dependency-aware order. It supports multi-phase
+ * validation for classes whose members depend on symbols that may not be
+ * available during the initial pass.
+ */
+pub record ClassContext {
+
+    pub {
+        /**
+         * Whether precary (partial) validation should be forced.
+         * When true, the validator may skip full validation of a class until
+         * the surrounding context allows it (e.g., during recursive dependencies).
+         */ 
+        let mut forcePrecary: bool = false;
+    }
+
+    prv {
+        /**
+         * Tracks the recursion level of class validation.
+         * Used to detect and prevent infinite recursion when validating classes
+         * that reference each other cyclically.
+         *
+         * Mapping:
+         *   Symbol => recursion depth
+         */
+        let mut _validation: [&Symbol => mut u32] = copy [];
+
+        /**
+         * Set of classes that require a second-phase validation pass.
+         * These are classes whose initial validation completed, but whose bodies
+         * (methods, constructors, etc.) must be validated later once dependent
+         * symbols become available.
+         *
+         * Mapping:
+         *   Symbol => ClassSymbol
+         */
+        let mut _toFinalize: [&Symbol => dmut &ClassSymbol] = copy [];
+
+        /**
+         * Set of classes that were precary-validated and must be validated
+         * again once the context depth allows it. This is used when a class
+         * cannot be fully validated due to unresolved dependencies or recursive
+         * structure.
+         *
+         * Mapping:
+         *   Symbol => (ClassSymbol, inModule)
+         *     - ClassSymbol: the class requiring post-validation
+         *     - inModule: whether the class originates from the current module
+         */
+        let dmut _postForceValidation: [&Symbol => (&ClassSymbol, bool)] = copy [];
+    }
+    
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * =====================================          CTORS          ======================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Creates a new empty ClassContext.
+     *     
+     */
+    pub self () {}
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * =====================================          LEVEL          ======================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Computes the validation recursion level for a class symbol.
+     *
+     * The recursion level determines whether a class can be validated immediately
+     * or whether validation must be deferred due to recursive dependencies.
+     *
+     * Rules:
+     *   - If the class has a non-UnitValue type reference, it is considered
+     *     non-instantiable and assigned MAX_RECURSIVE_LEVEL.
+     *   - If the class has constructors, it also receives MAX_RECURSIVE_LEVEL
+     *     to prevent premature validation.
+     *   - If the class is already in the validation table, its stored level
+     *     is returned.
+     *   - Otherwise, the class is considered to be at recursion level 1.
+     *
+     * @param:
+     *    - sym:  The class symbol being queried.
+     *    
+     * @return:
+     *    The recursion level for this class.
+     */
+    pub fn level (self, sym: &ClassSymbol)-> u32 {
+        if let Ok (cref) = sym.classRef {
+            if cref.hasTypeInfo {
+                return MAX_RECURSIVE_LEVEL;
+            }
+
+            if let Ok (lvl) = self._validation [sym] {
+                if cref.hasCtors { return MAX_RECURSIVE_LEVEL; }
+                return lvl;
+            }
+
+            return 1;
+        }
+        
+        return 1;
+    }
+
+    /**
+     * Records the recursion level for a class currently being validated.
+     *
+     * This is used to detect and prevent infinite recursion when classes
+     * reference each other cyclically.
+     *
+     * @params:
+     *   - sym:  The class symbol.
+     *   - l:    The recursion depth to assign.
+     *   
+     */
+    pub fn set (mut self, sym: &Symbol, l: u32) {
+        self._validation [sym] = l;
+    }
+
+    /**
+     * Removes a class from the active validation table.
+     *
+     * Called when a class finishes its validation pass, allowing dependent
+     * classes to resume or complete their own validation.
+     *
+     * @params:
+     *    - sym:  The class symbol to remove.
+     *    
+     */
+    pub fn remove (mut self, sym: &Symbol) {
+        self._validation:.remove (sym);
+    }
+
+    /**
+     * @return true if no classes are currently being validated.
+     *
+     * A root context means we are not inside any nested class validation. This
+     * is used to determine when deferred validations may be executed.
+     * 
+     */
+    @field
+    pub fn isRoot (self)-> bool {
+        return self._validation.len == 0;
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ===================================          FINALIZING          ===================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Schedules a class for finalization.
+     *
+     * Finalization is the second-phase validation pass performed after the
+     * class structure is known (e.g., validating method bodies, constructors,
+     * inherited members).
+     *
+     * @params:
+     *   - sym:  The class symbol to finalize.
+     */
+    pub fn insertFinalize (mut self, dmut sym: &ClassSymbol) {
+        self._toFinalize [sym] = (alias sym);
+    }
+
+    /**
+     * Retrieves and clears the list of classes scheduled for finalization.
+     *
+     * This is typically called when the validator reaches a context depth where
+     * finalization is allowed (e.g., after resolving recursive dependencies).
+     *
+     * @returns:
+     *   - A map of Symbol => ClassSymbol representing classes to finalize.
+     */
+    pub fn popFinalize (mut self)-> dmut [&Symbol => (&ClassSymbol)] {
+        let dmut ret = alias self._toFinalize;
+        self._toFinalize = copy [];
+
+        return alias ret;
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ================================          POST VALIDATION          =================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Schedules a class for post-force validation.
+     *
+     * This is used when a class was only partially validated (precary
+     * validation) due to recursive dependencies or insufficient context. Once
+     * the validator reaches a safe context depth, these classes are
+     * re-validated.
+     *
+     * @params:
+     *    - sym:       The class symbol requiring post-validation.
+     *    - inModule:  Whether the class originates from the current module (and must be finalized).
+     *    
+     */
+    pub fn insertPost (mut self, dmut sym: &ClassSymbol, inModule: bool) {
+        self._postForceValidation [sym] = (alias sym, inModule);
+    }
+
+    /**
+     * Retrieves and clears the list of classes requiring post-force validation.
+     *
+     * Post-validation is performed after the validator exits recursive contexts
+     * that prevented full validation earlier.
+     *
+     * @return: 
+     *   - A map of Symbol => (ClassSymbol, bool) representing classes to
+     *   re-validate and whether they belong to the current module.
+     *   
+     */
+    pub fn popPost (mut self)-> dmut [&Symbol => (&ClassSymbol, bool)] {
+        let dmut ret = alias self._postForceValidation;
+        self._postForceValidation = copy [];
+
+        return alias ret;        
+    }
+    
+}
