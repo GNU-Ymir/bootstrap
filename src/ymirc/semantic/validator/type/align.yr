@@ -1,0 +1,245 @@
+/*
+ * Declares the TypeAlign module, responsible for computing and validating the
+ * alignment of types during semantic analysis.
+ *
+ * This module is part of the semantic validator and is used to determine
+ * the byte-alignment of all Ymir types, including:
+ *   - native scalar types,
+ *   - pointer-based compound types,
+ *   - user-defined struct types,
+ *   - tuple types,
+ *   - and proxy types such as enums.
+ *
+ * The alignment rules implemented here are used by the backend to compute
+ * memory layout, ABI conformance, and field offsets. The validator also detects
+ * invalid or recursive alignof expressions and reports appropriate diagnostics.
+ *
+ * <hr>
+ * 
+ * @Package: ymirc        
+ * @Module: ymirc::semantic::validator::type::align
+ * @File: ymirc/semantic/validator/type/align.yr
+ * @Author(s):
+ *   - Emile Cadorel <ecadorel@gmail.com>
+ *
+ * @Created (YYYY-MM-DD): 2026-03-21
+ * @Copyright (C) 2021–2026 GNU-Ymir
+ * @License
+ *   ```text
+ *   This file is part of the Ymir language project.
+ *
+ *   Ymir is free software: you can redistribute it and/or modify it
+ *   under the terms of the GNU General Public License as published by
+ *   the Free Software Foundation, either version 3 of the License, or
+ *   (at your option) any later version.
+ *
+ *   Ymir is distributed in the hope that it will be useful,
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *   GNU General Public License for more details.
+ *
+ *   You should have received a copy of the GNU General Public License
+ *   along with Ymir.  If not, see <https://www.gnu.org/licenses/>.
+ *   ```
+ */
+
+in align;
+
+use ymirc::errors::message;
+use ymirc::semantic::{validator, generator::type::_};
+use ymirc::lexing::word;
+
+use ymirc::utils::format;
+
+/**
+ * The TypeAlign module provides functions used to compute the alignment of Ymir
+ * types during semantic validation.
+ *
+ * Alignment computation is required for:
+ *   - struct layout,
+ *   - tuple layout,
+ *   - ABI-compliant field placement,
+ *   - and validation of `alignof` expressions.
+ *
+ * The module handles:
+ *   - native scalar types,
+ *   - pointer-based compound types,
+ *   - user-defined struct types (with recursive detection),
+ *   - tuple types,
+ *   - and enum proxy types.
+ *
+ * Errors are reported when a type has no size, when a forward reference
+ * prevents computing alignment, or when recursive alignof calls occur.
+ * 
+ */
+pub mod TypeAlign {
+
+    /**
+     * Computes the alignment of a type.
+     *
+     * @params:
+     *    - context: the validation context used to detect recursive alignof calls
+     *    - loc:     the location of the alignof expression
+     *    - t:       the type whose alignment is being computed
+     *
+     * @returns: the alignment of the type in bytes
+     *
+     * @throws:
+     *    - &ErrorMsg: if the type has no size or cannot be aligned
+     */
+    pub fn validate (dmut context: &ValidationContext, loc: &Word, t: &Type)-> usize
+        throws ErrorMsg
+    {
+        match t {
+            // NATIVE SCALAR CONST            
+            BoolType () => {
+                return 1us;
+            }
+            VoidType () => {
+                return 1us;
+            }
+
+            // NATIVE SCALAR SIZED            
+            i: &IntType => {
+                if  i.size == 0 {
+                    return cast!usize (global::state::pointerArchSize () / 8u32);
+                }
+
+                return cast!usize (i.size) / 8us;
+            }
+            c: &CharType => {
+                return cast!usize (c.size) / 8us;
+            }
+            f: &FloatType => {
+                return cast!usize (f.size) / 8us;
+            }
+
+            // COMPOUND TYPES CONTAINING A POINTER           
+            DelegateType () => {
+                return cast!usize (global::state::pointerArchSize () / 8u32);
+            }            
+            FuncPtrType () => {
+                return cast!usize (global::state::pointerArchSize () / 8u32);
+            }
+            PointerType () => {
+                return cast!usize (global::state::pointerArchSize () / 8u32);
+            }
+            FutureType () => {
+                return cast!usize (global::state::pointerArchSize () / 8u32);
+            }
+            SliceType () => {
+                return cast!usize (global::state::pointerArchSize () / 8u32);
+            }
+            MapType () => {
+                return cast!usize (global::state::pointerArchSize () / 8u32);
+            }
+            OptionType () => { 
+                return cast!usize (global::state::pointerArchSize () / 8u32);
+            }
+
+            // CUSTOM            
+            c: &ClassPtrType => {
+                if (c.sym.isStruct) return TypeAlign::validateStruct (alias context,
+                                                                      loc,
+                                                                      c.inner);
+                
+                else return cast!usize (global::state::pointerArchSize () / 8u32);
+            }
+
+            // STACK COMPOUNDS
+            
+            a: &ArrayType => {
+                return TypeAlign::validate (alias context, loc, a.value);
+            }            
+            r: &RangeType => {
+                return TypeAlign::validate (alias context, loc, r.start);
+            }            
+            u: &TupleType => {
+                return TypeAlign::validateTuple (alias context, loc, u);
+            }
+
+            //PROXY            
+            e: &EnumType => {
+                return TypeAlign::validate (alias context, loc, e.getLastLevelProxy ());
+            }
+        }
+
+        // Temporary types
+        throw copy ErrorMsg::fatal (loc, format (ValidateErrorMessage::TYPE_HAS_NO_SIZE, t));
+    }
+
+    /**
+     * Computes the alignment of a struct type.
+     *
+     * The alignment is the maximum alignment of all fields, including inherited
+     * fields. Recursive alignof calls on the same struct are detected and
+     * rejected.
+     *
+     * @params:
+     *    - context: the validation context used to detect recursion
+     *    - loc:     the location of the struct reference
+     *    - s:       the struct type whose alignment is being computed
+     *
+     * @returns: the alignment of the struct in bytes
+     *
+     * @throws:
+     *    - &ErrorMsg: if a field has no size or if a forward reference prevents
+     *                 computing the alignment
+     */
+    fn validateStruct (dmut context: &ValidationContext, loc: &Word, s: &ClassRefType)-> usize
+        throws ErrorMsg
+    {
+        if s.sym in context.alignofContext {
+            throw copy ErrorMsg::fatal (s.sym.loc, format (ValidateErrorMessage::NO_SIZE_FORWARD_REF, s));
+        }
+
+        let mut max = 1us;
+        context.alignofContext:.insert (s.sym);
+        {
+            for v in s.fields { // all fields, including parent fields
+                {
+                    let align = TypeAlign::validate (alias context, loc, v.varType);
+                    if (align > max) { max = align; }
+                } catch {
+                    err: &ErrorMsg => {
+                        let note = copy ErrorMsg::note (s.sym.loc, format (ValidateErrorMessage::WITHIN_TYPE, s));
+                        throw err.withNote (copy [copy ErrorMsg::note (v.loc, format (ValidateErrorMessage::FOR_FIELD, v.loc.str),
+                                                                       notes-> copy [note])]);
+                    }
+                }
+            }
+        } exit {
+            context.alignofContext:.remove (s.sym);
+        }
+
+        return max;
+    }
+
+    /**
+     * Computes the alignment of a tuple type.
+     *
+     * The alignment is the maximum alignment of all inner types.
+     *
+     * @params:
+     *    - context: the validation context used to compute inner alignments
+     *    - loc:     the location of the tuple reference
+     *    - tu:      the tuple type whose alignment is being computed
+     *
+     * @returns: the alignment of the tuple in bytes
+     *
+     * @throws:
+     *    - &ErrorMsg: if any inner type has no size
+     */
+    fn validateTuple (dmut context: &ValidationContext, loc: &Word, tu: &TupleType)-> usize
+        throws ErrorMsg
+    {
+        let mut max = 1us;
+        for inner in tu.inners {
+            let align = TypeAlign::validate (alias context, loc, inner);
+            if (align > max) { max = align; }
+        }
+
+        max
+    }
+
+}
