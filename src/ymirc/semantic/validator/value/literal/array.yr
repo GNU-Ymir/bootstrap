@@ -1,39 +1,493 @@
+/*
+ * Implements validation and construction of array and slice literal values.
+ *
+ * This module handles:
+ *   - static array literals: [a, b, c]
+ *   - slice literals inside copy contexts
+ *   - static and dynamic slice allocation: [value ; size]
+ *   - expansion of nested lists via ExpandValue
+ *   - inference of element mutability and type unification
+ *   - construction of ArrayType, SliceType, ArrayValue, SliceCtorValue, and
+ *     ArrayAllocValue nodes
+ *
+ * The behavior depends on whether the validator is currently inside a copy
+ * expression, as slice literals and dynamic allocations require a copy context.
+ *
+ * <hr>
+ * 
+ * @Package: ymirc        
+ * @Module: ymirc::semantic::validator::value::literal::array
+ * @File: ymirc/semantic/validator/value/literal/array.yr
+ * @Author(s):
+ *   - Emile Cadorel <ecadorel@gmail.com>
+ *
+ * @Created (YYYY-MM-DD): 2026-03-25
+ * @Copyright (C) 2021–2026 GNU-Ymir
+ * @License
+ *   ```text
+ *   This file is part of the Ymir language project.
+ *
+ *   Ymir is free software: you can redistribute it and/or modify it
+ *   under the terms of the GNU General Public License as published by
+ *   the Free Software Foundation, either version 3 of the License, or
+ *   (at your option) any later version.
+ *
+ *   Ymir is distributed in the hope that it will be useful,
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *   GNU General Public License for more details.
+ *
+ *   You should have received a copy of the GNU General Public License
+ *   along with Ymir.  If not, see <https://www.gnu.org/licenses/>.
+ *   ```
+ */
+
 in array;
 
-use ymirc::syntax::{_, declaration::_, expression::_};
+use ymirc::lexing::word;
+use ymirc::syntax::expression::_;
 
-use ymirc::semantic::{declarator, validator, template_, symbol};
+use ymirc::semantic::{interpret, validator};
 use ymirc::semantic::generator::{value::_, type::_};
-use ymirc::semantic::generator::_;
 
-use ymirc::global::core_;
+use ymirc::global;
 use ymirc::errors::_;
 use ymirc::utils::format;
 
-use ymirc::lexing::{word, tokens, keys};
+use std::io;
 
-use std::{io, stream, time::_};
-
+/**
+ * ArrayLiteralValidation module
+ *
+ * Provides validation and construction of array and slice literal values.
+ * Supports:
+ *   - static array literals,
+ *   - slice literals created inside copy expressions,
+ *   - static and dynamic slice allocation,
+ *   - element-wise validation and type inference,
+ *   - expansion of nested lists,
+ *   - and stack-based vs dynamic allocation decisions.
+ *
+ */
 pub mod ArrayLiteralValidation {
-    
-    /**
-     * Add a parameter to an list of array parameters
-     * @params:
-     *   - context: the context of the validation
-     *   - val: the value to add
-     *   - parameters: the list of parameters inside the array literal
-     *   - innerType: the current type of the inner values of the array
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          PUBLICS          =====================================
+     * ====================================================================================================
+     * ====================================================================================================
      */
-    pub fn addArrayType (dmut context: &ValidationContext, val: &Value, innerType: &Type, ref mut parameters: [&Value])-> &Type
+
+    /**
+     * Validate an array or slice literal.
+     *
+     * Behavior depends on whether the validator is inside a copy expression:
+     *   - outside copy => produce a static ArrayValue,
+     *   - inside copy  => produce a SliceCtorValue wrapped in a CopierValue.
+     *
+     * @params:
+     *   - context: validation context
+     *   - l:       the ListExpr representing the literal
+     *
+     * @returns:
+     *   - an ArrayValue or a slice constructor depending on context
+     *
+     * @throws:
+     *   - ErrorMsg if any element is invalid
+     */
+    pub fn validate (dmut context: &ValidationContext, l: &ListExpr)-> &Value
+        throws ErrorMsg
+    {
+        if context.isInCopy (l) {
+            return ArrayLiteralValidation::validateListSlice (alias context, l);
+        }
+
+        return ArrayLiteralValidation::validateListStaticArray (alias context, l);
+    }
+
+    /**
+     * Validate a slice allocation expression: value[size].
+     *
+     * Behavior depends on copy context:
+     *   - inside copy → dynamic allocation producing a slice,
+     *   - outside copy → static allocation producing an ArrayAllocValue.
+     *
+     * @params:
+     *   - context: validation context
+     *   - alloc:   the SliceAllocatorExpr
+     *
+     * @returns:
+     *   - a slice or array allocation value
+     *
+     * @throws:
+     *   - ErrorMsg if size or value is invalid
+     */
+    pub fn validateAlloc (dmut context: &ValidationContext, alloc: &SliceAllocatorExpr)-> &Value
+        throws ErrorMsg
+    {
+        if (context.isInCopy (alloc)) {
+            return ArrayLiteralValidation::validateDynamicAlloc (alias context, alloc);
+        }
+        
+        return ArrayLiteralValidation::validateStaticAlloc (alias context, alloc);        
+    }
+    
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * =====================================          UTILS          ======================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Validate and append a single array element, updating the inferred inner type.
+     *
+     * Performs:
+     *   - void/none checks,
+     *   - type unification via TypeInference::inferValueForBranch,
+     *   - element mutability inference,
+     *   - and appends the validated element to the parameter list.
+     *
+     * @params:
+     *   - context:   validation context
+     *   - val:       the element value
+     *   - innerType: the current inferred inner type (NoneType for first element)
+     *   - params:    accumulator for validated element values
+     *
+     * @returns:
+     *   - the updated inner type after unifying with `val`
+     *
+     * @throws:
+     *   - ErrorMsg if the element is void or incompatible
+     */
+    pub fn addArrayType (dmut context: &ValidationContext, val: &Value, innerType: &Type, ref mut params: [&Value])-> &Type
         throws ErrorMsg
     {
         if (val.type of NoneType || val.type of VoidType) {
             throw copy ErrorMsg::fatal (val.loc, ValidateErrorMessage::VOID_VALUE);
         }
 
-        let (t, v) = TypeInference::inferValueForBranch (innerType.loc, innerType, val);
-        parameters ~= [v];
-        t
+        let (t, v) = TypeInference::inferValueForBranch (alias context, innerType.loc, innerType, val);
+        
+        params ~= [v];        
+        return t;
     }
+    
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ======================================          LIST          ======================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */    
+
+    /**
+     * Validate a static array literal: [a, b, c].
+     *
+     * Steps:
+     *   1. Validate each element.
+     *   2. Expand nested lists via ExpandValue.
+     *   3. Infer the inner type across all elements.
+     *   4. If empty, use VoidType as the inner type.
+     *   5. Construct an ArrayType and ArrayValue.
+     *
+     * @params:
+     *   - context: validation context
+     *   - l:       the ListExpr
+     *
+     * @returns:
+     *   - an ArrayValue containing the validated elements
+     *
+     * @throws:
+     *   - ErrorMsg if any element is invalid
+     */
+    fn validateListStaticArray (dmut context: &ValidationContext, l: &ListExpr)-> &Value
+        throws ErrorMsg
+    {
+        let mut params: [mut &Value] = [];
+        let mut inner: &Type = NONE_TYPE;
+
+        for it in l.params {
+            let val = ValueValidation::validate (alias context, it);
+            match val {
+                e: &ExpandValue => {
+                    for g_it in e.values {
+                        inner = ArrayLiteralValidation::addArrayType (alias context, g_it, inner, ref params);
+                    }
+                }
+                g_it: _ => {
+                    inner = ArrayLiteralValidation::addArrayType (alias context, g_it, inner, ref params);
+                }
+            }
+        }
+
+        // If there is no value in the slice (i.e. []), its values is [void]
+        if (params.len == 0us) inner = copy VoidType (l.loc);
+
+        let arrType = copy ArrayType (l.loc, inner, params.len, isMutable-> true);        
+        return copy ArrayValue (l.loc, arrType, params);
+    }
+
+    /**
+     * Validate a slice literal created inside a copy expression.
+     *
+     * Converts the static array literal into a slice by:
+     *   - allocating an ArrayValue,
+     *   - creating an AddressValue pointing to it,
+     *   - constructing a SliceCtorValue,
+     *   - and wrapping it in a CopierValue using the current copy context.
+     *
+     * Empty slices produce a null-pointer slice constructor.
+     *
+     * @params:
+     *   - context: validation context
+     *   - l:       the ListExpr
+     *
+     * @returns:
+     *   - a CopierValue containing a SliceCtorValue
+     *
+     * @throws:
+     *   - ErrorMsg if the copy context is invalid
+     */
+    fn validateListSlice (dmut context: &ValidationContext, l: &ListExpr)-> &Value
+        throws ErrorMsg
+    {
+        let content = ArrayLiteralValidation::validateListStaticArray (alias context, l);
+        let arrType = if let arrType: &ArrayType = content.type { arrType } else { panic; } 
+        
+        let inner = arrType.value;
+        
+        let slcType = copy SliceType (l.loc, inner, isMutable-> true);
+        if (arrType.len == 0) {
+            return copy SliceCtorValue (l.loc,
+                                        slcType,
+                                        ptr-> copy NullValue (l.loc),
+                                        blk-> copy NullValue (l.loc),
+                                        len-> copy IntValue (l.loc, USIZE_TYPE, 0),
+                                        isImplicitAlias-> true);
+        }
+        
+        if let i: &CopyExpr = context.getCopyExpr () {
+            let addr = copy AddressValue (l.loc, copy PointerType (l.loc, inner, isMutable-> false), content);
+            let ctor = copy SliceCtorValue (l.loc,
+                                            slcType,
+                                            ptr-> addr,
+                                            blk-> copy NullValue (l.loc), // no need for blk info, the slice is copied
+                                            len-> copy IntValue (l.loc, USIZE_TYPE, arrType.len),
+                                            isImplicitAlias-> true);
+            
+            
+            return copy CopierValue (i.loc, slcType, ctor, isDeep-> i.isDeep);
+        }
+        
+        eprintln ("internal slice literal validation; copy context invalid ", context.getCopyExpr ().__typeinfo.name);                    
+        panic;
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * =====================================          ALLOC          ======================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Validate a dynamic slice allocation inside a copy expression.
+     *
+     * Ensures:
+     *   - size is an integer,
+     *   - value is valid,
+     *   - and forwards to the core dynamic-allocation routine.
+     *
+     * @params:
+     *   - context: validation context
+     *   - alloc:   the SliceAllocatorExpr
+     *
+     * @returns:
+     *   - a slice allocation value
+     *
+     * @throws:
+     *   - ErrorMsg if size or value is invalid
+     */
+    fn validateDynamicAlloc (dmut context: &ValidationContext, alloc: &SliceAllocatorExpr)-> &Value
+        throws ErrorMsg
+    {        
+        let size = ValueCreation::createEnumUnwrap (ValueValidation::validate (alias context, alloc.size));
+        if size.type !of IntType {                                    
+            throw copy ErrorMsg::fatal (alloc.size.loc,
+                                        format (ValidateErrorMessage::INCOMPATIBLE_TYPE, size.type, USIZE_TYPE));        
+        }
+
+        let value = ValueValidation::validate (alias context, alloc.value);
+        return ArrayLiteralValidation::validateDynamicAlloc (alias context, alloc.loc, value, size);
+    }
+
+    /**
+     * Core implementation of dynamic slice allocation.
+     *
+     * Steps:
+     *   1. Infer inner type and verify completeness.
+     *   2. Reject NoneType/VoidType as inner types.
+     *   3. If size is a small constant (<= 255), allocate a temporary static array
+     *      and copy from it (faster than memset).
+     *   4. If inside a copy expression, wrap the slice constructor in a CopierValue.
+     *   5. Otherwise, fall back to dynamic allocation (ArrayAllocValue::dyn).
+     *
+     * @params:
+     *   - context: validation context
+     *   - loc:     location of the allocation
+     *   - value:   the element value to fill with
+     *   - size:    the size expression (validated)
+     *
+     * @returns:
+     *   - a slice allocation value
+     *
+     * @throws:
+     *   - ErrorMsg on overflow, invalid types, or missing copy context
+     */
+    pub fn validateDynamicAlloc (dmut context: &ValidationContext, loc: &Word, value: &Value, size: &Value)-> &Value
+        throws ErrorMsg
+    {
+        let innerType = TypeInference::inferImplicitMutability (value.type, value);
+        TypeVerification::verifyComplete (value.loc, innerType, false);
+        
+        if (innerType of NoneType || innerType of VoidType) {
+            throw copy ErrorMsg::fatal (value.loc, format (ValidateErrorMessage::EMPTY_ARRAY_INNER, innerType));
+        }
+
+        if let s: &IntValue = size {
+            let tabSize = {
+                s.value.to!usize ()
+            } catch {
+                _ => {
+                    throw copy ErrorMsg::fatal (size.loc,
+                                                format (ValidateErrorMessage::OVERFLOW_CAPACITY,
+                                                        USIZE_TYPE,
+                                                        size,
+                                                        IntInterpret::createIntMaxValue (0, false)));
+                }
+            };
+
+            if (tabSize <= 255us) { // then alloc from copy is faster (memset is slower than memcpy)
+                let valSize = copy IntValue (size.loc, USIZE_TYPE, tabSize);
+                let type = copy ArrayType (loc, innerType, tabSize, isMutable-> true);
+                let slcType = copy SliceType (loc, innerType, isMutable-> true);
+                let content = copy AddressValue (loc,
+                                                 copy PointerType (loc, innerType, isMutable-> true),
+                                                 copy ArrayAllocValue::stat (loc, type, value, valSize));
+
+                let ctor = copy SliceCtorValue (loc, slcType,
+                                                content,
+                                                NULL_VALUE, // no need for blk info the slice is copied
+                                                valSize, isImplicitAlias-> true);
+
+                // We can make a dynamic alloc only if we are inside a copy
+                if let c: &CopyExpr = context.getCopyExpr () {
+                    return copy CopierValue (c.loc, slcType, ctor, isDeep-> c.isDeep);
+                }
+
+                eprintln ("internal slice literal validation; copy context invalid ", context.getCopyExpr ().__typeinfo.name);
+                panic;
+            }
+        }
+
+        // Size is unknown, we cannot make an array in the stack to copy from
+        let type = copy SliceType (loc, innerType, isMutable-> true);
+        return copy ArrayAllocValue::dyn (loc, type, value, size);
+    }
+
+
+    /**
+     * Validate a static slice allocation outside a copy expression.
+     *
+     * Ensures the size expression is compile-time evaluable, then forwards to
+     * the core static-allocation routine.
+     *
+     * @params:
+     *   - context: validation context
+     *   - alloc:   the SliceAllocatorExpr
+     *
+     * @returns:
+     *   - an ArrayAllocValue::stat
+     *
+     * @throws:
+     *   - ErrorMsg if size is not a compile-time integer
+     */
+    fn validateStaticAlloc (dmut context: &ValidationContext, alloc: &SliceAllocatorExpr)-> &Value
+        throws ErrorMsg
+    {
+        let sizeVal = ValueCreation::createEnumUnwrap (ValueValidation::validate (alias context, alloc.size));
+        let value = ValueValidation::validate (alias context, alloc.value);
+
+        {
+            context.cteInterpret:.computeInt (sizeVal);
+        } catch {
+            err: &ErrorMsg => {
+                throw err.withNote (copy [copy ErrorMsg::note (alloc.loc, format (ValidateErrorMessage::ENCLOSE_COPY_LST))]);
+            }
+        }
+
+        return ArrayLiteralValidation::validateStaticAlloc (alias context, alloc.loc, value, sizeVal);
+    }
+
+    /**
+     * Core implementation of static slice allocation.
+     *
+     * Steps:
+     *   1. Evaluate the size at compile time.
+     *   2. Infer inner type and verify completeness.
+     *   3. Reject NoneType/VoidType as inner types.
+     *   4. Check stack-size limits.
+     *   5. Produce an ArrayAllocValue::stat.
+     *
+     * @params:
+     *   - context: validation context
+     *   - loc:     location of the allocation
+     *   - value:   the element value
+     *   - sizeVal: the compile-time size expression
+     *
+     * @returns:
+     *   - an ArrayAllocValue::stat
+     *
+     * @throws:
+     *   - ErrorMsg on overflow, invalid types, or exceeding stack limits
+     */
+    pub fn validateStaticAlloc (dmut context: &ValidationContext, loc: &Word, value: &Value, sizeVal: &Value)-> &Value
+        throws ErrorMsg
+    {
+        let size = context.cteInterpret:.computeInt (sizeVal);
+        let innerType = TypeInference::inferImplicitMutability (value.type, value);
+
+        TypeVerification::verifyComplete (value.loc, innerType, false);
+        if (innerType of NoneType || innerType of VoidType) {
+            throw copy ErrorMsg::fatal (value.loc, format (ValidateErrorMessage::EMPTY_ARRAY_INNER, innerType));
+        }
+
+        let tabSize = {
+            size.to!usize ()
+        } catch {
+            _ => throw copy ErrorMsg::fatal (sizeVal.loc,
+                                             format (ValidateErrorMessage::OVERFLOW_CAPACITY,
+                                                     USIZE_TYPE,
+                                                     size,
+                                                     IntInterpret::createIntMaxValue (0, false)));
+        };
+
+        if (tabSize > state::arrayMaxStackSize ()) { 
+            throw copy ErrorMsg::fatal (sizeVal.loc,
+                                        format (ValidateErrorMessage::OVERFLOW_CAPACITY_ARRAY,
+                                                tabSize,
+                                                state::arrayMaxStackSize ()));
+        }
+
+        let valSize = copy IntValue (sizeVal.loc, USIZE_TYPE, tabSize);
+        let type = copy ArrayType (loc, innerType, tabSize, isMutable-> true);
+        return copy ArrayAllocValue::stat (loc, type-> type, value-> value, len-> valSize);
+    }
+
 
 }

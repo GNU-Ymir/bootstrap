@@ -1,9 +1,1792 @@
+/*
+ * Declares the ValidationContext class, the central semantic-validation state
+ * used during the transformation of declared symbols into fully validated
+ * generators.
+ *
+ * This module orchestrates all semantic-analysis subcontexts: symbol
+ * resolution, type checking, constant folding, class and constructor
+ * validation, closure capture, unsafe-context tracking, scope management,
+ * and generator construction. Each subsystem of the semantic pass interacts
+ * with this context to maintain a coherent and isolated validation state
+ * across nested scopes, functions, lambdas, classes, macros, and templates.
+ *
+ * The ValidationContext is instantiated once per compilation and persists
+ * throughout the semantic pass. It ensures that recursive validation,
+ * dependent symbol resolution, and compile-time evaluation operate with
+ * consistent and correctly layered contextual information.
+
+ *
+ * <hr>
+ * 
+ * @Package: ymirc        
+ * @Module: ymirc::semantic::validator::context
+ * @File: ymirc/semantic/validator/context.yr
+ * @Author(s):
+ *   - Emile Cadorel <ecadorel@gmail.com>
+ *
+ * @Created (YYYY-MM-DD): 2026-03-18
+ * @Copyright (C) 2021–2026 GNU-Ymir
+ * @License
+ *   ```text
+ *   This file is part of the Ymir language project.
+ *
+ *   Ymir is free software: you can redistribute it and/or modify it
+ *   under the terms of the GNU General Public License as published by
+ *   the Free Software Foundation, either version 3 of the License, or
+ *   (at your option) any later version.
+ *
+ *   Ymir is distributed in the hope that it will be useful,
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *   GNU General Public License for more details.
+ *
+ *   You should have received a copy of the GNU General Public License
+ *   along with Ymir.  If not, see <https://www.gnu.org/licenses/>.
+ *   ```
+ */
 in context;
+
+use ymirc::syntax::{expression::_, declaration::_};
+use ymirc::semantic::{generator, generator::{value::_, type::_}};
+
+use ymirc::semantic::{symbol, declarator, validator, interpret};
+use ymirc::errors::message;
+
+use ymirc::lexing::{word, keys};
+
+use ymirc::utils::{list, format};
+
+use std::fs::path;
+
+/*!
+ * ====================================================================================================
+ * ====================================================================================================
+ * ====================================          SUBMODS          =====================================
+ * ====================================================================================================
+ * ====================================================================================================
+ */
 
 pub mod ::class_;
 pub mod ::def_;
 pub mod ::lambda;
 pub mod ::recursive;
-pub mod ::root;
 pub mod ::template_;
 pub mod ::scope;
+
+/*!
+ * ====================================================================================================
+ * ====================================================================================================
+ * ======================================          ROOT          ======================================
+ * ====================================================================================================
+ * ====================================================================================================
+ */
+
+/**
+ * The ValidationContext encapsulates all semantic-analysis state required to
+ * validate declarations, expressions, types, and generators.
+ *
+ * It maintains a stack-based model of nested validation frames (functions,
+ * lambdas, classes, constructors, loops, closures, macros, etc.), allowing the
+ * validator to enter and exit contexts while preserving correct symbol
+ * visibility, return-type expectations, unsafe-context rules, and scope
+ * semantics.
+ *
+ * The context also tracks compile-time evaluation state, generator creation,
+ * symbol referents, class-specific validation information, and the set of
+ * modules already validated. It is the backbone of the semantic pass and is
+ * consulted by all validator subsystems.
+ * 
+ */
+@final
+pub class ValidationContext {
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ===================================          DECLARATOR          ===================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Declarator used for post-semantic symbol declaration.
+     * Provides access to symbol definitions before validation.
+     * 
+     * */    
+    let dmut _declarator: &Declarator;
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * =======================          SYMBOL VALIDATOR WITH SUB CONTEXTS          =======================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /// Validation context for `def` declarations.
+    let dmut _defContext: &DefContext = copy DefContext ();
+
+    /// Validation context for class bodies (methods, ctors, fields).
+    let dmut _classContext: &ClassContext = copy ClassContext ();
+    
+    /// Validation context for lambda expressions.
+    let dmut _lambdaContext: &LambdaContext = copy LambdaContext ();    
+    
+    /// Validation context for template instantiation and specialization.
+    let dmut _templateContext: &TemplateContext = copy TemplateContext ();
+    
+    /// Recursive validation context for functions.
+    let dmut _functionContext: &RecursiveContext = copy RecursiveContext ();
+    
+    /// Recursive validation context for enums.
+    let dmut _enumContext: &RecursiveContext = copy RecursiveContext ();        
+    
+    /// Recursive validation context for global variables.
+    let dmut _globalVarContext: &RecursiveContext = copy RecursiveContext ();
+    
+    /// Recursive validation context for `sizeof`.
+    let dmut _sizeofContext: &RecursiveContext = copy RecursiveContext ();
+    
+    /// Recursive validation context for `alignof`.
+    let dmut _alignofContext: &RecursiveContext = copy RecursiveContext ();
+    
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ======================================          CTE          =======================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+    
+    /// Compile-time interpreter used to reduce constant expressions.
+    /// Stores already-reduced values to avoid recomputation.
+    let dmut _compileTimeInterpret: &CompileTimeInterpret = copy CompileTimeInterpret (reduced-> copy []);    
+    
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ==============================          GLOBAL TABLE CONTEXT          ==============================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+    
+    /// Stack of referent symbols used for global symbol lookup.
+    /// Supports recursive validation and macro-based symbol access.
+    let dmut _referent                  : &List!{dmut &Symbol} = copy List!{dmut &Symbol} ();
+    
+    /// Stack of referent symbols used when validating macro calls.
+    /// Allows macros to access symbols from both definition and call sites.
+    let dmut _macroReferent             : &List!{dmut &Symbol} = copy List!{dmut &Symbol} ();
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ========================          CURRENT FRAME VALIDATION CONTEXT          ========================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+    
+    /// Stack of expected return types for nested functions/lambdas.
+    let dmut _functionReturns           : &TypeList = copy TypeList ();
+
+    /// Stack indicating whether the current frame is a lambda body.
+    let dmut _inLambda                  : &BoolList = copy BoolList ();
+
+    /// Stack indicating whether the current frame is a function body.
+    let dmut _inFunctionBody            : &BoolList = copy BoolList ();
+
+    /// Stack indicating whether the current frame is a constructor pre-body.
+    let dmut _inCtorPreBody             : &BoolList = copy BoolList ();
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * =============================          CTOR/CLASS VALIDATION          ==============================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+    
+    /// Stack of class types currently being validated.
+    let dmut _classReferent             : &TypeList = copy TypeList ();
+    
+    /// Stack of types whose fields are currently being constructed.
+    let dmut _fieldConstructionTypes    : &TypeList = copy TypeList ();
+
+    /// Stack of fields validated during constructor pre-body.
+    let dmut _fieldConstructionValidated: &UsedList = copy UsedList ();
+    
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * =====================================          SCOPE          ======================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+    
+    /// Stack of symbol tables for nested scopes.
+    let dmut _symbols                   : &List!{dmut &ScopeList} = copy List!{dmut &ScopeList} ();
+
+    /// Stack of used-symbol lists for each scope.
+    let dmut _usedSyms                  : &List!{dmut &UsedList} = copy List!{dmut &UsedList} ();
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ===========================          CURRENT FRAME SAFETY INFOS          ===========================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+    
+    /// Stack tracking whether the current frame is inside an unsafe context.
+    let dmut _inUnsafeContext           : &WordList = copy WordList ();
+
+    /// Stack tracking whether unsafe operations were performed in the frame.
+    let dmut _inUnsafeContextUsed       : &WordList = copy WordList ();
+
+    /// Stack tracking active scope-guard constructs (`scope(exit|success|failure)`).
+    let dmut _inScopeGuard              : &WordList = copy WordList ();
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ==========================          IN SCOPE EXPRESSION CONTEXT          ===========================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+    
+    /// Stack of break-type lists for nested loops.
+    let dmut _loopBreakTypes            : &List!{dmut &TypeList} = copy List!{dmut &TypeList} ();
+
+    /// Stack of values used for `opDollar` resolution.
+    let dmut _dollarContext             : &List!{dmut &ValueList} = copy List!{dmut &ValueList} ();
+
+    /// Stack of copy-expression contexts.
+    let dmut _copyContext               : &List!{dmut &ExpressionList} = copy List!{dmut &ExpressionList} ();
+
+    /// Stack of call-expression contexts.
+    let dmut _callContext               : &List!{dmut &ExpressionList} = copy List!{dmut &ExpressionList} ();
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * =============================          LAMBDA CLOSURE CONTEXT          =============================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+    
+    /// Stack of closure types representing captured variables.
+    let dmut _closureType               : &ClosureList = copy ClosureList ();
+    
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ===================================          GENERATORS          ===================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+    
+    /// All generators created during validation.
+    let dmut _generators                : &GeneratorList = copy GeneratorList ();
+
+    /// Set of modules already validated.
+    let dmut _compiledModules           : [Path => ()] = copy [];
+    
+    /// Set of custom generators already inserted.
+    let mut _customGenerators           : [[c8] => mut ()] = copy [];
+
+    /// List of generator-level errors that do not abort validation.
+    let dmut _genErrors                 : &ErrorList = copy ErrorList ();
+
+    /// Cache of core types, that stores validated core types that may be reused multiple times (e.g. TypeInfo)
+    let mut _coreTypeCache             : [Path => mut &Type] = copy [];
+
+    /// Cache of core values, that stores validated core values that may be reused multiple times (e.g. hashKey)
+    let mut _coreValueCache             : [Path => mut &Value] = copy [];
+    
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ======================================          CTOR          ======================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+    
+    /**
+     * Create a new empty validator
+     */
+    pub self (dmut declarator: &Declarator)
+        with _declarator        = alias declarator                             
+    {}
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ==================================          SUBCONTEXTS          ===================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+    
+    @field
+    pub fn defContext (mut self)-> dmut &DefContext {
+        return alias self._defContext;
+    }
+
+    @field    
+    pub fn classContext (mut self)-> dmut &ClassContext {
+        return alias self._classContext;
+    }
+
+    @field
+    pub fn lambdaContext (mut self)-> dmut &LambdaContext {
+        return alias self._lambdaContext;        
+    }
+    
+    @field
+    pub fn functionContext (mut self)-> dmut &RecursiveContext {
+        return alias self._functionContext;                
+    }
+    
+    @field
+    pub fn enumContext (mut self)-> dmut &RecursiveContext {
+        return alias self._enumContext;            
+    }
+
+    @field
+    pub fn globalVarContext (mut self)-> dmut &RecursiveContext {
+        return alias self._globalVarContext;
+    }
+
+    @field
+    pub fn sizeofContext (mut self)-> dmut &RecursiveContext {
+        return alias self._sizeofContext;                        
+    }
+
+    @field
+    pub fn alignofContext (mut self)-> dmut &RecursiveContext {
+        return alias self._alignofContext;                        
+    }
+    
+    @field
+    pub fn templateContext (mut self)-> dmut &TemplateContext {
+        return alias self._templateContext;
+    }
+    
+    /**
+     * @returns: the declarator for symbol declaration
+     */
+    @field
+    pub fn declarator (mut self)-> dmut &Declarator {
+        alias self._declarator
+    }
+    
+    /**
+     * @returns: the declarator for symbol declaration
+     */
+    @field
+    pub fn declarator (self)-> &Declarator {
+        self._declarator
+    }
+    
+    @field
+    pub fn cteInterpretForRef (mut self)-> dmut &CompileTimeInterpret {
+        return copy CompileTimeInterpret (forRef-> true,
+                                          reduced-> alias self._compileTimeInterpret.reduced);
+    }
+    
+    @field
+    pub fn cteInterpret (mut self)-> dmut &CompileTimeInterpret {
+        return alias self._compileTimeInterpret;        
+    }
+    
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * =================================          SYMBOL CONTEXT          =================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+    
+    /**
+     * Push a new referent. Referent it the current symbol context in which all
+     * global symbol lookup will be performed. Only the current referent is
+     * used, the idea is to be able to restore context when a symbol has
+     * finished validated, and allow recursive validation of dependent symbols.
+     *      
+     * @params: 
+     *   - sym: the symbol that will be used for future symbol access
+     *   - macroSym: the symbol reference in which the macro is called (if we are pushing from a macro call)
+     *
+     *
+     * A macro call has access to the referent symbols of two different trees,
+     * the one in the module defining the macro, and the one in the module that
+     * calls it.
+     * @example:
+     * ```
+     * mod X {
+     *    fn foo (x: i32) {}
+     *    pub macro Z {
+     *       self (x) {
+     *          foo (#{x} ())
+     *       }
+     *    }
+     * }
+     *
+     *
+     * mod Y {
+     *     fn bar ()-> i32 {}
+     *
+     *     fn call () {
+     *        Z#{bar}; // bar is not accessible from X::Z, but we need it anyway
+     *        // And since it's accessible in Y::call, then it's allowed
+     *     }
+     * }
+     * ```
+     */
+    pub fn pushReferent (mut self, dmut sym: &Symbol, dmut macroSym: &Symbol = alias EMPTY_SYMBOL) {
+        self._referent:.push (alias sym);
+        self._macroReferent:.push (alias macroSym);
+    }
+
+    /**
+     * Exit the current referent
+     */
+    pub fn popReferent (mut self) {
+        self._referent:.pop ();
+        self._macroReferent:.pop ();
+    }
+
+    /**
+     * @returns: the current referent
+     * @info: empty if not in a symbol context
+     */
+    @field
+    pub fn referent (mut self)-> dmut &Symbol {
+        if (self._referent.len == 0us) { return alias EMPTY_SYMBOL; }
+        else {
+            return self._referent.back;
+        }
+    }
+
+    /**
+     * @returns: the current referent
+     * @info: empty if not in a symbol context
+     * */
+    @field
+    pub fn referent (self)-> &Symbol {
+        if (self._referent.len == 0us) return EMPTY_SYMBOL;
+        else {
+            return self._referent.back;
+        }
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ================================          FUNCTION CONTEXT          ================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+    
+    /**
+     * Enter a new foreign scope space
+     * @params: 
+     *   - isLambda: true iif the foreign that will be validated is lambda function (closure or not)
+     *   - isFnBody: true iif the foreign we just entered is for validating a function body
+     *   - classRef: type of the class whose symbol is being validated (applicable for symbol defined inside classes, e.g. methods, ctors)
+     */
+    pub fn enterForeign (mut self, isLambda: bool = false, isFnBody: bool, classRef: &Type = NONE_TYPE) {
+        // Enter a new frame validation
+        self._functionReturns:.push (NONE_TYPE); // return type of the frame
+        self._inLambda:.push (isLambda); // a lambda frame (enclosable?)
+        self._inFunctionBody:.push (isFnBody); // not prototype validation, immediately body
+        self._inCtorPreBody:.push (false); // post prototype, in ctor, but before body
+
+        // frame local scopes
+        self._symbols:.push (copy ScopeList ());
+        self._usedSyms:.push (copy UsedList ());
+        
+        // Loops of upper frame have no impact here
+        self._loopBreakTypes:.push (copy TypeList ());
+
+        // Foreign of a method, or ctor
+        self._classReferent:.push (classRef);
+        self._fieldConstructionTypes:.push (NONE_TYPE);
+        self._fieldConstructionValidated:.push (copy UsedVars ());
+
+        // dollars, copies, calls, of upper frame have no impact her
+        self._dollarContext:.push (copy ValueList ());
+        self._copyContext:.push (copy ExpressionList ());
+        self._callContext:.push (copy ExpressionList ());
+
+        // a new frame, so unsafe context is also new
+        self._inUnsafeContext:.push (EOF_WORD); // @unsafe on top of the frame
+        self._inUnsafeContextUsed:.push (EOF_WORD); // an unsafe operation was found
+
+        // scope guards of upper frame have no impact on inner frames
+        self._inScopeGuard:.push (EOF_WORD); // exit, success, failure
+    }
+
+    /**
+     * Exit a foreign scope space
+     */
+    pub fn exitForeign (mut self) {
+        // Poping everything that was pushed in enterForeign
+        self._functionReturns:.pop ();
+        self._inLambda:.pop ();
+        self._inFunctionBody:.pop ();
+        self._inCtorPreBody:.pop ();
+
+        self._symbols:.pop ();
+        self._usedSyms:.pop ();
+        
+        self._loopBreakTypes:.pop ();
+        
+        self._classReferent:.pop ();                
+        self._fieldConstructionTypes:.pop ();
+        self._fieldConstructionValidated:.pop ();
+        
+        self._dollarContext:.pop ();
+        self._copyContext:.pop ();
+        self._callContext:.pop ();        
+
+        self._inUnsafeContext:.pop ();
+        self._inUnsafeContextUsed:.pop ();
+        self._inScopeGuard:.pop ();        
+    }
+    
+    /**
+     * After entering a foreign with isFnBody-> false, we can change the context with this function 
+     * This allows to avoid exiting foreign, and reentering it just after
+     * @info: this does not have to be exited
+     * @example: 
+     * ==================
+     * enterForeign (isFnBody-> false); // <-    
+     * // Validate prototype                | 
+     * enterFunctionBody (); //             |
+     * // Validate function body            |
+     * exitForeign (); // ------------------+
+     * ==================
+     */
+    pub fn enterFunctionBody (mut self) {
+        self._inCtorPreBody.back = false;
+        self._inFunctionBody.back = true;
+    }
+
+
+    /**
+     * After entering a foreign with isFnBody-> false, we can change the context with this function 
+     * This allows to avoid exiting foreign, and reentering it just after
+     * @info: this does not have to be exited
+     * @example: 
+     * ==================
+     * enterForeign (isFnBody-> false); // <-    
+     * // Validate prototype                |
+     * enterCtorPreBody ();                 |
+     * // Validate pre constructor          |
+     * enterFunctionBody (); //             |
+     * // Validate function body            |
+     * exitForeign (); // ------------------+
+     * ==================
+     * */
+    pub fn enterCtorPreBody (mut self) {
+        self._inCtorPreBody.back = true;
+    }
+
+    /**
+     * @returns: true iif the context is currently in validation of a function body (or lambda)
+     */
+    pub fn isInFunctionBody (self)-> bool {
+        if (self._inFunctionBody.len != 0) {
+            self._inFunctionBody.back
+        } else {
+            false
+        }
+    }
+
+    /**
+     * @returns: true iif the context is currently in validation of a function body (or lambda)
+     */
+    pub fn isInCtorPreBody (self)-> bool {
+        if (self._inCtorPreBody.len != 0) {
+            self._inCtorPreBody.back
+        } else {
+            false
+        }
+    }
+    
+    /**
+     * @returns: true iif the context is currently in validation of a lambda body
+     */
+    pub fn isInLambdaBody (self)-> bool {
+        if (self._inLambda.len != 0us) {
+            self._inLambda.back
+        } else {
+            false
+        }
+    }
+    
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * =================================          UNSAFE CONTEXT          =================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+    
+    /**
+     * Enter an unsafe context (either an unsafe keyword, or the whole function body)
+     * */
+    pub fn enterUnsafeContext (mut self, loc: &Word) {
+        self._inUnsafeContext.back = loc;
+    }
+
+    /**
+     * Exit an unsafe context (either an unsafe keyword, or the whole function body)
+     * */
+    pub fn exitUnsafeContext (mut self, force: bool = false)
+        throws ErrorMsg
+    {
+        let unsafeLoc = self._inUnsafeContext.back;
+        let unsafeUsed = self._inUnsafeContextUsed.back;
+
+        self._inUnsafeContext.back = EOF_WORD;
+        self._inUnsafeContextUsed.back = EOF_WORD;
+
+        // if force is true, the unsafe was entered implicitely (extern C functions for example)
+        // So no need to warn that no unsafe were made
+        if (!force && !unsafeLoc.isEof && unsafeUsed.isEof) {
+            throw copy ErrorMsg::fatal (unsafeLoc, ValidateErrorMessage::NOT_UNSAFE);
+        }
+    }
+
+    /**
+     * @returns: the location of the unsafe block if any, EOF_WORD otherwise
+     * */
+    pub fn getUnsafeContextLoc (self)-> &Word {
+        self._inUnsafeContext.back
+    }
+
+    /**
+     * Set the location of an unsafe operation
+     * */
+    pub fn setUnsafeContextUsed (mut self, loc: &Word) {        
+        self._inUnsafeContextUsed.back = loc;
+    }
+    
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ==============================          SCOPE GUARD CONTEXT          ===============================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+    
+    /**
+     * Enter a scope guard validation
+     * */
+    pub fn enterScopeGuard (mut self, loc: &Word) {
+        self._inScopeGuard.back = loc;
+    }
+
+    /**
+     * Exit a scope guard validation
+     * */
+    pub fn exitScopeGuard (mut self) {
+        self._inScopeGuard.back = EOF_WORD;
+    }
+
+    /**
+     * @returns: the location of the scope guard being validated if any
+     * */
+    pub fn getInScopeGuard (self)-> &Word {
+        self._inScopeGuard.back
+    }
+
+    
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * =============================          CLASS / MACRO CONTEXT          ==============================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+    
+    /**
+     * @returns: the class being validated (might be NONE_TYPE)
+     */
+    pub fn getCurrentClassReferent (self)-> &Type {
+        if (self._classReferent.len == 0us) return NONE_TYPE;
+        self._classReferent.back
+    }
+
+    /**
+     * @params: 
+     *    - clRef: the type whose element we want to access
+     * @returns: 
+     *    - .0: true if the current context allows to access the private elements of clRef type
+     *    - .1: true if the current context allows to access the protected elements of clRef type
+     */
+    pub fn getCurrentClassReferentProtections (self, clRef: &ClassRefType)-> (bool, bool) {
+        let mut current = self.getCurrentClassReferent (); 
+        match current {
+            cl: &ClassRefType => {
+                if (cl == clRef) return (true, true); // We are in the class definition (a method, a ctor, etc.)
+                
+                let mut ancestor = cl.ancestor; // Maybe we are in the class definition of a child class
+                while let Ok (anc) = ancestor {
+                    if (anc == clRef) return (false, true); // This is a child class, so we have access to protected content
+                    ancestor = anc.ancestor;
+                }
+            }
+        }
+
+        (false, false)
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ================================          CLOSURE CONTEXT          =================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Enter a closure, that can enclose variable from the parent function
+     * @params: 
+     *   - refId: the uniq id of the declaration of the enclosing variable in the parent function
+     *   - closureIndex: the index of the closure (index of the foreign to enclose)
+     */
+    pub fn enterClosure (mut self, loc: &Word, refId: usize, closureIndex: usize) {
+        let dmut clType = copy ClosureType (loc-> loc,
+                                            refId,
+                                            vars-> self._symbols [closureIndex],
+                                            used-> alias self._usedSyms:[closureIndex]);
+        
+        self._symbols.back.front.content ["#{CLOSURE-VARREF}"] = copy VarRefValue (loc.locate ("#{CLOSURE-VARREF}"),
+                                                                                   EOF_WORD,
+                                                                                   clType,
+                                                                                   refId);
+        
+        self._usedSyms.back.front.content ["#{CLOSURE-VARREF}"] = EOF_WORD;
+        
+        self._closureType:.push (alias clType);
+    }
+
+    /**
+     * Exit the current closure validation
+     * @returns: the closure type
+     */
+    pub fn exitClosure (mut self) -> &ClosureType {
+        let type = self._closureType.back;
+        self._closureType:.pop ();
+        
+        type
+    }
+
+    /**
+     * @returns: the index of the foreign that would be enclosed if a lambda closure was created in current context
+     */
+    pub fn getCurrentClosingIndex (self)-> usize {
+        self._symbols.len - 1us
+    }
+    
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ================================          FUNCTION CONTEXT          ================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+    
+    /**
+     * Set the type of the current function
+     */
+    pub fn setFunctionReturn (mut self, type: &Type) {
+        self._functionReturns.back = type;
+    }
+
+    /**
+     * @returns: the current function return type
+     */
+    pub fn getFunctionReturn (self)-> &Type {
+        self._functionReturns.back
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ==================================          COPY CONTEXT          ==================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+    
+    /**
+     * Enter a copy context, where inner expression are affected by the copy
+     * @params:
+     *    - cp: the expression performing the copy
+     * */
+    pub fn enterCopy (mut self, cp: &Expression) {
+        self._copyContext.back:.push (cp);
+    }
+
+    /**
+     * Exit the current copy context
+     * */
+    pub fn exitCopy (mut self) {
+        self._copyContext.back:.pop ();
+    }
+
+    /**
+     * @returns: true iif the expression is located in a copy or a deep copy
+     * */
+    pub fn isInCopy (self, expr: &Expression)-> bool {
+        let i = self._copyContext.back;
+        if i.len == 0 { return false; }
+
+        return self.isInCopy (i.back, expr);
+    }
+
+    /**
+     * @returns: the location of the current copy/dcopy operator
+     * @warning: return EmptyExpression if not inside a dynamic expression
+     * */
+    pub fn getCopyExpr (self)-> &Expression {
+        let i = self._copyContext.back;
+        if i.len == 0 { return EMPTY_EXPR; };
+
+        i.back
+    }
+
+    /**
+     * @returns: true if the current dynamic expression is deep (false if not in dynamic expression)
+     * */
+    pub fn isInDeepCopy (self)-> bool {
+        let i = self._copyContext.back;
+        if i.len == 0 { return false; }
+        
+        if let cp: &CopyExpr = i.back {
+            return cp.isDeep;
+        }
+        
+        return false;
+    }
+    
+    /**
+     * @returns: true if the intricic values has an effect on the expr as copiyng
+     * */
+    fn isInCopy (self, copier: &Expression, expr: &Expression, inDeep: bool = false)-> bool {
+        if (copier is expr) return true;
+        match copier {
+            cp: &CopyExpr => {
+                if (!cp.isDeep) {
+                    return self.isInCopy (cp.content, expr, inDeep-> false || inDeep);
+                } else {
+                    return self.isInCopy (cp.content, expr, inDeep-> true);
+                }
+            }
+            t: &TryExpr => {
+                return self.isInCopy (t.value, expr, inDeep-> inDeep);
+            }
+            l: &ListExpr => {
+                if (inDeep) { // if not deep, then it the list that is copied, however l !is expr
+                    for i in l.params {
+                        if (self.isInCopy (i, expr, inDeep-> inDeep)) return true;
+                    }
+                }
+            }
+            l: &ListMapExpr => {
+                if (inDeep) { // if not deep, then it the list that is copied, however l !is expr
+                    for i in l.values {
+                        if (self.isInCopy (i, expr, inDeep-> inDeep)) return true;
+                    }
+                    for i in l.keys {
+                        if (self.isInCopy (i, expr, inDeep-> inDeep)) return true;
+                    }
+                }
+            }
+            s: &SliceAllocatorExpr => {
+                if (inDeep) {  // if not deep, then it the list that is copied, however s !is expr
+                    return self.isInCopy (s.value, expr, inDeep-> inDeep);
+                }
+            }
+            s: &SliceForAllocatorExpr => {
+                if (inDeep) {  // if not deep, then it the list that is copied, however s !is expr
+                    return self.isInCopy (s.value, expr, inDeep-> inDeep);
+                }
+            }
+        }
+
+        return false;
+    }
+
+    
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ==================================          CALL CONTEXT          ==================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+    
+    /**
+     * Enter a copy context, where inner expression are affected by the copy
+     * @params:
+     *    - cp: the expression performing the copy
+     * */
+    pub fn enterCall (mut self, cp: &Expression) {
+        self._callContext.back:.push (cp);
+    }
+
+    /**
+     * Exit the current copy context
+     * */
+    pub fn exitCall (mut self) {
+        self._callContext.back:.pop ();
+    }
+
+    /**
+     * @returns: true iif the expression is located in a call
+     * */
+    pub fn isInCall (self, expr: &Expression)-> bool {
+        let i = self._callContext.back;
+        if i.len == 0 { return false; }
+
+        return self.isInCall (i.back, expr);
+    }
+
+    /**
+     * @returns: true if 'expr' is the left operand of the current call
+     * @warning: this function is far from being absolute, it does the job only to check wether a class is accessing its vtable or just fields
+     * */
+    fn isInCall (self, caller: &Expression, expr: &Expression, firstLevel: bool = true)-> bool {
+        if (caller is expr) return true;
+        match caller {
+            c: &MultOperatorExpr => {
+                if (c.op != MultOperators::INDEX) && firstLevel {
+                    return self.isInCall (c.left, expr, firstLevel-> false);
+                }
+            }
+            t: &TemplateCallExpr => {
+                return self.isInCall (t.left, expr, firstLevel-> false);
+            }
+            u: &UnaryExpr => {
+                if (u.op == UnaryOperators::AND) {
+                    return self.isInCall (u.value, expr, firstLevel-> false);
+                }
+            }
+        }
+
+        false
+    }
+    
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * =================================          DOLLAR CONTEXT          =================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Enter a dollar context (opDollar is available on 'value')
+     * @params:
+     *    - value: the value being indexed
+     */
+    pub fn enterDollar (mut self, value: &Value) {
+        self._dollarContext.back:.push (value);
+    }
+
+    /**
+     * Quit a dollar context (opDollar is no longer usable on the last dollar context entered)
+     */
+    pub fn exitDollar (mut self) {
+        self._dollarContext.back:.pop ();
+    }
+    
+    /**
+     * @returns: the value being indexed that can be used for opDollar
+     */
+    pub fn getCurrentDollarContext (self)-> (&Value)? {
+        let i = self._dollarContext.back;
+        if i.len > 0 {
+            i.back?
+        }
+        else none
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * =================================          SCOPE CONTEXT          ==================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+    
+    /**
+     * Enter a new scope
+     */
+    pub fn enterBlock (mut self) {        
+        self._symbols.back:.push (copy DeclaredVars ());
+        self._usedSyms.back:.push (copy UsedVars ());
+    }
+
+    /**
+     * Exit a scope
+     */
+    pub fn safeQuitBlock (mut self) {
+        self._symbols.back:.pop ();
+        self._usedSyms.back:.pop ();
+    }
+    
+    /**
+     * Exit a scope
+     * @throws: 
+     *   - &ErrorMsg: if a symbol was declared but unused and warnUnused
+     */
+    pub fn quitBlock (mut self, warnUnused: bool = true)
+        throws ErrorMsg
+    {        
+        if !warnUnused {
+            self:.safeQuitBlock ();
+            return;
+        }
+
+        let mut errors: [mut &ErrorMsg] = [];
+        
+        let used = self._usedSyms.back.back;
+        for name, g in self._symbols.back.back.content {
+            let mut error = (name !in used);
+            if error {
+                if name == Keys::SELF { error = false; }
+                if name == Keys::UNDER { error = false; }
+                if name.len >= 2 && name [0] == '_' && name [$ - 1] == '_' { error = false; }
+                if name.len >= 1 && name [0] == '#' { error = false; }
+
+                if error {
+                    errors ~= [copy ErrorMsg::warn (g.loc, format (ValidateErrorMessage::DECLARED_NOT_USED, name))];
+                }
+            }                                
+        }        
+        
+        self:.safeQuitBlock ();
+        if errors.len != 0us {
+            throw copy ErrorMsg::list (errors);
+        }
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ==================================          LOOP CONTEXT          ==================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Enter a new loop
+     * @params: 
+     *    - type: the type of the breaks
+     */
+    pub fn enterLoop (mut self, type: &Type = NONE_TYPE) {
+        self._loopBreakTypes.back:.push (type);
+    }
+
+    /**
+     * Set the type of the break types
+     * @params: 
+     *    - type: the type to set for the breaks
+     */
+    pub fn setCurrentLoopType (mut self, type: &Type) {
+        self._loopBreakTypes.back.back = type;
+    }
+
+    /**
+     * @returns: the type of the current loop breaks
+     */
+    pub fn getCurrentLoopType (self)-> &Type {
+        self._loopBreakTypes.back.back
+    }
+
+    /**
+     * Quit the loop scope
+     * @returns: the type of the breaks inside the closing loop
+     */
+    pub fn quitLoop (mut self)-> &Type {
+        let ret = self._loopBreakTypes.back.back;
+        self._loopBreakTypes.back:.pop ();
+        ret
+    }
+
+    /**
+     * @returns: true if the context is actually validating a loop in the current validated function scope
+     */
+    pub fn isInLoop (self)-> bool {
+        self._loopBreakTypes.back.len != 0
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ============================          FIELD VALIDATION CONTEXT          ============================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Enter the validation of a pre constructor during field validation
+     * @params: 
+     *    - type: the type whose field are being validated
+     */
+    pub fn enterFieldConstruction (mut self, type: &ClassRefType) {
+        self._fieldConstructionTypes.back = type;
+        for c in type.localFields {
+            self._fieldConstructionValidated.back.content [c.loc.str] = EOF_WORD;
+        }
+    }
+
+    /**
+     * @returns: the list of fields that have been validated during pre validation
+     */
+    pub fn isUninitFieldValidated (self, name: [c8])-> bool {
+        name in self._fieldConstructionValidated.back
+    }
+
+    /**
+     * Insert a field inside the list of validated field
+     * @params: 
+     *   - field: the name of the field that have been validated and then is usable
+     */
+    pub fn setFieldValidated (mut self, field: [c8]) {
+        self._fieldConstructionValidated.back.content:.remove (field);
+    }
+
+    /**
+     * @returns: true iif we are currently validating the fields in a pre construction of a ctor of a class
+     */
+    pub fn isInFieldConstruction (self)-> bool {
+        if (self._fieldConstructionTypes.len == 0us) return false;
+
+        match self._fieldConstructionTypes.back {
+            NoneType () => { false }
+            _ => { true }
+        }
+    }
+
+    /**
+     * @returns: the type whose fields are being constructed (might be NONE_TYPE)
+     */
+    pub fn getFieldConstructionType (self)-> &Type {
+        if (self._fieldConstructionTypes.len == 0us) return NONE_TYPE;
+        else {
+            self._fieldConstructionTypes.back
+        }
+    }
+    
+    /**
+     * Quit the pre validation of fields 
+     */
+    pub fn quitFieldConstruction (mut self) {
+        self._fieldConstructionValidated.back.content = copy [];
+        self._fieldConstructionTypes.back = NONE_TYPE;
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * =================================          LOCAL VARIABLE          =================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+    
+    /**
+     * Insert a new variable in the current block
+     * @params: 
+     *    - name: the name of the variable
+     *    - val: the declaration of the variable
+     */
+    pub fn insertLocal (mut self, loc: &Word, name: [c8], val: &Value, canShadow: bool = false)
+        throws ErrorMsg
+    {
+        if self._symbols.len == 0 {
+            throw copy ErrorMsg::fatal (loc, format (ValidateErrorMessage::DECLARE_VARIABLE_NO_FUNCTION, name));
+        }
+
+        if self._symbols.back.len == 0 {
+            throw copy ErrorMsg::fatal (loc, format (ValidateErrorMessage::DECLARE_VARIABLE_NO_FUNCTION, name));
+        }
+        
+        if (name == Keys::UNDER) return {}
+        if (!canShadow) {
+            VariableVerification::verifyShadow (self, loc, name-> name);
+        }
+
+        self._symbols.back.back.content [name] = val;
+    }
+
+    /**
+     * Clear the current scope
+     */
+    pub fn clearLocalScope (mut self) {        
+        self._symbols.back.back.content = copy [];
+    }
+
+    /**
+     * Search the definition of a local variable 
+     * @warning: use only for shadowing verification, it does not update used variable infos
+     * @params: 
+     *   - name: the name of the variable to search
+     * @returns: the generator of the variable or UnitValue
+     */
+    pub fn getLocalNoUse (self, name: [c8])-> ((&Value)?) {    
+        if (self._symbols.len != 0us) {
+            for i in 0 .. self._symbols.back.len {
+                if let Ok (g) = self._symbols.back [i].content [name] {                    
+                    return g?;
+                }
+            }
+        }
+
+        return none;
+    }
+    
+    /**
+     * Search the definition of a local variable
+     * @params: 
+     *   - name: the name of the variable to search
+     *   - canBeInClosure: if the variable can be a variable from the parent of a closure
+     * @returns: the generator of the variable or UnitValue
+     */
+    pub fn getLocal (mut self, loc: &Word, name: [c8], canBeInClosure: bool = true)-> ((&Value)?)
+        throws ErrorMsg
+    {
+        if (self._symbols.len != 0us) {
+            for i in 0 .. self._symbols.back.len {
+                if let Ok (g) = self._symbols.back:[i].content [name] {
+                    self._usedSyms.back:[i].content [name] = loc;
+                    return g?;
+                }
+            }
+
+            if (canBeInClosure) {
+                return self:.getInClosure (loc, name);
+            }
+        }
+
+        return none;
+    }
+
+    /**
+     * Force the variable declared locally to be put inside the closure
+     * @params:
+     *   - name: the name of the variable to put in the closure
+     *   - forceRef: true iif the variable is inserted by reference
+     * */
+    pub fn forceInClosure (mut self, loc: &Word, name: [c8], type: &Type, byReference: bool)-> &Value
+        throws ErrorMsg
+    {
+        return self:.getInClosure (loc, name, type, byReference-> byReference);            
+    }
+
+    /**
+     * Finalize the closure, meaning all variable that can enclosed have been enclosed
+     * */
+    pub fn finalizeClosure (mut self) {
+        if (self._closureType.len == 0us) panic;
+
+        let dmut closureType = self._closureType.back;
+        self._closureType.back = closureType:.cloneAsFinalized ();
+    }
+
+    
+    fn getInClosure (mut self, loc: &Word, name: [c8])-> ((&Value)?)
+        throws ErrorMsg
+    {
+        // We are not inside a closure
+        if (self._closureType.len == 0) return none;
+
+        // Retreive current closure information
+        let dmut closureType = alias self._closureType.back;        
+        let oldRef = if let Ok (v: &VarRefValue) = self:.getLocal (EOF_WORD, "#{CLOSURE-VARREF}", canBeInClosure-> false) {
+            v
+        } else panic;
+
+        // 1. Reuse
+        if let Ok ((field, byRef, index)) = closureType.find (name) {
+            return (copy ClosureFieldAccessValue (loc.locate (name),
+                                                  field,
+                                                  oldRef,
+                                                  index,
+                                                  name-> name,
+                                                  isByRef-> byRef))?;
+        }
+
+        // 2. can insert?
+        if closureType.isFinalized { return none; } // cannot insert new enclosings
+
+        // 3. insert
+        let syms = closureType.vars;
+        for i in 0us .. syms.len { // Find the enclosable variable
+            if let Ok (g) = syms [i].content [name] { // enclose a new sym
+                let value = self.enclose (loc, g);
+                let type = value.type;
+                
+                closureType.used:[i].content [name] = EOF_WORD; // set as used in the upper frame
+                closureType:.insert (name, type, value, false); 
+
+                // index in the tuple list, to find it even if we add other enclosed elements
+                let fndIndex = closureType.values.len - 1us;
+
+                // Change the type of the closure var reference (first hidden parameter of the delegate)                                                
+                let closureRef = copy VarRefValue (oldRef.loc,
+                                                   EOF_WORD,
+                                                   closureType,
+                                                   oldRef.refId,
+                                                   isSelf-> oldRef.isSelf,
+                                                   isReference-> false);
+                
+                self._symbols.back.front.content ["#{CLOSURE-VARREF}"] = closureRef;
+                
+                // Return an access to the field of the var
+                return (copy ClosureFieldAccessValue (loc.locate (name),
+                                                      type,
+                                                      closureRef,
+                                                      fndIndex,
+                                                      name-> name,
+                                                      isByRef-> false))?;
+            }        
+        }        
+
+        // 4. Not found in parent function
+        return none;
+    }
+
+    /**
+     * @returns: a local variable that is enclosed
+     */
+    fn getInClosure (mut self, loc: &Word, name: [c8], type: &Type, byReference: bool)-> &Value
+        throws ErrorMsg
+    {
+        // We not inside a closure, we can't force the enclosing
+        if (self._closureType.len == 0) panic;
+
+        let dmut closureType = alias self._closureType.back;
+        
+
+        let oldRef = if let Ok (v: &VarRefValue) = self:.getLocal (EOF_WORD, "#{CLOSURE-VARREF}", canBeInClosure-> false) {
+            v
+        } else panic;
+
+        // 1. Reuse        
+        if let Ok ((field, byRefField, index)) = closureType.find (name) {        
+            return copy ClosureFieldAccessValue (loc.locate (name),
+                                                 field,
+                                                 oldRef,
+                                                 index,
+                                                 name-> name,
+                                                 isByRef-> byRefField);
+        }
+
+        // 2. Insert (assume it's not finalized)
+        let syms = closureType.vars;
+        
+        closureType:.insert (name, type, UNIT_VALUE, byReference);
+        for i in 0 .. syms.len if let Ok (_) = syms [i].content [name] { // Mark the var as used
+            closureType.used:[i].content [name] = EOF_WORD;
+            break;
+        }        
+        
+        let fndIndex = closureType.values.len - 1us;                    
+        let closureRef = copy VarRefValue (oldRef.loc,
+                                           EOF_WORD,
+                                           closureType,
+                                           oldRef.refId,
+                                           isSelf-> oldRef.isSelf,
+                                           isReference-> false);
+        
+        self._symbols.back.front.content ["#{CLOSURE-VARREF}"] = closureRef;
+        
+        return copy ClosureFieldAccessValue (loc.locate (name),
+                                             type,
+                                             closureRef,
+                                             fndIndex,
+                                             name-> name,
+                                             isByRef-> byReference);                    
+    } 
+
+    /**
+     * Check that the value is enclosable, and return a the enclosable value derived from it
+     * @params:
+     *    - loc: the location of the enclosing
+     *    - value: the value being enclosed
+     */
+    fn enclose (self, loc: &Word, value: &Value)-> &Value
+        throws ErrorMsg
+    {        
+        if let v: &VarDeclValue = value {
+            if (v.varType.isMovable) {
+                throw copy ErrorMsg::fatal (loc, format (ValidateErrorMessage::ENCLOSE_MOVABLE_TYPE, v.varType),
+                                            notes-> copy [copy ErrorMsg::note (value.loc, ValidateErrorMessage::DECLARED_HERE)]);
+            }
+
+            if v.varType of LambdaType {                    
+                throw copy ErrorMsg::fatal (loc, format (ValidateErrorMessage::ENCLOSE_INCOMPLETE_TYPE, v.varType),
+                                            notes-> copy [copy ErrorMsg::note (value.loc, ValidateErrorMessage::DECLARED_HERE)]);
+            }
+            
+            return copy VarRefValue (loc, v.loc, v.varType, v.uniqId, isSelf-> false,
+                                     canCte-> v.isCte,
+                                     isIterator-> v.isIterator,
+                                     isReference-> v.isReference,
+                                     isLazy-> v.isLazy,
+                                     value-> if (v.isMutable) { UNIT_VALUE } else { v.value })
+        }                    
+
+        if let p: &ProtoVarDeclValue = value {
+            if (p.type.isMovable) {
+                throw copy ErrorMsg::fatal (loc, format (ValidateErrorMessage::ENCLOSE_MOVABLE_TYPE, p.type),
+                                            notes-> copy [copy ErrorMsg::note (value.loc, ValidateErrorMessage::DECLARED_HERE)]);
+            }
+            
+            return copy VarRefValue (loc,
+                                     p.loc,
+                                     p.type,
+                                     p.uniqId,
+                                     isSelf-> p.isSelf,
+                                     isParam-> true,
+                                     isReference-> p.isReference,
+                                     isLazy-> p.isLazy);
+        }
+        
+        if (value.type.isMovable) {
+            throw copy ErrorMsg::fatal (loc, format (ValidateErrorMessage::ENCLOSE_MOVABLE_TYPE, value.type),
+                                        notes-> copy [copy ErrorMsg::note (value.loc, ValidateErrorMessage::DECLARED_HERE)]);
+        }
+        
+        return value;
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ============================          GLOBAL SYMBOLS RETRIEVAL          ============================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Search all the global symbols whose name are name
+     * @params: 
+     *   - name: the name of the symbols to get
+     * @returns: the list of symbols whose name are name, and are accessible from the current context
+     */
+    pub fn getGlobal (mut self, name: [c8])-> dmut [&Symbol] {
+        if (self._referent.len == 0us) return [];
+        else {
+            let dmut lst = self._referent.back:.getSymbols (name);
+            if self._macroReferent.back !of EmptySymbol {
+                let dmut lst2 = self._macroReferent.back:.getSymbols (name);
+                for dmut z in alias lst2:[] {
+                    lst:.insert (alias z);
+                }
+            }
+
+            return lst:[];
+        }
+    }
+
+    /**
+     * Finalize the validation of a module importation
+     * @params:
+     *    - l: the lazy module to finalize
+     * @returns: the declared module
+     * */
+    pub fn getModuleFromLazy (mut self, l: &LazyModuleSymbol)-> dmut &ModuleSymbol
+        throws ErrorMsg
+    {
+        return self._declarator:.finalizeImportDecl (l);
+    }
+
+    /**
+     * Search all the global symbols whose name are close to `name`, with a distance of `distance`
+     * @params:
+     *   - name: the name of the symbols to get
+     *   - distance: the distance of the name of the symbol to `name`
+     * @returns: the list of symbols whose name are close to `name` (only public ones)
+     */
+    pub fn getCloseGlobal (self, name: [c8], distance: usize = 2us)-> [&Symbol] {
+        if (name.len <= distance + 1us) return [];
+        else if (self._referent.len == 0us) return [];
+        else {
+            let dmut lst = self._referent.back.getCloseSymbols (name, distance);
+            if self._macroReferent.back !of EmptySymbol {
+                let dmut lst2 = self._macroReferent.back.getCloseSymbols (name, distance);
+                for z in lst2[] {
+                    lst:.insert (z);
+                }
+            }
+
+            return lst[];
+        }
+    }
+
+    /**
+     * Search all the global symbols whose name are name
+     * @params:
+     *   - name: the name of the symbols to get
+     * @returns: the list of symbols whose name are name, even if they are not accessible from the current context (protection)
+     */
+    pub fn getGlobalPrivate (mut self, name: [c8])-> dmut [&Symbol] {
+        if (self._referent.len == 0us) return [];
+        else {
+            let dmut lst = self._referent.back:.getSymbols (name, protection-> Protection::PRIVATE);
+            if self._macroReferent.back !of EmptySymbol {
+                let dmut lst2 = self._macroReferent.back:.getSymbols (name, protection-> Protection::PRIVATE);
+                for dmut z in alias lst2:[] {
+                    lst:.insert (alias z);
+                }
+            }
+
+            return lst:[];
+        }
+    }
+
+    /**
+     * Search all the local symbols whose name are name in the module mref
+     * @params:
+     *    - mref: the module in which the search is made
+     *    - name: the name of the symbols to get
+     * @returns: the list of found symbols
+     * */
+    pub fn getLocalFromMod (mut self, mref: &ModuleRefValue, name: [c8])-> dmut [&Symbol] {
+        return self._declarator:.getLocalFromContext (name,
+                                                      self.referent,
+                                                      mref.sym);
+    }
+
+    /**
+     * Search all the local symbols whose name are name in the module mref with private protection
+     * @params:
+     *    - mref: the module in which the search is made
+     *    - name: the name of the symbols to get
+     * @returns: the list of found symbols even if they are not accessible from the current context
+     * */
+    pub fn getLocalFromModPrivate (mut self, mref: &ModuleRefValue, name: [c8])-> dmut [&Symbol] {
+        return self._declarator:.getLocalFromContext (name,
+                                                      self.referent,
+                                                      mref.sym,
+                                                      protection-> Protection::PRIVATE);
+    }
+
+    /**
+     * Search all the local symbols whose name are close to name
+     * @params:
+     *    - mref: the module in which the search is made
+     *    - name: the name of the symbols to get
+     * @returns: the list of found symbols
+     * */
+    pub fn getCloseLocalFromMod (self, mref: &ModuleRefValue, name: [c8], distance: usize = 2us)-> [&Symbol] {
+        self._declarator.getCloseLocalFromContext (name,
+                                                   distance-> distance,
+                                                   self.referent,
+                                                   mref.sym)
+    }
+
+    /**
+     * @returns: the mutable version of the module registered in the module ref     
+     */
+    pub fn getModuleFromRef (mut self, module: &ModuleRefValue)-> dmut &ModuleSymbol {
+        if let dmut md: &ModuleSymbol = self._declarator:.getMutableSymbol (module.sym) {
+            return alias md;
+        }
+
+        panic;
+    }
+
+    /**
+     * @returns: the mutable version of the symbol      
+     */
+    pub fn getClassFromRef (mut self, sym: &ClassSymbol)-> dmut &ClassSymbol {
+        if let dmut cl: &ClassSymbol = self._declarator:.getMutableSymbol (sym) {
+            return alias cl;
+        }
+
+        panic;
+    }
+
+    /**
+     * @returns: the mutable version of the symbol
+     * 
+     */
+    pub fn getSymbolFromRef (mut self, sym: &Symbol)-> dmut &Symbol {
+        self._declarator:.getMutableSymbol (sym)
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ===================================          INSERTION          ====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+    
+    /**
+     * Insert a generator for post validation
+     * @params:
+     *    - sym: the symbol responsible of the generation
+     *    - gen: the generator created
+     * */
+    pub fn insertGenerator (mut self, dmut sym: &Symbol, gen: &Generator) {
+        self._generators:.push (gen);
+        sym:.insertGenerator (gen);
+    }
+
+    /**
+     * Insert a compiled module
+     * @params:
+     *    - path: the path of the file containing the compiled module
+     * */
+    pub fn insertCompiledModule (mut self, path: Path) {
+        self._compiledModules [path] = ();
+    }
+
+    /**
+     * Insert a custom generator
+     * @info: a custom generator is not attached to a symbol (for example the comparison informations of a map type)
+     * @info: only insert the generator if it does not exist
+     * @params:
+     *    - name: the name of the custom generator
+     *    - gen: the generator to insert
+     * */
+    pub fn insertCustomGenerator (mut self, name: [c8], gen: &Generator) {
+        if (name !in self._customGenerators) {
+            self._customGenerators [name] = ();
+            self._generators:.push (gen);
+        }
+    }
+
+    /**
+     * @returns: true if the custom generator 'name' is already inserted
+     * */
+    pub fn hasCustomGenerator (self, name: [c8])-> bool {
+        name in self._customGenerators
+    }
+
+    /**
+     * Insert a named generator
+     * @info: only insert the generator if it does not exist
+     * @params:
+     *    - name: the name of the custom generator
+     *    - gen: the generator to insert
+     * */
+    pub fn insertNamedGenerator (mut self, name: [c8], dmut sym: &Symbol, gen: &Generator) {
+        if (name !in self._customGenerators) {
+            self._customGenerators [name] = ();
+            self._generators:.push (gen);
+            sym:.insertGenerator (gen);
+        }
+    }
+
+    /**
+     * Insert errors that explains missing symbols generation
+     * This errors might be caught by the parser, or may not be depending on when they were thrown but will stop the parsing before the generation phase
+     * */
+    pub fn insertMissingGenerator (mut self, err: &ErrorMsg) {
+        self._genErrors:.push (err);
+    }
+
+    /**
+     * Errors that were not caught, but that provoke failure in generator insertions
+     * */
+    pub fn getMissingGenerators (self)-> [&ErrorMsg] {
+        self._genErrors[]
+    }
+
+    /**
+     * @returns: the list of generators created during validation
+     * */
+    pub fn getGenerators (self)-> [&Generator] {
+        self._generators[]
+    }
+
+    /**
+     * @returns: the list of files containing a module that was compiled
+     * */
+    pub fn getCompiledModules (self)-> [Path] {
+        copy [c for c, _ in self._compiledModules]
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ===================================          CORE TYPES          ===================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Retrieve a core-library type by its path.
+     *
+     * Core types are definitions provided by the Ymir standard library (e.g.,
+     * Exception, Hash, Allocator, Iterator, etc.). These types are resolved
+     * once lazily and cached for fast lookup.
+     *
+     * @params:
+     *    - path: the fully-qualified path of the core-library type
+     *
+     * @returns:
+     *    - &Type if the type is present in the cache
+     *    - none otherwise
+     */
+    pub fn getCoreType (self, path: Path)-> ((&Type)?) {
+        return self._coreTypeCache [path];
+    }
+
+    /**
+     * Insert a core-library type into the cache.
+     *
+     * This is used when loading the standard library: once a core type (such as
+     * Exception or Hash) is resolved, it is stored here so that semantic
+     * validation can retrieve it efficiently.
+     *
+     * @params:
+     *    - path: the fully-qualified path of the core-library type
+     *    - type: the resolved type instance
+     */
+    pub fn insertCoreType (mut self, path: Path, type: &Type) {
+        self._coreTypeCache [path] = type;
+    }
+
+    /**
+     * Retrieve a core-library value by its path.
+     *
+     * Core values are functions, global variables. They are cached after
+     * initial resolution.
+     *
+     * @params:
+     *    - path: the fully-qualified path of the core-library value
+     *
+     * @returns:
+     *    - &Value if the value is present in the cache
+     *    - null otherwise
+     */
+    pub fn getCoreValue (self, path: Path)-> ((&Value)?) {
+        return self._coreValueCache [path];
+    }
+
+    /**
+     * Insert a core-library value into the cache.
+     *
+     * This is used during standard-library initialization to register
+     * predefined values so that semantic validation can access them without
+     * re-resolving their declarations.
+     *
+     * @params:
+     *    - path:  the fully-qualified path of the core-library value
+     *    - value: the resolved value instance
+     */
+    pub fn insertCoreValue (mut self, path: Path, value: &Value) {
+        self._coreValueCache [path] = value;
+    }
+    
+}
