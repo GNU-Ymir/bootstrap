@@ -1,10 +1,58 @@
+/*
+ * Implements the core of Ymir’s value-validation subsystem.
+ *
+ * ValueValidation is responsible for transforming syntactic expressions into
+ * fully-typed semantic values. It performs:
+ *
+ *   - expression classification and dispatch
+ *   - compile-time evaluation (CTE) reduction
+ *   - type inference and type verification
+ *   - memory-ownership verification
+ *   - block semantics (scopes, returns, breaks)
+ *   - try/catch/finally semantics
+ *   - scope-guard semantics (success/failure/exit)
+ *   - validation of nested declarations inside blocks
+ *
+ * This module is one of the central components of the semantic pipeline. Every
+ * expression in the language eventually flows through ValueValidation before
+ * code generation or compile-time interpretation.
+ *
+ * <hr>
+ * 
+ * @Package: ymirc        
+ * @Module: ymirc::semantic::validator::value::validate
+ * @File: ymirc/semantic/validator/value/validate.yr
+ * @Author(s):
+ *   - Emile Cadorel <ecadorel@gmail.com>
+ *   - Emile Cadorel <emile.cadorel@davidson.fr>
+ *
+ * @Created (YYYY-MM-DD): 2021-12-06
+ * @Copyright (C) 2021-2026 GNU-Ymir
+ * @License
+ *   ```text
+ *   This file is part of the Ymir language project.
+ *
+ *   Ymir is free software: you can redistribute it and/or modify it
+ *   under the terms of the GNU General Public License as published by
+ *   the Free Software Foundation, either version 3 of the License, or
+ *   (at your option) any later version.
+ *
+ *   Ymir is distributed in the hope that it will be useful,
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *   GNU General Public License for more details.
+ *
+ *   You should have received a copy of the GNU General Public License
+ *   along with Ymir.  If not, see <https://www.gnu.org/licenses/>.
+ *   ```
+ */
+
 in validate;
 
 use ymirc::syntax::{_, declaration::_, expression::_};
 
-use ymirc::semantic::{declarator, validator, template_, symbol};
+use ymirc::semantic::{declarator, validator, symbol};
 use ymirc::semantic::generator::{value::_, type::_};
-use ymirc::semantic::generator::_;
 
 use ymirc::global::core_;
 use ymirc::errors::_;
@@ -12,11 +60,56 @@ use ymirc::utils::format;
 
 use ymirc::lexing::{word, tokens, keys};
 
-use std::{io, stream, time::_};
+use std::io;
 
-
+/**
+ * ValueValidation module
+ *
+ * Provides the main entry points for validating expressions into semantic
+ * values. The module exposes several overloads of `validate`:
+ *
+ *   - validate(expr) -- validate and optionally reduce the expression
+ *   - validate(expr, type) -- validate and cast to a target type
+ *
+ * Internally, the module handles:
+ *
+ *   - block validation (including nested declarations)
+ *   - try/catch/finally construction
+ *   - scope-guard execution semantics
+ *   - implicit aliasing and memory-ownership checks
+ *   - reduction through the compile-time interpreter
+ *
+ * All expression forms are dispatched through a central match, ensuring that
+ * each syntactic construct is validated by the appropriate subsystem.
+ * 
+ */
 pub mod ValueValidation {
 
+    /**
+     * Validate an expression and cast it to a target type.
+     *
+     * Steps:
+     *   1. Validate the expression into a Value.
+     *   2. If `verif` is true:
+     *        - verify the value’s type is complete
+     *        - infer and apply a cast to the target type
+     *        - verify memory-ownership constraints
+     *   3. Optionally skip compile-time reduction (`noReduce`).
+     *
+     * @params:
+     *   - context:  validation context
+     *   - loc:      location of the cast
+     *   - value:    expression to validate
+     *   - type:     target type
+     *   - verif:    whether to enforce type/memory verification
+     *   - noReduce: skip compile-time reduction
+     *
+     * @returns:
+     *   - the validated and casted Value
+     *
+     * @throws:
+     *   - ErrorMsg if validation or casting fails
+     */
     pub fn validate (dmut context: &ValidationContext,
                      loc:          &Word,
                      value:        &Expression,
@@ -37,7 +130,25 @@ pub mod ValueValidation {
 
         return casted;    
     }
-    
+
+    /**
+     * Validate an expression and optionally reduce it through the CTE interpreter.
+     *
+     * Steps:
+     *   1. Validate the expression into a Value.
+     *   2. If reduction is enabled, call cteInterpret.reduce.
+     *
+     * @params:
+     *   - context:  validation context
+     *   - value:    expression to validate
+     *   - noReduce: skip compile-time reduction
+     *
+     * @returns:
+     *   - the validated Value (possibly reduced)
+     *
+     * @throws:
+     *   - ErrorMsg if validation fails
+     */
     pub fn validate (dmut context: &ValidationContext,
                      value:        &Expression,
                      noReduce:     bool = false)-> &Value
@@ -51,30 +162,38 @@ pub mod ValueValidation {
 
         return val;        
     }
-    
-    pub fn validateCte (dmut context: &ValidationContext, expr: &Expression)-> &Value
-        throws ErrorMsg
-    {        
-        if let c: &ConditionalExpr = expr {
-            return ConditionalValidation::validateCte (alias context, c); 
-        }
 
-        if let f: &ForLoopExpr = expr {
-            return ForLoopValidation::validateCte (alias context, f);
-        }
-
-        if let a: &AssertExpr = expr {
-            return AssertValidation::validateCte (alias context, a);
-        }
-
-        let res = ValueValidation::validate (alias context, expr);
-        if !context.cteInterpret.isCte (res) {
-            throw copy ErrorMsg::fatal (res.loc, format (ValidateErrorMessage::UNKNOWN_AT_COMPILE_TIME, res.type));
-        }
-
-        return res;
-    }    
-
+    /**
+     * Main expression dispatcher.
+     *
+     * Dispatches based on the concrete expression type and forwards to the
+     * appropriate subsystem:
+     *
+     *   - EmptyExpr       => validateEmpty
+     *   - BlockExpr       => validateBlock
+     *   - SetExpr         => validateSet
+     *   - ComposeExpr     => ComposeValidation
+     *   - ControlExpr     => ControlValidation
+     *   - InstructionExpr => InstructionValidation
+     *   - LiteralExpr     => LiteralValidation
+     *   - MemoryExpr      => MemoryValidation
+     *   - OperatorExpr    => OperatorValidation
+     *
+     * Expressions that cannot appear in value position (types, templates, match
+     * filters, scope guards, etc.) produce USE_AS_VALUE errors.
+     *
+     * @params:
+     *   - context:   validation context
+     *   - value:     expression to validate
+     *   - canBeRef:  allow reference values
+     *   - canBeLazy: allow lazy values
+     *
+     * @returns:
+     *   - the validated Value
+     *
+     * @throws:
+     *   - ErrorMsg if the expression is invalid in value position
+     */
     pub fn validate (dmut context: &ValidationContext,
                      value:        &Expression,
                      canBeRef:     bool = false,
@@ -83,10 +202,9 @@ pub mod ValueValidation {
         throws ErrorMsg
     {
         match value {
-            e: &EmptyExpr       => return ValueValidation::validateEmpty (alias context, e);
-            b: &BlockExpr       => return ValueValidation::validateBlock (alias context, b);            
-            s: &ScopeGuardExpr  => return ValueValidation::validateScope (alias context, s);
-            s: &SetExpr         => return ValueValidation::validateSet (alias context, s);
+            e: &EmptyExpr       => return ValueValidation::validateEmpty (e);
+            b: &BlockExpr       => return ValueValidation::validateBlock (alias context, b);                        
+            s: &SetExpr         => return ValueValidation::validateSet (alias context, s);            
             
             c: &ComposeExpr     => return ComposeValidation::validate (alias context, c);
             c: &ControlExpr     => return ControlValidation::validate (alias context, c);
@@ -97,421 +215,541 @@ pub mod ValueValidation {
             m: &MemoryExpr      => return MemoryValidation::validate (alias context, m, canBeRef-> canBeRef, canBeLazy-> canBeLazy);
             o: &OperatorExpr    => return OperatorValidation::validate (alias context, o, canBeRef-> canBeRef, canBeLazy-> canBeLazy);
             
-            m: &MacroRuleExpr   => return ValueValidation::validateInvalid (alias context, m);
-            m: &MatchFilterExpr => return ValueValidation::validateInvalid (alias context, m);
-            t: &TemplateExpr    => return ValueValidation::validateInvalid (alias context, t);
-            t: &TypeExpr        => return ValueValidation::validateInvalid (alias context, t);
+            // Throw Invalid (either because they are types, or because they cannot be encountered in root context)
+            m: &MacroRuleExpr   => throw copy ErrorMsg::fatal (m.loc, ValidateErrorMessage::USE_AS_VALUE);
+            m: &MatchFilterExpr => throw copy ErrorMsg::fatal (m.loc, ValidateErrorMessage::USE_AS_VALUE);
+            t: &TemplateExpr    => throw copy ErrorMsg::fatal (t.loc, ValidateErrorMessage::USE_AS_VALUE);
+            t: &TypeExpr        => throw copy ErrorMsg::fatal (t.loc, ValidateErrorMessage::USE_AS_VALUE);            
+            s: &ScopeGuardExpr  => throw copy ErrorMsg::fatal (s.loc, ValidateErrorMessage::USE_AS_VALUE);
+
+            // Template wrapping
+            t: &TypeWrapperExpr        => return ValueValidation::validateTypeWrap (alias context, t);
+            v: &ValueWrapperExpr       => return ValueValidation::validateValueWrap (v);
+            l: &LambdaValueWrapperExpr => return LambdaComposeValidation::validateWrap (alias context, l);
+            
             _ => {
                 eprintln ("internal value validation error; ", value.__typeinfo.name);
                 panic
             }
-        }        
+        }                
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * =====================================          EMPTY          ======================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Validate an empty expression.
+     *
+     * Produces a UnitValue at the expression’s location.
+     * 
+     */
+    fn validateEmpty (e: &EmptyExpr)-> &Value {
+        return copy UnitValue::withLoc (loc-> e.loc);
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ===================================          TEMPLATES          ====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Validate a TypeWrapperExpr used in value position.
+     *
+     * A TypeWrapperExpr represents an expression of the form:
+     *
+     *     (T)
+     *
+     * where T is a type. In value position, this construct is only valid for
+     * class types, where it denotes access to the class’s static constructors.
+     *
+     * Behavior:
+     *   - Validate the wrapped type.
+     *   - If the type is a ClassRefType, return the class’s static constructor
+     *     value via ClassStaticFieldValidation.
+     *   - If the type is a ClassPtrType, unwrap the pointer and perform the same
+     *     static-constructor lookup.
+     *   - Otherwise, the type cannot be used as a value and a USE_AS_VALUE_TYPE
+     *     diagnostic is emitted.
+     *
+     * @params:
+     *   - context: validation context
+     *   - t:       the type-wrapper expression
+     *
+     * @returns:
+     *   - a Value representing the class’s static constructor set
+     *
+     * @throws:
+     *   - ErrorMsg if the wrapped type is not a class or cannot be used as a value
+     */
+    fn validateTypeWrap (dmut context: &ValidationContext, t: &TypeWrapperExpr)-> &Value
+        throws ErrorMsg
+    {
+        let type = TypeValidation::validate (alias context, t);        
+        if let c: &ClassRefType = type {
+            return ClassStaticFieldValidation::validateClassCtors (alias context, t.loc, c, name-> "");
+        }
+        
+        if let c: &ClassPtrType = type {
+            return ClassStaticFieldValidation::validateClassCtors (alias context, t.loc, c.inner, name-> "");            
+        }
+
+        throw copy ErrorMsg::fatal (t.loc, format (ValidateErrorMessage::USE_AS_VALUE_TYPE, type));
+    }
+
+    /**
+     * Validate a ValueWrapperExpr.
+     *
+     * A ValueWrapperExpr simply wraps an already-validated Value. This function
+     * returns the inner value unchanged. It exists to unify the handling of
+     * wrapper expressions in the validation pipeline.
+     *
+     * @params:
+     *   - v: the wrapper expression
+     *
+     * @returns:
+     *   - the wrapped Value
+     */
+    fn validateValueWrap (v: &ValueWrapperExpr)-> &Value {
+        v.value        
     }
     
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * =====================================          BLOCK          ======================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Validate a block expression.
+     *
+     * Responsibilities:
+     *   - validate the block body (validateTryBlock)
+     *   - apply catch semantics if a catcher is present
+     *   - apply finally/scope-guard semantics if guards are present
+     *   - accumulate errors and return them as a list
+     *
+     * The resulting value is either:
+     *   - BlockValue
+     *   - TryCatchValue
+     *   - TryFinallyValue
+     *
+     * @throws:
+     *   - ErrorMsg list if any part of the block fails validation
+     */
+    fn validateBlock (dmut context: &ValidationContext, b: &BlockExpr)-> &Value
+        throws ErrorMsg
+    {
+        let mut errors: [mut &ErrorMsg] = [];
+
+        let tryBlock = ValueValidation::validateTryBlock (alias context, b, ref errors);                
+        let (catchBlock, type, canThrow) = match (b.catcher, errors.len) {
+            (c: &MatcherExpr, 0us) => {
+                let (catcher, ctVar, finType) = ValueValidation::validateCatcher (alias context,
+                                                                                  c,
+                                                                                  tryBlock.type,
+                                                                                  tryBlock.throwers,
+                                                                                  ref errors);                
+                let nBlock = copy BlockValue (loc-> tryBlock.loc,
+                                              finType,
+                                              tryBlock.values,
+                                              breakLoc-> tryBlock.breakLoc,
+                                              returnLoc-> tryBlock.returnLoc);
+                
+                (copy TryCatchValue (tryBlock.loc, finType, nBlock, catcher, catchVar-> ctVar), finType, true)
+            }
+            _ => {
+                (tryBlock, tryBlock.type, tryBlock.throwers.len != 0us)
+            }
+        };
+
+        let finalBlock = if (errors.len == 0us && b.guards.len != 0us) {
+            let (onExit, failVar) = ValueValidation::validateScopeGuards (alias context,
+                                                                          b.loc,
+                                                                          b.guards,
+                                                                          canThrow,
+                                                                          ref errors);
+            
+            copy TryFinallyValue (catchBlock.loc, type, catchBlock, onExit, failVar-> failVar)
+        } else {
+            catchBlock
+        };
+        
+        if (errors.len != 0us) throw copy ErrorMsg::list (errors);
+        finalBlock
+    }
+
+    /**
+     * Validate the body of a block, including:
+     *
+     *   - entering a new block scope
+     *   - validating nested declarations (validateInnerModule)
+     *   - validating the block’s expressions (validateInnerBlock)
+     *   - handling referent push/pop
+     *   - handling block exit and unused-symbol warnings
+     *
+     * Returns a BlockValue containing:
+     *   - final type
+     *   - list of values
+     *   - return/break locations
+     *   - list of throwers
+     */
+    fn validateTryBlock (dmut context: &ValidationContext, b: &BlockExpr, ref mut errors: [&ErrorMsg])-> &BlockValue {                    
+        let block = {
+            context:.enterBlock ();
+            
+            // A block can have local symbol definitions (such as import, struct, etc.), we need to validate them
+            let dmut module = ValueValidation::validateInnerModule (alias context, b.declModule, ref errors);
+            if let Ok (dmut m) = alias module {
+                context:.pushReferent (alias m);
+            }
+
+            let value = {
+                ValueValidation::validateInnerBlock (alias context, b.loc, b.content, ref errors)
+            } exit { 
+                if module.hasValue {
+                    context:.popReferent ();
+                }
+            }
+            
+            value
+        } exit {
+            {
+                // No need to warn unused if there were errors in the validation
+                // of the block (it will complicate the error handling)
+                // 
+                context:.quitBlock (warnUnused-> (errors.len == 0us));
+            } catch { err: &ErrorMsg => { errors ~= [err]; } }
+        }
+
+        return block;
+    }
+    
+    /**
+     * Validate a declaration module inside a block.
+     *
+     * Responsibilities:
+     *   - create a temporary ModuleSymbol
+     *   - declare and finalize it
+     *   - validate its contents in a foreign scope
+     *   - return the symbol if successful
+     *
+     * If validation fails, the error is appended to `errors` and `none` is returned.
+     * 
+     */
+    fn validateInnerModule (dmut context: &ValidationContext, m: &Declaration, ref mut errors: [&ErrorMsg])-> dmut (&Symbol)? {
+        match m {
+            b: &BlockDecl => if (b.decls.len == 0us) return none;
+        }
+        
+        let dmut modSym = {   
+            let dmut modSym = copy ModuleSymbol (loc-> m.loc.locate (Keys::UNDER),
+                                                 importLoc-> EOF_WORD,
+                                                 comm-> "",
+                                                 isExtern-> false,
+                                                 isGlobal-> false,
+                                                 protection-> Protection::PRIVATE);
+            
+            modSym:.setReferent (alias context.referent);
+
+            context.declarator:.declare (m, alias modSym);
+            context.declarator:.finalizeDeclaration (alias modSym);
+
+            alias modSym
+        } catch {
+            err: &ErrorMsg => {
+                errors ~= [err];
+                return none;
+            }
+        };
+
+        // Enter a foreign, but this is not a function, we just want to avoid polluting the current context
+        context:.enterForeign (isFnBody-> false, classRef-> context.getCurrentClassReferent ());
+
+        {
+            SymbolValidation::validate (alias context, alias modSym);  // Validation of the declared symbols 
+        } catch {
+            err: &ErrorMsg => {
+                errors ~= [err];
+                return none;
+            }
+        } exit {            
+            context:.exitForeign ();
+        }
+
+        // Here we return a leaf that can be accessed only from the current block            
+        return (alias modSym)?;     
+    }
+
+    /**
+     * Validate the sequence of expressions inside a block.
+     *
+     * Responsibilities:
+     *   - detect unreachable statements
+     *   - validate each expression
+     *   - track return/break locations
+     *   - compute the block’s resulting type
+     *   - handle implicit aliasing
+     *   - perform type inference and memory verification on the final value
+     *     
+     */
+    fn validateInnerBlock (dmut context: &ValidationContext, loc: &Word, exprs: [&Expression], ref mut errors: [&ErrorMsg])-> &BlockValue {         
+        let mut rtLoc = EOF_WORD;
+        let mut brLoc = EOF_WORD;
+        let mut valueLoc = loc;
+        
+        let mut type: &Type = VOID_TYPE; 
+        let mut values: [mut &Value] = [];
+        
+        for i in 0us .. exprs.len {
+            {
+                if ((!rtLoc.isEof || !brLoc.isEof) && exprs [i] !of EmptyExpr) {
+                    throw copy ErrorMsg::fatal (exprs [i].loc,
+                                                ValidateErrorMessage::UNREACHBLE_STATEMENT,
+                                                notes-> copy [copy ErrorMsg::note (rtLoc, ValidateErrorMessage::EXITING_SCOPE_HERE)]);
+                }
+
+                let val = ValueValidation::validate (alias context, exprs [i]);
+                
+                TypeVerification::verifyCompleteWithValue (exprs [i].loc, val.type, val, construct-> false);
+                
+                rtLoc = val.returnLoc;
+                brLoc = val.breakLoc;
+                valueLoc = val.loc;
+                
+                // If the value is implicitely aliased, then we transform it
+                // into a immutable value
+                // 
+                type = if (MemoryVerification::needsExplicitAlias (val)) {
+                    val.type.clone (0u32)
+                } else {
+                    val.type
+                };
+                
+                if (i == exprs.len - 1us || val !of UnitValue) { 
+                    values ~= [val];  // push the value in the list of value of the block
+                }
+            } catch {
+                err: &ErrorMsg => { errors ~= [err]; }
+            }            
+        }
+
+        if type !of VoidType {         
+            // Verify implicit aliases and stuff
+            values [$ - 1] = TypeInference::inferValueForType (alias context, valueLoc, values [$ - 1], type, byReference-> false);            
+            MemoryVerification::verifyMemoryOwner (valueLoc, type, values [$ - 1], byReference-> false);            
+        } catch {
+            err: &ErrorMsg => { errors ~= [err]; }
+        }        
+        
+        return copy BlockValue (loc-> valueLoc,
+                                type,
+                                values,
+                                breakLoc-> brLoc,
+                                returnLoc-> rtLoc);
+    }
+
+    /**
+     * Validate a catch clause.
+     *
+     * Responsibilities:
+     *   - compute the union of thrown exception types
+     *   - create a catch variable
+     *   - validate the matcher against the thrown types
+     *   - validate the catch body
+     *   - return:
+     *        (catchContent, catchVar, finalType)
+     *
+     * Errors are appended to `errors` and do not immediately abort validation.
+     * 
+     */
+    fn validateCatcher (dmut context: &ValidationContext, catcher: &MatcherExpr, type: &Type, throwers: [Thrower], ref mut errors: [&ErrorMsg])-> (&Value, &Value, &Type) {
+        if (throwers.len == 0us) {
+            errors ~= [copy ErrorMsg::fatal (catcher.loc, ValidateErrorMessage::NOTHING_TO_CATCH)];
+            return (UNIT_VALUE, UNIT_VALUE, NONE_TYPE);
+        }
+        
+        let mut failed = false;
+
+        context:.enterBlock ();
+        let (content, catchVar, finType) = {            
+            let mut caughtType = TypeCreation::createClassInstance (throwers [0].type);
+            {
+                for i in 1us .. throwers.len {
+                    let inst = TypeCreation::createClassInstance (throwers [i].type);
+                    caughtType = TypeInference::inferBranching (catcher.loc, throwers [i].loc, caughtType, inst);
+                }
+            } catch {
+                _ => {
+                    caughtType = TypeCreation::createExceptionType (alias context, loc-> catcher.loc);
+                }
+            };
+
+            let catchVar = copy VarDeclValue (catcher.loc.locate ("#_catch"), caughtType, UNIT_VALUE, isMutable-> false);
+            let catchVarRef = copy VarRefValue (catchVar.loc,
+                                                catchVar.loc,
+                                                catchVar.varType,
+                                                catchVar.uniqId,
+                                                isSelf-> false,
+                                                canCte-> false);
+
+            let (x, y) = MatcherValidation::validateCatch (alias context, catcher, type, catchVarRef, throwers);
+            (x, catchVar, y)
+        } catch {
+            err: &ErrorMsg => {
+                failed = true;
+                errors ~= [err];
+                (UNIT_VALUE, UNIT_VALUE, NONE_TYPE)
+            }
+        };
+
+        {
+            context:.quitBlock (warnUnused-> !failed)
+        } catch {
+            err: &ErrorMsg => { errors ~= [err]; }
+        }
+
+        return (content, catchVar, finType);        
+    }
+
+    /**
+     * Validate scope-guard clauses (success/failure/exit).
+     *
+     * Responsibilities:
+     *   - enforce that success/failure guards only appear in throwing contexts
+     *   - validate each guard’s body
+     *   - ensure guards cannot throw
+     *   - ensure guard bodies return void/none
+     *   - construct the final guard value:
+     *        - exit only
+     *        - success/failure conditional
+     *        - combined block if exit + conditional
+     *
+     * @returns:
+     *   .0: finalGuardValue
+     *   .1: failureFlagVariable
+     *   
+     */
+    fn validateScopeGuards (dmut context: &ValidationContext, loc: &Word, guards: [&ScopeGuardExpr], canThrow: bool, ref mut errors: [&ErrorMsg])-> (&Value, &Value) {
+        let mut exit: &Value = UNIT_VALUE;
+        let mut fail: &Value = UNIT_VALUE;
+        let mut succ: &Value = UNIT_VALUE;
+
+        // already inside a scope guard, scope within another scope
+        let inScope = context.getInScopeGuard ();
+        for gu in guards {
+            if !canThrow && (gu.kind == ScopeGuardType::FAILURE || gu.kind == ScopeGuardType::SUCCESS) {         
+                errors ~= [copy ErrorMsg::fatal (gu.loc, format (ValidateErrorMessage::EXIT_SCOPE_NO_THROW, gu.loc.str))];
+            }             
+
+            let mut failed = false;
+            context:.enterBlock ();
+            if (inScope.isEof) {
+                context:.enterScopeGuard (gu.loc);
+            }
+
+            let value = {
+                ValueValidation::validate (alias context, gu.content)
+            } catch {
+                err: &ErrorMsg => {
+                    errors ~= [err];
+                    failed = true;
+                    UNIT_VALUE
+                }
+            };
+
+            for i in value.throwers { // cannot throw error in a scope guard
+                errors ~= [copy ErrorMsg::fatal (i.loc, end-> gu.loc, format (ValidateErrorMessage::THROW_SCOPE_GUARD_RETHROW, i.type))];
+            }
+
+            {
+                if (inScope.isEof) context:.exitScopeGuard ();
+                context:.quitBlock (warnUnused-> !failed)
+            } catch {
+                err: &ErrorMsg => { errors ~= [err]; }
+            }
+
+            if (value.type !of VoidType && value.type !of NoneType) {
+                errors ~= [copy ErrorMsg::fatal (gu.content.loc, format (ValidateErrorMessage::EXIT_SCOPE_VALUE_TYPE, gu.loc.str, value.type))];
+            }
+
+            match gu.kind {
+                ScopeGuardType::SUCCESS => { succ = value; }
+                ScopeGuardType::FAILURE => { fail = value; }
+                _ => { exit = value; }
+            }
+        }
+
+        if (fail !of UnitValue || succ !of UnitValue) {
+            let var  = copy VarDeclValue (loc.locate ("#_failed"),
+                                          BOOL_TYPE,
+                                          copy BoolValue (loc, true),
+                                          isMutable-> true);
+            
+            let vref = copy VarRefValue (var.loc,
+                                         var.loc,
+                                         var.varType,
+                                         var.uniqId,
+                                         isSelf-> false,
+                                         canCte-> false);            
+
+            let cnd: &Value = copy ConditionalValue (loc, type-> copy VoidType (loc), test-> vref, thenv-> fail, elsev-> succ);
+            let finValue = if (exit of UnitValue) {
+                cnd
+            } else {
+                copy BlockValue (loc, cnd.type, values-> copy [cnd, exit])
+            };
+
+
+            (finValue, var)
+        } else {
+            (exit, UNIT_VALUE)
+        }
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ======================================          SET          =======================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Validate a `set` expression.
+     *
+     * A set expression is validated like a block, but the resulting BlockValue
+     * is marked with `isSet = true`.
+     *
+     * @throws:
+     *   - ErrorMsg list if validation of the inner block fails
+     *   
+     */
+    fn validateSet (dmut context: &ValidationContext, s: &SetExpr)-> &Value
+        throws ErrorMsg
+    {
+        let mut errors: [&ErrorMsg] = [];
+        let tryBlock = ValueValidation::validateInnerBlock (alias context, s.loc, s.content, ref errors);        
+        if (errors.len != 0) throw copy ErrorMsg::list (errors);
+        
+        return copy BlockValue (s.loc,
+                                type-> tryBlock.type,
+                                values-> tryBlock.values,
+                                breakLoc-> tryBlock.breakLoc,
+                                returnLoc-> tryBlock.returnLoc,
+                                isSet-> true);
+    }    
+    
 }
-
-
-//     /*!
-//      * ================================================================================
-//      * ================================================================================
-//      * =========================            BLOCK             =========================
-//      * ================================================================================
-//      * ================================================================================
-//      */
-
-//     /**
-//      * Validate a block expression
-//      * @params: 
-//      *   - context: the context of the validation
-//      *   - b: the block to validate
-//      * @returns: the validated value
-//      */
-//     fn validateBlock (self, dmut context : &Validator, b : &BlockExpr)-> &Value
-//         throws ErrorMsg
-//     {
-//         let mut errors : [mut &ErrorMsg] = [];
-//         context:.enterBlock ();
-
-//         let (values, valuesType, rtLoc, brLoc, valueLoc) = {
-//             // A block can have local symbol definitions (such as import, struct, etc.), we need to validate them
-//             let dmut module = self.validateInnerModule (alias context, b.getModule (), ref errors);
-
-//             let value = match module {                
-//                 EmptySymbol () => { // No local symbol to access
-//                     self.validateInnerBlock (alias context, b.getExpressions (), ref errors)
-//                 }
-//                 _ => {
-//                     {
-//                         // There are some local symbols, we need to have access to them in the current block
-//                         context:.pushReferent (alias module);
-//                         self.validateInnerBlock (alias context, b.getExpressions (), ref errors)
-//                     } exit {
-//                         context:.popReferent (); // We go back to the previous symbol table, all local symbol are no longer accessible
-//                     }
-//                 }
-//             };
-
-//             value
-//         } exit {
-
-//             {
-//                 // No need to warn unused if there were errors in the validation of the block (it will complicate the error handling)
-//                 context:.quitBlock (warnUnused-> (errors.len == 0us));
-//             } catch { err : &ErrorMsg => { errors ~= [err]; } }
-//         }
-
-//         let loc = if (!valueLoc.isEof) { valueLoc } else { b.getLoc () };
-//         let trB = copy BlockValue (loc, valuesType, values, breakLoc-> brLoc, returnLoc-> rtLoc);
-//         let (retBlock, type, canThrow) = match (b.getCatcher (), errors.len) {
-//             (m : &MatcherExpr, 0us) => {
-//                 let (catcher, ctVar, finType) = self.validateCatcher (alias context, m, valuesType, trB.getThrowers (), ref errors);
-//                 let trBlock = copy BlockValue (loc, finType, values, breakLoc-> brLoc, returnLoc-> rtLoc);
-//                 (copy TryCatchValue (loc, finType, trBlock, catcher, catchVar-> ctVar), finType, true)
-
-//             }
-//             _ => {
-//                 (trB, valuesType, trB.getThrowers ().len != 0us)
-//             }
-//         };
-
-//         let finalValue = if (errors.len == 0us && b.getGuards ().len != 0us) {
-//             let (onExit, failVar) = self.validateScopeGuards (alias context, b.getLoc (), b.getGuards (), canThrow, ref errors);
-//             copy TryFinallyValue (loc, type, retBlock, onExit, failVar-> failVar)
-//         } else {
-//             retBlock
-//         };
-
-//         if (errors.len != 0us) throw copy ErrorMsg::list (errors);
-//         finalValue
-//     }
-
-
-//     /**
-//      * Validate the local module declared inside a block
-//      * @params: 
-//      *    - context: the context of the validation
-//      *    - m: the module declared in the block
-//      * @returns:
-//      *    - errors: the errors that occured when validating    
-//      *    - the symbol that was validated (or EmptySymbol, if the validation failed)
-//      */
-//     fn validateInnerModule (self, dmut context : &Validator, m : &Declaration, ref mut errors : [&ErrorMsg])-> dmut &Symbol {
-//         match m {
-//             b : &BlockDecl => if (b.getDeclarations ().len == 0us) return alias EMPTY_SYMBOL;
-//         }
-
-//         let dmut modSym = {   // We get the declarator of the context, maybe there are imports here, and maybe they are already imported, so we just have to make a reference
-//             let dmut modSym = copy ModuleSymbol (m.getLoc ().locate (Keys::UNDER), importLoc-> EOF_WORD, "", protection-> Protection::PRIVATE);
-//             modSym:.setReferent (alias context:.getReferent ());
-
-//             context:.getDeclarator ():.declare (m, alias modSym);
-//             context:.getDeclarator ():.finalizeDeclaration (alias modSym);
-
-//             alias modSym
-//         } catch {
-//             err : &ErrorMsg => {
-//                 errors ~= [err];
-//                 return alias EMPTY_SYMBOL;
-//             }
-//         };
-
-//         context:.enterForeign (isFnBody-> false, clContext-> context.getCurrentClassContext ()); // Enter a foreign, but this is not a function, we just want to avoid polluting the current context
-
-//         {
-//             context:.validate (alias modSym);  // Validation of the declared symbols 
-//         } catch {
-//             err : &ErrorMsg => {
-//                 errors ~= [err];
-//                 return alias EMPTY_SYMBOL;
-//             }
-//         } exit {            
-//             context:.exitForeign ();
-//         }
-
-//         // Here we return a leaf that can be accessed only from the current block            
-//         return alias modSym;     
-//     }
-
-//     /**
-//      * Validate the content of a block
-//      * @params: 
-//      *   - context: the context of the validation
-//      *   - m: the block to validate
-//      * @returns:
-//      *   - errors: the list of errors, if an errors occurs
-//      *   - .0: the list of values inside the block
-//      *   - .1: the type of the last value
-//      *   - .2: the location of a return statement if any (EOF otherwise)
-//      *   - .3: the location of a break statement if any (EOF otherwise)
-//      *   - .4: the location of the last value
-//      */
-//     fn validateInnerBlock (self, dmut context : &Validator, exprs : [&Expression], ref mut errors : [&ErrorMsg])-> ([&Value], &Type, &Word, &Word, &Word) {
-//         let mut returner = false, mut breaker = false; // Blocks can break loops or return functions
-//         // A returned block is a block in which every path leads to a return statement, and a break statement is breaker
-
-//         let mut rtLoc = EOF_WORD, mut brLoc = EOF_WORD, mut valueLoc = EOF_WORD; // The location of the return, break, and value for error handling
-//         let mut type : &Type = VOID_TYPE; // By default a block has no value, thus its type is void
-//         let mut values : [mut &Value] = []; // List of values in the block
-//         for i in 0us .. exprs.len {
-//             {
-//                 // There is another expression to validate, but there is no way that the program arrives at that point (cf. breaker or returner)
-//                 if ((breaker || returner) && exprs [i] !of EmptyExpression) {
-//                     throw copy ErrorMsg::fatal (exprs [i].getLoc (), ValidateErrorMessage::UNREACHBLE_STATEMENT, notes-> copy [copy ErrorMsg::note (rtLoc, ValidateErrorMessage::EXITING_SCOPE_HERE)]);
-//                 }
-
-//                 let val = context:.validateValue (exprs [i]);
-//                 context.verifyCompleteTypeWithValue (exprs [i].getLoc (), val.getType (), val, construct-> false);
-
-//                 if (val.isReturner ()) { returner = true; rtLoc = val.getReturnerLoc (); } else { returner = false; }
-//                 if (val.isBreaker ())  { breaker = true; rtLoc = val.getBreakerLoc (); } else { breaker = false; }
-
-//                 // If the value is implicitely aliased, then we transform it into a immutable value
-//                 type = if (context.needExplicitAlias (val)) {
-//                     val.getType ().clone (0u32)
-//                 } else {
-//                     val.getType ()
-//                 };
-
-//                 valueLoc = val.getLoc (); // store the location of the value of the block (if it is the last value, it will be definitely stored)
-//                 if (i == exprs.len - 1us || val !of UnitValue) { // ignore unit values, if there created by otherthings than EmptyExpression
-//                     values ~= [val];  // push the value in the list of value of the block
-//                 }
-//             } catch {
-//                 err : &ErrorMsg => { errors ~= [err]; }
-//             }            
-//         }
-
-//         match type { 
-//             VoidType () => {} 
-//             _ => { // Verify implicit aliases and stuff
-//                 values [$ - 1] = context:.verifyCompatibleTypeWithValue (valueLoc, type, values [$ - 1], byReference-> false);
-//                 context.verifyMemoryOwner (valueLoc, type, values [$ - 1], byReference-> false);
-//             } catch {
-//                 err : &ErrorMsg => { errors ~= [err]; }
-//             }
-//         }
-
-//         (values, type, rtLoc, brLoc, valueLoc)
-//     }
-
-
-//     /**
-//      * Validate the catcher part of a block
-//      * @params: 
-//      *   - context: the context of the validation
-//      *   - catcher: the catcher to validate
-//      *   - type: the type of the block that is catched
-//      *   - throwers: the list of exception thrown by the block
-//      * @returns: 
-//      *   - errors: if errors occured
-//      *   - .0: the content of the catcher
-//      *   - .1: the variable that is catched
-//      *   - .2: the type of the value (try{} catch{})
-//      */
-//     fn validateCatcher (self, dmut context : &Validator, catcher : &MatcherExpr, type : &Type, throwers : [(&Word, &Type)], ref mut errors : [&ErrorMsg])-> (&Value, &Value, &Type) {
-//         if (throwers.len == 0us) {
-//             errors ~= [copy ErrorMsg::fatal (catcher.getLoc (), ValidateErrorMessage::NOTHING_TO_CATCH)];
-//             (UNIT_VALUE, UNIT_VALUE, NONE_TYPE)
-//         } else {
-//             let mut failed = false;
-
-//             context:.enterBlock ();
-//             let (content, catchVar, finType) = {
-//                 let mut caughtType = context.createClassInstance (throwers [0]._1); // throwers are class ref, but catch variable is a class ptr
-//                 {
-//                     for i in 1us .. throwers.len {
-//                         caughtType = context.inferTypeBranching (catcher.getLoc (), throwers [i]._0, caughtType, context.createClassInstance (throwers [i]._1));
-//                     }
-//                 } catch {
-//                     _ => {
-//                         caughtType = context:.getExceptionType (loc-> catcher.getLoc ());
-//                     }
-//                 };
-
-//                 let catchVar = copy VarDeclValue (catcher.getLoc ().locate ("#_catch"), caughtType, UNIT_VALUE, isMutable-> false);
-//                 let catchVarRef = copy VarRefValue (catchVar.getLoc (), catchVar.getLoc (), catchVar.getVarType (), catchVar.getUniqId (), isSelf-> false, canCte-> false);
-
-//                 let (x, y) = context:.getMatcherValidator ().validateCatcher (alias context, catcher, type, catchVarRef, throwers);
-//                 (x, catchVar, y)
-//             } catch {
-//                 err : &ErrorMsg => {
-//                     failed = true;
-//                     errors ~= [err];
-//                     (UNIT_VALUE, UNIT_VALUE, NONE_TYPE)
-//                 }
-//             };
-
-//             {
-//                 context:.quitBlock (warnUnused-> !failed)
-//             } catch {
-//                 err : &ErrorMsg => { errors ~= [err]; }
-//             }
-
-//             (content, catchVar, finType)
-//         }
-//     }
-
-//     /**
-//      * Validate the scope guards of a block expression
-//      * @params:
-//      *    - context: the context of the validation
-//      *    - guards: the scope guards to validate
-//      *    - throwers: the list of throwers from the guarded scope
-//      * @returns:
-//      *    - errors: filled with errors if some occured
-//      *    - .0: the content of the validated scope guard
-//      *    - .1: the variable to declare in case of failure/success guards (might be UNIT_VALUE)
-//      * */
-//     fn validateScopeGuards (self, dmut context : &Validator, loc : &Word, guards : [&ScopeGuardExpr], canThrow : bool, ref mut errors : [&ErrorMsg])-> (&Value, &Value) {
-//         let mut exit : &Value = UNIT_VALUE;
-//         let mut fail : &Value = UNIT_VALUE;
-//         let mut succ : &Value = UNIT_VALUE;
-
-//         // already inside a scope guard, scope within another scope
-//         let inScope = context.getInScopeGuard ();
-//         for gu in guards {
-//             match gu.getKind () {
-//                 ScopeGuardType::FAILURE | ScopeGuardType::SUCCESS => {
-//                     if !canThrow {
-//                         errors ~= [copy ErrorMsg::fatal (gu.getLoc (), format (ValidateErrorMessage::EXIT_SCOPE_NO_THROW, gu.getLoc ().str))];
-//                     }
-//                 }
-//             }
-
-//             let mut failed = false;
-//             context:.enterBlock ();
-//             if (inScope.isEof) context:.enterScopeGuard (gu.getLoc ());
-
-//             let value = {
-//                 context:.validateValue (gu.getContent ())
-//             } catch {
-//                 err : &ErrorMsg => {
-//                     errors ~= [err];
-//                     failed = true;
-//                     UNIT_VALUE
-//                 }
-//             };
-
-//             for i in value.getThrowers () { // cannot throw error in a scope guard
-//                 errors ~= [copy ErrorMsg::fatal (i.0, end-> gu.getLoc (), format (ValidateErrorMessage::THROW_SCOPE_GUARD_RETHROW, i._1))];
-//             }
-
-//             {
-//                 if (inScope.isEof) context:.exitScopeGuard ();
-//                 context:.quitBlock (warnUnused-> !failed)
-//             } catch {
-//                 err : &ErrorMsg => { errors ~= [err]; }
-//             }
-
-//             if (value.getType () !of VoidType && value.getType () !of NoneType) {
-//                 errors ~= [copy ErrorMsg::fatal (gu.getContent ().getLoc (), format (ValidateErrorMessage::EXIT_SCOPE_VALUE_TYPE, gu.getLoc ().str, value.getType ()))];
-//             }
-
-//             match gu.getKind () {
-//                 ScopeGuardType::SUCCESS => { succ = value; }
-//                 ScopeGuardType::FAILURE => { fail = value; }
-//                 _ => { exit = value; }
-//             }
-//         }
-
-//         if (fail !of UnitValue || succ !of UnitValue) {
-//             let var  = copy VarDeclValue (loc.locate ("#_failed"), copy BoolType (loc), copy BoolValue (loc, true), isMutable-> true);
-//             let vref = copy VarRefValue (var.getLoc (), var.getLoc (), var.getVarType (), var.getUniqId (), isSelf-> false, canCte-> false);
-
-//             let cnd = copy ConditionalValue (loc, copy VoidType (loc), vref, fail, succ);
-//             let finValue = if (exit of UnitValue) {
-//                 cnd
-//             } else {
-//                 copy BlockValue (loc, cnd.getType (), copy [cnd, exit])
-//             };
-
-
-//             (finValue, var)
-//         } else {
-//             (exit, UNIT_VALUE)
-//         }
-//     }
-
-//     /*!
-//      * ====================================================================================================
-//      * ====================================================================================================
-//      * =============================          TEMPLATE TYPE WRAPPER          ==============================
-//      * ====================================================================================================
-//      * ====================================================================================================
-//      */
-
-//     /**
-//      * Validate a value from a template type wrapper that might contain a class ptr
-//      * @params:
-//      *    - context: the context of the validation
-//      *    - t: the type wrapper to validate
-//      * @returns: a value
-//      * @throws:
-//      *    - &ErrorMsg: if the validation fails
-//      * */
-//     fn validateValueFromTemplateType (self, dmut context : &Validator, t : &TypeWrapperExpr)-> &Value
-//         throws ErrorMsg
-//     {
-//         let type = context:.validateType (t);
-//         match type {
-//             c : &ClassRefType => {
-//                 return context:.getSubTypeValidator ().validateClassCtors (alias context, t.getLoc (), c, name-> "");
-//             }
-//             c : &ClassPtrType => {
-//                 return context:.getSubTypeValidator ().validateClassCtors (alias context, t.getLoc (), c.getInner (), name-> "");
-//             }
-//         }
-
-//         throw copy ErrorMsg::fatal (t.getLoc (), format (ValidateErrorMessage::USE_AS_VALUE_TYPE, type));
-//     }
-
-
-//     /*!
-//      * ================================================================================
-//      * ================================================================================
-//      * =====================          SLICE/ARRAYS/TUPLES           ===================
-//      * ================================================================================
-//      * ================================================================================
-//      */
-
-//     /**
-//      * Validate a list expression
-//      * */
-//     fn validateList (self, dmut context : &Validator, l : &ListExpr)-> &Value
-//         throws ErrorMsg
-//     {
-//         context:.getLiteralValidator ().validateList (alias context, l)
-//     }
-
-//     /**
-//      * Validate a map literal expression
-//      * */
-//     fn validateListMap (self, dmut context : &Validator, l : &ListMapExpr)-> &Value
-//         throws ErrorMsg
-//     {
-//         context:.getLiteralValidator ().validateListMap (alias context, l)
-//     }
-
-//     /**
-//      * Validate a slice allocator expression
-//      * */
-//     fn validateSliceAllocator (self, dmut context :  &Validator, l : &SliceAllocatorExpr)-> &Value
-//         throws ErrorMsg
-//     {
-//         context:.getLiteralValidator ().validateSliceAllocator (alias context, l)
-//     }
-
-//     /**
-//      * Validate a slice allocation using a for loop
-//      * @params:
-//      *    - context: the context of the validation
-//      *    - alloc: the allocator to validate
-//      * */
-//     fn validateSliceFor (self, dmut context : &Validator, alloc : &SliceForAllocatorExpr)-> &Value
-//         throws ErrorMsg
-//     {
-//         context:.getForLoopValidator ().validateListComprehension (alias context, alloc)
-//     }
 
 //     /*!
 //      * ================================================================================
@@ -528,22 +766,22 @@ pub mod ValueValidation {
 //      *   - o: the operator to validate
 //      * @returns: the validated value
 //      */
-//     fn validateOperator (self, dmut context : &Validator, o : &OperatorExpr)-> &Value
+//     fn validateOperator (self, dmut context: &Validator, o: &OperatorExpr)-> &Value
 //         throws ErrorMsg
 //     {
 //         match o {
-//             b : &BinaryExpr => return context:.getBinOpValidator ().validateValue (alias context, b);
-//             m : &MultOperatorExpr => {
+//             b: &BinaryExpr => return context:.getBinOpValidator ().validateValue (alias context, b);
+//             m: &MultOperatorExpr => {
 //                 if (m.isIndex ()) {
 //                     return context:.getIndexOpValidator ().validate (alias context, m);
 //                 } else {
 //                     return context:.getCallOpValidator ().validate (alias context, m);
 //                 }
 //             }
-//             u : &UnaryExpr => return context:.getUnOpValidator ().validate (alias context, u);
-//             p : &PathExpr =>  return context:.getBinOpValidator ().validateModuleOperation (alias context, p);
+//             u: &UnaryExpr => return context:.getUnOpValidator ().validate (alias context, u);
+//             p: &PathExpr =>  return context:.getBinOpValidator ().validateModuleOperation (alias context, p);
 //             _ => {
-//                 println ("Unknown OP : ", o.__typeinfo__.name);
+//                 println ("Unknown OP: ", o.__typeinfo__.name);
 //                 panic;
 //             }
 //         }
@@ -564,7 +802,7 @@ pub mod ValueValidation {
 //     *    - v: the var declaration to validate
 //      * @returns: the validated var decl value
 //      */
-//     pub fn validateVarDecl (self, dmut context : &Validator, v : &VarDeclExpr, needInitValue : bool = true)-> &VarDeclValue
+//     pub fn validateVarDecl (self, dmut context: &Validator, v: &VarDeclExpr, needInitValue: bool = true)-> &VarDeclValue
 //         throws ErrorMsg
 //     {
 //         if (v.getValue () of EmptyExpression) {
@@ -582,7 +820,7 @@ pub mod ValueValidation {
 
 //             let fin = self.validatePatternVarDecl (alias context, copy PatternVarDeclExpr (v.getLoc (), rewrite, v.getValue ()));
 //             match fin {
-//                 z : &VarDeclValue => {
+//                 z: &VarDeclValue => {
 //                     return z;
 //                 }
 //                 _ => {
@@ -601,16 +839,16 @@ pub mod ValueValidation {
 //      *    - v: the variable declaration to validate
 //      *    - needInitValue:
 //      * */
-//     fn validateVarDeclNoValue (self, dmut context : &Validator, v : &VarDeclExpr)-> &VarDeclValue
+//     fn validateVarDeclNoValue (self, dmut context: &Validator, v: &VarDeclExpr)-> &VarDeclValue
 //         throws ErrorMsg
 //     {
-//         let mut errors : [&ErrorMsg] = [];
+//         let mut errors: [&ErrorMsg] = [];
 //         context.verifyShadow (v.getLoc ());
 
 //         let type = {
 //             context:.validateTypeForVarDecl (v.getType (), v, canBeRef-> true, canBeLazy-> true)
 //         }  catch {
-//             err : &ErrorMsg => { // error when validating the type of the variable, so it has an error type, no matter the value
+//             err: &ErrorMsg => { // error when validating the type of the variable, so it has an error type, no matter the value
 //                 errors ~= [err];
 //                 copy ErrorType (v.getLoc ())
 //             }
@@ -619,7 +857,7 @@ pub mod ValueValidation {
 //         {
 //             context.verifyNonVoidType (v.getType ().getLoc (), type, true)
 //         } catch {
-//             err : &ErrorMsg => { errors ~= [err]; }
+//             err: &ErrorMsg => { errors ~= [err]; }
 //         }
 
 //         let finalType = if (errors.len != 0) {
@@ -645,10 +883,10 @@ pub mod ValueValidation {
 //      * @throws:
 //      *     - If the validation fails
 //      * */
-//     fn validatePatternVarDecl (self, dmut context : &Validator, p : &PatternVarDeclExpr)-> &Value
+//     fn validatePatternVarDecl (self, dmut context: &Validator, p: &PatternVarDeclExpr)-> &Value
 //         throws ErrorMsg
 //     {
-//         let mut blk : [&Value] = [];
+//         let mut blk: [&Value] = [];
 //         let (mValue, cond, vars, error) = context:.getMatcherValidator ().validateMatcher (alias context, p.getValue (), p.getPattern (), canBeLazy-> true);
 //         for v in vars { // insert the declared variables
 //             context:.insertLocal (v.1.getLoc (), v.0, v.1);
@@ -661,7 +899,7 @@ pub mod ValueValidation {
 //         // the test has to be irrefutable to be usable outside a conditional
 //         let reducedCond = context:.getCompileTimeInterpreter ():.reduce (cond);
 //         if (match reducedCond {
-//             b : &BoolValue => { !b.isTrue () }
+//             b: &BoolValue => { !b.isTrue () }
 //             _ => { true }
 //         }) throw copy ErrorMsg::fatal (p.getLoc (), format (ValidateErrorMessage::PATTERN_IS_REFUTABLE, p.getPattern (), mValue));
 
@@ -679,20 +917,7 @@ pub mod ValueValidation {
 //      *   - s: the set to validate
 //      * @returns: the validated value
 //      */
-//     fn validateSet (self, dmut context : &Validator, s : &SetExpr)-> &Value
-//         throws ErrorMsg
-//     {
-//         let mut errors : [&ErrorMsg] = [];
-//         let (values, type, brLoc, rtLoc, _) = {
-//             self.validateInnerBlock (alias context, s.getContent (), ref errors)
-//         };
 
-//         let retBlock = copy BlockValue (s.getLoc (), type, values, breakLoc-> brLoc, returnLoc-> rtLoc, isSet-> true);
-
-//         if (errors.len != 0) throw copy ErrorMsg::list (errors);
-
-//         retBlock
-//     }    
 
 //     /*!
 //      * ================================================================================
@@ -708,7 +933,7 @@ pub mod ValueValidation {
 //      *    - context: the context of the validation
 //      *    - i: the decorated expression
 //      * */
-//     fn validateDecoExpr (self, dmut _ : &Validator, d : &DecoratedExpr)-> &Value
+//     fn validateDecoExpr (self, dmut _: &Validator, d: &DecoratedExpr)-> &Value
 //         throws ErrorMsg
 //     {
 //         throw copy ErrorMsg::fatal (d.getLoc (), format (ValidateErrorMessage::UNDEF_DECORATOR_VALUE, d.getDecorator ().str));
@@ -721,12 +946,12 @@ pub mod ValueValidation {
 //      *   - i: the intrinsic expression to validate
 //      * @returns: the validated value
 //      */
-//     fn validateIntrinsics (self, dmut context : &Validator, i : &IntrinsicExpr, canValidateRef : bool = false, canBeLazy : bool = false)-> &Value
+//     fn validateIntrinsics (self, dmut context: &Validator, i: &IntrinsicExpr, canValidateRef: bool = false, canBeLazy: bool = false)-> &Value
 //         throws ErrorMsg
 //     {
 //         match i.getType () {
 //             IntrinsicKeys::COPY => {
-//                 if let lmbd : &LambdaValueExpr = i.getContent () {
+//                 if let lmbd: &LambdaValueExpr = i.getContent () {
 //                     return context:.getLambdaValidator ():.validate (alias context, lmbd, isClosure-> true, copyLoc-> i.getLoc ());
 //                 } else {
 //                     return context:.getCopyValidator ().validateCopy (alias context, i);
@@ -770,7 +995,7 @@ pub mod ValueValidation {
 //      * @throws:
 //      *    - &ErrorMsg: if the value is not aliasable, or cannot be validated
 //      */
-//     pub fn validateAlias (self, dmut context : &Validator, loc : &Word, content : &Expression, isClass : bool = false, isField : bool = false)-> &Value
+//     pub fn validateAlias (self, dmut context: &Validator, loc: &Word, content: &Expression, isClass: bool = false, isField: bool = false)-> &Value
 //         throws ErrorMsg
 //     {
 //         let mut value = context:.getValueValidator ().validate (alias context, content, canBeLazy-> true);
@@ -783,12 +1008,12 @@ pub mod ValueValidation {
 //      * @throws:
 //      *    - &ErrorMsg: if the value is not aliasable, or cannot be validated
 //      */
-//     pub fn validateAlias (self, dmut context : &Validator, loc : &Word, value : &Value, isClass : bool = false, isField : bool = false)-> &Value
+//     pub fn validateAlias (self, dmut context: &Validator, loc: &Word, value: &Value, isClass: bool = false, isField: bool = false)-> &Value
 //         throws ErrorMsg
 //     {
 //         if (isClass) {
 //             match value.getType () {
-//                 cl : &ClassPtrType => {
+//                 cl: &ClassPtrType => {
 //                     if (cl.isStruct ()) {
 //                         context.verifyLeftOperandMove (loc, value, allowSelf-> true);
 //                     } else {
@@ -799,7 +1024,7 @@ pub mod ValueValidation {
 
 //                     return copy ClassAliaserValue (loc, cl, value);
 //                 }
-//                 m : &MapType => {
+//                 m: &MapType => {
 //                     if (!isField) throw copy ErrorMsg::fatal (value.getLoc (), format (ValidateErrorMessage::CLASS_ALIAS_INDEX_NO_CLASS, m));
 //                     if (!m.isMutable ()) {
 //                         throw copy ErrorMsg::fatal (loc, end-> value.getLoc (), format (ValidateErrorMessage::NOT_A_LVALUE_TYPE, m));
@@ -807,7 +1032,7 @@ pub mod ValueValidation {
 
 //                     return copy MapAliaserValue (loc, m, value);
 //                 }
-//                 t : _ => {
+//                 t: _ => {
 //                     if (isField) {
 //                         throw copy ErrorMsg::fatal (value.getLoc (), format (ValidateErrorMessage::CLASS_ALIAS_FIELD_NO_CLASS, t));
 //                     } else {
@@ -840,17 +1065,10 @@ pub mod ValueValidation {
 //      *   - n: the named expression to validate
 //      * @returns: the validated value
 //      */
-//     fn validateNamedExpr (self, dmut context : &Validator, n : &NamedExpr, canBeRef : bool = false, canBeLazy : bool = false)-> &Value
+//     fn validateNamedExpr (self, dmut context: &Validator, n: &NamedExpr, canBeRef: bool = false, canBeLazy: bool = false)-> &Value
 //         throws ErrorMsg
 //     {
-//         let content = self.validate (alias context, n.getContent (), canBeRef-> canBeRef, canBeLazy-> canBeLazy);
-//         let rContent = if (!canBeLazy && !canBeRef) {
-//             context:.getCompileTimeInterpreter ():.reduce (content)
-//         } else {
-//             content
-//         };
 
-//         copy NamedValue (n.getLoc (), n.getLoc ().str, rContent)
 //     }
 
 //     /**
@@ -864,7 +1082,7 @@ pub mod ValueValidation {
 //      * @throws:
 //      *   - &ErrorMsg: if the validation fails
 //      * */
-//     fn validateRefExpr (self, dmut context : &Validator, i : &IntrinsicExpr, expr : &Expression, canValidateRef : bool)-> &Value
+//     fn validateRefExpr (self, dmut context: &Validator, i: &IntrinsicExpr, expr: &Expression, canValidateRef: bool)-> &Value
 //         throws ErrorMsg
 //     {
 //         let ret = context:.validateValue (expr);
@@ -889,7 +1107,7 @@ pub mod ValueValidation {
 //      * @throws:
 //      *   - &ErrorMsg: if the validation fails
 //      * */
-//     pub fn validateLazy (self, dmut context : &Validator, i : &IntrinsicExpr, expr : &Expression, canBeLazy : bool)-> &Value
+//     pub fn validateLazy (self, dmut context: &Validator, i: &IntrinsicExpr, expr: &Expression, canBeLazy: bool)-> &Value
 //         throws ErrorMsg
 //     {
 //         if (!canBeLazy) throw copy ErrorMsg::fatal (i.getLoc (), format (ValidateErrorMessage::UNECESSARY_LAZY));
@@ -931,7 +1149,7 @@ pub mod ValueValidation {
 //      * @throws:
 //      *    - &ErrorMsg: if the validation fails
 //      * */
-//     pub fn validateFuture (self, dmut context : &Validator, i : &IntrinsicExpr, expr : &Expression)-> &Value
+//     pub fn validateFuture (self, dmut context: &Validator, i: &IntrinsicExpr, expr: &Expression)-> &Value
 //         throws ErrorMsg
 //     {
 //         let retValue = context:.validateValue (expr);
@@ -975,17 +1193,17 @@ pub mod ValueValidation {
 //      * @throws:
 //      *   - &ErrorMsg: if the validation fails
 //      */
-//     pub fn validateCteExpr (self, dmut context : &Validator, expr : &Expression)-> &Value
+//     pub fn validateCteExpr (self, dmut context: &Validator, expr: &Expression)-> &Value
 //         throws ErrorMsg
 //     {
 //         match expr {
-//             c : &ConditionalExpr => { // Conditionals have a different treatment for ctes
+//             c: &ConditionalExpr => { // Conditionals have a different treatment for ctes
 //                 return self.validateCteConditionalExpr (alias context, c);
 //             }
-//             f : &ForLoopExpr => { // Same for "for" loops
+//             f: &ForLoopExpr => { // Same for "for" loops
 //                 return self.validateCteForLoopExpr (alias context, f);
 //             }
-//             a : &AssertExpr => {
+//             a: &AssertExpr => {
 //                 return self.validateCteAssertExpr (alias context, a);
 //             }
 //             _ => { // Otherwise we just try to get the value at compilation time
@@ -1008,7 +1226,7 @@ pub mod ValueValidation {
 //      * @throws:
 //      *     - &ErrorMsg: if the validation fails or the test value cannot be known at compile time
 //      */
-//     fn validateCteConditionalExpr (self, dmut context : &Validator, expr : &ConditionalExpr)-> &Value
+//     fn validateCteConditionalExpr (self, dmut context: &Validator, expr: &ConditionalExpr)-> &Value
 //         throws ErrorMsg
 //     {
 //         let test = context:.validateValue (expr.getTest ()); // First we need to validate the expression of the test of the conditional
@@ -1029,7 +1247,7 @@ pub mod ValueValidation {
 //      * @throws:
 //      *    - &ErrorMsg: if the for loop cannot be executed at compile time, or there is an error in the validation (iterator, or for loop content)
 //      */
-//     fn validateCteForLoopExpr (self, dmut context : &Validator, expr : &ForLoopExpr)-> &Value
+//     fn validateCteForLoopExpr (self, dmut context: &Validator, expr: &ForLoopExpr)-> &Value
 //         throws ErrorMsg
 //     {
 //         context:.getForLoopValidator ().validateCteForLoop (alias context, expr)
@@ -1044,7 +1262,7 @@ pub mod ValueValidation {
 //      * @throws:
 //      *   - &ErrorMsg: if the assert expression failed to be validated, or is test is false
 //      * */
-//     fn validateCteAssertExpr (self, dmut context : &Validator, a : &AssertExpr)-> &Value
+//     fn validateCteAssertExpr (self, dmut context: &Validator, a: &AssertExpr)-> &Value
 //         throws ErrorMsg
 //     {
 //         let test = context:.validateValue (a.getTest ());
@@ -1058,7 +1276,7 @@ pub mod ValueValidation {
 //                 EmptyExpression () => {
 //                     throw copy ErrorMsg::fatal (a.getLoc (), ValidateErrorMessage::CTE_ASSERT_NO_MSG);
 //                 }
-//                 msg : _ => {
+//                 msg: _ => {
 //                     let m = context:.validateValue (msg);
 //                     throw copy ErrorMsg::fatal (a.getLoc (), format (ValidateErrorMessage::CTE_ASSERT_WITH_MSG, m));
 //                 }
@@ -1083,7 +1301,7 @@ pub mod ValueValidation {
 //      *   - c: the conditional expression to validate
 //      * @returns: the validated value
 //      */
-//     fn validateConditional (self, dmut context : &Validator, c : &ConditionalExpr)-> &Value
+//     fn validateConditional (self, dmut context: &Validator, c: &ConditionalExpr)-> &Value
 //         throws ErrorMsg
 //     {
 //         if (c.isLet ()) {
@@ -1092,7 +1310,7 @@ pub mod ValueValidation {
 
 //         let test = match c.getTest () {
 //             EmptyExpression () => { UNIT_VALUE }
-//             t : _ => {
+//             t: _ => {
 //                 let r = context:.validateValue (t);
 //                 if (r.getType () !of BoolType) {
 //                     throw copy ErrorMsg::fatal (r.getLoc (), format (ValidateErrorMessage::INCOMPATIBLE_TYPE, r.getType (), copy BoolType (r.getLoc ())));
@@ -1102,7 +1320,7 @@ pub mod ValueValidation {
 //         };
 
 //         match test {
-//             b : &BoolValue => {
+//             b: &BoolValue => {
 //                 if (b.isTrue ()) throw copy ErrorMsg::fatal (b.getLoc (), format (ValidateErrorMessage::USELESS_COND_TRUE));
 //                 else throw copy ErrorMsg::fatal (b.getLoc (), format (ValidateErrorMessage::USELESS_COND_FALSE));
 //             }
@@ -1113,7 +1331,7 @@ pub mod ValueValidation {
 //         {
 //             context.verifyMemoryOwner (content.getLoc (), type, content, byReference-> false);
 //         } catch {
-//             _ : &ErrorMsg => {
+//             _: &ErrorMsg => {
 //                 type = type.clone (0u32);
 //                 context.verifyMemoryOwner (content.getLoc (), type, content, byReference-> false);
 //             }
@@ -1128,18 +1346,18 @@ pub mod ValueValidation {
 //      *    - context: the context of the validation
 //      *    - c: the conditional to validate
 //      * */
-//     fn validateConditionalPattern (self, dmut context : &Validator, c : &ConditionalExpr)-> &Value
+//     fn validateConditionalPattern (self, dmut context: &Validator, c: &ConditionalExpr)-> &Value
 //         throws ErrorMsg
 //     {
-//         let mut error : (&ErrorMsg)? = none, mut hasErrors = false;
+//         let mut error: (&ErrorMsg)? = none, mut hasErrors = false;
 //         let (pattern, value) = match c.getTest () {
-//             v : &VarDeclExpr => {
+//             v: &VarDeclExpr => {
 //                 let rewrite = copy VarDeclExpr (v.getLoc (), v.getName (), value-> EMPTY_EXPR, type-> v.getType (),
 //                                                 isLazyOrRef-> v.getLazyOrRefLocation (),
 //                                                 isMutOrDmut-> v.getMutOrDmutLocation ());
 //                 (rewrite, v.getValue ())
 //             }
-//             p : &PatternVarDeclExpr => (p.getPattern (), p.getValue ())
+//             p: &PatternVarDeclExpr => (p.getPattern (), p.getValue ())
 //             _ => panic;
 //         };
 
@@ -1150,7 +1368,7 @@ pub mod ValueValidation {
 //         let (content, test, type) = {
 //             let (test, taut, _) = context:.getMatcherValidator ().validateConditionGuard (alias context, vars, c.getGuard (), test_);
 //             match context:.getCompileTimeInterpreter ():.reduce (taut) {
-//                 b : &BoolValue => {
+//                 b: &BoolValue => {
 //                     if (b.isTrue ()) throw copy ErrorMsg::fatal (b.getLoc (), format (ValidateErrorMessage::USELESS_COND_TRUE));
 //                     else throw copy ErrorMsg::fatal (b.getLoc (), format (ValidateErrorMessage::USELESS_COND_FALSE));
 //                 }
@@ -1161,7 +1379,7 @@ pub mod ValueValidation {
 //             {
 //                 context.verifyMemoryOwner (content.getLoc (), type, content, byReference-> false);
 //             } catch {
-//                 _ : &ErrorMsg => {
+//                 _: &ErrorMsg => {
 //                     type = type.clone (0u32);
 //                     context.verifyMemoryOwner (content.getLoc (), type, content, byReference-> false);
 //                 }
@@ -1169,7 +1387,7 @@ pub mod ValueValidation {
 
 //             (content, test, type)
 //         } catch {
-//             err : &ErrorMsg => {
+//             err: &ErrorMsg => {
 //                 error = (err)?;
 //                 hasErrors = true;
 //                 (UNIT_VALUE, UNIT_VALUE, NONE_TYPE)
@@ -1180,7 +1398,7 @@ pub mod ValueValidation {
 //             // No need to warn unused if there were errors in the validation of the block (it will complicate the error handling)
 //             context:.quitBlock (warnUnused-> !hasErrors);
 //         } catch {
-//             err : &ErrorMsg => {
+//             err: &ErrorMsg => {
 //                 if (!hasErrors) {
 //                     error = (err)?;
 //                 }
@@ -1199,7 +1417,7 @@ pub mod ValueValidation {
 //      *    - c: the conditional to validate
 //      *    - content: the content of the if
 //      * */
-//     fn validateConditionalElse (self, dmut context : &Validator, c : &ConditionalExpr, type : &Type, test : &Value, content : &Value)-> &Value
+//     fn validateConditionalElse (self, dmut context: &Validator, c: &ConditionalExpr, type: &Type, test: &Value, content: &Value)-> &Value
 //         throws ErrorMsg
 //     {
 //         match c.getElse () {
@@ -1210,7 +1428,7 @@ pub mod ValueValidation {
 
 //                 copy ConditionalValue (c.getLoc (), type, test, content, elsev-> UNIT_VALUE)
 //             }
-//             e : _ => {
+//             e: _ => {
 //                 let else_ = context:.validateValue (e);
 //                 let (inferedType, valueElse) = if (!else_.isBreaker () && !else_.isReturner ()) {
 //                     {
@@ -1220,7 +1438,7 @@ pub mod ValueValidation {
 //                             context:.inferTypeBranchingWithValue (content.getLoc (), type, else_)
 //                         }
 //                     } catch {
-//                         err : &ErrorMsg => throw copy ErrorMsg::fatal (c.getLoc (), notes-> copy [err], ValidateErrorMessage::BRANCHING_VALUE);
+//                         err: &ErrorMsg => throw copy ErrorMsg::fatal (c.getLoc (), notes-> copy [err], ValidateErrorMessage::BRANCHING_VALUE);
 //                     }
 //                 } else {
 //                     if (!content.isBreaker () && !content.isReturner ()) {
@@ -1242,7 +1460,7 @@ pub mod ValueValidation {
 //      *   - f: the for loop to validate
 //      * @returns: the validated value
 //      */
-//     fn validateForLoop (self, dmut context : &Validator, f : &ForLoopExpr)-> &Value
+//     fn validateForLoop (self, dmut context: &Validator, f: &ForLoopExpr)-> &Value
 //         throws ErrorMsg
 //     {
 //         return context:.getForLoopValidator ().validate (alias context, f);
@@ -1255,19 +1473,19 @@ pub mod ValueValidation {
 //      *   - w: the while loop to validate
 //      * @returns: the validated value
 //      */
-//     fn validateWhileLoop (self, dmut context : &Validator, w : &WhileLoopExpr)-> &Value
+//     fn validateWhileLoop (self, dmut context: &Validator, w: &WhileLoopExpr)-> &Value
 //         throws ErrorMsg
 //     {
 //         let test = match w.getTest () {
 //             EmptyExpression () => { UNIT_VALUE }
-//             t : _ => {
+//             t: _ => {
 //                 let r = context:.validateValue (t);
 //                 if (r.getType () !of BoolType) {
 //                     throw copy ErrorMsg::fatal (r.getLoc (), format (ValidateErrorMessage::INCOMPATIBLE_TYPE, r.getType (), copy BoolType (r.getLoc ())));
 //                 }
 
 //                 match r {
-//                     b : &BoolValue => {
+//                     b: &BoolValue => {
 //                         if b.isTrue () throw copy ErrorMsg::fatal (b.getLoc (), format (ValidateErrorMessage::INFINITE_LOOP));
 //                         else {
 //                             if (!w.isDo ()) throw copy ErrorMsg::fatal (b.getLoc (), format (ValidateErrorMessage::NEVER_ENTERED_LOOP));
@@ -1288,7 +1506,7 @@ pub mod ValueValidation {
 
 //             context:.validateValue (w.getContent ())
 //         } catch {
-//             err : &ErrorMsg => { 
+//             err: &ErrorMsg => { 
 //                 context:.quitLoop ();
 //                 throw err;
 //             }
@@ -1318,7 +1536,7 @@ pub mod ValueValidation {
 //      *   - b: the break to validate
 //      * @returns: the validated value
 //      */
-//     fn validateBreak (self, dmut context : &Validator, b : &BreakExpr)-> &Value
+//     fn validateBreak (self, dmut context: &Validator, b: &BreakExpr)-> &Value
 //         throws ErrorMsg
 //     {        
 //         if (!context.isInLoop ()) throw copy ErrorMsg::fatal (b.getLoc (), ValidateErrorMessage::BREAK_NO_LOOP);
@@ -1328,7 +1546,7 @@ pub mod ValueValidation {
 //         // Break can have a value in 'loop' loops
 //         let val = match b.getValue () {
 //             EmptyExpression () => { copy UnitValue (loc-> b.getLoc ()) }
-//             v : &Expression => {
+//             v: &Expression => {
 //                 context:.validateValue (v)
 //             }
 //         };
@@ -1356,7 +1574,7 @@ pub mod ValueValidation {
 //      *   - r: the return to validate
 //      * @returns: the validated value
 //      */
-//     fn validateReturn (self, dmut context : &Validator, r : &ReturnExpr)-> &Value
+//     fn validateReturn (self, dmut context: &Validator, r: &ReturnExpr)-> &Value
 //         throws ErrorMsg
 //     {
 //         if (!context.isInFunctionBody ()) throw copy ErrorMsg::fatal (r.getLoc (), ValidateErrorMessage::RETURN_NO_FUNCTION);
@@ -1369,7 +1587,7 @@ pub mod ValueValidation {
 //         // Return can be used in void function to quit the function immediately, so without a value
 //         let val = match r.getValue () {
 //             EmptyExpression () => { copy UnitValue (loc-> r.getLoc ()) }
-//             v : &Expression => {
+//             v: &Expression => {
 //                 let res = context:.validateValue (v);
 
 //                 match res.getType () {
@@ -1408,7 +1626,7 @@ pub mod ValueValidation {
 //      *   - t: the throw to validate
 //      * @returns: the validated value
 //      */
-//     fn validateThrow (self, dmut context : &Validator, t : &ThrowExpr)-> &Value
+//     fn validateThrow (self, dmut context: &Validator, t: &ThrowExpr)-> &Value
 //         throws ErrorMsg
 //     {
 //         if (!context.isInFunctionBody ()) throw copy ErrorMsg::fatal (t.getLoc (), ValidateErrorMessage::THROW_NO_FUNCTION);
@@ -1431,7 +1649,7 @@ pub mod ValueValidation {
 //      *    - p: the panic to validate
 //      * @returns: the panic value
 //      * */
-//     fn validatePanic (self, dmut _ : &Validator, p : &PanicExpr)-> &Value {
+//     fn validatePanic (self, dmut _: &Validator, p: &PanicExpr)-> &Value {
 //         copy PanicValue (p.getLoc ())
 //     }
 
@@ -1450,7 +1668,7 @@ pub mod ValueValidation {
 //      *   - m: the pattern matcher to validate
 //      * @returns: the validated value
 //      */
-//     fn validateMatcher (self, dmut context : &Validator, m : &MatcherExpr)-> &Value
+//     fn validateMatcher (self, dmut context: &Validator, m: &MatcherExpr)-> &Value
 //         throws ErrorMsg
 //     {
 //         return context:.getMatcherValidator ().validate (alias context, m);
@@ -1472,7 +1690,7 @@ pub mod ValueValidation {
 //      *   - m: the macro call expression to validate
 //      * @returns: the validated value
 //      */
-//     fn validateMacroCall (self, dmut context : &Validator, m : &MacroCallExpr)-> &Value
+//     fn validateMacroCall (self, dmut context: &Validator, m: &MacroCallExpr)-> &Value
 //         throws ErrorMsg
 //     {
 //         return context:.getMacroSolver ().validate (alias context, m);
@@ -1494,7 +1712,7 @@ pub mod ValueValidation {
 //      *   - p: the pragma expression to validate
 //      * @returns: the validated value
 //      */
-//     fn validatePragma (self, dmut context : &Validator, p : &PragmaExpr)-> &Value
+//     fn validatePragma (self, dmut context: &Validator, p: &PragmaExpr)-> &Value
 //         throws ErrorMsg
 //     {
 //         context:.getPragmaValidator ().validateValue (alias context, p)
@@ -1517,7 +1735,7 @@ pub mod ValueValidation {
 //      *   - isCte: true iif the assertion has to be done CTE
 //      * @returns: the validated value
 //      */
-//     fn validateAssert (self, dmut context : &Validator, a : &AssertExpr, isCte : bool = false)-> &Value
+//     fn validateAssert (self, dmut context: &Validator, a: &AssertExpr, isCte: bool = false)-> &Value
 //         throws ErrorMsg
 //     {
 //         let test = context:.validateValue (a.getTest ());
@@ -1528,7 +1746,7 @@ pub mod ValueValidation {
 //         let (isFalse, canCte) = { // if the test is false at compile time, we can assume its a return loc
 //             (!context:.getCompileTimeInterpreter ():.computeBool (test), true)
 //         } catch {
-//             err : _ => {
+//             err: _ => {
 //                 if (isCte) throw err;
 //                 (false, false) // not cte
 //             }
@@ -1538,7 +1756,7 @@ pub mod ValueValidation {
 //             // if the expression has a message, it is passed to the abort function
 //             let message = match a.getMessage () {
 //                 EmptyExpression () => { makeStringSliceValue (a.getLoc (), "") }
-//                 expr : _ => {
+//                 expr: _ => {
 //                     context:.validateValue (expr)
 //                 }
 //             };
@@ -1583,7 +1801,7 @@ pub mod ValueValidation {
 //      *   - t: the try expression to validate
 //      * @returns: the validated value
 //      */
-//     fn validateTry (self, dmut context : &Validator, t : &TryExpr)-> &Value
+//     fn validateTry (self, dmut context: &Validator, t: &TryExpr)-> &Value
 //         throws ErrorMsg
 //     {
 //         let content = context:.validateValue (t.getValue ());
@@ -1609,7 +1827,7 @@ pub mod ValueValidation {
 //      * @throws:
 //      *    - &ErrorMsg: if the validation fails
 //      * */
-//     fn validateOptionCatcher (self, dmut context : &Validator, loc : &Word, t : &Type, v : &Value)-> &Value
+//     fn validateOptionCatcher (self, dmut context: &Validator, loc: &Word, t: &Type, v: &Value)-> &Value
 //         throws ErrorMsg
 //     {
 //         let optType = copy OptionType (loc, t, isMutable-> true);
@@ -1642,7 +1860,7 @@ pub mod ValueValidation {
 //      *   - a: the atomic expression to validate
 //      * @returns: the validated value
 //      */
-//     fn validateAtomic (self, dmut context : &Validator, a : &AtomicExpr)-> &Value
+//     fn validateAtomic (self, dmut context: &Validator, a: &AtomicExpr)-> &Value
 //         throws ErrorMsg
 //     {
 //         match a.getMonitor () {
@@ -1662,12 +1880,12 @@ pub mod ValueValidation {
 //      *     - a: the atomic expr to validate
 //      * @returns: the try finally value
 //      * */
-//     fn validateAtomicWithMonitor (self, dmut context : &Validator, a : &AtomicExpr)-> &Value
+//     fn validateAtomicWithMonitor (self, dmut context: &Validator, a: &AtomicExpr)-> &Value
 //         throws ErrorMsg
 //     {
 //         let monitor = context:.validateValue (a.getMonitor ());
 //         let isClass = match monitor.getType () {
-//             c : &ClassPtrType => { !c.isStruct () }
+//             c: &ClassPtrType => { !c.isStruct () }
 //             _ => { false }
 //         };
 
@@ -1696,7 +1914,7 @@ pub mod ValueValidation {
 //      *     - a: the atomic expr to validate
 //      * @returns: the try finally value
 //      * */
-//     fn validateAtomicNoMonitor (self, dmut context : &Validator, a : &AtomicExpr)-> &Value
+//     fn validateAtomicNoMonitor (self, dmut context: &Validator, a: &AtomicExpr)-> &Value
 //         throws ErrorMsg
 //     {
 //         let (lock, unlock) = context:.getAtomicLockerNoMonitorFuncs (loc-> a.getLoc ());
@@ -1728,7 +1946,7 @@ pub mod ValueValidation {
 //      *   - c: the cast expression to validate
 //      * @returns: the validated value
 //      */
-//     fn validateCast (self, dmut context : &Validator, c : &CastExpr)-> &Value
+//     fn validateCast (self, dmut context: &Validator, c: &CastExpr)-> &Value
 //         throws ErrorMsg
 //     {
 //         context:.getCastValidator ().validateValue (alias context, c)
@@ -1749,7 +1967,7 @@ pub mod ValueValidation {
 //      *   - t: the template call to validate
 //      * @returns: the validated value
 //      */
-//     fn validateTemplateCall (self, dmut context : &Validator, t : &TemplateCallExpr)-> &Value
+//     fn validateTemplateCall (self, dmut context: &Validator, t: &TemplateCallExpr)-> &Value
 //         throws ErrorMsg
 //     {
 //         let left = context:.validateValue (t.getLeft ());
@@ -1766,12 +1984,12 @@ pub mod ValueValidation {
 //      *    - t: the template call to validate
 //      * @returns: the validated value
 //      * */
-//     pub fn validateTemplateCall (self, dmut context : &Validator, loc : &Word, left : &Value, rights : [&Generator])-> &Value
+//     pub fn validateTemplateCall (self, dmut context: &Validator, loc: &Word, left: &Value, rights: [&Generator])-> &Value
 //         throws ErrorMsg
 //     {
-//         let value : &MultSymValue = match left {
-//             m : &MultSymValue => { m }
-//             tmp : _ => { copy MultSymValue (left.getLoc (), copy [tmp], prettyStr-> format ("%", tmp, tags-> FormatTags (withParams-> true))) }
+//         let value: &MultSymValue = match left {
+//             m: &MultSymValue => { m }
+//             tmp: _ => { copy MultSymValue (left.getLoc (), copy [tmp], prettyStr-> format ("%", tmp, tags-> FormatTags (withParams-> true))) }
 //         };
 
 //         self.validateTemplateCallMultSym (alias context, loc, value, rights)
@@ -1787,19 +2005,19 @@ pub mod ValueValidation {
 //      * @throws:
 //      *    - &ErrorMsg: if the call is impossible
 //      */
-//     pub fn validateTemplateCallMultSym (self, dmut context : &Validator, loc : &Word, left : &MultSymValue, rights : [&Generator])-> &Value
+//     pub fn validateTemplateCallMultSym (self, dmut context: &Validator, loc: &Word, left: &MultSymValue, rights: [&Generator])-> &Value
 //         throws ErrorMsg
 //     {
 //         // We store the results inside a vector, where to each valid values is associated the correct rewriter
-//         let mut results : [u32 => mut [(TemplateRewriter, &Value)]] = copy [];
-//         let mut notFinalized : [(TemplateRewriter, &Value)] = [];
+//         let mut results: [u32 => mut [(TemplateRewriter, &Value)]] = copy [];
+//         let mut notFinalized: [(TemplateRewriter, &Value)] = [];
 //         let mut maxScore = 0u32;
-//         let mut errors : [&ErrorMsg] = [];
+//         let mut errors: [&ErrorMsg] = [];
 //         for it in left.getValues () {
 //             {
 //                 let rewriter = context:.getTemplateSolver ().validateCallValue (alias context, left.getLoc (), it, rights);
 //                 let (isFinalized, score) = match it {
-//                     t : &TemplateRefValue => {
+//                     t: &TemplateRefValue => {
 //                         let oldScore = match t.getSymbol ().getTemplateMapper () {
 //                             Ok (map) => { map.getScore () }
 //                             _ => { 0u32 }
@@ -1822,7 +2040,7 @@ pub mod ValueValidation {
 //                     notFinalized ~= [(rewriter, it)];
 //                 }
 //             } catch {
-//                 err : &ErrorMsg => { // does not work
+//                 err: &ErrorMsg => { // does not work
 //                     errors ~= [err];
 //                 }
 //             }
@@ -1841,7 +2059,7 @@ pub mod ValueValidation {
 
 //             self.finalizeTemplateCallMultSym (alias context, left.getLoc (), final)
 //         } catch {
-//             err : &ErrorMsg => {
+//             err: &ErrorMsg => {
 //                 throw copy ErrorMsg::fatal (loc, format (ValidateErrorMessage::UNDEFINED_TEMPLATE_CALL, left, rights, tags-> FormatTags (withParams-> true)), notes-> copy [err]);
 //             }
 //         }
@@ -1857,33 +2075,33 @@ pub mod ValueValidation {
 //      * @throws:
 //      *     - &ErrorMsg: if there was in error in the validation
 //      */
-//     fn finalizeTemplateCallMultSym (self, dmut context : &Validator, loc : &Word, list : [(TemplateRewriter, &Value)])-> &Value
+//     fn finalizeTemplateCallMultSym (self, dmut context: &Validator, loc: &Word, list: [(TemplateRewriter, &Value)])-> &Value
 //         throws ErrorMsg
 //     {
-//         let mut finalResults : [dmut &Symbol] = [];
-//         let mut delegates : [&Value] = [];
-//         let mut errors : [&ErrorMsg] = [];
+//         let mut finalResults: [dmut &Symbol] = [];
+//         let mut delegates: [&Value] = [];
+//         let mut errors: [&ErrorMsg] = [];
 
 //         for it in list { // for each value that can be rewritten
 //             {
 //                 match it._1 {
-//                     m : &MethodDelegateTemplateValue => {
+//                     m: &MethodDelegateTemplateValue => {
 //                         delegates ~= [self.finalizeTemplateMethodCall (alias context, loc, it._0, m)];
 //                     }
-//                     c : &CtorDelegateTemplateValue => {
+//                     c: &CtorDelegateTemplateValue => {
 //                         delegates ~= [self.finalizeTemplateCtorCall (alias context, loc, it._0, c)];
 //                     }
-//                     x : &TemplateRefValue => {
+//                     x: &TemplateRefValue => {
 //                         let dmut val = alias context:.getTemplateDeclarator ():.declare (alias context, loc, it._0, x);
 //                         finalResults ~= [alias val];
 //                     }
-//                     z : _ => {
-//                         println ("TODO : ", z.__typeinfo__.name);
+//                     z: _ => {
+//                         println ("TODO: ", z.__typeinfo__.name);
 //                         panic;
 //                     }
 //                 }
 //             } catch {
-//                 err : &ErrorMsg => { // symbol declaration failed (rewrite cannot fail)
+//                 err: &ErrorMsg => { // symbol declaration failed (rewrite cannot fail)
 //                     errors ~= [err];
 //                 }
 //             }            
@@ -1907,18 +2125,18 @@ pub mod ValueValidation {
 //      * @returns: The delegate value with some template left or fully validated (and thus validated by the function validator)
 //      * @info: uses the function validator to include the frame generator if the constructor templates are all rewritten
 //      * */
-//     fn finalizeTemplateCtorCall (self, dmut context : &Validator, loc : &Word, r : TemplateRewriter, c : &CtorDelegateTemplateValue)-> &Value
+//     fn finalizeTemplateCtorCall (self, dmut context: &Validator, loc: &Word, r: TemplateRewriter, c: &CtorDelegateTemplateValue)-> &Value
 //         throws ErrorMsg
 //     {
 //         let dmut val = alias context:.getTemplateDeclarator ():.declare (alias context, loc, r, c.getPrototype ());
-//         if let dmut func : &ConstructorSymbol = alias val {
-//             if let Ok (clRef : &ClassRefType) = c.getPrototype ().getClassSymbol ().getClassRef () {
-//                 let proto : &CtorPrototypeValue = context:.getFunctionValidator ():.validateCtorPrototype (alias context, alias func, clRef);
+//         if let dmut func: &ConstructorSymbol = alias val {
+//             if let Ok (clRef: &ClassRefType) = c.getPrototype ().getClassSymbol ().getClassRef () {
+//                 let proto: &CtorPrototypeValue = context:.getFunctionValidator ():.validateCtorPrototype (alias context, alias func, clRef);
 //                 return copy CtorDelegateValue (loc, c.getInstanceType (), proto, instance-> c.getInstance (), nextCtor-> c.getNextCtor ());
 //             }
 //         }
 
-//         else if let z : &TemplateSymbol = val {
+//         else if let z: &TemplateSymbol = val {
 //             let meth = copy TemplateRefCtorValue (z.getLoc (), c.getPrototype ().getClassSymbol (), z);
 //             return copy CtorDelegateTemplateValue (loc, c.getInstanceType (), meth, instance-> c.getInstance ());
 //         }
@@ -1936,18 +2154,18 @@ pub mod ValueValidation {
 //      * @returns: The delegate value with some template left or fully validated (and thus validated by the function validator)
 //      * @info: uses the function validator to include the frame generator if the method templates are all rewritten
 //      * */
-//     fn finalizeTemplateMethodCall (self, dmut context : &Validator, loc : &Word, r : TemplateRewriter, m : &MethodDelegateTemplateValue)-> &Value
+//     fn finalizeTemplateMethodCall (self, dmut context: &Validator, loc: &Word, r: TemplateRewriter, m: &MethodDelegateTemplateValue)-> &Value
 //         throws ErrorMsg
 //     {
 //         let dmut val = alias context:.getTemplateDeclarator ():.declare (alias context, loc, r, m.getPrototype ());
-//         if let dmut func : &FunctionSymbol = alias val {
-//             if let Ok (clRef : &ClassRefType) = m.getPrototype ().getClassSymbol ().getClassRef () {
-//                 let proto : &MethodPrototypeValue = context:.getFunctionValidator ():.validateMethodPrototype (alias context, alias func, clRef);
+//         if let dmut func: &FunctionSymbol = alias val {
+//             if let Ok (clRef: &ClassRefType) = m.getPrototype ().getClassSymbol ().getClassRef () {
+//                 let proto: &MethodPrototypeValue = context:.getFunctionValidator ():.validateMethodPrototype (alias context, alias func, clRef);
 //                 return copy MethodDelegateValue (loc, proto, closure-> m.getClosure (), direct-> true, vtableIndex-> 0us, isStruct-> m.isStruct ());
 //             }
 //         }
 
-//         else if let z : &TemplateSymbol = val {
+//         else if let z: &TemplateSymbol = val {
 //             let meth = copy TemplateRefMethodValue (z.getLoc (), m.getPrototype ().getClassSymbol (), z);
 //             return copy MethodDelegateTemplateValue (loc, meth, m.getClosure (), isStruct-> m.isStruct ());
 //         }
@@ -1962,7 +2180,7 @@ pub mod ValueValidation {
 //      *   - t: the template checker to validate
 //      * @returns: the validated value
 //      */
-//     fn validateTemplateChecker (self, dmut context : &Validator, t : &TemplateCheckerExpr)-> &Value
+//     fn validateTemplateChecker (self, dmut context: &Validator, t: &TemplateCheckerExpr)-> &Value
 //         throws ErrorMsg
 //     {        
 //         let list = context:.validateTemplateArgumentList (t.getParameters ());// validate the arguments passed to the checker
