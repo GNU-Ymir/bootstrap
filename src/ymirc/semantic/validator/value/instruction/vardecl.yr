@@ -1,18 +1,188 @@
+/*
+ * Implements validation for variable declarations in Ymir.
+ *
+ * A variable declaration may specify:
+ *   - a name
+ *   - an optional type
+ *   - an optional initializer
+ *   - optional modifiers (lazy, ref, mut, dmut)
+ *   - optional quoting (affects shadowing rules)
+ *
+ * The declaration is validated according to the following rules:
+ *
+ *   - If both type and initializer are missing => VAR_DECL_WITH_NOTHING.
+ *   - If the initializer is missing but a type is present:
+ *         - allowed only when `needInitValue` is false
+ *         - otherwise => VAR_DECL_WITHOUT_VALUE.
+ *
+ *   - If an initializer is present:
+ *         - the declaration is rewritten into a pattern declaration
+ *           and validated by PatternVarDeclValidation.
+ *
+ *   - Shadowing is prohibited unless the identifier is quoted.
+ *
+ *   - Type validation errors produce an ErrorType but the variable is
+ *     still inserted into the local scope to avoid cascading failures.
+ *
+ * Responsibilities:
+ *   - validate type/initializer consistency
+ *   - enforce shadowing rules (with quoted-identifier exceptions)
+ *   - validate declared types
+ *   - construct VarDeclValue
+ *   - insert the variable into the local scope
+ *
+ * <hr>
+ * 
+ * @Package: ymirc        
+ * @Module: ymirc::semantic::validator::value::instruction::vardecl
+ * @File: ymirc/semantic/validator/value/instruction/vardecl.yr
+ * @Author(s):
+ *   - Emile Cadorel <ecadorel@gmail.com>
+ *
+ * @Created (YYYY-MM-DD): 2026-03-27
+ * @Copyright (C) 2021–2026 GNU-Ymir
+ * @License
+ *   ```text
+ *   This file is part of the Ymir language project.
+ *
+ *   Ymir is free software: you can redistribute it and/or modify it
+ *   under the terms of the GNU General Public License as published by
+ *   the Free Software Foundation, either version 3 of the License, or
+ *   (at your option) any later version.
+ *
+ *   Ymir is distributed in the hope that it will be useful,
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *   GNU General Public License for more details.
+ *
+ *   You should have received a copy of the GNU General Public License
+ *   along with Ymir.  If not, see <https://www.gnu.org/licenses/>.
+ *   ```
+ */
+
 in vardecl;
 
-use ymirc::syntax::expression::instruction;
+use ymirc::syntax::expression::_;
 use ymirc::semantic::validator;
-use ymirc::semantic::generator::value;
-use ymirc::errors::message;
+use ymirc::semantic::generator::{value::_, type::_};
 
+use ymirc::errors::message;
+use ymirc::utils::format;
+use std::io;
+
+/**
+ * VarDeclValidation module
+ *
+ * Provides validation for variable declarations.
+ *
+ * Semantics:
+ *   - A declaration without an initializer is allowed only when:
+ *        - a type is provided, and
+ *        - `needInitValue` is false.
+ *
+ *   - A declaration with an initializer is rewritten into a pattern
+ *     declaration and validated through PatternVarDeclValidation.
+ *
+ *   - A declaration without an initializer is validated directly:
+ *        - the type is validated
+ *        - UNIT is used as the initial value
+ *        - the variable is inserted into the local scope
+ *
+ *   - Type validation failures produce ErrorType but still create a
+ *     VarDeclValue so that the variable exists in scope.
+ */
 pub mod VarDeclValidation {
 
-    pub fn validate (dmut context: &ValidationContext, la: &VarDeclExpr)-> &Value
+    /**
+     * Validate a variable declaration.
+     *
+     * @returns:
+     *   - VarDeclValue
+     *
+     * @throws:
+     *   - ErrorMsg for invalid declarations
+     */
+    pub fn validate (dmut context: &ValidationContext, v: &VarDeclExpr, needInitValue: bool = true)-> &Value
         throws ErrorMsg
-    {        
-        context;
-        la;
-        panic;
+    {
+        if (v.value of EmptyExpr) {
+            if (v.type of EmptyExpr) {
+                throw copy ErrorMsg::fatal (v.loc, format (ValidateErrorMessage::VAR_DECL_WITH_NOTHING));
+            } else if (needInitValue) {
+                throw copy ErrorMsg::fatal (v.loc, format (ValidateErrorMessage::VAR_DECL_WITHOUT_VALUE));
+            }
+
+            return VarDeclValidation::validateNoValue (alias context, v);
+        }
+        
+        let rewrite = copy VarDeclExpr (v.loc,
+                                        v.name,
+                                        value-> EMPTY_EXPR,
+                                        type-> v.type,
+                                        isLazyOrRef-> v.isLazyOrRef,
+                                        isMutOrDmut-> v.isMutOrDmut);
+        
+        let fin = PatternVarDeclValidation::validate (alias context,
+                                                      copy PatternVarDeclExpr (v.loc, rewrite, v.value));        
+
+        if let z: &VarDeclValue = fin {
+            return z;
+        }
+        
+        eprintln ("internal var declaration error; ", fin.__typeinfo.name);
+        panic;    
+    }
+
+    /**
+     * Validate a variable declaration without an initializer.     
+     *
+     * @returns:
+     *   - VarDeclValue
+     *
+     * @throws:
+     *   - ErrorMsg if type validation fails
+     */
+    fn validateNoValue (dmut context: &ValidationContext, v: &VarDeclExpr)-> &VarDeclValue
+        throws ErrorMsg
+    {
+        let mut errors: [&ErrorMsg] = [];
+        VariableVerification::verifyShadow (context, v.name, isQuoted-> v.isQuoted);
+
+        let type = {
+            TypeValidation::validateForVarDecl (alias context, v.type, v, canBeRef-> true, canBeLazy-> true)
+        }  catch {
+            err: &ErrorMsg => { // error when validating the type of the variable, so it has an error type, no matter the value
+                errors ~= [err];
+                copy ErrorType (v.loc)
+            }
+        };
+
+        {
+            TypeVerification::verifyNonVoid (v.type.loc, type, construct-> true);
+        } catch {
+            err: &ErrorMsg => { errors ~= [err]; }
+        }
+
+        let finalType = if (errors.len != 0) {
+            copy ErrorType (v.loc)
+        } else {
+            type
+        };
+
+        let ret = copy VarDeclValue (v.loc,
+                                     finalType,
+                                     UNIT_VALUE,
+                                     isReference-> v.isRef,
+                                     isLazy-> v.isLazy,
+                                     isMutable-> type.isMutable);
+        
+        context:.insertLocal (v.loc, v.name.str, ret, canShadow-> false);
+
+        if (errors.len != 0) {
+            throw copy ErrorMsg::list (errors);
+        }
+
+        return ret;
     }
     
 }

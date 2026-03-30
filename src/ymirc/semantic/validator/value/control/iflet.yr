@@ -1,18 +1,220 @@
+/*
+ * Implements validation for `if let` conditional expressions in Ymir.
+ *
+ * An `if let` expression combines pattern matching with conditional control
+ * flow. It has the general form:
+ *
+ *     if let PATTERN = VALUE [&& GUARD] {
+ *         ...
+ *     } else {
+ *         ...
+ *     }
+ *
+ * This module validates the pattern, performs match checking, evaluates
+ * optional guards, validates the block under a new lexical scope, and finally
+ * delegates to standard conditional-else validation to infer the resulting
+ * type.
+ *
+ * Responsibilities:
+ *   • extract the pattern/value pair from the test expression
+ *   • validate pattern matching via MatcherValidation
+ *   • validate optional guard expressions
+ *   • detect useless constant guards
+ *   • validate the `then` block under a scoped environment
+ *   • infer the resulting type across branches
+ *   • integrate with ConditionalValidation for the else branch
+ *
+ * <hr>
+ * 
+ * @Package: ymirc        
+ * @Module: ymirc::semantic::validator::value::control::iflet
+ * @File: ymirc/semantic/validator/value/control/iflet.yr
+ * @Author(s):
+ *   - Emile Cadorel <ecadorel@gmail.com>
+ *
+ * @Created (YYYY-MM-DD): 2026-03-27
+ * @Copyright (C) 2021–2026 GNU-Ymir
+ * @License
+ *   ```text
+ *   This file is part of the Ymir language project.
+ *
+ *   Ymir is free software: you can redistribute it and/or modify it
+ *   under the terms of the GNU General Public License as published by
+ *   the Free Software Foundation, either version 3 of the License, or
+ *   (at your option) any later version.
+ *
+ *   Ymir is distributed in the hope that it will be useful,
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *   GNU General Public License for more details.
+ *
+ *   You should have received a copy of the GNU General Public License
+ *   along with Ymir.  If not, see <https://www.gnu.org/licenses/>.
+ *   ```
+ */
+
 in iflet;
 
-use ymirc::syntax::expression::control;
-use ymirc::semantic::validator;
-use ymirc::semantic::generator::value;
-use ymirc::errors::message;
+use ymirc::lexing::word;
 
+use ymirc::syntax::expression::_;
+use ymirc::semantic::validator;
+use ymirc::semantic::generator::{value, value::_, type, type::_};
+
+use ymirc::errors::message;
+use ymirc::utils::format;
+
+use std::io;
+
+/**
+ * ConditionalLetValidation module
+ *
+ * Provides validation for `if let` expressions.
+ *
+ * Semantics:
+ *   - The test expression must be a pattern binding (`let x = value`)
+ *     or a pattern declaration (`let (a, b) = value`).
+ *
+ *   - Pattern matching is validated through MatcherValidation, which
+ *     produces:
+ *        - a match result (success/failure)
+ *        - a set of bound variables
+ *        - a test expression representing the match condition
+ *
+ *   - Optional guards refine the match condition. Constant guards produce
+ *     USELESS_COND diagnostics.
+ *
+ *   - The `then` block is validated inside a new lexical scope containing
+ *     the pattern-bound variables.
+ *
+ *   - The else branch is validated and merged using the same rules as
+ *     standard conditionals.
+ *
+ * The module enforces:
+ *   - correct pattern extraction
+ *   - correct matcher and guard validation
+ *   - correct scoping of pattern-bound variables
+ *   - correct type inference across branches
+ *   - correct memory-ownership rules for the `then` block
+ */
 pub mod ConditionalLetValidation {
 
+    /**
+     * Validate an `if let` expression.
+     *     
+     * @returns:
+     *   - a ConditionalValue representing the `if let` expression
+     *
+     * @throws:
+     *   - ErrorMsg if pattern matching fails, the guard is invalid, the
+     *     condition is useless, or branch types cannot be reconciled
+     */
     pub fn validate (dmut context: &ValidationContext, iflet: &ConditionalLetExpr)-> &Value
         throws ErrorMsg
-    {        
-        context;
-        iflet;
+    {
+        let mut error: (&ErrorMsg)? = none;
+        let mut hasErrors = false;
+        
+        let (pattern, value) = ConditionalLetValidation::extractPattern (iflet.test);
+        let (result, error_) = MatcherValidation::validateMatcher (alias context, value, pattern);
+        if let Ok (err) = error_ {
+            throw err;
+        }
+
+        context:.enterBlock ();
+        let (content, test, type) = {
+            let (test, taut, _) = MatcherValidation::validateGuard (alias context, result.vars, iflet.guard, result.test);            
+            if let b: &BoolValue = context.cteInterpret:.reduce (taut) {
+                if (b.isTrue) {
+                    throw copy ErrorMsg::fatal (b.loc, format (ValidateErrorMessage::USELESS_COND_TRUE));
+                }
+                
+                else throw copy ErrorMsg::fatal (b.loc, format (ValidateErrorMessage::USELESS_COND_FALSE));                
+            }
+
+            let content = ValueValidation::validate (alias context, iflet.block);
+            let mut type = content.type;
+            {
+                MemoryVerification::verifyMemoryOwner (content.loc, type, content, byReference-> false);
+            } catch {
+                _: &ErrorMsg => {
+                    type = type.clone (0u32);
+                    MemoryVerification::verifyMemoryOwner (content.loc, type, content, byReference-> false);
+                }
+            }
+
+            (content, test, type)
+        } catch {
+            err: &ErrorMsg => {
+                error = (err)?;
+                hasErrors = true;
+                (UNIT_VALUE, UNIT_VALUE, NONE_TYPE)
+            }
+        };
+
+        {
+            // No need to warn unused if there were errors in the validation of the block (it will complicate the error handling)
+            context:.quitBlock (warnUnused-> !hasErrors);
+        } catch {
+            err: &ErrorMsg => {
+                if (!hasErrors) {
+                    error = (err)?;
+                }
+            }
+        }
+
+        if let Ok (err) = error {
+            throw err;
+        }
+
+        return ConditionalValidation::validateConditionalElse (alias context, iflet.loc, iflet.else_, type, test, content);            
+
+    }
+
+    /**
+     * Extract the pattern and value from an `if let` test expression.
+     *
+     * Supported forms:
+     *
+     *   - VarDeclExpr:
+     *        let x: T = value
+     *     Rewritten internally as:
+     *        pattern = let x: T = EMPTY
+     *        value   = value
+     *
+     *   - PatternVarDeclExpr:
+     *        let (a, b) = value
+     *     Extracts:
+     *        pattern = (a, b)
+     *        value   = value
+     *
+     * If the test expression is not a declaration or pattern declaration, an
+     * internal compiler error is raised.
+     *
+     * @returns:
+     *   - (pattern, value)
+     *   
+     */
+    pub fn extractPattern (test: &Expression)-> (&Expression, &Expression) {
+        match test {
+            v: &VarDeclExpr => {
+                let rewrite = copy VarDeclExpr (v.loc,
+                                                v.name,
+                                                value-> EMPTY_EXPR,
+                                                type-> v.type,
+                                                isLazyOrRef-> v.isLazyOrRef,
+                                                isMutOrDmut-> v.isMutOrDmut);
+                return (rewrite, v.value);
+            }
+            p: &PatternVarDeclExpr => {
+                return (p.pattern, p.value);
+            }            
+        };
+
+        
+        eprintln ("internal conditional let validation error; ", test._typeinfo.name);
         panic;
     }
+    
     
 }
