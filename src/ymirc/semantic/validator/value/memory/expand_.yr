@@ -1,0 +1,379 @@
+/*
+ * Implements validation for expansion expressions in Ymir.
+ *
+ * Expansion (`expand x`) destructures a composite value into its components.
+ * The expansion result is always an ExpandValue containing a list of values
+ * extracted from:
+ *
+ *   - tuples
+ *   - arrays
+ *   - slices
+ *   - class/record/entity fields
+ *
+ * Expansion is alias-aware:
+ *   - If the expanded value was itself an alias (`alias x`), the expansion
+ *     produces aliasers for each mutable field/element that requires explicit
+ *     aliasing.
+ *   - If the expanded value was not aliased, expansion produces plain values.
+ *
+ * Responsibilities:
+ *   - validate the expanded expression
+ *   - reduce the value through the CTE interpreter
+ *   - unwrap enum wrappers
+ *   - detect alias-based expansion and propagate aliasing rules
+ *   - expand tuples, arrays, slices, and classes
+ *   - enforce field-access protection rules for classes
+ *   - detect unnecessary aliasing
+ *
+ * <hr>
+ * 
+ * @Package: ymirc        
+ * @Module: ymirc::semantic::validator::value::memory::expand_
+ * @File: ymirc/semantic/validator/value/memory/expand_.yr
+ * @Author(s):
+ *   - Emile Cadorel <ecadorel@gmail.com>
+ *
+ * @Created (YYYY-MM-DD): 2026-03-30
+ * @Copyright (C) 2021–2026 GNU-Ymir
+ * @License
+ *   ```text
+ *   This file is part of the Ymir language project.
+ *
+ *   Ymir is free software: you can redistribute it and/or modify it
+ *   under the terms of the GNU General Public License as published by
+ *   the Free Software Foundation, either version 3 of the License, or
+ *   (at your option) any later version.
+ *
+ *   Ymir is distributed in the hope that it will be useful,
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *   GNU General Public License for more details.
+ *
+ *   You should have received a copy of the GNU General Public License
+ *   along with Ymir.  If not, see <https://www.gnu.org/licenses/>.
+ *   ```
+ */
+
+in expand_;
+
+use ymirc::syntax::expression::memory;
+use ymirc::semantic::validator;
+use ymirc::semantic::generator::{value, value::_, type::_};
+
+use ymirc::errors::message;
+use ymirc::lexing::{word, keys};
+
+use ymirc::utils::format;
+
+
+/**
+ * ExpandValidation module
+ *
+ * Provides validation for expansion expressions (`expand x`).
+ *
+ * Expansion behavior:
+ *
+ *   - For tuples:
+ *       expand (a, b, c) => (a, b, c)
+ *
+ *   - For arrays:
+ *       expand arr => (arr[0], arr[1], ...)
+ *
+ *   - For slices:
+ *       expand slc => (slc[0], slc[1], ...)
+ *
+ *   - For classes/records/entities:
+ *       expand obj => (obj.field1, obj.field2, ...)
+ *       respecting private/protected access rules
+ *
+ *   - For all other types:
+ *       expand x => x
+ *
+ * Alias-aware expansion:
+ *   - If the expanded value is an AliaserValue, each expanded component
+ *     becomes an AliaserValue when:
+ *         - the component type is mutable
+ *         - the component type requires explicit aliasing
+ *
+ * The module enforces:
+ *   - no expansion of lazy or incomplete values
+ *   - correct field-access protection for classes
+ *   - correct alias propagation
+ *   - detection of unnecessary aliasing
+ */
+pub mod ExpandValidation {
+
+    /**
+     * Validate an expansion expression (`expand x`).
+     *
+     * Steps:
+     *   1. Validate the inner expression.
+     *   2. Reduce the value through the CTE interpreter.
+     *   3. Ensure the type is complete for expansion.
+     *   4. Detect whether the value is an AliaserValue.
+     *   5. Dispatch based on the underlying type:
+     *        - TupleType     => validateTuple
+     *        - ArrayType     => validateArray
+     *        - SliceType     => validateSlice
+     *        - ClassPtrType  => validateClass
+     *        - otherwise     => return the value unchanged
+     *
+     * Alias semantics:
+     *   - If the expanded value was aliased, expansion may produce aliasers
+     *     for each component that requires explicit aliasing.
+     *
+     * Unnecessary alias detection:
+     *   - If the user wrote `alias x` but none of the expanded components
+     *     required aliasing, an UNECESSARY_ALIAS diagnostic is emitted.
+     *
+     * @returns:
+     *   - an ExpandValue containing the expanded components
+     */
+    pub fn validate (dmut context: &ValidationContext, mem: &ExpandExpr)-> &Value
+        throws ErrorMsg
+    {
+        let value = ValueValidation::validate (alias context, mem.content);
+        let mValue = context.cteInterpret:.reduce (value);
+        
+        TypeVerification::verifyCompleteWithValue (mem.content.loc, mValue.type, mValue, construct-> false);
+
+        // Extract the alias around the expanded value if any
+        let (byAlias, fVal) = match mValue {
+            a: &AliaserValue => { (true, a.value) }
+            _ => { (false, mValue) }
+        };
+
+        // expand alias x = (alias x.0, alias x.1, etc.);
+        // it cannot be written as `alias expand x`, AliasValidation ensures it
+        //        
+        let (result, useAlias) = match fVal.type {
+            t: &TupleType => {
+                ExpandValidation::validateTuple (alias context, t, fVal, mem, byAlias)
+            }
+            a: &ArrayType => {
+                ExpandValidation::validateArray (alias context, a, fVal, mem, byAlias)
+            }
+            a: &SliceType => {
+                ExpandValidation::validateSlice (alias context, a, fVal, mem, byAlias)
+            }
+            c: &ClassPtrType => {
+                ExpandValidation::validateClass (alias context, c, fVal, mem, byAlias)
+            }
+            _ => {
+                // expand x => x; for any other types
+                (mValue, MemoryVerification::needsExplicitAlias (mValue))
+            }
+        };
+
+        // we aliased the expansion, but nothing needed alias
+        // 
+        if (!useAlias && byAlias) {
+            throw copy ErrorMsg::fatal (mValue.loc,
+                                        format (ValidateErrorMessage::UNECESSARY_ALIAS, mValue.type));
+        }
+        
+        return result;
+    }
+
+    /**
+     * Expand a tuple.
+     *
+     * For each element:
+     *   - If not alias-based:
+     *       - perform a validated tuple index access
+     *       - reduce the result through the CTE interpreter
+     *
+     *   - If alias-based:
+     *       - construct a TupleFieldAccessValue
+     *       - wrap it in an AliaserValue if:
+     *            - the element type is mutable
+     *            - the element type requires explicit aliasing
+     *
+     * @returns:
+     *   - an ExpandValue containing all expanded elements
+     *   - a boolean indicating whether aliasing was used
+     *   
+     */
+    fn validateTuple (dmut context: &ValidationContext, t: &TupleType, value: &Value, mem: &ExpandExpr, byAlias: bool)-> (&Value, bool)
+        throws ErrorMsg
+    {
+        let mut values: [&Value] = [];
+        let mut useAlias = false;
+        for it in 0us .. t.inners.len {
+            let type = t.inners [it];
+            if (!byAlias) {
+                let access = TupleIndexValidation::validate (alias context, mem.loc, type.clone (0u32), value, it);
+                values ~= [context.cteInterpret:.reduce (access)];
+            } else {
+                let access = copy TupleFieldAccessValue (mem.loc, type, value, it);
+                let (fAcc, useAlias_) = if (byAlias && type.isMutable && type.needsExplicitAlias) {
+                    (copy AliaserValue (access.loc, access.type, access, isFromExpansion-> true), true)
+                } else {
+                    (access, false)
+                };
+
+                values ~= [fAcc];
+                useAlias = useAlias || useAlias_;
+            }
+        }
+
+        return (copy ExpandValue (mem.loc, values), useAlias);
+    }
+
+
+    /**
+     * Expand a class, record, or entity instance.
+     *
+     * Steps:
+     *   1. Determine private/protected accessibility based on the current
+     *      class context.
+     *   2. For each accessible field:
+     *        - determine the field type (deeply mutable if alias-based)
+     *        - construct a StructFieldAccessValue or ClassFieldAccessValue
+     *        - wrap in an AliaserValue if:
+     *             - alias-based expansion
+     *             - the field type is mutable
+     *             - the field type requires explicit aliasing
+     *
+     * @returns:
+     *   - an ExpandValue containing all accessible fields
+     *   - a boolean indicating whether aliasing was used
+     *   
+     */
+    fn validateClass (dmut context: &ValidationContext, c: &ClassPtrType, value: &Value, mem: &ExpandExpr, byAlias: bool)-> (&Value, bool)
+        throws ErrorMsg
+    {
+        let mut values: [&Value] = [];
+        let mut useAlias = false;
+        
+        let (inPrv, inProt) = context.getCurrentClassReferentProtections (c.inner);
+        let clRef = c.inner;
+
+        for field in clRef.localFields {            
+            let canAccess = if (clRef.sym.isFieldPrivate (field.loc.str)) { inPrv }
+            else if (clRef.sym.isFieldProtected (field.loc.str)) { inProt || inPrv }
+            else { true };
+            
+            if (canAccess) {
+                let type = if (byAlias && value.type.isDeeplyMutable) { field.varType } else { field.varType.clone (0u32) };
+                
+                let acc = if (clRef.sym.isStruct) {
+                    copy StructFieldAccessValue (mem.loc, type, value, field.name)
+                } else {
+                    copy ClassFieldAccessValue (mem.loc, type, value, field.name)
+                };
+
+                let (fAcc, useAlias_) = if (byAlias && type.isMutable && type.needsExplicitAlias) {
+                    (copy AliaserValue (acc.loc, acc.type, acc, isFromExpansion-> true), true)
+                } else {
+                    (acc, false)
+                };
+
+                values ~= [fAcc];
+                useAlias = useAlias || useAlias_;                
+            }
+        }
+
+        return (copy ExpandValue (mem.loc, values), useAlias);
+    }
+
+    /**
+     * Expand an array.
+     *
+     * For each index:
+     *   - If not alias-based:
+     *       - validate array index access
+     *       - reduce the result through the CTE interpreter
+     *
+     *   - If alias-based:
+     *       - construct an ArrayAccessValue
+     *       - wrap in an AliaserValue if required
+     *
+     * Returns:
+     *   - an ExpandValue containing all elements
+     *   - a boolean indicating whether aliasing was used
+     *   
+     */
+    fn validateArray (dmut context: &ValidationContext, a: &ArrayType, value: &Value, mem: &ExpandExpr, byAlias: bool)-> (&Value, bool)
+        throws ErrorMsg
+    {
+        let mut values: [&Value] = [];
+        let mut useAlias = false;
+
+        let type = a.value;
+        
+        for it in 0us .. a.len {
+            if (!byAlias) {
+                let access = ArrayIndexValidation::validate (alias context, mem.loc, type, value, copy IntValue (mem.loc, USIZE_TYPE, it));
+                values ~= [context.cteInterpret:.reduce (access)];
+            } else {
+                let access = copy ArrayAccessValue (mem.loc, type, value, copy IntValue (mem.loc, USIZE_TYPE, it));
+                let (fAcc, useAlias_) = if (byAlias && type.isMutable && type.needsExplicitAlias) {
+                    (copy AliaserValue (access.loc, access.type, access, isFromExpansion-> true), true)
+                } else {
+                    (access, false)
+                };
+
+                values ~= [fAcc];
+                useAlias = useAlias || useAlias_;
+            }
+
+        }
+
+        return (copy ExpandValue (mem.loc, values), useAlias);
+    }
+
+    /**
+     * Expand a slice.
+     *
+     * Steps:
+     *   1. Compute the slice length via CTE evaluation of `value.len`.
+     *      If the length cannot be determined, UNKNOWN_LENGTH_OF_EXPANSION
+     *      is emitted.
+     *
+     *   2. For each index:
+     *        - construct a SliceAccessValue
+     *        - wrap in an AliaserValue if:
+     *             - alias-based expansion
+     *             - the element type is mutable
+     *             - the element type requires explicit aliasing
+     *
+     * Returns:
+     *   - an ExpandValue containing all slice elements
+     *   - a boolean indicating whether aliasing was used
+     *   
+     */
+    fn validateSlice (dmut context: &ValidationContext, a: &SliceType, value: &Value, mem: &ExpandExpr, byAlias: bool)-> (&Value, bool)
+        throws ErrorMsg
+    {        
+        let len = {
+            context.cteInterpret:.computeInt (copy StructFieldAccessValue (mem.loc, USIZE_TYPE, value, SliceKeys::LEN))
+        } catch {
+            _: &ErrorMsg => {
+                throw copy ErrorMsg::fatal (mem.loc, format (ValidateErrorMessage::UNKNOWN_LENGTH_OF_EXPANSION, a));
+            }
+        }
+
+        let mut values: [&Value] = [];
+        let mut useAlias = false;
+
+        let type = a.value;
+        
+        for it in 0us .. len.toT!{usize} () {
+            let access = copy SliceAccessValue (mem.loc, type, value, copy IntValue (mem.loc, USIZE_TYPE, it));
+            let (fAcc, useAlias_) = if (byAlias && type.isMutable && type.needsExplicitAlias) {
+                (copy AliaserValue (access.loc, access.type, access, isFromExpansion-> true), true)
+            } else {
+                (access, false)
+            };
+
+            values ~= [fAcc];
+            useAlias = useAlias || useAlias_;
+        }
+
+        return (copy ExpandValue (mem.loc, values), useAlias);
+    }
+
+
+    
+}
