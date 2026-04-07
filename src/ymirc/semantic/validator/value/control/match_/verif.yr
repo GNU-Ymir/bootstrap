@@ -1,0 +1,286 @@
+/*
+ * Implements verification utilities used throughout Ymir’s pattern-matching
+ * and catch-matching system.
+ *
+ * These checks enforce correctness rules that cannot be expressed purely
+ * through type inference or pattern structure. They ensure:
+ *
+ *   - memory semantics are used meaningfully (no useless alias/ref/lazy)
+ *   - match expressions are complete when required
+ *   - no variable shadowing occurs inside patterns
+ *   - catch patterns only match thrown types
+ *   - catch blocks catch all thrown types
+ *   - tautology detection for pattern and guard conditions
+ *
+ * <hr>
+ * 
+ * @Package: ymirc        
+ * @Module: ymirc::semantic::validator::value::control::match_::verif
+ * @File: ymirc/semantic/validator/value/control/match_/verif.yr
+ * @Author(s):
+ *   - Emile Cadorel <ecadorel@gmail.com>
+ *
+ * @Created (YYYY-MM-DD): 2026-04-07
+ * @Copyright (C) 2021–2026 GNU-Ymir
+ * @License
+ *   ```text
+ *   This file is part of the Ymir language project.
+ *
+ *   Ymir is free software: you can redistribute it and/or modify it
+ *   under the terms of the GNU General Public License as published by
+ *   the Free Software Foundation, either version 3 of the License, or
+ *   (at your option) any later version.
+ *
+ *   Ymir is distributed in the hope that it will be useful,
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *   GNU General Public License for more details.
+ *
+ *   You should have received a copy of the GNU General Public License
+ *   along with Ymir.  If not, see <https://www.gnu.org/licenses/>.
+ *   ```
+ */
+
+in verif;
+
+
+use ymirc::lexing::{word, keys};
+use ymirc::syntax::expression::control;
+use ymirc::semantic::validator;
+use ymirc::semantic::generator::{value::_, type::_};
+
+use ymirc::errors::message;
+use ymirc::utils::format;
+use ymirc::semantic::validator::value::control::match_::_;
+
+/**
+ * MatchVerification module
+ *
+ * Provides semantic verification helpers for pattern matching and
+ * exception matching. These functions do not construct values or
+ * patterns; instead, they enforce correctness rules and detect invalid
+ * or unreachable constructs.
+ *
+ * Responsibilities:
+ *   - detect unnecessary memory semantics (alias/ref/lazy)
+ *   - verify match completeness
+ *   - detect variable shadowing inside patterns
+ *   - verify that catch patterns match thrown types
+ *   - compute remaining uncaught thrown types
+ *   - detect tautological conditions
+ *
+ * These checks ensure that the match/catch system is sound, predictable,
+ * and free of unreachable or meaningless constructs.
+ */
+pub mod MatchVerification {
+
+    /**
+     * Verify that memory semantics (alias, ref, lazy) were actually used.
+     *
+     * If the pattern did not require a memory mode (e.g., byMutRef) but the
+     * matched value was accessed using that mode, the memory mode is considered
+     * unnecessary and an error is raised.
+     *
+     * @params:
+     *   - matchLoc: location of the match expression
+     *   - valueLoc: location of the matched value
+     *   - type:     type of the matched value
+     *   - retInfo:  memory info produced by the pattern
+     *   - memInfo:  memory info of the matched value
+     *
+     * @throws:
+     *   ErrorMsg if alias/ref/lazy was used but not required.
+     */
+    pub fn verifyUselessMemoryInfo (matchLoc: &Word,
+                                    valueLoc: &Word,
+                                    type:     &Type,
+                                    retInfo:  MemoryInfo,
+                                    memInfo:  MemoryInfo)
+        throws ErrorMsg
+    {        
+        if (!retInfo.isByMutRef && memInfo.isByMutRef) {
+            throw copy ErrorMsg::fatal (valueLoc, ValidateErrorMessage::UNECESSARY_REFERENCE,
+                                        notes-> copy [copy ErrorMsg::note (matchLoc, ValidateErrorMessage::NO_REFERENCE_PATTERN)]);
+        }
+
+        if (!retInfo.isByAlias && memInfo.isByAlias) {
+            throw copy ErrorMsg::fatal (valueLoc, format (ValidateErrorMessage::UNECESSARY_ALIAS, type),
+                                        notes-> copy [copy ErrorMsg::note (matchLoc, format (ValidateErrorMessage::NO_ALIAS_PATTERN, ""))]);
+        }
+
+        if (!retInfo.isByLazy && memInfo.isByLazy) {
+            throw copy ErrorMsg::fatal (valueLoc, format (ValidateErrorMessage::UNECESSARY_LAZY, type),
+                                        notes-> copy [copy ErrorMsg::note (matchLoc, format (ValidateErrorMessage::NO_LAZY_PATTERN, ""))]);
+        }
+
+    }
+
+    /**
+     * Verify that a match expression is complete.
+     *
+     * If the match is marked as complete, the resulting type is returned.
+     * Otherwise, each non-void branch value is reported as an incomplete match
+     * case.
+     *
+     * @params:
+     *   - loc:     location of the match expression
+     *   - value:   matched value
+     *   - complete: whether the match was detected as complete
+     *   - type:    resulting type of the match
+     *   - values:  list of branch values
+     *
+     * @returns:
+     *   The resulting type if complete, otherwise VOID_TYPE.
+     *
+     * @throws:
+     *   ErrorMsg if the match is incomplete.
+     */
+    pub fn verifyComplete (loc:      &Word,
+                           value:    &Value,
+                           complete: bool,
+                           type:     &Type,
+                           values:   [&Value])-> &Type
+        throws ErrorMsg
+    {
+        if complete {
+            return type;
+        }
+        
+        let mut errors: [&ErrorMsg] = [];
+        for i in values if (i.type !of VoidType) {
+            errors ~= [copy ErrorMsg::fatal (i.loc, format (ValidateErrorMessage::MATCH_NOT_COMPLETE, i.type))];                
+        }
+
+        if (errors.len != 0) {
+            throw copy ErrorMsg::fatal (loc,
+                                        format (ValidateErrorMessage::MATCH_VALIDATION, value, value.type),
+                                        notes-> errors);
+        }
+
+        return VOID_TYPE;
+    }
+
+    /**
+     * Verify that a variable name does not shadow an existing pattern variable.
+     *
+     * Shadowing inside patterns is forbidden because it leads to ambiguous
+     * bindings and unpredictable semantics.
+     *
+     * @params:
+     *   - loc:  location of the variable declaration
+     *   - name: variable name
+     *   - vars: list of already declared pattern variables
+     *
+     * @throws:
+     *   ErrorMsg if the variable shadows a previous declaration.
+     */
+    pub fn verifyShadow (loc: &Word, name: [c8], vars: [&VarDeclValue])
+        throws ErrorMsg
+    {
+        if (name == Keys::UNDER) return;
+        for vd in vars if (vd.name == name) {
+            throw copy ErrorMsg::fatal (loc, format (ValidateErrorMessage::SHADOWING_DECL, name),
+                                        notes-> copy [copy ErrorMsg::note (vd.loc, ValidateErrorMessage::FIRST_DEFINED)]);
+        }         
+    }
+
+    /**
+     * Verify that a catch pattern matches a thrown type.
+     *
+     * A catch pattern is valid if:
+     *   - its type is a direct instance of a thrown type
+     *   - or its type is an ancestor of a thrown type
+     *   - or a thrown type is an ancestor of it (covariant catch)
+     *
+     * It is invalid if:
+     *   - the type was already caught earlier
+     *   - the type does not match any thrown type
+     *
+     * @params:
+     *   - loc:      location of the catch pattern
+     *   - type:     type declared in the catch pattern
+     *   - throwers: list of all thrown types
+     *   - caught:   list of already caught types
+     *
+     * @throws:
+     *   ErrorMsg if the type was already caught or matches no thrown type.
+     */
+    pub fn verifyIsThrown (loc: &Word, type: &Type, throwers: [Thrower], caught: [Thrower])
+        throws ErrorMsg
+    {
+        for i in caught {
+            if (TypeVerification::isDirectInstance (type, i.type) || TypeVerification::isAncestor (i.type, type)) {
+                throw copy ErrorMsg::fatal (loc,
+                                            end-> i.loc,
+                                            format (ValidateErrorMessage::ALREADY_CAUGHT, type, i.type));
+            }
+        }
+
+        for i in throwers {
+            if (TypeVerification::isDirectInstance (type, i.type)) return;
+            if (TypeVerification::isAncestor (type, i.type)) return;
+            if (TypeVerification::isAncestor (i.type, type)) return;
+        }
+
+        throw copy ErrorMsg::fatal (loc, format (ValidateErrorMessage::CATCH_NOTHING, type));
+    }
+
+    /**
+     * Compute the list of thrown types that have not yet been caught.
+     *
+     * A thrown type is considered caught if:
+     *   - a catch pattern matches it directly
+     *   - or a catch pattern matches one of its ancestors
+     *
+     * @params:
+     *   - used:     list of caught throwers
+     *   - throwers: list of all thrown types
+     *
+     * @returns:
+     *   A list of throwers that remain uncaught.
+     */
+    pub fn listNonCaughtThrowers (used: [Thrower], throwers: [Thrower])-> [Thrower]
+        throws ErrorMsg
+    {
+        let mut res: [Thrower] = [];
+        for i in throwers {
+            let mut found = false;
+            for j in used {
+                if TypeVerification::isDirectInstance (i.type, j.type) || TypeVerification::isAncestor (j.type, i.type) {
+                    found = true;
+                    break;
+                }
+            }
+
+            if (!found) {
+                res ~= [i];
+            }
+        }
+
+        return res;
+    }
+
+    /**
+     * Determine whether a boolean condition is a tautology.
+     *
+     * Uses the constant-expression interpreter to evaluate the condition. If
+     * evaluation fails (non-constant), the condition is not a tautology.
+     *
+     * @params:
+     *   - context: validation context
+     *   - cond:    boolean expression to evaluate
+     *
+     * @returns:
+     *   true if the condition is a compile-time true value, false otherwise.
+     */
+    pub fn isTautology (dmut context: &ValidationContext, cond: &Value)-> bool {    
+        {
+            return context.cteInterpret:.computeBool (cond);
+        } catch {
+            _ => {}
+        }
+
+        return false;
+    }
+    
+}

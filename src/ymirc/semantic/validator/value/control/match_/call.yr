@@ -1,0 +1,239 @@
+/*
+ * Implements validation for call-pattern matching in Ymir.
+ *
+ * A call-pattern has the form:
+ *
+ *     Type (field1-> pattern1, field2-> pattern2, ...)
+ *
+ * and is used inside matchers to destructure objects by invoking
+ * dynamic field access and recursively validating sub-patterns.
+ *
+ * Responsibilities:
+ *   - validate the left-hand side of a call pattern (type tests, casts)
+ *   - validate each named field matcher on the right-hand side
+ *   - accumulate boolean test expressions for pattern success
+ *   - accumulate memory-information for ownership/borrowing analysis
+ *   - propagate variable bindings introduced by sub-patterns
+ *   - report structural or typing errors with contextual notes
+ *
+ * <hr>
+ * 
+ * @Package: ymirc        
+ * @Module: ymirc::semantic::validator::value::control::match_::call
+ * @File: ymirc/semantic/validator/value/control/match_/call.yr
+ * @Author(s):
+ *   - Emile Cadorel <ecadorel@gmail.com>
+ *
+ * @Created (YYYY-MM-DD): 2026-04-07
+ * @Copyright (C) 2021–2026 GNU-Ymir
+ * @License
+ *   ```text
+ *   This file is part of the Ymir language project.
+ *
+ *   Ymir is free software: you can redistribute it and/or modify it
+ *   under the terms of the GNU General Public License as published by
+ *   the Free Software Foundation, either version 3 of the License, or
+ *   (at your option) any later version.
+ *
+ *   Ymir is distributed in the hope that it will be useful,
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *   GNU General Public License for more details.
+ *
+ *   You should have received a copy of the GNU General Public License
+ *   along with Ymir.  If not, see <https://www.gnu.org/licenses/>.
+ *   ```
+ */
+
+in call;
+
+use ymirc::lexing::{word, tokens, keys};
+
+use ymirc::syntax::expression::_;
+use ymirc::semantic::validator;
+use ymirc::semantic::generator::{value::_, type::_};
+
+use ymirc::errors::message;
+use ymirc::utils::format;
+
+use ymirc::semantic::validator::value::control::match_::_;
+
+
+/**
+ * MatchCallValidation module
+ *
+ * Provides validation for call-operator patterns used in match expressions. A
+ * call pattern applies a sequence of named sub-patterns to a value, optionally
+ * preceded by a type-test on the left operand.
+ *
+ * Semantics:
+ *   - The left operand may be:
+ *        - `_` (underscore), meaning “accept any type”
+ *        - a type expression, requiring a type-test and optional cast
+ *        - any other expression, validated through validateLeft
+ *
+ *   - Each right-hand side element must be a NamedExpr:
+ *        fieldName = pattern
+ *
+ *   - For each field:
+ *        - dynamic field access is validated
+ *        - the sub-pattern is validated
+ *        - the resulting test expression is AND-combined
+ *        - memory information is merged
+ *
+ *   - Errors are collected and thrown as a list when possible.
+ * 
+ */
+pub mod MatchCallValidation {
+
+    /**
+     * Validate a call-pattern and return only:
+     *   - the boolean test expression
+     *   - the resulting memory information
+     *
+     * This is a convenience wrapper around validateValue.
+     *
+     * @params:
+     *    - value:     The value being matched.
+     *    - cl:        The call-operator expression.
+     *    - memInfo:   Memory information inherited from the parent pattern.
+     *    - vars:      Variable bindings introduced by sub-patterns.
+     *
+     * @returns:
+     *   (testExpression, memoryInfo)
+     *
+     * @throws:
+     *   ErrorMsg if the call pattern is invalid.
+     */
+    pub fn validate (dmut context: &ValidationContext,
+                     value:        &Value,
+                     cl:           &MultOperatorExpr,
+                     memInfo:      MemoryInfo,
+                     ref mut vars: [&VarDeclValue])-> (&Value, MemoryInfo)
+        throws ErrorMsg
+    {
+        let result = MatchCallValidation::validateValue (alias context, value, cl, memInfo, ref vars);
+        return (result.test, result.memInfo);
+    }
+
+    /**
+     * Validate a call-pattern and return a full CallOpPatternResult.
+     *
+     * @returns:
+     *   CallOpPatternResult
+     *
+     * @throws:
+     *   ErrorMsg or ErrorMsg::list if validation fails.
+     */
+    pub fn validateValue (dmut context: &ValidationContext,
+                          value:        &Value,
+                          cl:           &MultOperatorExpr,
+                          memInfo:      MemoryInfo,
+                          ref mut vars: [&VarDeclValue])-> CallOpPatternResult 
+        throws ErrorMsg
+    {                
+        let (mut typeTest, mut castedValue, mut resType) = match cl.left {
+            v: &VarExpr if v.loc.str == Keys::UNDER => { // don't validate _ ()                            
+                (TRUE_BOOL_VALUE,
+                 value,
+                 TypeValidation::validate (alias context, copy TypeWrapperExpr (value.loc, value.type)))                 
+            }
+            _ => {
+                MatchCallValidation::validateLeft (alias context, value, cl)
+            }
+        };
+        
+        let mut errors: [&ErrorMsg] = [];
+        let mut curValueTest: &Value = TRUE_BOOL_VALUE;
+        
+        let mut innerRetInfo = MemoryInfo ();
+        for p in cl.rights match p {
+            n: &NamedExpr => {
+                let val = FieldValidation::validateDynamicAccess (alias context, n.loc, castedValue, n.name.str);
+                let (innerTest, innerRetInfo_) = {
+                    MatchValidation::validatePattern (alias context, val, n.value, memInfo, ref vars)
+                } catch {
+                    error: &ErrorMsg => {
+                        throw error.withNote (copy [copy ErrorMsg::note (n.loc, format (ValidateErrorMessage::FOR_PATTERN_FIELD, n.loc.str, castedValue.type))]);
+                    }
+                }
+
+                curValueTest = copy LogicalBoolOperatorValue (n.loc, BinaryOperators::DAND, curValueTest, innerTest);
+                innerRetInfo = innerRetInfo | innerRetInfo_;
+            }
+            _ => {
+                errors ~= [copy ErrorMsg::fatal (p.loc, format (ValidateErrorMessage::FIELD_MATCHER_NO_NAME))];
+            }
+        }
+
+        if (errors.len != 0) {
+            throw copy ErrorMsg::list (errors);
+        }
+
+        return CallOpPatternResult (test-> copy LogicalBoolOperatorValue (cl.loc, BinaryOperators::DAND, typeTest, curValueTest),
+                                    fieldTest-> curValueTest,
+                                    type-> resType,
+                                    memInfo-> innerRetInfo);
+    }
+
+    /**
+     * Validate the left operand of a call-pattern.
+     *
+     * The left operand may specify a type constraint. This function:
+     *   - validates the type expression
+     *   - performs type-tests (value OF type)
+     *   - performs casts when necessary
+     *   - ensures compatibility between the value and the expected type
+     *
+     * Cases:
+     *   1. Left is a ClassPtrType and value is ClassPtrType:
+     *        - perform OF-test
+     *        - cast if the target is not a struct
+     *
+     *   2. Left is ClassRefType and value is ClassPtrType:
+     *        - perform OF-test
+     *        - create an instance type and cast if needed
+     *
+     *   3. Otherwise:
+     *        - verify type compatibility directly
+     *
+     * @returns:
+     *   (typeTestExpression, castedValue, resultingType)
+     *
+     * @throws:
+     *   ErrorMsg if the type is invalid or incompatible.
+     */
+    fn validateLeft (dmut context: &ValidationContext,
+                     value:        &Value,
+                     cl:           &MultOperatorExpr)-> (&Value, &Value, &Type)
+        throws ErrorMsg
+    {
+        let mut typeTest: &Value    = TRUE_BOOL_VALUE;
+        let mut castedValue: &Value = value;
+        let mut resType: &Type      = TypeValidation::validate (alias context, cl.left);
+
+        if let cptr: &ClassPtrType = resType && value.type of ClassPtrType {
+            typeTest = ClassBinOpValidation::validateTypeTest (alias context, resType.loc, BinaryOperators::OF, value, cptr.inner);
+            if !cptr.isStruct {
+                resType = resType.clone (pattern-> value.type);
+                castedValue = copy CastValue (resType.loc, resType, value, isLvalue-> value.isLvalue);
+            }
+        }
+
+        else if let (vtype: &ClassPtrType, cref: &ClassRefType) = (value.type, resType) {
+            typeTest = ClassBinOpValidation::validateTypeTest (alias context, resType.loc, BinaryOperators::OF, value, cref);
+            if !cref.sym.isStruct {
+                resType = cref.createInstance (loc-> resType.loc, vtype.isMutable, vtype.isDeeplyMutable);
+                castedValue = copy CastValue (resType.loc, resType, value, isLvalue-> value.isLvalue);
+            }
+        }
+
+        else {
+            TypeVerification::verifyCompatible (value.loc, resType.loc, value.type, resType);            
+        }
+        
+
+        return (typeTest, castedValue, resType);        
+    }
+    
+}
