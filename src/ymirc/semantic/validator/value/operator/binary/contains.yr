@@ -1,0 +1,344 @@
+/*
+ * Implements semantic validation for the containment operators in Ymir:
+ *
+ *      x in y
+ *      x !in y
+ *
+ * Supported right-hand operand categories:
+ *   - class instances (via operator overloading)
+ *   - slices
+ *   - arrays
+ *   - maps
+ *   - ranges
+ *
+ * <hr>
+ * 
+ * @Package: ymirc        
+ * @Module: ymirc::semantic::validator::value::operator::binary::contains
+ * @File: ymirc/semantic/validator/value/operator/binary/contains.yr
+ * @Author(s):
+ *   - Emile Cadorel <ecadorel@gmail.com>
+ *
+ * @Created (YYYY-MM-DD): 2026-04-15
+ * @Copyright (C) 2021–2026 GNU-Ymir
+ * @License
+ *   ```text
+ *   This file is part of the Ymir language project.
+ *
+ *   Ymir is free software: you can redistribute it and/or modify it
+ *   under the terms of the GNU General Public License as published by
+ *   the Free Software Foundation, either version 3 of the License, or
+ *   (at your option) any later version.
+ *
+ *   Ymir is distributed in the hope that it will be useful,
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *   GNU General Public License for more details.
+ *
+ *   You should have received a copy of the GNU General Public License
+ *   along with Ymir.  If not, see <https://www.gnu.org/licenses/>.
+ *   ```
+ */
+
+in contains;
+
+use ymirc::lexing::{word, tokens, keys};
+
+use ymirc::syntax::expression::_;
+use ymirc::semantic::validator;
+use ymirc::semantic::generator::{value::_, type::_};
+
+use ymirc::errors::message;
+use ymirc::utils::format;
+use ymirc::global::_;
+
+/**
+ * BinaryContainsValidation
+ *
+ * Provides semantic validation for the containment operators:
+ *
+ *      left in right
+ *      left !in right
+ *
+ * This module defines the complete semantics of containment in Ymir.
+ */
+pub mod BinaryContainsValidation {
+
+    /**
+     * Validate a containment expression.
+     *
+     * @params:
+     *   - context: the validation context
+     *   - bin:     the binary expression node
+     *   - op:      the containment operator (IN or NOT_IN)
+     *
+     * @returns:
+     *   A &Value representing the validated containment expression.
+     */
+    pub fn validate (dmut context: &ValidationContext, bin: &BinaryExpr, op: BinaryOperators)-> &Value
+        throws ErrorMsg
+    {
+        return BinaryContainsValidation::validate (alias context, bin.loc, op,
+                                                   left-> ValueValidation::validate (alias context, bin.left),
+                                                   right-> ValueValidation::validate (alias context, bin.right));                                                   
+    }
+
+    /**
+     * Validate a containment expression after both operands have been validated.
+     *
+     * Enum values are unwrapped before containment so that the operator applies
+     * to the underlying slice/map/range/class value.
+     *
+     * @params:
+     *   - context: the validation context
+     *   - loc:     operator location
+     *   - op:      containment operator
+     *   - left:    validated left operand
+     *   - right:   validated right operand
+     *
+     * @returns:
+     *   A &Value representing the validated containment expression.
+     */
+    pub fn validate (dmut context: &ValidationContext,
+                     loc:          &Word,
+                     op:           BinaryOperators,
+                     left:         &Value,
+                     right:        &Value)-> &Value
+        throws ErrorMsg
+    {
+        let lvalue = ValueCreation::createEnumUnwrap (left);
+        let rvalue = ValueCreation::createEnumUnwrap (right);
+        
+        return BinaryContainsValidation::validateImpl (alias context, loc, op,
+                                                       left-> lvalue,
+                                                       right-> rvalue);        
+    }
+
+    /**
+     * Core implementation of containment validation.
+     *
+     * @params:
+     *   - context: the validation context
+     *   - loc:     operator location
+     *   - op:      containment operator
+     *   - left:    validated left operand
+     *   - right:   validated right operand
+     *
+     * @returns:
+     *   A &Value representing the validated containment expression.
+     */
+    fn validateImpl (dmut context: &ValidationContext,
+                     loc:          &Word,
+                     op:           BinaryOperators,
+                     left:         &Value,
+                     right:        &Value)-> &Value
+        throws ErrorMsg
+    {
+        let mut errors: [&ErrorMsg] = [];
+        {
+            match right.type {
+                c: &ClassPtrType => {
+                    return BinaryContainsValidation::validateClassRight (alias context, loc, op, left, right, c);
+                }
+                s: &SliceType => {
+                    return BinaryContainsValidation::validateSliceOrArrayRight (alias context, loc, op, left, right, s.value);
+                }
+                m: &MapType => {
+                    return BinaryContainsValidation::validateMapRight (alias context, loc, op, left, right, m);
+                }
+                a: &ArrayType => {
+                    return BinaryContainsValidation::validateSliceOrArrayRight (alias context, loc, op, left, right, a.value);
+                }
+                r: &RangeType => {
+                    return BinaryContainsValidation::validateRangeRight (alias context, loc, op, left, right, r);
+                }
+            }
+        } catch {
+            err => {
+                errors ~= [err];
+            }
+        }
+
+        throw copy ErrorMsg::fatal (loc,
+                                    format (ValidateErrorMessage::UNDEFINED_BIN_OP, op, left.type, right.type),
+                                    notes-> errors);
+    }
+    
+    /**
+     * Validate containment where the right operand is a class instance.
+     *
+     * Behavior:
+     *   • Resolve the contains() method on the class.
+     *   • Call opContains(left).
+     *   • Negate the result if operator is NOT_IN.
+     *
+     * This enables user-defined containment semantics.
+     *
+     * @params:
+     *   - context:   the validation context
+     *   - loc:       operator location
+     *   - op:        containment operator
+     *   - left:      validated left operand
+     *   - right:     validated right class instance
+     *   - rightType: class pointer type of the right operand
+     *
+     * @returns:
+     *   A &Value representing the class-specific containment result.
+     */
+    fn validateClassRight (dmut context: &ValidationContext,
+                           loc:          &Word,
+                           op:           BinaryOperators,
+                           left:         &Value,
+                           right:        &Value,
+                           rightType:    &ClassPtrType)-> &Value
+        throws ErrorMsg
+    {
+        let meth = ValueCreation::createObjectMethodAcc (alias context, loc, rightType, right, OpOverrideNames::CONTAINS);                        
+        let call = CallValidation::validate (alias context, loc, meth, copy [left]);
+
+        if (op == BinaryOperators::NOT_IN) {
+            return UnaryValidation::validate (alias context, loc, UnaryOperators::NOT, call)
+        }
+
+        return call;
+    }
+
+    /**
+     * Validate containment where the right operand is a slice or array.
+     *
+     * Steps:
+     *   1. Convert arrays to slice aliases.
+     *   2. Infer the type of the key (left operand) to match the slice element type.
+     *   3. Call the runtime helper SliceUtils::OP_CONTAINS_FUNC(slice, key).
+     *   4. Wrap the call in SpecialArrayOperatorValue for CTE traceability.
+     *   5. Negate the result if operator is NOT_IN.
+     *
+     * @params:
+     *   - context:    the validation context
+     *   - loc:        operator location
+     *   - op:         containment operator
+     *   - left:       validated left operand (key)
+     *   - right:      validated right slice or array
+     *   - sliceInner: element type of the slice/array
+     *
+     * @returns:
+     *   A &Value representing slice/array containment.
+     */
+    fn validateSliceOrArrayRight (dmut context: &ValidationContext,
+                                  loc:          &Word,
+                                  op:           BinaryOperators,
+                                  left:         &Value,
+                                  right:        &Value,
+                                  sliceInner:   &Type)-> &Value
+        throws ErrorMsg
+    {
+        let finRight = match right.type {
+            SliceType () => { right }
+            a: &ArrayType => { ValueCreation::createSliceAliasFromArray (loc, a, right) }
+            _ => {
+                throw copy ErrorMsg::list ([]);
+            }
+        };
+        
+        let syntVar = VariableCreation::createSyntaxVarFromPath (loc, SliceUtils::OP_CONTAINS_FUNC);
+        let func = ValueValidation::validate (alias context, syntVar);
+        let key = TypeInference::inferValueForType (alias context, loc, left, sliceInner,
+                                                    byReference-> false);
+        
+        let mut call = CallValidation::validate (alias context, loc, func, copy [finRight, key]);
+
+        if let c: &PrototypeCallValue = call { // for cte tracability
+            call = copy SpecialArrayOperatorValue (loc,
+                                                   c.type,
+                                                   BinaryOperators::IN,
+                                                   c.params [0],
+                                                   c.params [1], c);
+        }
+
+        // We need to inverse the test, the operator returns 'in'
+        if (op == BinaryOperators::NOT_IN) { 
+            return UnaryValidation::validate (alias context, loc, UnaryOperators::NOT, call);
+        } 
+
+        return call;
+    }
+
+    /**
+     * Validate containment where the right operand is a map.
+     *
+     * Behavior:
+     *   - Infer the key type to match the map's key type.
+     *   - Produce a MapContainsValue representing:
+     *         key in map
+     *     or:
+     *         key !in map
+     *
+     * @params:
+     *   - context:   the validation context
+     *   - loc:       operator location
+     *   - op:        containment operator
+     *   - left:      validated left operand (key)
+     *   - right:     validated right map
+     *   - rightType: map type of the right operand
+     *
+     * @returns:
+     *   A MapContainsValue representing map containment.
+     */
+    fn validateMapRight (dmut context: &ValidationContext,
+                         loc:          &Word,
+                         op:           BinaryOperators,
+                         left:         &Value,
+                         right:        &Value,
+                         rightType:    &MapType)-> &Value
+        throws ErrorMsg
+    {
+        let key = TypeInference::inferValueForType (alias context, loc, left, rightType.key,
+                                                    byReference-> false);
+
+        return copy MapContainsValue (loc, BOOL_TYPE, right, key,
+                                      isNot-> (op == BinaryOperators::NOT_IN));
+    }
+
+    /**
+     * Validate containment where the right operand is a range.
+     *
+     * Steps:
+     *   1. Infer the key type to match the range's start type.
+     *   2. Call the runtime helper RangeUtils::OP_CONTAINS_FUNC(range, key).
+     *   3. Negate the result if operator is NOT_IN.
+     *   4. Wrap the result in a RangeContainsValue for IR traceability.
+     *
+     * @params:
+     *   - context:   the validation context
+     *   - loc:       operator location
+     *   - op:        containment operator
+     *   - left:      validated left operand (key)
+     *   - right:     validated right range
+     *   - rightType: range type of the right operand
+     *
+     * @returns:
+     *   A RangeContainsValue representing range containment.
+     */
+    fn validateRangeRight (dmut context: &ValidationContext,
+                           loc:          &Word,
+                           op:           BinaryOperators,
+                           left:         &Value,
+                           right:        &Value,
+                           rightType:    &RangeType)-> &Value
+        throws ErrorMsg
+    {
+        let key = TypeInference::inferValueForType (alias context, loc, left, rightType.start,
+                                                    byReference-> false);
+        
+        let syntVar = VariableCreation::createSyntaxVarFromPath (loc, RangeUtils::OP_CONTAINS_FUNC);
+        let func = ValueValidation::validate (alias context, syntVar);
+        let mut call = CallValidation::validate (alias context, loc, func, copy [right, key]);
+        
+        if (op == BinaryOperators::NOT_IN) { 
+            call = UnaryValidation::validate (alias context, loc, UnaryOperators::NOT, call);
+        } 
+
+        return copy RangeContainsValue (loc, call.type, op, key, right, call);
+    }        
+    
+}

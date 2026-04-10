@@ -1,0 +1,498 @@
+/*
+ * Implements semantic validation for mathematical binary operators in Ymir.
+ *
+ * Supported operand categories:
+ *   - integers
+ *   - characters (with restricted + / - semantics)
+ *   - floating-point numbers
+ *   - pointers (pointer arithmetic)
+ *   - class instances (via operator overloading)
+ *
+ * Supported operators include:
+ *   - +, -, *, /, %, &, |, ^, <<, >>
+ *   - power operator (DXOR, ^^)
+ *   - modulo for floats
+ *
+ * This module is invoked by BinaryValidation when the operator kind is
+ * OperatorType::MATH.
+ *
+ * <hr>
+ * 
+ * @Package: ymirc        
+ * @Module: ymirc::semantic::validator::value::operator::binary::math
+ * @File: ymirc/semantic/validator/value/operator/binary/math.yr
+ * @Author(s):
+ *   - Emile Cadorel <ecadorel@gmail.com>
+ *
+ * @Created (YYYY-MM-DD): 2026-04-10
+ * @Copyright (C) 2021–2026 GNU-Ymir
+ * @License
+ *   ```text
+ *   This file is part of the Ymir language project.
+ *
+ *   Ymir is free software: you can redistribute it and/or modify it
+ *   under the terms of the GNU General Public License as published by
+ *   the Free Software Foundation, either version 3 of the License, or
+ *   (at your option) any later version.
+ *
+ *   Ymir is distributed in the hope that it will be useful,
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *   GNU General Public License for more details.
+ *
+ *   You should have received a copy of the GNU General Public License
+ *   along with Ymir.  If not, see <https://www.gnu.org/licenses/>.
+ *   ```
+ */
+
+in math;
+
+use ymirc::lexing::{word, tokens, keys};
+
+use ymirc::syntax::expression::_;
+use ymirc::semantic::validator;
+use ymirc::semantic::generator::{value::_, type::_};
+
+use ymirc::errors::message;
+use ymirc::global::_;
+use ymirc::utils::format;
+
+/**
+ * BinaryMathValidation
+ *
+ * Provides semantic validation for all mathematical binary operators.
+ *
+ *
+ * This module defines the complete semantics of mathematical operators
+ * in Ymir.
+ */
+pub mod BinaryMathValidation {
+
+    /**
+     * Validate a mathematical binary expression.    
+     *
+     * @params:
+     *   - context: the validation context
+     *   - bin:     the binary expression node
+     *   - op:      the mathematical operator
+     *
+     * @returns:
+     *   A &Value representing the validated mathematical expression.
+     */
+    pub fn validate (dmut context: &ValidationContext, bin: &BinaryExpr, op: BinaryOperators)-> &Value
+        throws ErrorMsg
+    {
+        return BinaryMathValidation::validate (alias context, bin.loc, op,
+                                               left-> ValueValidation::validate (alias context, bin.left),
+                                               right-> ValueValidation::validate (alias context, bin.right));                                                   
+    }
+
+    /**
+     * Validate a mathematical expression after both operands have been validated.
+     *
+     * Enum values are unwrapped before validation so that the operator applies
+     * to the underlying numeric/pointer/class value.
+     *
+     * @params:
+     *   - context: the validation context
+     *   - loc:     operator location
+     *   - op:      mathematical operator
+     *   - left:    validated left operand
+     *   - right:   validated right operand
+     *
+     * @returns:
+     *   A &Value representing the validated mathematical expression.
+     */
+    pub fn validate (dmut context: &ValidationContext,
+                     loc:          &Word,
+                     op:           BinaryOperators,
+                     left:         &Value,
+                     right:        &Value)-> &Value
+        throws ErrorMsg
+    {
+        return BinaryMathValidation::validateImpl (alias context, loc, op,
+                                                   left-> ValueCreation::createEnumUnwrap (left),
+                                                   right-> ValueCreation::createEnumUnwrap (right));
+    }
+
+    /**
+     * Core implementation of mathematical operator validation.
+     *
+     * @params:
+     *   - context: the validation context
+     *   - loc:     operator location
+     *   - op:      mathematical operator
+     *   - left:    validated left operand
+     *   - right:   validated right operand
+     *
+     * @returns:
+     *   A &Value representing the validated mathematical expression.
+     */
+    fn validateImpl (dmut context: &ValidationContext,
+                     loc:          &Word,
+                     op:           BinaryOperators,
+                     left:         &Value,
+                     right:        &Value)-> &Value
+        throws ErrorMsg
+    {
+        let mut errors: [&ErrorMsg] = [];
+        {
+            // First we try the operation as a left side operation (asking for left operand to be the master of the operation, i.e. left.opBinary!{op} (right)
+            match left.type { 
+                li: &IntType => {
+                    return BinaryMathValidation::validateIntLeft (alias context, loc, op, left, li, right);
+                }
+                ci: &CharType => {
+                    return BinaryMathValidation::validateCharLeft (alias context, loc, op, left, ci, right);
+                }
+                fi: &FloatType => {
+                    return BinaryMathValidation::validateFloatLeft (alias context, loc, op, left, fi, right);
+                }
+                pi: &PointerType => {
+                    return BinaryMathValidation::validatePointerLeft (alias context, loc, op, left, pi, right);
+                }
+                c: &ClassPtrType => {
+                    return BinaryValidation::validateClassLeft (alias context, loc, op, left, c, right);
+                }
+            };
+        } catch {
+            err: &ErrorMsg => {
+                errors ~= [err];
+            }        
+        }
+
+        {
+            // if we are here the validation as a left operand validation
+            // failed, so we need to try it as a right operation
+            // (right.opBinaryRight!{op} (left)) 
+            // 
+            match right.type { 
+                c: &ClassPtrType => {
+                    return BinaryValidation::validateClassRight (alias context, loc, op, left, right, c);
+                }
+            } 
+        } catch {
+            err: &ErrorMsg => {
+                errors ~= [err];
+            } 
+        }
+
+        // there is no valid math operation for left and right
+        throw copy ErrorMsg::fatal (loc,
+                                    format (ValidateErrorMessage::UNDEFINED_BIN_OP, op, left.type, right.type),
+                                    notes-> errors);        
+    }
+
+    /**
+     * Validate mathematical operations where the left operand is an integer.
+     *
+     * Supported cases:
+     *   - int op int
+     *   - int ^^ int (power operator)
+     *   - int + char (unsigned, same size)
+     *
+     * Behavior:
+     *   - If both ints have same signedness and size => direct operation.
+     *   - Otherwise => infer common type via inferValuesForBranch().
+     *   - Power operator is delegated to validateIntOrFloatPowerOp().
+     *
+     * @params:
+     *   - context:   the validation context
+     *   - loc:       operator location
+     *   - op:        mathematical operator
+     *   - left:      validated left integer
+     *   - leftType:  integer type of the left operand
+     *   - right:     validated right operand
+     *
+     * @returns:
+     *   A &Value representing the validated integer operation.
+     */
+    fn validateIntLeft (dmut context: &ValidationContext,
+                        loc:          &Word,
+                        op:           BinaryOperators,
+                        left:         &Value,
+                        leftType:     &IntType,
+                        right:        &Value)-> &Value
+        throws ErrorMsg
+    {        
+        
+        if let rightType: &IntType = right.type {
+            if (op == BinaryOperators::DXOR) {
+                return BinaryMathValidation::validateIntOrFloatPowerOp (alias context, loc, left, right);
+            }
+
+            if (leftType.isSigned == rightType.isSigned && leftType.size == rightType.size) {                
+                return copy MathIntOperatorValue (loc, leftType, op, left, right);
+            }            
+            
+            let (common, lvalue, rvalue) = TypeInference::inferValuesForBranch (alias context, loc, left, right);                                                                                         
+            return copy MathIntOperatorValue (loc, common, op, lvalue, rvalue);
+        }    
+        
+        // char values as right operands, 12u8 + 'a'c8 == 'm'c8
+        else if let rightType: &CharType = right.type { 
+            if (!leftType.isSigned && rightType.size == leftType.size) {                 
+                let l = TypeInference::inferValueForType (alias context, loc, left, rightType,
+                                                          byReference-> false);
+                
+                return copy MathCharOperatorValue (loc, rightType, op, l, right);
+            }
+        }        
+        
+        throw copy ErrorMsg::list ([]);
+    }
+
+    /**
+     * Validate the power operator (DXOR, ^^) for integers and floats.
+     *
+     * Behavior:
+     *   - Select the appropriate core math function:
+     *        - IPOW_FUNC  for int ^^ int
+     *        - FIPOW_FUNC for float ^^ int
+     *        - FFPOW_FUNC for float ^^ float
+     *
+     *   - Call the function via CallValidation.
+     *   - Wrap the result in a SpecialMathOperatorValue for IR traceability.
+     *
+     * @params:
+     *   - context: the validation context
+     *   - loc:     operator location
+     *   - left:    validated left operand
+     *   - right:   validated right operand
+     *
+     * @returns:
+     *   A &Value representing the validated power operation.
+     */
+    fn validateIntOrFloatPowerOp (dmut context: &ValidationContext,
+                                  loc:          &Word,
+                                  left:         &Value,
+                                  right:        &Value)-> &Value
+        throws ErrorMsg
+    {
+        let funcPath = if (left.type of IntType) {
+            MathUtils::IPOW_FUNC
+        } else if (right.type of IntType) {
+            MathUtils::FIPOW_FUNC
+        } else { MathUtils::FFPOW_FUNC };
+
+        // Create a var path to the core function core::math::pow
+        let syntVar = VariableCreation::createSyntaxVarFromPath (loc, funcPath);
+        let func = ValueValidation::validate (alias context, syntVar);
+        let call = CallValidation::validate (alias context, loc, func, copy [left, right]);
+
+        match call.type {
+            IntType () => {
+                return copy SpecialMathIntOperatorValue (loc,
+                                                         call.type, BinaryOperators::DXOR, left, right, call);
+            }
+            FloatType () => {
+                return copy SpecialMathFloatOperatorValue (loc,
+                                                           call.type, BinaryOperators::DXOR, left, right, call);
+            }
+            _ => {
+                throw copy ErrorMsg::fatal (func.loc, ValidateErrorMessage::MALFORMED_CORE);
+            }
+        }
+    }
+
+    /**
+     * Validate mathematical operations where the left operand is a character.
+     *
+     * Supported operations:
+     *   - char + int
+     *   - char - int
+     *
+     * Restrictions:
+     *   - Only unsigned integers of the same size may be added/subtracted.
+     *
+     * @params:
+     *   - context:   the validation context
+     *   - loc:       operator location
+     *   - op:        mathematical operator (+ or -)
+     *   - left:      validated left character
+     *   - leftType:  character type of the left operand
+     *   - right:     validated right operand
+     *
+     * @returns:
+     *   A &Value representing the validated char operation.
+     */
+    fn validateCharLeft (dmut context: &ValidationContext,
+                         loc:          &Word,
+                         op:           BinaryOperators,
+                         left:         &Value,
+                         leftType:     &CharType,
+                         right:        &Value)-> &Value
+        throws ErrorMsg
+    {
+        if (op != BinaryOperators::PLUS && op != BinaryOperators::MINUS) {
+            throw copy ErrorMsg::list ([]);
+        }
+        
+        if let rightType: &IntType = right.type { // only int values can be added, substracted to char values
+            if (!rightType.isSigned && rightType.size == leftType.size) {            
+                let r = TypeInference::inferValueForType (alias context, loc, right, leftType,
+                                                          byReference-> false);
+                
+                return copy MathCharOperatorValue (loc, leftType, op, left, r);
+            }
+        }
+        
+        throw copy ErrorMsg::list ([]);
+    }
+
+    /**
+     * Validate mathematical operations where the left operand is a float.
+     *
+     * Supported cases:
+     *   - float op float
+     *   - float ^^ int
+     *   - float ^^ float
+     *   - float % float (delegated to validateFloatModOp)
+     *
+     * Behavior:
+     *   - If sizes match => direct operation.
+     *   - Otherwise => infer common type via inferValuesForBranch().
+     *
+     * @params:
+     *   - context:   the validation context
+     *   - loc:       operator location
+     *   - op:        mathematical operator
+     *   - left:      validated left float
+     *   - leftType:  float type of the left operand
+     *   - right:     validated right operand
+     *
+     * @returns:
+     *   A &Value representing the validated float operation.
+     */
+    fn validateFloatLeft (dmut context: &ValidationContext,
+                          loc:          &Word,
+                          op:           BinaryOperators,
+                          left:         &Value,
+                          leftType:     &FloatType,
+                          right:        &Value)-> &Value
+        throws ErrorMsg
+    {                
+        if right.type of IntType && op == BinaryOperators::DXOR {                
+            return BinaryMathValidation::validateIntOrFloatPowerOp (alias context, loc, left, right);                
+        }
+        
+        if let rightType: &FloatType = right.type {
+            if (op == BinaryOperators::DXOR) {
+                return BinaryMathValidation::validateIntOrFloatPowerOp (alias context, loc, left, right);
+            }
+
+            if (op == BinaryOperators::PERCENT) {
+                return BinaryMathValidation::validateFloatModOp (alias context, loc, left, right);
+            }
+
+            if (leftType.size == rightType.size) {            
+                return copy MathFloatOperatorValue (loc, leftType, op, left, right);
+            }
+
+            let (common, lvalue, rvalue) = TypeInference::inferValuesForBranch (alias context, loc, left, right);                                                                                         
+            return copy MathFloatOperatorValue (loc, common, op, lvalue, rvalue);
+        }
+
+        throw copy ErrorMsg::list ([]);
+    }
+
+    /**
+     * Validate the float modulo operator (float % float).
+     *
+     * Behavior:
+     *   - Calls the core math function FFMOD_FUNC.
+     *   - Wraps the result in SpecialMathFloatOperatorValue.
+     *
+     * @params:
+     *   - context: the validation context
+     *   - loc:     operator location
+     *   - left:    validated left float
+     *   - right:   validated right float
+     *
+     * @returns:
+     *   A &Value representing the validated float modulo operation.
+     */
+    fn validateFloatModOp (dmut context: &ValidationContext,
+                           loc:          &Word,
+                           left:         &Value,
+                           right:        &Value)-> &Value
+        throws ErrorMsg
+    {        
+        let syntVar = VariableCreation::createSyntaxVarFromPath (loc, MathUtils::FFMOD_FUNC);
+        let func = ValueValidation::validate (alias context, syntVar);
+        let call = CallValidation::validate (alias context, loc, func, copy [left, right]);
+
+        match call.type {
+            FloatType () => {
+                return copy SpecialMathFloatOperatorValue (loc, call.type, BinaryOperators::PERCENT, left, right, call);
+            }
+            _ => {
+                throw copy ErrorMsg::fatal (func.loc, ValidateErrorMessage::MALFORMED_CORE);
+            }
+        }
+    }
+
+    /**
+     * Validate pointer arithmetic.
+     *
+     * Supported operations:
+     *   - pointer + int
+     *   - pointer - int
+     *   - pointer - pointer (same pointed type or void*)
+     *
+     * Rules:
+     *   - Only unsigned integers of size 0 (usize) may be used for pointer offset.
+     *   - pointer - pointer is allowed only when:
+     *        - both point to the same type, or
+     *        - one of them points to void.
+     *
+     * @params:
+     *   - context:   the validation context
+     *   - loc:       operator location
+     *   - op:        mathematical operator (+ or -)
+     *   - left:      validated left pointer
+     *   - leftType:  pointer type of the left operand
+     *   - right:     validated right operand
+     *
+     * @returns:
+     *   A &Value representing the validated pointer arithmetic.
+     */
+    fn validatePointerLeft (dmut _:   &ValidationContext,
+                            loc:      &Word,
+                            op:       BinaryOperators,
+                            left:     &Value,
+                            leftType: &PointerType,
+                            right:    &Value)-> &Value
+        throws ErrorMsg
+    {
+        if (op != BinaryOperators::PLUS && op != BinaryOperators::MINUS) {
+            throw copy ErrorMsg::list ([]);
+        }
+        
+        if let rightType: &IntType = right.type {
+            if (!rightType.isSigned && rightType.size == 0) {
+                return copy MathPointerOperatorValue (loc, leftType, op, left, right);
+            }            
+        }
+
+        else if let rightType: &PointerType = right.type {
+            if (rightType.pointed == leftType.pointed) {
+                return copy MathPointerOperatorValue (loc, leftType, op, left, right);
+            }
+
+            if rightType.pointed of VoidType {
+                return copy MathPointerOperatorValue (loc, leftType, op, left, right);
+            }
+            
+            if leftType.pointed of VoidType {
+                return copy MathPointerOperatorValue (loc, rightType, op, left, right);                
+            }
+        }
+        
+        throw copy ErrorMsg::list ([]);
+    }
+
+    
+}
+
+

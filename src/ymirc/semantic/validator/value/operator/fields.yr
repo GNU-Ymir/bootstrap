@@ -1,40 +1,213 @@
+/*
+ * Implements semantic validation for field access operators in Ymir.
+ *
+ * Supported operators:
+ *   - .      (field access)
+ *   - .:     (field access with aliasing / borrow semantics)
+ *
+ * Supported operand categories:
+ *   - tuple
+ *   - class instance (dynamic fields and vtable)
+ *   - range
+ *   - slice
+ *   - array
+ *   - option
+ *   - map
+ *   - future
+ *
+ * This module is invoked by BinaryValidation when the operator kind is
+ * OperatorType::FIELD.
+ */
+
 in fields;
 
-use ymirc::lexing::word;
+use ymirc::lexing::{word, keys};
+
+use ymirc::syntax::expression::_;
 use ymirc::semantic::validator;
-use ymirc::semantic::generator::{value, type};
+use ymirc::semantic::generator::{value::_, type::_};
+use ymirc::semantic::validator::value::operator::fields::_;
 use ymirc::utils::format;
 use ymirc::errors::message;
 
 
-pub mod ::enum_;
+/*!
+ * ====================================================================================================
+ * ====================================================================================================
+ * ====================================          SUBMODS          =====================================
+ * ====================================================================================================
+ * ====================================================================================================
+ */
 
-pub mod ::class_stat;
-pub mod ::class_dyn;
+pub mod ::class_;
+pub mod ::array;
+pub mod ::future_;
+pub mod ::map;
+pub mod ::option;
+pub mod ::range;
+pub mod ::slice;
 pub mod ::tuple;
 
-pub mod FieldValidation {
+/*!
+ * ====================================================================================================
+ * ====================================================================================================
+ * ======================================          ROOT          ======================================
+ * ====================================================================================================
+ * ====================================================================================================
+ */
 
-    // '::'
-    pub fn validateStaticAccess (dmut context: &ValidationContext, loc: &Word, object: &Value, field: [c8])-> &Value
+/**
+ * FieldValidation
+ *
+ * Provides semantic validation for field access expressions:
+ *
+ *      object.field
+ *      object.&field
+ *
+ * The validator:
+ *   - unwraps enum values
+ *   - applies aliasing rules for .: access
+ *   - dispatches to the appropriate sub-validator based on the object type:
+ *        - TupleFieldValidation
+ *        - ClassDynamicFieldValidation
+ *        - RangeFieldValidation
+ *        - SliceFieldValidation
+ *        - ArrayFieldValidation
+ *        - OptionFieldValidation
+ *        - MapFieldValidation
+ *        - FutureFieldValidation
+ *
+ * This module defines the complete semantics of field access in Ymir.
+ */
+pub mod FieldValidation {
+    
+    /**
+     * Validate a simple field access of the form:
+     *
+     *      object.field
+     *
+     * This overload is used when the field name is already known as a string.
+     * It constructs a VarExpr for the field and forwards to the main validator.
+     *
+     * @params:
+     *   - context: validation context
+     *   - loc:     location of the '.' operator
+     *   - object:  validated left operand
+     *   - field:   field name as a UTF-8 byte slice
+     *
+     * @returns:
+     *   A &Value representing the validated field access.
+     *
+     * @throws:
+     *   ErrorMsg if the field is undefined for the object type.
+     */
+    pub fn validate (dmut context: &ValidationContext, loc: &Word, object: &Value, field: [c8])-> &Value
         throws ErrorMsg
-    {
-        context;
-        loc;
-        object;
-        field;
-        panic;
+    { 
+        return FieldValidation::validate (alias context,
+                                          loc,
+                                          BinaryOperators::DOT,
+                                          object,
+                                          copy VarExpr (loc.locate (field), isQuoted-> true),
+                                          inCall-> false);
     }
 
-    // '.'
-    pub fn validateDynamicAccess (dmut context: &ValidationContext, loc: &Word, object: &Value, field: [c8])-> &Value
+    /**
+     * Validate a field access expression from a BinaryExpr node.
+     *
+     *
+     * @params:
+     *   - context: validation context
+     *   - bin:     binary expression containing the field access
+     *   - op:      field operator (DOT or DOT_AND)
+     *
+     * @returns:
+     *   A &Value representing the validated field access.
+     *
+     * @throws:
+     *   ErrorMsg if the field is undefined for the object type.
+     */
+    pub fn validate (dmut context: &ValidationContext, bin: &BinaryExpr, op: BinaryOperators)-> &Value
         throws ErrorMsg
     {
-        context;
-        loc;
-        object;
-        field;
-        panic;        
-    }    
+        return FieldValidation::validate (alias context, bin.loc, op,
+                                          left-> ValueValidation::validate (alias context, bin.left),
+                                          right-> bin.right,
+                                          inCall-> false);
+    }
+
+
+    /**
+     * Validate a field access expression after both operands have been validated.
+     *
+     * Steps:
+     *   1. Unwrap enum values.
+     *   2. If operator is DOT_AND, apply aliasing rules via AliasValidation.
+     *   3. Dispatch based on the type of the left operand     
+     *   4. If no case matches, emit a fatal UNDEFINED_BIN_OP error.
+     *
+     * @params:
+     *   - context: validation context
+     *   - loc:     operator location
+     *   - op:      field operator (DOT or DOT_AND)
+     *   - left:    validated left operand
+     *   - right:   field expression (identifier or expression)
+     *   - inCall:  whether this field access occurs inside a call expression
+     *
+     * @returns:
+     *   A &Value representing the validated field access.
+     *
+     * @throws:
+     *   ErrorMsg if the field is undefined or the operator is invalid.
+     */
+    pub fn validate (dmut context: &ValidationContext,
+                     loc:          &Word,
+                     op:           BinaryOperators,
+                     left:         &Value,
+                     right:        &Expression,
+                     inCall:       bool = false)-> &Value
+        throws ErrorMsg
+    {
+        let mut lvalue = ValueCreation::createEnumUnwrap (left);
+        if op == BinaryOperators::DOT_AND {
+            lvalue = AliasValidation::validate (alias context, loc, lvalue,
+                                                isClass-> true,
+                                                isField-> true);
+        }
+
+        match lvalue.type {
+            t: &TupleType => {
+                return TupleFieldValidation::validate (alias context, loc, lvalue, t, right);
+            }
+            c: &ClassFieldAccType => {
+                return ClassDynamicFieldValidation::validateField (alias context, loc, lvalue, c, right);
+            }
+            c: &ClassPtrType => {
+                return ClassDynamicFieldValidation::validateFieldOrVtable (alias context, loc, lvalue, c.inner, right,
+                                                                           inCall-> inCall);
+            }
+            r: &RangeType => {
+                return RangeFieldValidation::validate (alias context, loc, lvalue, r, right);
+            }
+            s: &SliceType => {
+                return SliceFieldValidation::validate (alias context, loc, lvalue, s, right);
+            }
+            a: &ArrayType => {
+                return ArrayFieldValidation::validate (alias context, loc, lvalue, a, right);
+            }
+            o: &OptionType => {
+                return OptionFieldValidation::validate (alias context, loc, lvalue, o, right);
+            }
+            m: &MapType => {
+                return MapFieldValidation::validate (alias context, loc, lvalue, m, right);
+            }
+            f: &FutureType => {
+                return FutureFieldValidation::validate (alias context, loc, lvalue, f, right);
+            }
+        }
+
+        throw copy ErrorMsg::fatal (loc,
+                                    format (ValidateErrorMessage::UNDEFINED_BIN_OP, op, left.type, right));
+    }
     
 }

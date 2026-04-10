@@ -1,0 +1,1001 @@
+/*
+ * Implements semantic validation for all comparison operators in Ymir.
+ *
+ * Supported operator families:
+ *   - integer comparisons
+ *   - float comparisons (including <=> / <!> special float congruence)
+ *   - char comparisons
+ *   - bool equality
+ *   - pointer comparisons
+ *   - slice/array equality and lexicographic comparison
+ *   - tuple structural equality
+ *   - function pointer equality
+ *   - delegate equality
+ *   - range equality
+ *   - option equality (None / Some)
+ *   - class opEquals() and class opCmp() overloads
+ *
+ *
+ * <hr>
+ * 
+ * @Package: ymirc        
+ * @Module: ymirc::semantic::validator::value::operator::binary::compare
+ * @File: ymirc/semantic/validator/value/operator/binary/compare.yr
+ * @Author(s):
+ *   - Emile Cadorel <ecadorel@gmail.com>
+ *
+ * @Created (YYYY-MM-DD): 2026-04-10
+ * @Copyright (C) 2021–2026 GNU-Ymir
+ * @License
+ *   ```text
+ *   This file is part of the Ymir language project.
+ *
+ *   Ymir is free software: you can redistribute it and/or modify it
+ *   under the terms of the GNU General Public License as published by
+ *   the Free Software Foundation, either version 3 of the License, or
+ *   (at your option) any later version.
+ *
+ *   Ymir is distributed in the hope that it will be useful,
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *   GNU General Public License for more details.
+ *
+ *   You should have received a copy of the GNU General Public License
+ *   along with Ymir.  If not, see <https://www.gnu.org/licenses/>.
+ *   ```
+ */
+
+in compare;
+
+use ymirc::lexing::{word, tokens, keys};
+
+use ymirc::syntax::expression::_;
+use ymirc::semantic::validator;
+use ymirc::semantic::generator::{value::_, type::_};
+
+use ymirc::errors::message;
+use ymirc::utils::{format, bigint};
+use ymirc::global::_;
+
+/**
+ * BinaryComparisonValidation
+ *
+ * Provides semantic validation for all comparison operators in Ymir.
+ *
+ * The validator:
+ *   - unwraps enum values
+ *   - dispatches based on operand types
+ *   - handles both symmetric and asymmetric comparison rules
+ *   - uses type inference to reconcile mismatched numeric types
+ *   - delegates to specialized comparison routines for complex types
+ *   - supports class operator overloading via equals() and cmp()
+ *
+ * This module defines the complete comparison semantics of the language.
+ */
+pub mod BinaryComparisonValidation {
+
+    /**
+     * Validate a comparison expression.
+     *
+     * @params:
+     *   - context: the validation context
+     *   - bin:     the binary comparison expression
+     *   - op:      the comparison operator
+     *
+     * @returns:
+     *   A &Value representing the validated comparison.
+     */
+    pub fn validate (dmut context: &ValidationContext, bin: &BinaryExpr, op: BinaryOperators)-> &Value
+        throws ErrorMsg
+    {
+        return BinaryComparisonValidation::validate (alias context, bin.loc, op,
+                                                     left-> ValueValidation::validate (alias context, bin.left),
+                                                     right-> ValueValidation::validate (alias context, bin.right));                                                   
+    }
+
+    /**
+     * Validate a comparison after both operands have been validated.
+     *
+     * Enum values are unwrapped before comparison so that comparisons operate
+     * on the underlying primitive or pointer type.
+     *
+     * @params:
+     *   - context: the validation context
+     *   - loc:     operator location
+     *   - op:      comparison operator
+     *   - left:    validated left operand
+     *   - right:   validated right operand
+     *
+     * @returns:
+     *   A &Value representing the validated comparison.
+     */
+    pub fn validate (dmut context: &ValidationContext,
+                     loc:          &Word,
+                     op:           BinaryOperators,
+                     left:         &Value,
+                     right:        &Value)-> &Value
+        throws ErrorMsg
+    {
+        return BinaryComparisonValidation::validateImpl (alias context, loc, op,
+                                                         left-> ValueCreation::createEnumUnwrap (left),
+                                                         right-> ValueCreation::createEnumUnwrap (right));
+    }
+
+    /**
+     * Core implementation of comparison validation.
+     *
+     *
+     * Special rule:
+     *   - CONGRUENT / UNCONGRUENT are only valid for floats.
+     *
+     * @params:
+     *   - context: the validation context
+     *   - loc:     operator location
+     *   - op:      comparison operator
+     *   - left:    validated left operand
+     *   - right:   validated right operand
+     *
+     * @returns:
+     *   A &Value representing the validated comparison.
+     */
+    fn validateImpl (dmut context: &ValidationContext,
+                     loc:          &Word,
+                     op:           BinaryOperators,
+                     left:         &Value,
+                     right:        &Value)-> &Value
+        throws ErrorMsg
+    {                
+        let mut errors : [&ErrorMsg] = [];
+        {
+            if (op == BinaryOperators::CONGRUENT || op == BinaryOperators::UNCONGRUENT) && left.type !of FloatType {
+                throw copy ErrorMsg::list ([]);                
+            }        
+            
+            match left.type {
+                li: &IntType => {
+                    return BinaryComparisonValidation::validateIntLeft (alias context, loc, op, left, li, right);
+                }
+                lf: &FloatType => {
+                    return BinaryComparisonValidation::validateFloatLeft (alias context, loc, op, left, lf, right);
+                }
+                lc: &CharType => {
+                    return BinaryComparisonValidation::validateCharLeft (alias context, loc, op, left, lc, right);
+                }
+                _: &BoolType => {
+                    return BinaryComparisonValidation::validateBoolLeft (alias context, loc, op, left, right);
+                }
+                lp: &PointerType => {
+                    return BinaryComparisonValidation::validatePointerLeft (alias context, loc, op, left, lp, right);
+                }
+                _: &ArrayType => {
+                    return BinaryComparisonValidation::validateSliceOrArrayLeft (alias context, loc, op, left, right);
+                }
+                _: &SliceType => {
+                    return BinaryComparisonValidation::validateSliceOrArrayLeft (alias context, loc, op, left, right);
+                }
+                lt: &TupleType => {
+                    return BinaryComparisonValidation::validateTupleLeft (alias context, loc, op, left, lt, right);
+                }
+                lr: &RangeType => {
+                    return BinaryComparisonValidation::validateRangeLeft (alias context, loc, op, left, lr, right);
+                }                
+                lo: &OptionType => {
+                    return BinaryComparisonValidation::validateOptionLeft (alias context, loc, op, left, lo, right);
+                }
+                lf: &FuncPtrType => {
+                    return BinaryComparisonValidation::validateFuncPtrLeft (alias context, loc, op, left, lf, right);
+                }
+                ld: &DelegateType => {
+                    return BinaryComparisonValidation::validateDGPtrLeft (alias context, loc, op, left, ld, right);
+                }
+                c : &ClassPtrType => {
+                    return BinaryComparisonValidation::validateClassLeftOrRight (alias context, loc, op, c, left, right,
+                                                                                 asLeft-> true);
+                }
+            };
+        } catch {
+            err : &ErrorMsg => { errors ~= [err]; }
+        }
+
+        { 
+            match right.type {
+                c : &ClassPtrType => {
+                    return BinaryComparisonValidation::validateClassLeftOrRight (alias context, loc, op, c, left, right,
+                                                                                 asLeft-> false);
+                }
+            }
+        } catch {
+            err : &ErrorMsg => {
+                errors ~= [err];
+            } 
+        }
+
+        throw copy ErrorMsg::fatal (loc,
+                                    format (ValidateErrorMessage::UNDEFINED_BIN_OP, op, left.type, right.type),
+                                    notes-> errors);
+    }
+
+    /**
+     * Validate integer comparisons.
+     *
+     * If both operands are integers:
+     *   - If signedness matches => compare directly.
+     *   - Otherwise => reconcile types using inferValuesForBranch().
+     *
+     * @params:
+     *   - context:   the validation context
+     *   - loc:       operator location
+     *   - op:        comparison operator
+     *   - left:      validated left operand
+     *   - leftType:  integer type of the left operand
+     *   - right:     validated right operand
+     *
+     * @returns:
+     *   A CmpIntOperatorValue.
+     */
+    fn validateIntLeft (dmut context: &ValidationContext,
+                        loc:          &Word,
+                        op:           BinaryOperators,
+                        left:         &Value,
+                        leftType:     &IntType,
+                        right:        &Value)-> &Value
+        throws ErrorMsg
+    {                
+        if let rightType: &IntType = right.type {
+            if leftType.isSigned == rightType.isSigned {
+                return copy CmpIntOperatorValue (loc, op, left, right);
+            }
+
+            let (_, lvalue, rvalue) = TypeInference::inferValuesForBranch (alias context, loc, left, right);
+            return copy CmpIntOperatorValue (loc, op, lvalue, rvalue);
+        }    
+        
+        throw copy ErrorMsg::list ([])
+    }
+
+    /**
+     * Validate float comparisons.
+     *
+     * Special operators:
+     *   - CONGRUENT / UNCONGRUENT => handled by validateFloatSpecial()
+     *
+     * Otherwise:
+     *   - If sizes match => compare directly.
+     *   - Else => reconcile via inferValuesForBranch().
+     *
+     * @params:
+     *   - context:   the validation context
+     *   - loc:       operator location
+     *   - op:        comparison operator
+     *   - left:      validated left operand
+     *   - leftType:  float type of the left operand
+     *   - right:     validated right operand
+     *
+     * @returns:
+     *   A CmpFloatOperatorValue.
+     */
+    fn validateFloatLeft (dmut context: &ValidationContext,
+                          loc:          &Word,
+                          op:           BinaryOperators,
+                          left:         &Value,
+                          leftType:     &FloatType,
+                          right:        &Value)-> &Value
+        throws ErrorMsg
+    {
+        if op == BinaryOperators::CONGRUENT || op == BinaryOperators::UNCONGRUENT {
+            return BinaryComparisonValidation::validateFloatSpecial (alias context, loc, op, left, right); 
+        }
+        
+        if let rightType: &FloatType = right.type {
+            if (leftType.size == rightType.size) {
+                return copy CmpFloatOperatorValue (loc, op, left, right);
+            }
+
+            let (_, lvalue, rvalue) = TypeInference::inferValuesForBranch (alias context, loc, left, right);
+            return copy CmpFloatOperatorValue (loc, op, lvalue, rvalue);                    
+        }
+        
+        throw copy ErrorMsg::list ([]);
+    }
+
+    /**
+     * Validate float congruence operators:
+     *
+     *   <=>  (CONGRUENT)
+     *   <!>  (UNCONGRUENT)
+     *
+     * These operators call a runtime float-comparison helper:
+     *   MathUtils::FLOAT_CMP_FUNC(left, right)
+     *
+     * UNCONGRUENT is implemented as logical NOT of the result.
+     *
+     * @params:
+     *   - context: the validation context
+     *   - loc:     operator location
+     *   - op:      congruence operator
+     *   - left:    validated left operand
+     *   - right:   validated right operand
+     *
+     * @returns:
+     *   A &Value representing the congruence comparison.
+     */
+    fn validateFloatSpecial (dmut context: &ValidationContext,
+                             loc:          &Word,
+                             op:           BinaryOperators,
+                             left:         &Value,
+                             right:        &Value)-> &Value
+        throws ErrorMsg
+    {
+        if (right.type !of FloatType) {
+            throw copy ErrorMsg::list ([]);            
+        }
+        
+        let syntVar = VariableCreation::createSyntaxVarFromPath (loc, MathUtils::FLOAT_CMP_FUNC);
+        let func = ValueValidation::validate (alias context, syntVar);
+        let call = CallValidation::validate (alias context, loc, func, copy [left, right]);
+
+        if (op == BinaryOperators::UNCONGRUENT) {
+            return UnaryValidation::validate (alias context, loc, UnaryOperators::NOT, call);
+        } 
+
+        return call;                            
+    }
+
+    /**
+     * Validate char comparisons.
+     *
+     * If both operands are chars:
+     *   - If sizes match => compare directly.
+     *   - Else => reconcile via inferValuesForBranch().
+     *
+     * @params:
+     *   - context:   the validation context
+     *   - loc:       operator location
+     *   - op:        comparison operator
+     *   - left:      validated left operand
+     *   - leftType:  char type of the left operand
+     *   - right:     validated right operand
+     *
+     * @returns:
+     *   A CmpCharOperatorValue.
+     */
+    fn validateCharLeft (dmut context: &ValidationContext,
+                         loc:          &Word,
+                         op:           BinaryOperators,
+                         left:         &Value,
+                         leftType:     &CharType,
+                         right:        &Value)-> &Value
+        throws ErrorMsg
+    {
+        if let rightType: &CharType = right.type {
+            if (leftType.size == rightType.size) {
+                return copy CmpCharOperatorValue (loc, op, left, right);
+            }
+            
+            let (_, lvalue, rvalue) = TypeInference::inferValuesForBranch (alias context, loc, left, right);
+            return copy CmpCharOperatorValue (loc, op, lvalue, rvalue);
+        }
+
+        throw copy ErrorMsg::list ([]);
+    }
+
+    /**
+     * Validate boolean equality.
+     *
+     * Only DEQUAL and NOT_EQUAL are allowed.
+     *
+     * @params:
+     *   - context: the validation context
+     *   - loc:     operator location
+     *   - op:      comparison operator
+     *   - left:    validated left operand
+     *   - right:   validated right operand
+     *
+     * @returns:
+     *   A CmpBoolOperatorValue.
+     */
+    fn validateBoolLeft (dmut _:   &ValidationContext,
+                         loc:      &Word,
+                         op:       BinaryOperators,
+                         left:     &Value,                          
+                         right:    &Value)-> &Value
+        throws ErrorMsg
+    {
+        if (op == BinaryOperators::DEQUAL || op == BinaryOperators::NOT_EQUAL) {        
+            if right.type of BoolType {                
+                return copy CmpBoolOperatorValue (loc, op, left, right);
+            }             
+        }
+
+        throw copy ErrorMsg::list ([]);
+    }
+
+    /**
+     * Validate pointer comparisons.
+     *
+     * If both operands are pointers:
+     *   - If types match => compare directly.
+     *   - Else => reconcile via inferValuesForBranch().
+     *
+     * @params:
+     *   - context:   the validation context
+     *   - loc:       operator location
+     *   - op:        comparison operator
+     *   - left:      validated left operand
+     *   - leftType:  pointer type of the left operand
+     *   - right:     validated right operand
+     *
+     * @returns:
+     *   A CmpPointerOperatorValue.
+     */
+    fn validatePointerLeft (dmut context: &ValidationContext,
+                            loc:          &Word,
+                            op:           BinaryOperators,
+                            left:         &Value,
+                            leftType:     &PointerType,
+                            right:        &Value)-> &Value
+        throws ErrorMsg
+    {                
+        if let rightType: &PointerType = right.type {
+            if (leftType == rightType) {
+                return copy CmpPointerOperatorValue (loc, op, left, right);
+            }
+
+            let (_, lvalue, rvalue) = TypeInference::inferValuesForBranch (alias context, loc, left, right);
+            return copy CmpPointerOperatorValue (loc, op, lvalue, rvalue);
+        }
+
+        throw copy ErrorMsg::list ([]);
+    }
+
+    /**
+     * Validate slice/array comparisons.
+     *
+     * Steps:
+     *   1. Convert arrays to slice aliases.
+     *   2. Try equality comparison via validateSliceEqual().
+     *   3. If that fails, try lexicographic comparison via validateSliceCmp().
+     *
+     * @params:
+     *   - context: the validation context
+     *   - loc:     operator location
+     *   - op:      comparison operator
+     *   - left:    validated left operand
+     *   - right:   validated right operand
+     *
+     * @returns:
+     *   A &Value representing slice/array comparison.
+     */
+    fn validateSliceOrArrayLeft (dmut context: &ValidationContext,
+                                 loc:          &Word,
+                                 op:           BinaryOperators,
+                                 left:         &Value,
+                                 right:        &Value)-> &Value
+        throws ErrorMsg
+    {
+        let finLeft = match left.type {
+            SliceType () => { left }
+            a: &ArrayType => { ValueCreation::createSliceAliasFromArray (loc, a, left) }
+            _ => {
+                throw copy ErrorMsg::list ([]);
+            }
+        };
+        
+        let finRight = match right.type {
+            SliceType () => { right }
+            a: &ArrayType => { ValueCreation::createSliceAliasFromArray (loc, a, right) }
+            _ => {
+                throw copy ErrorMsg::list ([]);
+            }
+        };
+
+        let mut errors: [&ErrorMsg] = [];
+
+        // There is another function for equality that is faster than
+        // comparison, so we call it if we can.
+        // 
+        if (op == BinaryOperators::DEQUAL || op == BinaryOperators::NOT_EQUAL) {
+            return BinaryComparisonValidation::validateSliceEqual (alias context, loc, op, finLeft, finRight);
+        } catch {
+            err: &ErrorMsg => {
+                errors ~= [err];
+            }
+        }
+
+        {
+            return BinaryComparisonValidation::validateSliceCmp (alias context, loc, op, finLeft, finRight);            
+        } catch {
+            err: &ErrorMsg => {
+                errors ~= [err];
+            }
+        }
+
+        throw copy ErrorMsg::list (errors);
+    }
+
+    /**
+     * Validate slice equality using SliceUtils::OP_EQUALS_FUNC.
+     *
+     * @params:
+     *   - context: the validation context
+     *   - loc:     operator location
+     *   - op:      DEQUAL or NOT_EQUAL
+     *   - left:    validated left slice
+     *   - right:   validated right slice
+     *
+     * @returns:
+     *   A &Value representing slice equality.
+     */
+    fn validateSliceEqual (dmut context: &ValidationContext,
+                           loc:          &Word,
+                           op:           BinaryOperators,
+                           left:         &Value,
+                           right:        &Value)-> &Value
+        throws ErrorMsg
+    {
+        let syntVar = VariableCreation::createSyntaxVarFromPath (loc, SliceUtils::OP_EQUALS_FUNC);
+        let func = ValueValidation::validate (alias context, syntVar);    
+        let mut call = CallValidation::validate (alias context, loc, func, copy [left, right]);
+        
+        if let c: &PrototypeCallValue = call { // for cte tracability
+            call = copy SpecialArrayOperatorValue (loc,
+                                                   c.type,
+                                                   BinaryOperators::DEQUAL,
+                                                   c.params [0],
+                                                   c.params [1], c);
+        }
+
+        // We need to inverse the equality, the operator returns '=='
+        if (op == BinaryOperators::NOT_EQUAL) { 
+            return UnaryValidation::validate (alias context, loc, UnaryOperators::NOT, call);
+        } 
+
+        return call;        
+    }
+
+    /**
+     * Validate lexicographic slice comparison using SliceUtils::OP_CMP_FUNC.
+     *
+     * @params:
+     *   - context: the validation context
+     *   - loc:     operator location
+     *   - op:      comparison operator
+     *   - left:    validated left slice
+     *   - right:   validated right slice
+     *
+     * @returns:
+     *   A &Value representing slice comparison.
+     */
+    fn validateSliceCmp (dmut context: &ValidationContext,
+                         loc:          &Word,
+                         op:           BinaryOperators,
+                         left:         &Value,
+                         right:        &Value)-> &Value
+        throws ErrorMsg
+    {    
+        let syntVar = VariableCreation::createSyntaxVarFromPath (loc, SliceUtils::OP_CMP_FUNC);
+        let func = ValueValidation::validate (alias context, syntVar);
+        let mut call = CallValidation::validate (alias context, loc, func, copy [left, right]);
+
+        if let c: &PrototypeCallValue = call { // for cte tracability
+            call = copy SpecialArrayOperatorValue (loc,
+                                                   c.type,
+                                                   BinaryOperators::DEQUAL,
+                                                   c.params [0],
+                                                   c.params [1], c);
+        }
+        
+        
+        let casted = TypeInference::inferValueForType (alias context, loc, copy IntValue (loc, USIZE_TYPE, 0), call.type,
+                                                       byReference-> false);
+        
+        return BinaryComparisonValidation::validate (alias context, loc, op, call, casted);
+    }
+
+    /**
+     * Validate tuple structural equality.
+     *
+     * Only DEQUAL and NOT_EQUAL are allowed.
+     *
+     * @params:
+     *   - context:   the validation context
+     *   - loc:       operator location
+     *   - op:        comparison operator
+     *   - left:      validated left tuple
+     *   - leftType:  tuple type of the left operand
+     *   - right:     validated right operand
+     *
+     * @returns:
+     *   A &Value representing tuple equality.
+     */
+    fn validateTupleLeft (dmut context: &ValidationContext,
+                          loc : &Word,
+                          op : BinaryOperators,
+                          left : &Value,
+                          leftType: &TupleType,
+                          right : &Value)-> &Value
+        throws ErrorMsg
+    {
+        if (op != BinaryOperators::DEQUAL && op != BinaryOperators::NOT_EQUAL) {
+            throw copy ErrorMsg::list ([]);
+        }
+        
+        if let rightType: &TupleType = right.type && leftType.arity == rightType.arity {            
+            let mut res : &Value = UNIT_VALUE;
+            for i in leftType.arity .. 0us {
+                let fieldL = TupleFieldValidation::validate (loc, left, leftType, i - 1us, false);
+                let fieldR = TupleFieldValidation::validate (loc, right, rightType, i - 1us, false);
+
+                let cmp = BinaryComparisonValidation::validate (alias context, loc, op, fieldL, fieldR);
+                if res of UnitValue {
+                    res = cmp;
+                } else {
+                    if op == BinaryOperators::DEQUAL {
+                        res = copy LogicalBoolOperatorValue (loc, BinaryOperators::DAND, cmp, res);
+                    } else {
+                        res = copy LogicalBoolOperatorValue (loc, BinaryOperators::DPIPE, cmp, res);
+                    }
+                }
+            }
+            
+            return res;
+        }        
+        
+        throw copy ErrorMsg::list ([]);
+    }
+
+    /**
+     * Validate function pointer equality.
+     *
+     * Only DEQUAL and NOT_EQUAL are allowed.
+     *
+     * @params:
+     *   - context:   the validation context
+     *   - loc:       operator location
+     *   - op:        comparison operator
+     *   - left:      validated left function pointer
+     *   - leftType:  function pointer type
+     *   - right:     validated right operand
+     *
+     * @returns:
+     *   A CmpPointerOperatorValue.
+     */
+    fn validateFuncPtrLeft (dmut context: &ValidationContext,
+                            loc:          &Word,
+                            op:           BinaryOperators,
+                            left:         &Value,
+                            leftType:     &FuncPtrType,
+                            right:        &Value)-> &Value
+        throws ErrorMsg
+    {
+        if (op == BinaryOperators::DEQUAL || op == BinaryOperators::NOT_EQUAL) {            
+            let compatibleRight = TypeInference::inferValueForType (alias context, loc, right, leftType,
+                                                                    byReference-> false);
+            
+            return copy CmpPointerOperatorValue (loc, op, left, compatibleRight);
+        }
+
+        throw copy ErrorMsg::list ([]);
+    }
+    
+    /**
+     * Validate delegate equality.
+     *
+     * Only DEQUAL and NOT_EQUAL are allowed.
+     * 
+     * Delegates are equal if:
+     *   - their closures are equal
+     *   - their function pointers are equal
+     *
+     * @params:
+     *   - context:   the validation context
+     *   - loc:       operator location
+     *   - op:        comparison operator
+     *   - left:      validated left delegate
+     *   - leftType:  delegate type
+     *   - right:     validated right operand
+     *
+     * @returns:
+     *   A &Value representing delegate equality.
+     */
+    fn validateDGPtrLeft (dmut context: &ValidationContext,
+                          loc:          &Word,
+                          op:           BinaryOperators,
+                          left:         &Value,
+                          leftType:     &DelegateType, 
+                          right:        &Value)-> &Value
+        throws ErrorMsg
+    {
+        if (op == BinaryOperators::DEQUAL || op == BinaryOperators::NOT_EQUAL) {            
+            let compatibleRight = TypeInference::inferValueForType (alias context, loc, right, leftType,
+                                                                    byReference-> false);
+
+            
+            let leftCl : &Value = copy StructFieldAccessValue (loc, PTR_VOID_TYPE, left, DelegateKeys::CLOSURE);
+            let rightCl: &Value = copy StructFieldAccessValue (loc, PTR_VOID_TYPE, compatibleRight, DelegateKeys::CLOSURE);
+
+            let fptr = leftType.cloneAsFptr ();                    
+            let leftPtr : &Value = copy StructFieldAccessValue (loc, fptr, left, DelegateKeys::FUNC);
+            let rightPtr: &Value = copy StructFieldAccessValue (loc, fptr, compatibleRight, DelegateKeys::FUNC);
+
+            let clTest = copy CmpPointerOperatorValue (loc, op, leftCl, rightCl);
+            let fpTest = copy CmpPointerOperatorValue (loc, op, leftPtr, rightPtr);
+
+            if (op == Tokens::DEQUAL) {
+                return copy LogicalBoolOperatorValue (loc, BinaryOperators::DAND, clTest, fpTest)
+            } else {
+                return copy LogicalBoolOperatorValue (loc, BinaryOperators::DPIPE, clTest, fpTest)
+            };
+        }
+
+        throw copy ErrorMsg::list ([]);
+    }
+
+    /**
+     * Validate range equality.
+     *
+     * Only DEQUAL and NOT_EQUAL are allowed.
+     *
+     * @params:
+     *   - context:   the validation context
+     *   - loc:       operator location
+     *   - op:        comparison operator
+     *   - left:      validated left range
+     *   - leftType:  range type
+     *   - right:     validated right operand
+     *
+     * @returns:
+     *   A &Value representing range equality.
+     */
+    fn validateRangeLeft (dmut context: &ValidationContext,
+                          loc:          &Word,
+                          op:           BinaryOperators,
+                          left:         &Value,
+                          leftType:     &RangeType,
+                          right:        &Value)-> &Value
+        throws ErrorMsg
+    {
+        if (op != BinaryOperators::DEQUAL && op != BinaryOperators::NOT_EQUAL) {
+            throw copy ErrorMsg::list ([]);
+        }
+        
+        let rVal = TypeInference::inferValueForType (alias context, loc, right, leftType,
+                                                     byReference-> false);
+        
+        let inType = leftType.start;
+        let stType = leftType.step;
+        
+        let fstL = copy StructFieldAccessValue (loc, inType, left, RangeKeys::FST);
+        let fstR = copy StructFieldAccessValue (loc, inType, rVal, RangeKeys::FST);
+
+        let scdL = copy StructFieldAccessValue (loc, inType, left, RangeKeys::SCD);
+        let scdR = copy StructFieldAccessValue (loc, inType, rVal, RangeKeys::SCD);
+
+        let stepL = copy StructFieldAccessValue (loc, stType, left, RangeKeys::STEP);
+        let stepR = copy StructFieldAccessValue (loc, stType, rVal, RangeKeys::STEP);
+
+        let containL = copy StructFieldAccessValue (loc, BOOL_TYPE, left, RangeKeys::CONTAINS);
+        let containR = copy StructFieldAccessValue (loc, BOOL_TYPE, rVal, RangeKeys::CONTAINS);
+        
+        let fstEq  = BinaryComparisonValidation::validate (alias context, loc, BinaryOperators::DEQUAL, fstL, fstR);
+        let scdEq  = BinaryComparisonValidation::validate (alias context, loc, BinaryOperators::DEQUAL, scdL, scdR);
+        let stepEq = BinaryComparisonValidation::validate (alias context, loc, BinaryOperators::DEQUAL, stepL, stepR);
+        let cntEq  = BinaryComparisonValidation::validate (alias context, loc, BinaryOperators::DEQUAL, containL, containR);
+        
+        let retA = copy LogicalBoolOperatorValue (loc, BinaryOperators::DAND, fstEq, scdEq);
+        let retB = copy LogicalBoolOperatorValue (loc, BinaryOperators::DAND, stepEq, cntEq);
+        let ret: &Value = copy LogicalBoolOperatorValue (loc, BinaryOperators::DAND, retA, retB);
+
+        if (op == BinaryOperators::NOT_EQUAL) {
+            return UnaryValidation::validate (alias context, loc, UnaryOperators::NOT, ret);
+        }
+
+        return ret;
+    }
+    
+    /**
+     * Validate comparison between two Option values.
+     *
+     * Option comparison in Ymir defines a *total ordering* over:
+     *
+     *     None  <  Ok(x)
+     *
+     * and delegates inner comparison to the wrapped type when both sides
+     * contain a value.
+     *
+     * The comparison is implemented through four exhaustive cases:
+     *
+     *   1. None vs None
+     *      Both options are unset. They compare as equal:
+     *          0 op 0
+     *      This ensures:
+     *          None == None      => true
+     *          None != None      => false
+     *          None < None       => false
+     *          None > None       => false
+     *
+     *   2. Ok(x) vs Ok(y)
+     *      Both options contain a value. The comparison delegates to the
+     *      inner type:
+     *          x op y
+     *      This supports nested comparisons such as:
+     *          Ok(3) < Ok(10)
+     *          Ok("abc") == Ok("abc")
+     *          Ok(0..10) != Ok(0...10)
+     *
+     *   3. Ok(x) vs None
+     *      A set option is always greater than an unset one:
+     *          1 op 0
+     *      Meaning:
+     *          Ok(_) > None => true
+     *          Ok(_) == None => false
+     *          Ok(_) < None => false
+     *
+     *   4. None vs Ok(x)
+     *      An unset option is always less than a set one:
+     *          -1 op 0
+     *      Meaning:
+     *          None < Ok(_) => true
+     *          None == Ok(_) => false
+     *          None > Ok(_) => false
+     *
+     * Implementation details:
+     *   - The function first aligns both operands to compatible Option types
+     *     using TypeInference::inferValueForType.
+     *
+     *   - It extracts:
+     *         - SET flags (lSet, rSet)
+     *         - inner values (lInnerVal, rInnerVal)
+     *
+     *   - It constructs a nested ConditionalValue tree encoding the four
+     *     cases above.
+     *
+     *   - When both sides are Ok(_), the comparison is delegated to
+     *     BinaryComparisonValidation::validate(), ensuring full support for
+     *     all inner types (tuples, slices, classes, ranges, etc.).
+     *
+     *   - The final expression is reduced via cteInterpret.reduce() so that
+     *     constant cases (e.g., None == None) fold to literal booleans.
+     *
+     * @params:
+     *   - context:   the validation context
+     *   - loc:       operator location
+     *   - op:        comparison operator
+     *   - left:      validated left Option value
+     *   - leftType:  OptionType of the left operand
+     *   - right:     validated right operand
+     *
+     * @returns:
+     *   A &Value representing the fully validated Option comparison.
+     */
+
+    fn validateOptionLeft (dmut context: &ValidationContext,
+                           loc:          &Word,
+                           op:           BinaryOperators,
+                           left:         &Value,
+                           leftType:     &OptionType, 
+                           right:        &Value)-> &Value
+        throws ErrorMsg
+    {
+        let (lVal, rVal) = if (leftType.wrapped of NoneType) {
+            (TypeInference::inferValueForType (alias context, loc, left, right.type, byReference-> false), right)
+        } else {
+            (left, TypeInference::inferValueForType (alias context, loc, right, leftType, byReference-> false))
+        };
+
+        let innerLType = if let lo: &OptionType = lVal.type { lo.wrapped } else { panic; }
+        let innerRType = if let ro: &OptionType = rVal.type { ro.wrapped } else { panic; }
+        
+        if (innerRType of NoneType && innerLType of NoneType) { // none op none
+            return copy CmpIntOperatorValue (loc, 
+                                             op,
+                                             copy IntValue (loc, ISIZE_TYPE, 0),
+                                             copy IntValue (loc, ISIZE_TYPE, 0));
+        }
+
+        let lSet = copy StructFieldAccessValue (loc, BOOL_TYPE, lVal, OptionKeys::SET);
+        let rSet = copy StructFieldAccessValue (loc, BOOL_TYPE, rVal, OptionKeys::SET);
+
+        let lInnerVal = copy OptionFieldAccessValue (loc, innerLType, lVal, OptionKeys::VALUE);
+        let rInnerVal = copy OptionFieldAccessValue (loc, innerRType, rVal, OptionKeys::VALUE);
+
+        let bothSet = copy LogicalBoolOperatorValue (loc, BinaryOperators::DAND, lSet, rSet);
+        let bothSetRes = BinaryComparisonValidation::validate (alias context, loc, op, lInnerVal, rInnerVal);
+
+        let onlyRightSetRes = copy CmpIntOperatorValue (loc, op,
+                                                        copy IntValue (loc, ISIZE_TYPE, copy BigInt (-1)),
+                                                        copy IntValue (loc, ISIZE_TYPE, 0));
+        
+        let onlyLeftSetRes = copy CmpIntOperatorValue (loc, op,
+                                                       copy IntValue (loc, ISIZE_TYPE, 1),
+                                                       copy IntValue (loc, ISIZE_TYPE, 0));
+        
+        let noneSetRes = copy CmpIntOperatorValue (loc, op,
+                                                   copy IntValue (loc, ISIZE_TYPE, 0),
+                                                   copy IntValue (loc, ISIZE_TYPE, 0));
+
+        let finalCond = copy ConditionalValue (loc, BOOL_TYPE, lSet, onlyLeftSetRes, noneSetRes); // 
+        let preCond = copy ConditionalValue (loc, BOOL_TYPE, rSet, onlyRightSetRes, finalCond);  // 
+        
+        let test = copy ConditionalValue (loc, BOOL_TYPE, bothSet, bothSetRes, preCond);
+
+        // if left.isSet && right.isSet {
+        //    left.value == right.value
+        // } else if right.isSet { everything > none
+        //    1 op 0
+        // } else left.isSet { none < everything
+        //    -1 op 0 
+        // } else { 0 op 0 } // `==` true
+
+        return context.cteInterpret:.reduce (test);        
+    }
+
+    /**
+     * Validate class equality or comparison via operator overloading.
+     *
+     * Overloads:
+     *   - opEquals(other) => for DEQUAL / NOT_EQUAL
+     *   - opCmp(other)    => for ordering comparisons
+     *
+     * @params:
+     *   - context: the validation context
+     *   - loc:     operator location
+     *   - op:      comparison operator
+     *   - cptr:    class pointer type
+     *   - left:    left operand
+     *   - right:   right operand
+     *   - asLeft:  whether the left operand is the class instance
+     *
+     * @returns:
+     *   A &Value representing class comparison.
+     */
+    fn validateClassLeftOrRight (dmut context: &ValidationContext,
+                                 loc:          &Word,
+                                 op:           BinaryOperators,
+                                 cptr:         &ClassPtrType,
+                                 left:         &Value,                             
+                                 right:        &Value,
+                                 asLeft:       bool)-> &Value
+        throws ErrorMsg
+    {
+        let (cl, aux, correctOp) = if (!asLeft) {
+            (right, left, binary::kind::inverseCmp (op))
+        } else {
+            (left, right, op)
+        };
+
+        let mut errors: [&ErrorMsg] = [];
+        if (op == BinaryOperators::DEQUAL || op == BinaryOperators::NOT_EQUAL) {
+            let meth = ValueCreation::createObjectMethodAcc (alias context, loc, cptr, cl, OpOverrideNames::EQUALS);                        
+            let call = CallValidation::validate (alias context, loc, meth, copy [aux]);
+
+            if (op == BinaryOperators::NOT_EQUAL) {
+                return UnaryValidation::validate (alias context, loc, UnaryOperators::NOT, call)
+            }
+
+            return call;        
+        } catch {
+            err: _ => {
+                errors ~= [err];
+            }                
+        }
+        
+        {
+            let meth = ValueCreation::createObjectMethodAcc (alias context, loc, cptr, cl, OpOverrideNames::CMP);
+            
+            let call = CallValidation::validate (alias context, loc, meth, copy [aux]);
+            let casted = TypeInference::inferValueForType (alias context, loc, copy IntValue (loc, ISIZE_TYPE, 0), call.type,
+                                                           byReference-> false);
+
+            return BinaryComparisonValidation::validate (alias context, loc, correctOp, call, casted);
+        } catch {
+            err: _ => { 
+                errors ~= [err];
+            }                    
+        }
+
+        throw copy ErrorMsg::list (errors);
+    }
+
+
+}

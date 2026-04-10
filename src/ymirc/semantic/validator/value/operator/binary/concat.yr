@@ -1,0 +1,303 @@
+/*
+ * Implements semantic validation for the concatenation operator in Ymir.
+ *
+ * Supported operand categories:
+ *   - slices (mutable or const)
+ *   - arrays (fixed-length)
+ *   - class instances (via operator overloading)
+ *
+ * <hr>
+ * 
+ * @Package: ymirc        
+ * @Module: ymirc::semantic::validator::value::operator::binary::concat
+ * @File: ymirc/semantic/validator/value/operator/binary/concat.yr
+ * @Author(s):
+ *   - Emile Cadorel <ecadorel@gmail.com>
+ *
+ * @Created (YYYY-MM-DD): 2026-04-10
+ * @Copyright (C) 2021–2026 GNU-Ymir
+ * @License
+ *   ```text
+ *   This file is part of the Ymir language project.
+ *
+ *   Ymir is free software: you can redistribute it and/or modify it
+ *   under the terms of the GNU General Public License as published by
+ *   the Free Software Foundation, either version 3 of the License, or
+ *   (at your option) any later version.
+ *
+ *   Ymir is distributed in the hope that it will be useful,
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *   GNU General Public License for more details.
+ *
+ *   You should have received a copy of the GNU General Public License
+ *   along with Ymir.  If not, see <https://www.gnu.org/licenses/>.
+ *   ```
+ */
+
+in concat;
+
+use ymirc::lexing::{word, tokens, keys};
+
+use ymirc::syntax::expression::_;
+use ymirc::semantic::validator;
+use ymirc::semantic::generator::{value::_, type::_};
+
+use ymirc::errors::message;
+use ymirc::utils::format;
+
+/**
+ * BinaryConcatValidation
+ *
+ * Provides semantic validation for the concatenation operator. The operator
+ * supports:
+ *
+ *   - slice ~ slice
+ *   - array ~ array
+ *   - array ~ slice
+ *   - slice ~ array
+ *   - class ~ any (via operator overloading)
+ *
+ *
+ * This module defines the complete semantics of concatenation in Ymir.
+ */
+pub mod BinaryConcatValidation {
+
+    /**
+     * Validate a concatenation expression.
+     *
+     * @params:
+     *   - context: the validation context
+     *   - bin:     the binary expression node
+     *   - op:      the concatenation operator
+     *
+     * @returns:
+     *   A &Value representing the validated concatenation.
+     */
+    pub fn validate (dmut context: &ValidationContext, bin: &BinaryExpr, op: BinaryOperators)-> &Value
+        throws ErrorMsg
+    {
+        return BinaryConcatValidation::validate (alias context, bin.loc, op,
+                                                 left-> ValueValidation::validate (alias context, bin.left),
+                                                 right-> ValueValidation::validate (alias context, bin.right));                                                   
+    }
+
+    /**
+     * Validate a concatenation after both operands have been validated.
+     *
+     * Enum values are unwrapped before concatenation so that the operator
+     * applies to the underlying slice/array/class value.
+     *
+     * @params:
+     *   - context: the validation context
+     *   - loc:     operator location
+     *   - op:      concatenation operator
+     *   - left:    validated left operand
+     *   - right:   validated right operand
+     *
+     * @returns:
+     *   A &Value representing the validated concatenation.
+     */
+    pub fn validate (dmut context: &ValidationContext,
+                     loc:          &Word,
+                     op:           BinaryOperators,
+                     left:         &Value,
+                     right:        &Value)-> &Value
+        throws ErrorMsg
+    {
+        let lvalue = ValueCreation::createEnumUnwrap (left);
+        let rvalue = ValueCreation::createEnumUnwrap (right);
+        
+        return BinaryConcatValidation::validateConcat (alias context, loc, op,
+                                                       left-> lvalue,
+                                                       right-> rvalue);        
+    }
+
+    /**
+     * Core implementation of concatenation validation.
+     *
+     * Dispatch strategy:
+     *   1. Try validating based on the left operand type:
+     *        - SliceType => validateSliceOrArrayLeft()
+     *        - ArrayType => validateArrayLeft()
+     *        - ClassPtrType => class operator overload
+     *
+     *   2. If left-side validation fails, try class-specific overload on the right.
+     *
+     *   3. If both fail, emit a fatal UNDEFINED_BIN_OP error with aggregated notes.
+     *
+     * @params:
+     *   - context: the validation context
+     *   - loc:     operator location
+     *   - op:      concatenation operator
+     *   - left:    validated left operand
+     *   - right:   validated right operand
+     *
+     * @returns:
+     *   A &Value representing the validated concatenation.
+     */
+    fn validateConcat (dmut context: &ValidationContext,
+                       loc:          &Word,
+                       op:           BinaryOperators,
+                       left:         &Value,
+                       right:        &Value)-> &Value
+        throws ErrorMsg
+    {
+        let mut errors: [&ErrorMsg] = [];
+        {
+            match left.type {                
+                _: &SliceType => {
+                    return BinaryConcatValidation::validateSliceOrArrayLeft (alias context, loc, left, right);
+                }
+                a: &ArrayType => {
+                    return BinaryConcatValidation::validateArrayLeft (alias context, loc, left, a, right);
+                }
+                c: &ClassPtrType => {
+                    return BinaryValidation::validateClassLeft (alias context, loc, op, left, c, right);
+                }
+            }
+        } catch {
+            err => {
+                errors ~= [err];
+            }
+        }
+
+        {
+            match right.type {
+                c: &ClassPtrType => {
+                    return BinaryValidation::validateClassRight (alias context, loc, op, left, right, c);
+                }
+            }
+        } catch {
+            err => {
+                errors ~= [err];
+            }
+        }
+
+        throw copy ErrorMsg::fatal (loc,
+                                    format (ValidateErrorMessage::UNDEFINED_BIN_OP, op, left.type, right.type),
+                                    notes-> errors);
+    }
+
+    /**
+     * Validate concatenation where the left operand is an array.
+     *
+     * Supported cases:
+     *   - array ~ array
+     *   - array ~ slice (delegated to validateSliceOrArrayLeft)
+     *
+     * Behavior:
+     *   - Extract each element of both arrays via IndexValidation.
+     *   - Accumulate them into a new parameter list.
+     *   - Infer the resulting element type using ArrayComposeValidation.
+     *   - Construct a new ArrayType and ArrayValue.
+     *
+     * If both arrays are empty, the resulting element type is VOID_TYPE.
+     *
+     * @params:
+     *   - context:   the validation context
+     *   - loc:       operator location
+     *   - left:      validated left array
+     *   - leftType:  array type of the left operand
+     *   - right:     validated right operand
+     *
+     * @returns:
+     *   A new ArrayValue representing the concatenation.
+     */
+    fn validateArrayLeft (dmut context: &ValidationContext,
+                          loc:          &Word,                          
+                          left:         &Value,
+                          leftType:     &ArrayType, 
+                          right:        &Value)-> &Value
+        throws ErrorMsg
+    {
+        if right.type of SliceType {
+            return BinaryConcatValidation::validateSliceOrArrayLeft (alias context, loc, left, right);
+        }
+        
+        let rightType: &ArrayType = if let arr: &ArrayType = right.type {
+            arr
+        } else {
+            throw copy ErrorMsg::list ([]);
+        };
+        
+        let mut inner: &Type = NONE_TYPE;
+        let mut params: [&Value] = [];
+        for i in 0 .. leftType.len {
+            let val = IndexValidation::validate (alias context, loc, left, copy IntValue (loc, USIZE_TYPE, i));
+            inner = ArrayComposeValidation::addArrayType (alias context, val, inner, ref params);
+        }
+
+        for i in 0 .. rightType.len {
+            let val = IndexValidation::validate (alias context, loc, right, copy IntValue (loc, USIZE_TYPE, i));
+            inner = ArrayComposeValidation::addArrayType (alias context, val, inner, ref params);            
+        }
+
+        if params.len == 0 {
+            inner = VOID_TYPE; 
+        }
+
+        let resultType = copy ArrayType (loc, inner, params.len, isMutable-> true);
+        return copy ArrayValue (loc, resultType, params);
+    }
+
+    /**
+     * Validate concatenation where the left operand is a slice or array.
+     *
+     * Steps:
+     *   1. Convert arrays to slice aliases.
+     *   2. Convert right operand similarly.
+     *   3. Use inferValuesForBranch() to reconcile slice types and produce:
+     *        - result slice type
+     *        - left slice value
+     *        - right slice value
+     *
+     *   4. If the resulting slice type is const, clone it as mutable so that
+     *      concatenation is allowed without mutating borrowed data.
+     *
+     *   5. Produce a SliceConcatValue representing the concatenation.
+     *
+     * @params:
+     *   - context: the validation context
+     *   - loc:     operator location
+     *   - left:    validated left slice or array
+     *   - right:   validated right slice or array
+     *
+     * @returns:
+     *   A SliceConcatValue representing the concatenation.
+     */
+    fn validateSliceOrArrayLeft (dmut context:  &ValidationContext,
+                                 loc:           &Word,                                 
+                                 left:          &Value,                                 
+                                 right:         &Value)-> &Value
+        throws ErrorMsg
+    {
+        let finLeft = match left.type {
+            SliceType () => { left }
+            a: &ArrayType => { ValueCreation::createSliceAliasFromArray (loc, a, left) }
+            _ => {
+                throw copy ErrorMsg::list ([]);
+            }
+        };
+        
+        let finRight = match right.type {
+            SliceType () => { right }
+            a: &ArrayType => { ValueCreation::createSliceAliasFromArray (loc, a, right) }
+            _ => {
+                throw copy ErrorMsg::list ([]);
+            }
+        };
+
+        let (mut retType, lvalue, rvalue) = TypeInference::inferValuesForBranch (alias context, loc, finLeft, finRight);
+
+        // If the type of left or right operands is const, we still can modify
+        // the inner values, without modifying the inner borrowed datas
+        if let t: &SliceType = retType && !t.value.isMutable {
+            retType = retType.clone (2);
+        }
+
+        return copy SliceConcatValue (loc, retType, lvalue, rvalue);
+    }
+    
+    
+}

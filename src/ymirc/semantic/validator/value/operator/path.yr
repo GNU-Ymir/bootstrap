@@ -1,20 +1,274 @@
 in path;
 
-use ymirc::syntax::expression::operator;
-use ymirc::semantic::validator;
-use ymirc::semantic::generator::value;
+use ymirc::lexing::{word, keys};
+
+use ymirc::semantic::{validator, symbol};
+
+use ymirc::syntax::{_, declaration::_, expression::_};
+use ymirc::semantic::generator::{value::_, type::_};
 
 use ymirc::errors::message;
+use ymirc::utils::format;
 
+/*!
+ * ====================================================================================================
+ * ====================================================================================================
+ * ====================================          SUBMODS          =====================================
+ * ====================================================================================================
+ * ====================================================================================================
+ */
+
+pub mod ::class_;
+pub mod ::enum_;
+
+
+/*!
+ * ====================================================================================================
+ * ====================================================================================================
+ * ======================================          ROOT          ======================================
+ * ====================================================================================================
+ * ====================================================================================================
+ */
+
+// operator '::'
 pub mod PathValidation {
+    
+    pub fn validate (dmut context: &ValidationContext,
+                     op:           &PathExpr)-> &Value
+        throws ErrorMsg
+    {
+        return PathValidation::validate (alias context, op.loc, op.left, op.right);
+    }
 
-    pub fn validate (dmut context: &ValidationContext, op: &PathExpr)-> &Value
+    pub fn validate (dmut context: &ValidationContext,
+                     op:          &BinaryExpr)-> &Value
+        throws ErrorMsg
+    {
+        return PathValidation::validate (alias context, op.loc, op.left, op.right);
+    }
+
+    fn validate (dmut context: &ValidationContext,
+                 loc:          &Word,
+                 left:         &Expression,
+                 right:        &Expression)-> &Value
+        throws ErrorMsg
+    {
+        let mut errorTypes: [&ErrorMsg] = [];
+        let mut errorFoll : [&ErrorMsg] = [];
+        let mut finalVals : [&Value] = [];
+
+        let (asValue, okValue) = { // try to validate the left part as a value
+            (ValueCreation::createEnumUnwrap (ValueValidation::validate (alias context, left)), true)
+        } catch {
+            err: &ErrorMsg => {
+                errorTypes ~= [err];
+                (UNIT_VALUE, false) // failed, maybe its a type
+            }
+        };
+
+        let (asType, okType) = { // try to validate the left part as a type
+            (TypeValidation::validate (alias context, left), true)
+        } catch {
+            err: &ErrorMsg => {
+                errorTypes ~= [err];
+                (NONE_TYPE, false) // failed maybe its a value
+            }
+        };
+
+        // WARNING: actually it can be both a type and a value (for example, a
+        // class and a module can have the same name)
+        
+        // it is neither a type nor a valeu
+        if (!okValue && !okType) {
+            throw copy ErrorMsg::list (errorTypes);
+        }
+        
+        if (okValue) { // it is a value
+            PathValidation::validateValue (alias context, loc, asValue, right,
+                                           ref finalVals,
+                                           ref errorFoll);
+        }
+
+        if (okType) { // it is a type
+            PathValidation::validateType (alias context, loc, asType, right,
+                                          ref finalVals,
+                                          ref errorFoll);
+        }
+        
+        if (finalVals.len == 0us) {
+            throw copy ErrorMsg::list (errorFoll);
+        }
+
+        // only one result
+        if (finalVals.len == 1us) {
+            return finalVals [0us];
+        }
+        
+        // multiple symbols        
+        return copy MultSymValue (loc, finalVals, prettyStr-> format ("%", right)); 
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * =====================================          VALUE          ======================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    fn validateValue (dmut context: &ValidationContext,
+                      loc: &Word,
+                      left: &Value,
+                      right: &Expression,
+                      ref mut values: [&Value],
+                      ref mut errors: [&ErrorMsg])
+    {
+        {
+            let inVal = PathValidation::validateValue (alias context, loc, left, right);
+            if let m: &MultSymValue = inVal {
+                for v in m.values {
+                    values ~= [v];
+                }
+            } else {
+                values ~= [inVal];
+            }
+        } catch {
+            err => {
+                errors ~= [err];
+            }
+        }
+    }
+
+    fn validateValue (dmut context: &ValidationContext,
+                      loc: &Word,
+                      left: &Value,
+                      right: &Expression)-> &Value
+        throws ErrorMsg
+    {
+        let mut errors: [&ErrorMsg] = [];
+        if let v: &VarExpr = right match left {
+            m: &ModuleRefValue => {
+                if let Ok (r) = PathValidation::validateModule (alias context, loc, m, v, ref errors) {
+                    return r;
+                }
+            }
+            m: &MultSymValue => {                
+                if let Ok (r) = PathValidation::validateMultSym (alias context, loc, m, v, ref errors) {
+                    return r;
+                }
+            }
+        }
+
+        throw copy ErrorMsg::fatal (loc,
+                                    format (ValidateErrorMessage::UNDEFINED_BIN_MOD_OP, BinaryOperators::DCOLON, left, right),
+                                    notes-> errors);
+    }
+    
+    fn validateModule (dmut context: &ValidationContext,
+                       loc: &Word,
+                       left: &ModuleRefValue,
+                       right: &VarExpr,
+                       ref mut errors: [&ErrorMsg])-> (&Value)?
+    {        
+        let dmut res = context:.getLocalFromMod (left, right.name.str);
+        if res.len != 0 {
+            {
+                let m = VariableValidation::validateMultSymbols (alias context, loc, alias res);
+                return m?;
+            } catch {
+                err => {
+                    errors ~= [err];
+                    return none;
+                }
+            }
+        }
+        
+        errors ~= VariableCreation::createLocalVarError (context, loc, left, right.name.str);
+        return none;
+    }
+
+    fn validateMultSym (dmut context: &ValidationContext,
+                       loc: &Word,
+                       left: &MultSymValue,
+                       right: &VarExpr,
+                       ref mut errors: [&ErrorMsg])-> (&Value)?
+    {
+        let mut innerErrors: [&ErrorMsg] = [];
+        let dmut all: [&Symbol] = [];
+        
+        for v in left.values match v {
+            m: &ModuleRefValue => {
+                let dmut res = context:.getLocalFromMod (m, right.name.str);
+                all ~= res;
+                
+                if res.len == 0 {
+                    innerErrors ~= VariableCreation::createLocalVarError (context, loc, m, right.name.str);                    
+                }
+            }
+        }
+
+        if all.len != 0 {
+            {
+                let m = VariableValidation::validateMultSymbols (alias context, loc, alias all);
+                return m?;
+            } catch {
+                err => {
+                    errors ~= [err];
+                    return none;
+                }
+            }
+        }
+
+        errors ~= innerErrors;
+        return none;
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ======================================          TYPE          ======================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+
+    fn validateType (dmut context: &ValidationContext,
+                     loc: &Word,
+                     left: &Type,
+                     right: &Expression,
+                     ref mut values: [&Value],
+                     ref mut errors: [&ErrorMsg])
+    {
+        {
+            let inVal = PathValidation::validateType (alias context, loc, left, right);
+            if let m: &MultSymValue = inVal {
+                for v in m.values {
+                    values ~= [v];
+                }
+            } else {
+                values ~= [inVal];
+            }
+        } catch {
+            err => {
+                errors ~= [err];
+            }
+        }
+    }
+
+    
+    fn validateType (dmut context: &ValidationContext,
+                     loc: &Word,
+                     left: &Type,
+                     right: &Expression)-> &Value
         throws ErrorMsg
     {
         context;
-        op;
+        loc;
+        left;
+        right;
         
-        panic;
+        throw copy ErrorMsg::fatal (loc, "");        
     }
-    
+
+        
 }

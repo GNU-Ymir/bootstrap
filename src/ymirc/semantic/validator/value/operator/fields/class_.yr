@@ -1,0 +1,347 @@
+/*
+ * Implements semantic validation for ambiguous class member access in Ymir.
+ *
+ * A class member access may refer to:
+ *   - a normal field
+ *   - a normal method
+ *   - a field-method or field-assign-method
+ *   - a template method
+ *   - a meta-field (__super, __typeinfo, __typeid)
+ *
+ * This module is invoked by FieldValidation when the left operand is a class
+ * and the field name may refer to either a field or a method.
+ *
+ * <hr>
+ * 
+ * @Package: ymirc        
+ * @Module: ymirc::semantic::validator::value::operator::fields::class_
+ * @File: ymirc/semantic/validator/value/operator/fields/class_.yr
+ * @Author(s):
+ *   - Emile Cadorel <ecadorel@gmail.com>
+ *
+ * @Created (YYYY-MM-DD): 2026-04-18
+ * @Copyright (C) 2021–2026 GNU-Ymir
+ * @License
+ *   ```text
+ *   This file is part of the Ymir language project.
+ *
+ *   Ymir is free software: you can redistribute it and/or modify it
+ *   under the terms of the GNU General Public License as published by
+ *   the Free Software Foundation, either version 3 of the License, or
+ *   (at your option) any later version.
+ *
+ *   Ymir is distributed in the hope that it will be useful,
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *   GNU General Public License for more details.
+ *
+ *   You should have received a copy of the GNU General Public License
+ *   along with Ymir.  If not, see <https://www.gnu.org/licenses/>.
+ *   ```
+ */
+
+in class_;
+
+
+use ymirc::syntax::{_, declaration::_, expression::_};
+use ymirc::semantic::validator;
+use ymirc::semantic::generator::{value::_, type::_};
+
+use ymirc::errors::_;
+use ymirc::lexing::word;
+use ymirc::utils::format;
+
+/*!
+ * ====================================================================================================
+ * ====================================================================================================
+ * ====================================          SUBMODS          =====================================
+ * ====================================================================================================
+ * ====================================================================================================
+ */
+
+pub mod ::vtable;
+pub mod ::field;
+
+/*!
+ * ====================================================================================================
+ * ====================================================================================================
+ * ======================================          ROOT          ======================================
+ * ====================================================================================================
+ * ====================================================================================================
+ */
+
+/**
+ * ClassFieldOrMethodValidation
+ *
+ * Provides semantic validation for ambiguous class member access.
+ *
+ * The validator:
+ *   - attempts field access first (highest priority)
+ *   - attempts method access (vtable + template methods)
+ *   - attempts meta-fields (__super, __typeinfo, __typeid)
+ *   - aggregates errors from all attempts
+ *   - produces the best possible diagnostic
+ *
+ * This module defines the resolution strategy for expressions of the form:
+ *
+ *      object.member
+ *
+ * where `member` may refer to a field, a method, or a meta-field.
+ */
+pub mod ClassFieldOrMethodValidation {
+
+    /**
+     * Resolve an ambiguous class member access as either a field or a method.
+     *
+     * Resolution order:
+     *   1. Field access (ClassFieldAccessValidation::validate)
+     *        - If successful → return immediately
+     *        - If failure → store rootError
+     *
+     *   2. Method access (validateMethod)
+     *        - If successful → return
+     *        - Otherwise → append error to notes
+     *
+     *   3. Meta-fields (ClassFieldAccessValidation::validateBasic)
+     *        - If successful → return
+     *        - Otherwise → append error to notes
+     *
+     *   4. If all attempts fail:
+     *        - enrich notes with createErrorNotes()
+     *        - if rootError exists → rethrow it with notes
+     *        - otherwise → throw CLASS_NO_FIELD with notes
+     *
+     * @params:
+     *   - context: validation context
+     *   - loc:     operator location
+     *   - object:  validated class instance
+     *   - cref:    class reference type
+     *   - field:   field/method expression
+     *   - inCall:  whether this is a method call context
+     *
+     * @returns:
+     *   A &Value representing the resolved field or method access.
+     *
+     * @throws:
+     *   ErrorMsg if no valid interpretation exists.
+     */
+    pub fn validateFieldOrMethod (dmut context: &ValidationContext,
+                                  loc:          &Word,
+                                  object:       &Value,
+                                  cref:         &ClassRefType,
+                                  field:        &Expression,
+                                  inCall:       bool)-> &Value
+        throws ErrorMsg
+    {        
+
+        let mut rootError: (&ErrorMsg)? = none;
+        let dmut notes: [&ErrorMsg] = [];
+        
+        // Field have the priority
+        {
+            return ClassFieldAccessValidation::validate (alias context, loc, object, cref, field);
+        } catch {
+            err => {
+                rootError = err?;
+            }
+        }
+        
+        // Test methods
+        {
+            return ClassFieldOrMethodValidation::validateMethod (alias context, loc, object, cref, field, inCall);
+        } catch {
+            err => {
+                notes ~= [err];
+            }            
+        }        
+
+        {
+            // No method, maybe a basic field, such as __super, __typeinfo, etc.
+            return ClassFieldAccessValidation::validateBasic (alias context, object, cref, field);
+        } catch {
+            err => {
+                notes ~= [err];
+            }
+        }
+
+        ClassFieldOrMethodValidation::createErrorNotes (alias context, loc, object, cref, field, inCall, ref notes);
+
+        if let Ok (msg: &ErrorMsg) = rootError { // already CLASS_NO_FIELD
+            throw msg.withNote (notes);
+        }
+
+        throw copy ErrorMsg::fatal (field.loc, format (ValidateErrorMessage::CLASS_NO_FIELD, object.type, field),
+                                    notes-> notes);        
+    }
+
+    /**
+     * Attempt to resolve the member as a method access.
+     *
+     * Strategy:
+     *   1. Try normal method lookup via ClassVtableAccessValidation::validate
+     *        (with inCall = true)
+     *
+     *   2. If that fails and inCall = true:
+     *        - try again with inCall = false
+     *          (field-methods may be callable even in call context)
+     *
+     *   3. If both fail → throw aggregated errors
+     *
+     * @params:
+     *   - context: validation context
+     *   - loc:     operator location
+     *   - object:  validated class instance
+     *   - cref:    class reference type
+     *   - field:   method expression
+     *   - inCall:  whether this is a method call context
+     *
+     * @returns:
+     *   A &Value representing the method delegate or call.
+     *
+     * @throws:
+     *   ErrorMsg if no method matches.
+     */
+    fn validateMethod (dmut context:       &ValidationContext,
+                       loc:                &Word,
+                       object:             &Value,
+                       cref:               &ClassRefType,
+                       field:              &Expression,
+                       inCall:             bool)-> &Value
+        throws ErrorMsg     
+    {
+        let dmut notes: [&ErrorMsg] = [];
+        
+        {
+            return ClassVtableAccessValidation::validate (alias context, loc, object, cref, field,
+                                                          isProxy-> TypeVerification::isSuperProxy (object),
+                                                          assign-> false,
+                                                          inCall-> inCall);                        
+        } catch {
+            err => {
+                notes ~= [err];
+            }
+        }    
+
+        // Failure, no methods has the correct name
+        if inCall {
+            {
+                // but maybe a field access does even inside an inCall (e.g. '@field fn foo (self)-> (dg (i32)-> void)', can be called with 'f.foo (12)');                
+                return ClassVtableAccessValidation::validate (alias context, loc, object, cref, field,
+                                                              isProxy-> TypeVerification::isSuperProxy (object),
+                                                              assign-> false,
+                                                              inCall-> false);
+            } catch {
+                err => {
+                    notes ~= [err];
+                }
+            }
+        }
+        
+        throw copy ErrorMsg::list (notes);
+    }
+
+    /**
+     * Enrich the error notes with additional diagnostics from failed attempts.
+     *
+     * Purpose:
+     *   When both field and method resolution fail, this function attempts
+     *   additional lookups *only to generate better error messages*.
+     *
+     * Behavior:
+     *   - If not inCall:
+     *        - try method lookup with inCall = true
+     *        - if it succeeds, report IMPLICIT_ADDRESS_METHOD errors
+     *          (user forgot parentheses or '&')
+     *
+     *   - If inCall:
+     *        - try method lookup with inCall = false
+     *          to detect field-methods that are not applicable
+     *
+     *   - Always:
+     *        - try field-assign-method lookup to detect assignment-only methods
+     *
+     * All successful lookups produce notes explaining why the candidate is invalid.
+     *
+     * @params:
+     *   - context: validation context
+     *   - loc:     operator location
+     *   - object:  validated class instance
+     *   - cref:    class reference type
+     *   - field:   field/method expression
+     *   - inCall:  whether this is a method call context
+     *   - notes:   list of accumulated error notes
+     */
+    fn createErrorNotes (dmut context:       &ValidationContext,
+                         loc:                &Word,
+                         object:             &Value,
+                         cref:               &ClassRefType,
+                         field:              &Expression,
+                         inCall:             bool,
+                         ref mut notes:      [&ErrorMsg])        
+    {
+        // no luck, last try but this time only to have a better error message
+        if !inCall {
+            // If we are not in call, maybe something went wrong earlier and inCall was meanto
+            // method access outside call are incomplete, we can already print that error
+            let fstVtAcc = ClassVtableAccessValidation::validate (alias context, loc, object, cref, field,
+                                                                  isProxy-> TypeVerification::isSuperProxy (object),
+                                                                  assign-> false,
+                                                                  inCall-> true)?;
+            if let Ok (vtableAcc) = fstVtAcc {
+                if let m: &MultSymValue = vtableAcc {
+                    for v in m.values if let mt: &MethodDelegateValue = v {
+                        notes ~= [copy ErrorMsg::fatal (loc, format (ValidateErrorMessage::IMPLICIT_ADDRESS_METHOD, mt, tags-> FormatTags (withParams-> true)),
+                                                        notes-> copy [copy ErrorMsg::note (loc, format (ValidateErrorMessage::FORGET_PAR_PROTO_CALL, MultOperators::CALL, oneLine-> true),
+                                                                                           copy ErrorMsg::note (loc, format (ValidateErrorMessage::FORGET_AND_PROTO), oneLine-> true))])];
+                    }
+                } else if let mt: &MethodDelegateValue = vtableAcc {
+                    notes ~= [copy ErrorMsg::fatal (loc, format (ValidateErrorMessage::IMPLICIT_ADDRESS_METHOD, mt, tags-> FormatTags (withParams-> true)),
+                                                    notes-> copy [copy ErrorMsg::note (loc, format (ValidateErrorMessage::FORGET_PAR_PROTO_CALL, MultOperators::CALL, oneLine-> true),
+                                                                                       copy ErrorMsg::note (loc, format (ValidateErrorMessage::FORGET_AND_PROTO), oneLine-> true))])];
+                }
+            }
+            
+            if let Err (err: &ErrorMsg) = fstVtAcc { notes ~= [err]; }
+        }
+
+        else {
+            // Check for field access, even not applicable printing the error message can be useful
+            if let Ok (vtableAcc) = ClassVtableAccessValidation::validate (alias context, loc, object, cref, field,
+                                                                           isProxy-> TypeVerification::isSuperProxy (object), 
+                                                                           assign-> false,
+                                                                           inCall-> false,
+                                                                           forceCall-> false)? {
+                if let m: &MultSymValue = vtableAcc {
+                    for v in m.values if let mt: &MethodDelegateValue = v {
+                        notes ~= [copy ErrorMsg::note (mt.proto.loc, format (ValidateErrorMessage::FIELD_METHOD_ACCESS_NOT_APPLICABLE, mt,
+                                                                             tags-> FormatTags (withParams-> true)),
+                                                       oneLine-> true)];
+                    }
+                } else if let mt: &MethodDelegateValue = vtableAcc {
+                    notes ~= [copy ErrorMsg::note (mt.proto.loc, format (ValidateErrorMessage::FIELD_METHOD_ACCESS_NOT_APPLICABLE, mt,
+                                                                         tags-> FormatTags (withParams-> true)),
+                                                   oneLine-> true)];
+                }
+            }
+        }
+
+        // Check for field assign, even not applicable printing the error message can be useful
+        if let Ok (vtableAcc) = ClassVtableAccessValidation::validate (alias context, loc, object, cref, field,
+                                                                       isProxy-> TypeVerification::isSuperProxy (object),
+                                                                       assign-> true,
+                                                                       inCall-> false)? {
+            if let m: &MultSymValue = vtableAcc {
+                for v in m.values if let mt: &MethodDelegateValue = v {
+                    notes ~= [copy ErrorMsg::note (mt.proto.loc, format (ValidateErrorMessage::FIELD_METHOD_ASSIGN_NOT_APPLICABLE, mt,
+                                                                         tags-> FormatTags (withParams-> true)),
+                                                   oneLine-> true)];
+                }
+            } else if let mt: &MethodDelegateValue = vtableAcc {
+                notes ~= [copy ErrorMsg::note (mt.proto.loc, format (ValidateErrorMessage::FIELD_METHOD_ASSIGN_NOT_APPLICABLE, mt,
+                                                                     tags-> FormatTags (withParams-> true)),
+                                               oneLine-> true)];
+            }
+        }
+    }
+
+}
