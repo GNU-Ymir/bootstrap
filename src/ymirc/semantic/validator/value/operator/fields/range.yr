@@ -1,3 +1,48 @@
+
+/*
+ * Implements semantic validation for field access on range values in Ymir.
+ *
+ * Supported fields:
+ *   - fst       — start of the range
+ *   - scd       — end of the range
+ *   - step      — step value (may be negative)
+ *   - contains  — inclusiveness flag (true for ...)
+ *   - stepBy    — method-like field returning a delegate for step adjustment
+ *   - reverse   — returns a reversed range
+ *   - len       — number of iterations in the range
+ *
+ *
+ * This module is invoked by FieldValidation when the left operand is a RangeType.
+ *
+ * <hr>
+ * 
+ * @Package: ymirc        
+ * @Module: ymirc::semantic::validator::value::operator::fields::range
+ * @File: ymirc/semantic/validator/value/operator/fields/range.yr
+ * @Author(s):
+ *   - Emile Cadorel <ecadorel@gmail.com>
+ *
+ * @Created (YYYY-MM-DD): 2026-04-18
+ * @Copyright (C) 2021–2026 GNU-Ymir
+ * @License
+ *   ```text
+ *   This file is part of the Ymir language project.
+ *
+ *   Ymir is free software: you can redistribute it and/or modify it
+ *   under the terms of the GNU General Public License as published by
+ *   the Free Software Foundation, either version 3 of the License, or
+ *   (at your option) any later version.
+ *
+ *   Ymir is distributed in the hope that it will be useful,
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *   GNU General Public License for more details.
+ *
+ *   You should have received a copy of the GNU General Public License
+ *   along with Ymir.  If not, see <https://www.gnu.org/licenses/>.
+ *   ```
+ */
+
 in range;
 
 use ymirc::syntax::{_, declaration::_, expression::_};
@@ -14,16 +59,192 @@ use ymirc::lexing::{word, tokens, keys};
 
 use std::{io, stream, time::_};
 
+/**
+ * RangeFieldValidation
+ *
+ * Provides semantic validation for field access on range values.
+ *
+ * Supported field names:
+ *   - fst, scd, step, contains
+ *   - stepBy
+ *   - reverse
+ *   - len
+ *
+ * This module defines the complete semantics of range field access in Ymir.
+ */
 pub mod RangeFieldValidation {
 
+    /**
+     * Validate a field access on a range value.
+     *
+     * Supported fields:
+     *   - fst       => start of the range
+     *   - scd       => end of the range
+     *   - step      => step value
+     *   - contains  => inclusiveness flag
+     *   - stepBy    => returns a delegate for step adjustment
+     *   - reverse   => returns a reversed range
+     *   - len       => number of iterations in the range     
+     *
+     * @params:
+     *   - context:   validation context
+     *   - loc:       operator location
+     *   - left:      validated range value
+     *   - leftType:  range type of the left operand
+     *   - right:     field expression
+     *
+     * @returns:
+     *   A &Value representing the validated field access.
+     *
+     * @throws:
+     *   ErrorMsg if the field is not a valid range field.
+     */
     pub fn validate (dmut context: &ValidationContext,
                      loc:          &Word,
                      left:         &Value,
                      leftType:     &RangeType,
                      right:        &Expression)-> &Value
         throws ErrorMsg
-    {
-        
+    {        
+        if let field: &VarExpr = right {
+            match field.name.str {
+                RangeKeys::FST | RangeKeys::SCD => {                    
+                    return copy StructFieldAccessValue (loc, leftType.start, left, field.name.str);
+                }
+                RangeKeys::STEP => {                    
+                    return copy StructFieldAccessValue (loc, leftType.step, left, field.name.str);
+                }
+                RangeKeys::CONTAINS => {                    
+                    return copy StructFieldAccessValue (loc, BOOL_TYPE, left, field.name.str);
+                }
+                RangeKeys::STEP_BY => {
+                    return RangeFieldValidation::validateStepBy (alias context, loc, left, leftType);
+                }
+                RangeKeys::REVERSE => {
+                    return RangeFieldValidation::validateReverse (alias context, loc, left, leftType);
+                }
+                RangeKeys::LEN => {
+                    return RangeFieldValidation::validateLen (alias context, loc, left, leftType);
+                }
+            }        
+        }
+
+        throw copy ErrorMsg::fatal (right.loc, format (ValidateErrorMessage::TYPE_NO_FIELD, left.type, right));    
     }
+
+    /**
+     * Validate the `range.stepBy` field.
+     *
+     * Behavior:
+     *   - Resolve the core function RangeUtils::STEP_BY_FUNC.
+     *   - Instantiate the template with the range's inner types.
+     *   - Wrap the resulting prototype in a FakeMethodDelegateValue so that
+     *     it behaves like a method bound to the range instance.
+     *
+     * @params:
+     *   - context: validation context
+     *   - loc:     operator location
+     *   - left:    range value
+     *   - range:   range type
+     *
+     * @returns:
+     *   A &Value representing a delegate to the stepBy function.
+     *
+     * @throws:
+     *   ErrorMsg if the core function is malformed.
+     */
+    fn validateStepBy (dmut context: &ValidationContext, loc: &Word, left: &Value, range: &RangeType)-> &Value
+        throws ErrorMsg
+    {        
+        let methExpr = VariableCreation::createSyntaxVarFromPath (loc, RangeUtils::STEP_BY_FUNC);
+        let methFunc = TemplateValidation::validateCall (
+            alias context,
+            loc,
+            ValueValidation::validate (alias context, methExpr),
+            range.inners);
+
         
+        if let n: &PrototypeValue = methFunc {
+            return copy FakeMethodDelegateValue (loc, n, left, rename-> RangeKeys::STEP_BY);
+        } 
+
+        throw copy ErrorMsg::fatal (loc, ValidateErrorMessage::MALFORMED_CORE);                                        
+    }
+
+    /**
+     * Validate the `range.reverse` field.
+     *
+     * Behavior:
+     *   - Extract fst, scd, step, and contains via StructFieldAccessValue.
+     *   - Reduce each field using the compile-time interpreter.
+     *   - Compute the negated step.
+     *   - Construct a new RangeValue with:
+     *        start  = scd
+     *        end    = fst
+     *        step   = -step
+     *        contains unchanged
+     *
+     * This produces a reversed range with correct semantics.
+     *
+     * @params:
+     *   - context: validation context
+     *   - loc:     operator location
+     *   - left:    range value
+     *   - range:   range type
+     *
+     * @returns:
+     *   A &Value representing the reversed range.
+     *
+     * @throws:
+     *   ErrorMsg if reduction fails.
+     */
+    fn validateReverse (dmut context: &ValidationContext, loc: &Word, left: &Value, range: &RangeType)-> &Value
+        throws ErrorMsg
+    {
+        let dmut interpret = alias context.cteInterpret;
+        let fst  = interpret:.reduce (copy StructFieldAccessValue (loc, range.start, left, RangeKeys::FST));
+        let scd  = interpret:.reduce (copy StructFieldAccessValue (loc, range.start, left, RangeKeys::SCD));
+        let step = interpret:.reduce (copy StructFieldAccessValue (loc, range.step, left, RangeKeys::STEP));
+        let contains = interpret:.reduce (copy StructFieldAccessValue (loc, BOOL_TYPE, left, RangeKeys::CONTAINS));
+
+        let invStep = interpret:.reduce (copy UnaryOperatorValue (loc, step.type, UnaryOperators::MINUS, step));
+        return interpret:.reduce (copy RangeValue (loc, range, scd, fst, step-> invStep, isFull-> contains));
+    }
+
+    /**
+     * Validate the `range.len` field.
+     *
+     * Behavior:
+     *   - Extract fst, scd, step, and contains via StructFieldAccessValue.
+     *   - Reduce each field using the compile-time interpreter.
+     *   - Delegate to RangeInterpret::reduceLen() to compute the number of
+     *     iterations, supporting:
+     *        - fully constant ranges
+     *        - partially constant ranges
+     *        - fully dynamic ranges
+     *
+     * @params:
+     *   - context: validation context
+     *   - loc:     operator location
+     *   - left:    range value
+     *   - range:   range type
+     *
+     * @returns:
+     *   A &Value representing the number of iterations (usize).
+     *
+     * @throws:
+     *   ErrorMsg if reduction fails.
+     */
+    fn validateLen (dmut context: &ValidationContext, loc: &Word, left: &Value, range: &RangeType)-> &Value
+        throws ErrorMsg
+    {
+        let dmut interpret = alias context.cteInterpret;
+        let fst  = interpret:.reduce (copy StructFieldAccessValue (loc, range.start, left, RangeKeys::FST));
+        let scd  = interpret:.reduce (copy StructFieldAccessValue (loc, range.start, left, RangeKeys::SCD));
+        let step = interpret:.reduce (copy StructFieldAccessValue (loc, range.step, left, RangeKeys::STEP));
+        let contains = interpret:.reduce (copy StructFieldAccessValue (loc, BOOL_TYPE, left, RangeKeys::CONTAINS));
+
+        return RangeInterpret::reduceLen (alias interpret, loc, fst, scd, step, contains);
+    }
+
 }
