@@ -1,0 +1,220 @@
+/*
+ * Implements semantic validation for static field access on class types
+ * using the path operator `::`.
+ *
+ * Supported static fields:
+ *   - Constructors (named or unnamed)
+ *
+ * <hr>
+ * 
+ * @Package: ymirc        
+ * @Module: ymirc::semantic::validator::value::operator::path::class_
+ * @File: ymirc/semantic/validator/value/operator/path/class_.yr
+ * @Author(s):
+ *   - Emile Cadorel <ecadorel@gmail.com>
+ *
+ * @Created (YYYY-MM-DD): 2024-07-09
+ * @Copyright (C) 2021–2026 GNU-Ymir
+ * @License
+ *   ```text
+ *   This file is part of the Ymir language project.
+ *
+ *   Ymir is free software: you can redistribute it and/or modify it
+ *   under the terms of the GNU General Public License as published by
+ *   the Free Software Foundation, either version 3 of the License, or
+ *   (at your option) any later version.
+ *
+ *   Ymir is distributed in the hope that it will be useful,
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *   GNU General Public License for more details.
+ *
+ *   You should have received a copy of the GNU General Public License
+ *   along with Ymir.  If not, see <https://www.gnu.org/licenses/>.
+ *   ```
+ */
+
+in class_;
+
+use ymirc::lexing::{word, tokens, keys};
+use ymirc::syntax::expression::_;
+
+use ymirc::semantic::{validator, symbol, declarator};
+use ymirc::semantic::generator::{value::_, type::_};
+
+use ymirc::global::core_;
+use ymirc::errors::_;
+use ymirc::utils::{format, string};
+
+
+/**
+ * ClassStaticFieldValidation
+ *
+ * Provides semantic validation for static field access on class types.
+ *
+ * Static class fields are accessed using the path operator:
+ *
+ *      Class :: field
+ *
+ * In Ymir, the only valid static fields for classes are constructors.
+ * A constructor may be:
+ *   - unnamed (default constructor)
+ *   - named   (overloaded constructors)
+ *   - template constructors
+ *
+ * The validator:
+ *   - normalizes ClassPtrType and ClassRefType
+ *   - resolves constructor overloads by name
+ *   - enforces visibility rules
+ *   - constructs CtorDelegateValue or CtorDelegateTemplateValue
+ *   - aggregates overloads into a MultSymValue
+ *   - rejects construction of abstract classes
+ * 
+ */
+pub mod ClassStaticFieldValidation {
+
+    /**
+     * Validate static field access on a ClassPtrType.          
+     *
+     * Example:
+     *      MyClass :: new
+     *
+     * @params:
+     *   - context: validation context
+     *   - loc:     operator location
+     *   - c:       ClassPtrType on the left side of `::`
+     *   - right:   field expression (constructor name)
+     *
+     * @returns:
+     *   A &Value representing the resolved constructor overload set.
+     *
+     * @throws:
+     *   ErrorMsg if the field is not a constructor name.
+     */
+    pub fn validate (dmut context: &ValidationContext, loc: &Word, c: &ClassPtrType, right: &Expression)-> &Value
+        throws ErrorMsg
+    {
+        if let var: &VarExpr = right {
+            return ClassStaticFieldValidation::validateCtors (alias context, loc, c.inner, name-> var.name.str);
+        }
+
+        throw copy ErrorMsg::fatal (loc,
+                                    format (ValidateErrorMessage::UNDEFINED_BIN_ACC_OP, BinaryOperators::DCOLON, c, right));
+    }
+
+    /**
+     * Validate static field access on a ClassRefType.     
+     *
+     * Example:
+     *      MyClass :: new
+     *      MyClass :: open
+     *
+     * @params:
+     *   - context: validation context
+     *   - loc:     operator location
+     *   - c:       ClassRefType on the left side of `::`
+     *   - right:   field expression (constructor name)
+     *
+     * @returns:
+     *   A &Value representing the resolved constructor overload set.
+     *
+     * @throws:
+     *   ErrorMsg if the field is not a constructor name.
+     */
+    pub fn validate (dmut context: &ValidationContext, loc: &Word, c: &ClassRefType, right: &Expression)-> &Value
+        throws ErrorMsg
+    {
+        if let var: &VarExpr = right {
+            return ClassStaticFieldValidation::validateCtors (alias context, loc, c, name-> var.name.str);
+        }
+
+        throw copy ErrorMsg::fatal (loc,
+                                    format (ValidateErrorMessage::UNDEFINED_BIN_ACC_OP, BinaryOperators::DCOLON, c, right));
+    }
+
+    /**
+     * Core constructor resolution logic for class static access.
+     *
+     * This function resolves constructor overloads for:
+     *
+     *      Class :: ctorName
+     *
+     * or for the unnamed constructor.
+     *
+     *
+     * @params:
+     *   - context: validation context
+     *   - loc:     operator location
+     *   - cref:    ClassRefType being constructed
+     *   - name:    constructor name ("" for unnamed)
+     *   - selfParam: instance used for constructor chaining
+     *   - nextDg:    next constructor delegate in chain
+     *   - fromSubType: whether construction originates from a derived class. Abstract-class construction is only forbidden when false.
+     *
+     * @returns:
+     *   A MultSymValue containing all matching constructor delegates.
+     *
+     * @throws:
+     *   ErrorMsg if:
+     *     • no constructor matches
+     *     • visibility rules are violated
+     *     • attempting to construct an abstract class
+     */
+    pub fn validateCtors (dmut context: &ValidationContext,
+                          loc:          &Word,
+                          cref:         &ClassRefType,
+                          name:         [c8] = "",
+                          selfParam:    &Value = UNIT_VALUE,
+                          nextDg:       &Value = UNIT_VALUE,
+                          fromSubType:  bool = false)-> &Value
+        throws ErrorMsg
+    {
+        if !cref.hasTypeInfo {
+            let dmut sym: &ClassSymbol = context:.getClassFromRef (cref.sym);
+            ClassValidation::validateLayout (alias context, alias sym);            
+        }
+
+        let isBasicCtor = (name == "");
+        let prots = cref.ctorProtections;
+        let tmpProts = cref.templateCtorProtections;
+        let (inPrv, inProt) = context.getCurrentClassReferentProtections (cref);
+        let ptrType = cref.createInstance (true, true);
+
+        let mut results: [&Value] = [];
+        let mut errors: [&ErrorMsg] = [];
+        for i, ctor in cref.ctors {                        
+            if (inPrv || (inProt && prots[i] == MethodProtection::PROT) || prots[i] == MethodProtection::PUB) {
+                if (isBasicCtor || name == ctor.name) {
+                    results ~= [copy CtorDelegateValue (loc, ptrType, ctor, instance-> selfParam, nextCtor-> nextDg)];
+                }
+            } else if (isBasicCtor || name == ctor.name) {
+                errors ~= [copy ErrorMsg::fatal (ctor.loc, format (DeclareErrorMessage::PRIVATE_IN_THIS_CONTEXT, ctor))];
+            }                        
+        }
+
+        for i, ctor in cref.templateCtors {
+            if (inPrv || (inProt && tmpProts [i] == MethodProtection::PROT) || tmpProts [i] == MethodProtection::PUB) {
+                if (isBasicCtor || name == ctor.name) {
+                    results ~= [copy CtorDelegateTemplateValue (loc, ptrType, ctor, instance-> selfParam, nextCtor-> nextDg)];
+                }
+            } else if (isBasicCtor || name == ctor.name) {
+                errors ~= [copy ErrorMsg::fatal (ctor.loc, format (DeclareErrorMessage::PRIVATE_IN_THIS_CONTEXT, ctor))];
+            }
+        }
+
+        if (results.len == 0us) {
+            if (name == "") {
+                throw copy ErrorMsg::fatal (loc, format (ValidateErrorMessage::NO_CTOR_FOUND, cref), notes-> errors);
+            } else {
+                throw copy ErrorMsg::fatal (loc, format (ValidateErrorMessage::NO_CTOR_FOUND_NAME, name, cref), notes-> errors);
+            }
+        }
+
+        if (!fromSubType && cref.sym.isAbstract) {
+            throw copy ErrorMsg::fatal (loc, format (ValidateErrorMessage::CONSTRUCT_ABSTRACT_CLASS, cref));
+        }
+
+        return copy MultSymValue (loc, results,
+                                  prettyStr-> if (!isBasicCtor) { name } else { Keys::NEW });
+    }
+}
