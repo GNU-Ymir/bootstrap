@@ -1,3 +1,64 @@
+/*
+ * Implements semantic validation for the call operator `(...)` and all
+ * syntactic variants of function invocation in Ymir.
+ *
+ * Responsibilities:
+ *   - Validate the left operand of a call expression, including:
+ *       - direct callable values
+ *       - multi-symbol sets (overload groups)
+ *       - dot-call syntax (a.b(x) → b(a, x))
+ *       - template call rewrites ( (a.b)!{T}(x) )
+ *
+ *   - Validate and normalize right-hand operands (arguments):
+ *       - positional arguments
+ *       - named arguments
+ *       - expanded arguments (`...`)
+ *       - lazy and reference arguments
+ *
+ *   - Detect and reject calls containing error-typed parameters early,
+ *     preventing cascading diagnostics.
+ *
+ *   - Dispatch the final call to MultSymCallValidation, which performs
+ *     overload resolution, scoring, and final selection.
+ *
+ *   - Produce precise diagnostics for:
+ *       - invalid call targets
+ *       - invalid dot-call rewrites
+ *       - invalid named arguments
+ *       - invalid expansions
+ *       - undefined call operators
+ *
+ * This module defines the complete semantics of the call operator.
+ *
+ * <hr>
+ * 
+ * @Package: ymirc        
+ * @Module: ymirc::semantic::validator::value::operator::call
+ * @File: ymirc/semantic/validator/value/operator/call.yr
+ * @Author(s):
+ *   - Emile Cadorel <ecadorel@gmail.com>
+ *
+ * @Created (YYYY-MM-DD): 2026-03-26
+ * @Copyright (C) 2021–2026 GNU-Ymir
+ * @License
+ *   ```text
+ *   This file is part of the Ymir language project.
+ *
+ *   Ymir is free software: you can redistribute it and/or modify it
+ *   under the terms of the GNU General Public License as published by
+ *   the Free Software Foundation, either version 3 of the License, or
+ *   (at your option) any later version.
+ *
+ *   Ymir is distributed in the hope that it will be useful,
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *   GNU General Public License for more details.
+ *
+ *   You should have received a copy of the GNU General Public License
+ *   along with Ymir.  If not, see <https://www.gnu.org/licenses/>.
+ *   ```
+ */
+
 in call;
 
 use ymirc::syntax::{_, declaration::_, expression::_};
@@ -12,16 +73,121 @@ use ymirc::utils::format;
 
 use ymirc::lexing::{word, tokens, keys};
 
+use ymirc::semantic::validator::value::operator::call::_;
+use std::stream;
+
+/*!
+ * ====================================================================================================
+ * ====================================================================================================
+ * ====================================          SUBMODS          =====================================
+ * ====================================================================================================
+ * ====================================================================================================
+ */
+
+mod ::multsym;
+mod ::params;
+mod ::fptr;
+mod ::delegate;
+mod ::method;
+mod ::proto;
+mod ::ctor;
+mod ::lambda;
+mod ::template;
+
+
+/*!
+ * ====================================================================================================
+ * ====================================================================================================
+ * ======================================          ROOT          ======================================
+ * ====================================================================================================
+ * ====================================================================================================
+ */
+
+/**
+ * CallValidation
+ *
+ * Root validator for all call expressions:
+ *
+ *      left ( arg1, arg2, ... )
+ *
+ * This module handles:
+ *
+ *   - Direct calls on values
+ *   - Calls on multi-symbol sets (overload groups)
+ *   - Dot-call syntax:
+ *         a.b(x)  →  b(a, x)
+ *
+ *   - Template-call rewrites:
+ *         (a.b)!{T}(x)  →  b!{T}(a, x)
+ *
+ *   - Named arguments and argument reordering
+ *   - Argument expansion (`...`)
+ *   - Error-parameter detection
+ *
+ * After normalization, the call is delegated to:
+ *
+ *      MultSymCallValidation::validate()
+ *
+ * which performs overload resolution and returns the final callable.
+ *
+ */
 pub mod CallValidation {
 
+    /**
+     * Entry point for validating a call expression represented as a
+     * MultOperatorExpr.
+     *
+     * Steps:
+     *   1. Validate the left operand via validateLeftOperand().
+     *   2. Validate and normalize right operands via validateRightOperands().
+     *   3. Reject calls containing error-typed parameters.
+     *   4. Dispatch to the core call validator.
+     *
+     * This function handles dot-call rewriting and UFC rewriting.
+     *
+     * @returns:
+     *   A &Value representing the result of the call.
+     *
+     * @throws:
+     *   ErrorMsg if the call cannot be resolved.
+     */
     pub fn validate (dmut context: &ValidationContext, mult: &MultOperatorExpr) -> &Value
         throws ErrorMsg
     {
-        context;
-        mult;
-        panic;
+        let (left, rightDot) = CallValidation::validateLeftOperand (alias context, mult, mult.left, mult.canBeDotCall);
+        let (rights, nbNamed) = CallValidation::validateRightOperands (alias context, mult.rights, rightDot);
+
+        // If one of the param is "error" then no need to actually perform the call, nothing will work
+        // And it will show an extremely long error for nothing
+        CallParamListCreation::checkNoErrorParams (mult.loc, left, rights);
+        
+        return CallValidation::validate (alias context, mult.loc, left, rights,
+                                         nbNamed-> nbNamed,
+                                         inCopy-> context.isInCopy (mult));        
     }
 
+    /**
+     * Validate a call expression when the left operand and argument list
+     * are already known.
+     *
+     * Responsibilities:
+     *   - Separate named and positional arguments.
+     *   - Reject calls containing error-typed parameters.
+     *   - Forward to the core call dispatcher with nbNamed.
+     *
+     * @params:
+     *   - context: validation context
+     *   - loc:     source location of the call operator
+     *   - left:    the left operand (call target)
+     *   - rights:  list of argument values (named + positional)
+     *   - inCopy:  whether the call occurs inside a copy expression
+     *
+     * @returns:
+     *   A &Value representing the resolved call.
+     *
+     * @throws:
+     *   ErrorMsg if the call cannot be resolved.
+     */
     pub fn validate (dmut context: &ValidationContext,
                      loc:          &Word,
                      left:         &Value,
@@ -29,1530 +195,296 @@ pub mod CallValidation {
                      inCopy:       bool = false)-> &Value
         throws ErrorMsg
     {
-        context;
-        loc;
-        left;
-        rights;
-        inCopy;
-        panic;
+        let mut finRights: [&Value] = [];
+        let mut named: [&Value] = [];
+        for r in rights match r {
+            n: &NamedValue => { named ~= [n]; }
+            _ => { finRights ~= [r]; }
+        }
+
+        let rights_ = (named ~ finRights);
+
+        // If one of the param is "error" then no need to actually perform the call, nothing will work
+        // And it will show an extremely long error for nothing
+        CallParamListCreation::checkNoErrorParams (loc, left, rights_);
+        
+        return CallValidation::validate (alias context, loc, left, rights_,
+                                         nbNamed-> named.len,
+                                         inCopy-> inCopy);
     }
+
+    /**
+     * Core call dispatcher.
+     *
+     * Ensures that the left operand is a MultSymValue (overload group).
+     * If it is not, it wraps it into a single-element MultSymValue.
+     *
+     * Delegates overload resolution to:
+     *
+     *      MultSymCallValidation::validate()
+     *
+     * @params:
+     *   - context: validation context
+     *   - loc:     operator location
+     *   - left:    the call target (value or overload group)
+     *   - rights:  normalized argument list
+     *   - nbNamed: number of named arguments in `rights`
+     *   - inCopy:  whether the call occurs inside a copy expression
+     *
+     * @returns:
+     *   The selected overload result.
+     *
+     * @throws:
+     *   ErrorMsg if overload resolution fails.
+     */
+    pub fn validate (dmut context: &ValidationContext,
+                     loc:          &Word,
+                     left:         &Value,
+                     rights:       [&Value],
+                     nbNamed:      usize,
+                     inCopy:       bool = false)-> &Value
+        throws ErrorMsg
+    {
+        let value: &MultSymValue = match left {
+            m: &MultSymValue => { m }
+            l: _ => { copy MultSymValue (l.loc, copy [l], prettyStr-> format ("%", l)) }
+        };
+
+        let (result, _score_) = MultSymCallValidation::validate (alias context, loc, value, rights,
+                                                                 nbNamed-> nbNamed,
+                                                                 inCopy-> inCopy);
+
+        return result;
+    }    
+    
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ==================================          LEFT OPERAND          ==================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Validate the left operand of a call expression.
+     *
+     * Steps:
+     *   1. Enter call-context (context.enterCall).
+     *   2. Attempt to validate the left expression normally.
+     *   3. If validation fails and dot-call syntax is allowed:
+     *        - attempt dot-call rewriting via validateDotCall().
+     *
+     * Dot-call syntax allows:
+     *      a.b(x)  →  b(a, x)
+     *
+     * @params:
+     *   - context:      validation context
+     *   - m:            the full call expression
+     *   - left:         the left-hand expression before call
+     *   - canBeDotCall: whether dot-call rewriting is permitted
+     *
+     * @returns:
+     *   (validatedLeftValue, preValidatedArguments)
+     *
+     * @throws:
+     *   ErrorMsg if neither normal nor dot-call validation succeeds.
+     */    
+    fn validateLeftOperand (dmut context: &ValidationContext,
+                            m:            &MultOperatorExpr,
+                            left:         &Expression,
+                            canBeDotCall: bool)-> (&Value, [&Value])
+        throws ErrorMsg
+    {
+        {
+            context:.enterCall (m);
+
+            {
+                let l = ValueCreation::createEnumUnwrap (ValueValidation::validate (alias context, left));
+                return (l, []);
+            } catch {
+                err: &ErrorMsg => {
+                    
+                    // If left was not correct, maybe it is a dotCall syntax
+                    if (canBeDotCall) { 
+                        return CallValidation::validateDotCall (alias context, left, err);
+                    }
+
+                    throw err;
+                }
+            }
+        } exit {
+            context:.exitCall ();
+        }
+    }
+
+    /**
+     * Attempt to rewrite a dot-call expression into a normal call.
+     *
+     * Examples:
+     *      a.b(x)          →  b(a, x)
+     *      a.b!{T}(x)      →  b!{T}(a, x)
+     *
+     * Steps:
+     *   1. Rewrite the syntax via rewriteDotCallSyntax().
+     *   2. Validate the rewritten left operand.
+     *   3. Reject dot-call on error-typed values.
+     *   4. Validate the right operand.
+     *
+     * If rewriting fails, the error is combined with the original error
+     * to produce a multi-note diagnostic.
+     *
+     * @params:
+     *   - context: validation context
+     *   - left:    original left expression
+     *   - err:     the error raised by normal validation
+     *
+     * @returns:
+     *   (rewrittenLeftValue, extraArguments)
+     *
+     * @throws:
+     *   ErrorMsg if rewriting or validation fails.
+     */
+    fn validateDotCall (dmut context: &ValidationContext, left: &Expression, err: &ErrorMsg)-> (&Value, [&Value])
+        throws ErrorMsg
+    {
+        let (lValRewritten, rightSynt) = CallValidation::rewriteDotCallSyntax (alias context, left, err);
+        let lval = ValueCreation::createEnumUnwrap (lValRewritten);
+
+        // Cannot use dot call syntax on error values
+        if lval.type of ErrorType {
+            throw err;
+        }
+
+        // Otherwise we try the UFC rewritting
+        {
+            let rval = ValueCreation::createEnumUnwrap (ValueValidation::validate (alias context, rightSynt));
+            return (rval, copy [lval]);
+        } catch {
+            rerr: &ErrorMsg => {
+                // We add the error, in case the user really wanted a dot call but the function is miswritten or something
+                let note = copy ErrorMsg::note (rightSynt.loc, ValidateErrorMessage::UFC_REWRITING, notes-> copy [rerr]);
+                
+                throw copy ErrorMsg::list (copy [note, err]);
+            }
+        }
+    }
+
+    /**
+     * Rewrite syntactic forms of dot-call expressions.
+     *
+     * Supported rewrites:
+     *   - a.b              →  (a, b)
+     *   - a.b!{params}     →  (a, b!{params})
+     *
+     * @params:
+     *   - context: validation context
+     *   - left:    original left expression
+     *   - err:     error to throw if no dot-call pattern matches
+     *
+     * @returns:
+     *   (rewrittenLeftValue, rewrittenRightExpression)
+     *
+     * @throws:
+     *   ErrorMsg if no dot-call pattern matches.
+     */
+    fn rewriteDotCallSyntax (dmut context: &ValidationContext, left: &Expression, err: &ErrorMsg)-> (&Value, &Expression)
+        throws ErrorMsg
+    {
+        
+        if let bin: &BinaryExpr = left && bin.op == BinaryOperators::DOT { // rewrite (a.b)            
+            let l = ValueValidation::validate (alias context, bin.left);
+            return (l, bin.right);
+        }
+        
+        if let t: &TemplateCallExpr = left {            
+            if let bin: &BinaryExpr = t.left && bin.op == BinaryOperators::DOT {  // rewrite ( (a.b)!{params} )                
+                let l = ValueValidation::validate (alias context, bin.left);
+                let right: &Expression = copy TemplateCallExpr (t.loc, bin.right, t.rights);
+                return (l, right);
+            }             
+        }
+
+        throw err;
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * =====================================          RIGHTS          =====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Validate and normalize the argument list of a call expression.
+     *
+     * Responsibilities:
+     *   - Merge pre-validated arguments (from dot-call rewriting).
+     *   - Validate each argument expression.
+     *   - Verify that each argument has a complete type.
+     *   - Handle:
+     *       - ExpandValue (argument expansion)
+     *       - NamedValue (named arguments)
+     *       - Positional arguments
+     *
+     * @params:
+     *   - context:   validation context
+     *   - rightOps:  list of argument expressions
+     *   - validated: pre-validated arguments from dot-call rewriting
+     *
+     * @returns:
+     *   (normalizedArguments, numberOfNamedArguments)
+     *
+     * @throws:
+     *   ErrorMsg if any argument fails validation.
+     */
+    fn validateRightOperands (dmut context: &ValidationContext,
+                              rightOps:     [&Expression],
+                              validated:    [&Value])-> ([&Value], usize)
+        throws ErrorMsg
+    {
+        let mut errors: [&ErrorMsg] = [];
+        let mut rights: [&Value] = [];
+        let mut named: [&Value] = [];
+
+        for r in validated match r {
+            n: &NamedValue => { named ~= [n]; }
+            _ => { rights ~= [r]; }
+        }
+
+        for r in rightOps {
+            {
+                let v = ValueValidation::validate (alias context, r,
+                                                   canBeRef-> true,
+                                                   canBeLazy-> true);
+                
+                TypeVerification::verifyCompleteWithValue (r.loc,  v.type, v,
+                                                           construct-> true);
+
+                match v {
+                    e: &ExpandValue => {
+                        rights ~= e.values;                       
+                    }
+                    n: &NamedValue => {
+                        named ~= [n];
+                    }
+                    _ => {
+                        rights ~= [v];
+                    }
+                }
+            } catch {
+                err: &ErrorMsg => {
+                    errors ~= [err];
+                }
+            }
+        }
+
+        if (errors.len != 0us) throw copy ErrorMsg::list (errors);
+
+        return (named ~ rights, named.len);
+    }
+
+
     
 }
-
-//        let (left, rightDot) = self.validateLeftOperand (alias context, mult, mult.getLeft (), mult.canBeDotCall ());
-//         let (rights, nbNamed) = self.validateRightOperands (alias context, mult.getRights (), rightDot);
-
-//         // If one of the param is "error" then no need to actually perform the call, nothing will work
-//         // And it will show an extremely long error for nothing
-//         self.checkNoErrorParams (mult.loc, left, rights);
-
-//         self.validate (alias context, mult.loc, left, rights, nbNamed-> nbNamed, inCopy-> context.isDynamic (mult))
-//     }
-
-//     /**
-//      * Validate a mult expression
-//      * @params:
-//      *    - context: the context of the validation
-//      *    - left: the left operand of the operation
-//      *    - right: the right operand of the operation
-//      * @returns: the result value
-//      * @throws:
-//      *    - &ErrorMsg: if the validation failed
-//      */
-
-//     {
-//         let mut finRights: [&Value] = [];
-//         let mut named: [&Value] = [];
-//         for r in rights match r {
-//             n: &NamedValue => { named ~= [n]; }
-//             _ => { finRights ~= [r]; }
-//         }
-
-//         let rights_ = (named ~ finRights);
-
-//         // If one of the param is "error" then no need to actually perform the call, nothing will work
-//         // And it will show an extremely long error for nothing
-//         self.checkNoErrorParams (loc, left, rights_);
-//         self.validate (alias context, loc, left, rights_, named.len, inCopy-> inCopy)
-//     }
-
-//     /**
-//      * Validate a mult expression
-//      * @params:
-//      *    - context: the context of the validation
-//      *    - left: the left operand of the operation
-//      *    - right: the right operand of the operation
-//      * @returns: the result value
-//      * @throws:
-//      *    - &ErrorMsg: if the validation failed
-//      */
-//     fn validate (self, dmut context: &ValidationContext, loc: &Word, left: &Value, rights: [&Value], nbNamed: usize, inCopy: bool = false)-> &Value
-//         throws ErrorMsg
-//     {
-//         let value: &MultSymValue = match left {
-//             m: &MultSymValue => { m }
-//             tmp: _ => { copy MultSymValue (tmp.loc, copy [tmp], prettyStr-> format ("%", tmp)) }
-//         };
-
-//         self.validateMultSym (alias context, loc, value, rights, nbNamed-> nbNamed, inCopy-> inCopy)._0
-//     }
-
-//     /*!
-//      * ====================================================================================================
-//      * ====================================================================================================
-//      * =================================          LEFT OPERANDS          ==================================
-//      * ====================================================================================================
-//      * ====================================================================================================
-//      */
-
-//     /**
-//      * Validate the left operand of the mult operator
-//      * @params:
-//      *   - context: the context of the validation
-//      *   - left: the left operand to validate
-//      *   - canBeDotCall: true iif the left expression can be a dot call syntax
-//      * @returns:
-//      *   - .0: the value of the left operand
-//      *   - .1: the list of parameters to add to the right operand (applicable only iif dot call)
-//      */
-//     fn validateLeftOperand (self, dmut context: &ValidationContext, m: &MultOperatorExpr, left: &Expression, canBeDotCall: bool)-> (&Value, [&Value])
-//         throws ErrorMsg
-//     {
-//         {
-//             context:.enterCall (m);
-
-//             {
-//                 let l = context.implicitEnumUnwrap (context:.validateValue (left));
-//                 return (l, []);
-//             } catch {
-//                 err: &ErrorMsg => {
-//                     if (canBeDotCall) { // If left was not correct, maybe it is a dotCall syntax
-//                         return self.validateDotCall (alias context, left, err);
-//                     } else throw err;
-//                 }
-//             }
-//         } exit {
-//             context:.exitCall ();
-//         }
-//     }
-
-//     /**
-//      * Try to validate a dot call expression
-//      * @params:
-//      *   - context: the context of the validation
-//      *   - left: the left operand of the mult operation
-//      *   - err: the error that occured when validating without trying dot call
-//      * @returns:
-//      *   - .0: the left operand of the expression
-//      *   - .1: the list of parameters to add to the mult operators (len == 1us, or throws)
-//      * @throws: &ErrorMsg, if this is not a dot call
-//      */
-//     fn validateDotCall (self, dmut context: &ValidationContext, left: &Expression, err: &ErrorMsg)-> (&Value, [&Value])
-//         throws ErrorMsg
-//     {
-//         let (lValRewritten, rightSynt) = self.rewriteDotCallSyntax (alias context, left, err);
-//         let lval = context.implicitEnumUnwrap (lValRewritten);
-
-//         // Cannot use dot call syntax on error values
-//         if lval.getType () of ErrorType {
-//             throw err;
-//         }
-
-//         // Otherwise we try the UFC rewritting
-//         let rval = {
-//             context.implicitEnumUnwrap (context:.validateValue (rightSynt))
-//         } catch {
-//             rerr: &ErrorMsg => {
-//                 // We add the error, in case the user really wanted a dot call but the function is miswritten or something
-//                 let note = copy ErrorMsg::note (rightSynt.loc, ValidateErrorMessage::UFC_REWRITING, notes-> copy [rerr]);
-//                 throw copy ErrorMsg::list (copy [note, err]);
-//             }
-//         };
-
-//         (rval, copy [lval])
-//     }
-
-//     /**
-//      * Try to transform unwrap 'left' to get two elements for dot call validation
-//      * @params:
-//      *    - context: the context of the validation
-//      *    - left: the left operand of the mult operation
-//      *    - err: the error to throw if the unwrapping fails
-//      * @returns:
-//      *    - .0: the first parameter of the call (element on the left of the dot call)
-//      *    - .1: the function to call
-//      * @throws:
-//      *   - &ErrorMsg: parameter err, if the unwrap fails, and thus this is not a dot call
-//      */
-//     fn rewriteDotCallSyntax (self, dmut context: &ValidationContext, left: &Expression, err: &ErrorMsg)-> (&Value, &Expression)
-//         throws ErrorMsg
-//     {
-//         match left {
-//             bin: &BinaryExpr => {
-//                 if (bin.loc == Tokens::DOT) { // rewrite (a.b)
-//                     let l = context:.validateValue (bin.getLeft ());
-//                     (l, bin.getRight ())
-//                 } else throw err;
-//             }
-//             t: &TemplateCallExpr => {
-//                 match t.getLeft () {
-//                     bin: &BinaryExpr => {
-//                         if (bin.loc == Tokens::DOT) { // rewrite ( (a.b)!{params} )
-//                             let l = context:.validateValue (bin.getLeft ());
-//                             let right: &Expression = copy TemplateCallExpr (t.loc, bin.getRight (), t.getRights ());
-//                             (l, right)
-//                         } else throw err;
-//                     }
-//                     _ => throw err;
-//                 }
-//             }
-//             _ => throw err;
-//         }
-//     }
-
-//     /*!
-//      * ====================================================================================================
-//      * ====================================================================================================
-//      * =================================          RIGHT OPERANDS          =================================
-//      * ====================================================================================================
-//      * ====================================================================================================
-//      */
-
-//     /**
-//      * Validate the right operands
-//      * @params:
-//      *   - context: the context of the validation
-//      *   - rightOps: the list of right operands
-//      *   - validated: the list of values already validated by Dot call syntax
-//      * @returns:
-//      *    - .0: the list of right operands, where named operands are placed at the beginning of the slice
-//      *    - .1: the number of named operands
-//      */
-//     fn validateRightOperands (self, dmut context: &ValidationContext, rightOps: [&Expression], validated: [&Value])-> ([&Value], usize)
-//         throws ErrorMsg
-//     {
-//         let mut errors: [&ErrorMsg] = [];
-//         let mut rights: [&Value] = [];
-//         let mut named: [&Value] = [];
-
-//         for r in validated match r {
-//             n: &NamedValue => { named ~= [n]; }
-//             _ => { rights ~= [r]; }
-//         }
-
-//         for r in rightOps {
-//             {
-//                 let v = context:.getValueValidator ().validate (alias context, r, canBeRef-> true, canBeLazy-> true);
-//                 context.verifyCompleteTypeWithValue (r.loc, v.getType (), v, construct-> true);
-
-//                 match v {
-//                     e: &ExpandValue => {
-//                         for i_v in e.getInnerValues () {
-//                             rights ~= [i_v];
-//                         }
-//                     }
-//                     n: &NamedValue => {
-//                         named ~= [n];
-//                     }
-//                     _ => {
-//                         rights ~= [v];
-//                     }
-//                 }
-//             } catch {
-//                 err: &ErrorMsg => {
-//                     errors ~= [err];
-//                 }
-//             }
-//         }
-
-//         if (errors.len != 0us) throw copy ErrorMsg::list (errors);
-
-//         (named ~ rights, named.len)
-//     }
-
-//     /**
-//      * Check that no parameters is of type "error"
-//      * If any throw a undefined call error, to avoid long validation of something that will ultimately fail
-//      * @params:
-//      *     - loc: the location of the call
-//      *     - left: the left operand of the call
-//      *     - rights: the list of parameters
-//      * @throws:
-//      *     - &ErrorMsg: if one of the parameters is an "error"
-//      * */
-//     fn checkNoErrorParams (self, loc: &Word, left: &Value, rights: [&Value])
-//         throws ErrorMsg
-//     {
-//         let mut notes: [&ErrorMsg] = [];
-//         for v in rights {
-//             if (v.getType () of ErrorType) {
-//                 notes ~= [copy ErrorMsg::note (v.loc, format (ValidateErrorMessage::ERROR_PARAM, v, v.getType ()))];
-//             }
-//         }
-
-//         if (notes.len != 0us) {
-//             let prettyName = self.prettyName (left);
-//             throw copy ErrorMsg::fatal (loc, format (ValidateErrorMessage::UNDEFINED_CALL_OP, prettyName, self.formatParamsWithTypes (rights)),
-//                                         notes-> notes);
-//         }
-//     }
-
-//     /*!
-//      * ====================================================================================================
-//      * ====================================================================================================
-//      * ====================================          MULTSYM          =====================================
-//      * ====================================================================================================
-//      * ====================================================================================================
-//      */
-
-//     /**
-//      * Validate the calling where the values left and rights are already validated, and the left value is a multsym
-//      * @params:
-//      *   - context: the context of the validation
-//      *   - loc: the location of the operator
-//      *   - left: the left operand
-//      *   - rights: the right operands
-//      *   - nbNamed: the number of named operand in rights (they are placed at the beginning)
-//      * @returns:
-//      *   - .0: a value
-//      *   - .1: the score of the validation
-//      * @throws: if the operation is impossible
-//      */
-//     fn validateMultSym (self, dmut context: &ValidationContext, loc: &Word, left: &MultSymValue, rights: [&Value], nbNamed: usize, inCopy: bool = false)-> (&Value, u32)
-//         throws ErrorMsg
-//     {
-//         let prettyName = self.prettyName (left);
-//         let (nonTemplates, templates) = self.divideByPriority (left.getValues ()); // non template values have higher priorities than template ones, so if there can be called then no need to validate template ones
-//         let (call, res, rewrite, score) = {
-//             let (call, res, score) = self.validateValueList (alias context, loc, prettyName, nonTemplates, rights, nbNamed, inCopy-> inCopy);
-//             (call, res, cast!{[TemplateRewriter]} ([]), score)
-//         } catch { // there is no need to worry of empty list, it is managed in validateValueList
-//             err: &ErrorMsg => { // there is no value in non template values that works with rigths
-//                 if (templates.len != 0us) {
-//                     {
-//                         let (call, res, rewrite, score) = self.validateValueTemplateList (alias context, loc, prettyName, templates, rights, nbNamed); // so we try the template values
-//                         if (res.len == 1us) { // there is only success validation, then we finalize the validation of the template symbol (@assert, res.len != 0us, or an error is thrown by 'validateValueTemplateList')
-//                             self.finalizeImplicitTemplateDeclaration (alias context, loc, rewrite [0us], call [0us]);
-//                         }
-
-//                         (call, res, rewrite, score)
-//                     } catch { // there is no need to worry of empty list here either, it is managed in validateValueList
-//                         templateError: &ErrorMsg => { // Does not work with both template and non templates
-//                             if (nonTemplates.len != 0us) {
-//                                 throw copy ErrorMsg::list (copy [err, templateError]);
-//                             }
-//                             else throw templateError;
-//                         }
-//                     }
-//                 } else throw err;
-//             }
-//         };
-
-
-//         if (res.len != 1us) { // there are more than one success in the call validation, so we need to throw the error of 'works with both'
-//             // This error is not managed in validateValueList, because we don't want to validate templates when it occurs
-//             let mut errors: [&ErrorMsg] = [];
-//             for i in 0us .. call.len {
-//                 let notes = if (rewrite.len > i) {
-//                     copy [copy ErrorMsg::note (call [i].loc, format (ValidateErrorMessage::TEMPLATE_SPE, rewrite [i]), oneLine-> true)]
-//                 } else { [] };
-
-//                 let msg = copy ErrorMsg::note (call [i].loc, format (ValidateErrorMessage::CANDIDATE_ARE, self.prettyName (call [i])), oneLine-> true, withLoc-> true,
-//                                           notes-> notes);
-
-//                 errors ~= [msg];
-//             }
-
-//             throw copy ErrorMsg::fatal (loc, format (ValidateErrorMessage::WORKS_WITH_BOTH, prettyName, rights), notes-> errors);
-//         }
-
-//         // Only one success ! we return it
-//         (res [0us], score)
-//     }
-
-//     /**
-//      * Validate a call on a list of values, where only the values with the highest score are called
-//      * @params:
-//      *    - context: the context of the validation
-//      *    - loc: the loc of the call
-//      *    - prettyName: the pretty name to use in error throwing
-//      *    - lefts: the list of values to call
-//      *    - rights: the list of values used as right operands
-//      *    - nbNamed: the number of named operand in rights (assuming they are placed at the beginning)
-//      * @returns:
-//      *    - .0: the list of values that are called with highest score (left[i])
-//      *    - .1: the list of call values (validation of: left[i] (rights))
-//      *    - .2: the score of the call (the highest one)
-//      * @throws:
-//      *    - &ErrorMsg: if no value can be called
-//      */
-//     fn validateValueList (self, dmut context: &ValidationContext, loc: &Word, prettyName: [c8], lefts: [&Value], rights: [&Value], nbNamed: usize, inCopy: bool = false)-> ([&Value], [&Value], u32)
-//         throws ErrorMsg
-//     {
-//         let mut results: [&Value] = []; // stores the list of call validation (left[i] (rigths)
-//         let mut call: [&Value] = []; // stores the list of used values (left[i])
-//         let mut highestScore = 0u32;
-//         let mut errors: [&ErrorMsg] = [];
-
-//         for it in lefts { // traverse all the candidates
-//             {
-//                 let (gen, score) = self.validateCall (alias context, loc, it, rights, nbNamed, candidate-> true, inCopy-> inCopy); // try to use it
-//                 if (score > highestScore) { // It works and has a better score than previous candidates
-//                     highestScore = score;
-//                     results = copy [gen]; // all the last success are removed, they have a lesser score
-//                     call = copy [it];
-//                 } else if (score == highestScore) { // It works and has the same score
-//                     results ~= [gen];
-//                     call ~= [it];
-//                 } // Does work, but with a lesser score, just skip it
-//             } catch {
-//                 err: &ErrorMsg => { // Does not work
-//                     errors ~= [err]; // we store the error, if no candidate works we need to use the error
-//                 }
-//             }
-//         }
-
-//         if (results.len == 0us) { // No candidates work, we throw all the stored errors
-//             throw copy ErrorMsg::fatal (loc, format (ValidateErrorMessage::UNDEFINED_CALL_OP, prettyName, self.formatParamsWithTypes (rights)),
-//                                         notes-> errors)
-//         }
-
-//         // Some values succeeded in the call, so we return them, along with the score they generate
-//         (call, results, highestScore)
-//     }
-
-//     /**
-//      * Validate a call on a list of template ref values, where only the values with the highest score are called (and validated)
-//      * @params:
-//      *    - context: the context of the validation
-//      *    - loc: the loc of the call
-//      *    - prettyName: the pretty name to use in error throwing
-//      *    - lefts: the list of values to call
-//      *    - rights: the list of values used as right operands
-//      *    - nbNamed: the number of named operand in rights (assuming they are placed at the beginning)
-//      * @returns:
-//      *    - .0: the list of values that are called with highest score (left[i])
-//      *    - .1: the list of call values (validation of: left[i] (rights))
-//      *    - .2: the rewriters to use to create the final symbols needed for the calls
-//      *    - .3: the score of the call (the highest one)
-//      * @throws:
-//      *    - &ErrorMsg: if no value can be called
-//      */
-//     fn validateValueTemplateList (self, dmut context: &ValidationContext, loc: &Word, prettyName: [c8], lefts: [&Value], rights: [&Value], nbNamed: usize)-> ([&Value], [&Value], [TemplateRewriter], u32)
-//         throws ErrorMsg
-//     {
-//         // We store the results inside a vector, where to each valid values is associated the correct rewriter
-//         let mut results: [&Value] = [];; // stores the list of call validation (left[i] (rigths)
-//         let mut call: [&Value] = []; // stores the list of used values (left[i])
-//         let mut syms: [TemplateRewriter] = []; // stores the list of generated symbols
-//         let mut highestScore = 0u32;
-//         let mut errors: [&ErrorMsg] = [];
-//         for it in lefts {
-//             {
-//                 let (value, sym, score) = self.validateTemplateCall (alias context, loc, it, rights, nbNamed, candidate-> true);
-//                 if (score > highestScore) { // It works and has a better score than previous candidates
-//                     highestScore = score;
-//                     results = copy [value]; // all the last success are removed, they have a lesser score
-//                     call = copy [it];
-//                     syms = copy [sym];
-//                 } else if (score == highestScore) { // It works and has the same score
-//                     results ~= [value];
-//                     call ~= [it];
-//                     syms ~= [sym];
-//                 }
-//             } catch {
-//                 err: &ErrorMsg => { // does not work
-//                     errors ~= [err];
-//                 }
-//             }
-//         }
-
-//         if (results.len == 0us) { // No candidates work, we throw all the stored errors
-//             throw copy ErrorMsg::fatal (loc, format (ValidateErrorMessage::UNDEFINED_CALL_OP, prettyName, self.formatParamsWithTypes (rights)),
-//                                         notes-> errors)
-//         }
-
-//         // Some values succeeded in the call, so we return them, along with the score they generate
-//         (call, results, syms, highestScore)
-//     }
-
-
-//     /**
-//      * Finalize the template declaration that was implicitely specialized during the call
-//      * @params:
-//      *    - context: the context of the validation
-//      *    - loc: the location of the call
-//      *    - rewriter: the rewriter defined by template specialization solver
-//      *    - value: the value template to declare
-//      * @throws:
-//      *    - &ErrorMsg: if the declaration fails
-//      * */
-//     fn finalizeImplicitTemplateDeclaration (self, dmut context: &ValidationContext, loc: &Word, rewriter: TemplateRewriter, value: &Value)
-//         throws ErrorMsg
-//     {
-//         match value {
-//             m: &MethodDelegateTemplateValue => {
-//                 context:.getTemplateDeclarator ():.declare (alias context, loc, rewriter, m.getPrototype ());
-//             }
-//             c: &CtorDelegateTemplateValue => {
-//                 context:.getTemplateDeclarator ():.declare (alias context, loc, rewriter, c.getPrototype ());
-//             }
-//             x: &TemplateRefValue => {
-//                 context:.getTemplateDeclarator ():.declare (alias context, loc, rewriter, x);
-//             }
-//             z: _ => {
-//                 println ("TODO: ", z.__typeinfo__.name);
-//                 panic;
-//             }
-//         }
-//     }
-
-//     /*!
-//      * ====================================================================================================
-//      * ====================================================================================================
-//      * ====================================          CALLING          =====================================
-//      * ====================================================================================================
-//      * ====================================================================================================
-//      */
-
-//     /**
-//      * Validate the calling where the values left and rights are already validated
-//      * @params:
-//      *   - context: the context of the validation
-//      *   - loc: the location of the operator
-//      *   - left: the left operand
-//      *   - rights: the right operands
-//      *    - nbNamed: the number of named operand in rights (assuming they are placed at the beginning)
-//      * @returns:
-//      *   - .0: a value
-//      *   - .1: the score of the validation
-//      * @throws: if the operation is impossible
-//      */
-//     fn validateCall (self, dmut context: &ValidationContext, loc: &Word, left: &Value, rights: [&Value], nbNamed: usize, candidate: bool = true, inCopy: bool = false)-> (&Value, u32)
-//         throws ErrorMsg
-//     {
-//         match left.getType () {
-//             fptr: &FuncPtrType => { self.validateFuncPtrType (alias context, loc, fptr, left, rights, nbNamed, candidate-> candidate) }
-//             dl: &DelegateType => { self.validateDelegateType (alias context, loc, dl, left, rights, nbNamed, candidate-> candidate) }
-//             _ => {
-//                 match left {
-//                     m: &MethodDelegateValue => {
-//                         self.validateMethodDelegateCall (alias context, loc, m, rights, nbNamed, candidate-> candidate)
-//                     }
-//                     m: &FakeMethodDelegateValue => {
-//                         return self.validateFakeMethodDelegateCall (alias context, loc, m, rights, nbNamed, candidate-> candidate);
-//                     }
-//                     m: &CtorDelegateValue => {
-//                         self.validateCtorDelegateCall (alias context, loc, m, rights, nbNamed, candidate-> candidate, inCopy-> inCopy)
-//                     }
-//                     f: &PrototypeValue => {
-//                         self.validatePrototype (alias context, loc, f, rights, nbNamed, candidate-> candidate)
-//                     }
-//                     v: &VarRefValue => {
-//                         if (v.getValue () !of UnitValue) {
-//                             self.validateCall (alias context, loc, v.getValue (), rights, nbNamed, candidate-> candidate, inCopy-> inCopy)
-//                         } else {
-//                             throw copy ErrorMsg::fatal (v.getDeclLoc (), ValidateErrorMessage::DEFINED_HERE,
-//                                                    notes-> copy [copy ErrorMsg::note (loc, format (ValidateErrorMessage::NOT_CALLABLE, v.getType ()), oneLine-> true, withLoc-> true)]);
-//                         }
-//                     }
-//                     l: &LambdaValue => {
-//                         self.validateLambdaCall (alias context, loc, l, rights, nbNamed, candidate-> candidate)
-//                     }
-//                     _ => {
-//                         throw copy ErrorMsg::fatal (left.loc, format (ValidateErrorMessage::IS_NOT_CALLABLE, self.prettyName (left)));
-//                     }
-//                 }
-//             }
-//         }
-//     }
-
-//     /**
-//      * Divide the list of values into two lists where the first list values have higher priorities than those in the right one
-//      * @info: this function places template values in the right list
-//      * @params:
-//      *    - list: the list of values to divide
-//      * @returns:
-//      *    - .0: the list of values with high priority
-//      *    - .1: the list of values with low priority
-//      */
-//     fn divideByPriority (self, list: [&Value])-> ([&Value], [&Value]) {
-//         let mut left: [&Value] = [];
-//         let mut right: [&Value] = [];
-//         for i in list match i {
-//             t: &TemplateRefValue => { right ~= [t]; }
-//             m: &MethodDelegateTemplateValue => { right ~= [m]; }
-//             c: &CtorDelegateTemplateValue => { right ~= [c]; }
-//             _ => { left ~= [i]; }
-//         }
-
-//         (left, right)
-//     }
-
-//     /*!
-//      * ====================================================================================================
-//      * ====================================================================================================
-//      * ===============================          FUNCTION PROTOTYPE          ===============================
-//      * ====================================================================================================
-//      * ====================================================================================================
-//      */
-
-//     /**
-//      * Validate a function prototype call
-//      * @params:
-//      *    - context: the context of the validation
-//      *    - loc: the location of the call
-//      *    - left: the left operand
-//      *    - rights: the right operands
-//      *    - candidate: add the candidate_are not in case of failure ?
-//      *    - nbNamed: the number of named operand in rights (assuming they are placed at the beginning)
-//      * @returns:
-//      *   - .0: the call
-//      *   - .1: the score of the call
-//      * @throws: &ErrorMsg, if the call is not possible
-//      */
-//     fn validatePrototype (self, dmut context: &ValidationContext, loc: &Word, left: &PrototypeValue, rights: [&Value], nbNamed: usize, candidate: bool = false)-> (&Value, u32)
-//         throws ErrorMsg
-//     {
-//         let (params, rest) = self.validateParameterListSort (loc, left.getParameters (), rights, nbNamed, isVariadic-> left.isCVariadic ());
-//         let (_, n_params, score) = self.validateTypeParameterList (alias context, loc, left.getParameters (), params, verifType-> true, verifMemory-> true, isLambda-> false);
-
-//         if (left.isUnsafe ()) {
-//             context:.verifyUnsafeContext (left.loc, msg-> ValidateErrorMessage::UNSAFE_CALL);
-//         }
-
-//         (copy CallValue (loc, left.getRetType (), left, n_params, addParams-> rest), score + left.getTemplateScore ())
-//     } catch {
-//         err: &ErrorMsg => {
-//             if (!candidate) throw err;
-//             throw copy ErrorMsg::note (left.loc, format (ValidateErrorMessage::CANDIDATE_ARE, self.prettyName (left)), notes-> copy [err], oneLine-> true, withLoc-> true);
-//         }
-//     }
-
-
-//     /*!
-//      * ====================================================================================================
-//      * ====================================================================================================
-//      * ===============================          FPTR AND DELEGATES          ===============================
-//      * ====================================================================================================
-//      * ====================================================================================================
-//      */
-
-//     /**
-//      * Validate a function pointer call
-//      * @params:
-//      *    - context: the context of the validation
-//      *    - loc: the location of the call
-//      *    - fptr: the type of the function pointer
-//      *    - left: the left operand
-//      *    - rights: the right operands
-//      *    - candidate: add the candidate_are not in case of failure ?
-//      * @returns:
-//      *   - .0: the call
-//      *   - .1: the score of the call
-//      * @throws: &ErrorMsg, if the call is not possible
-//      */
-//     fn validateFuncPtrType (self, dmut context: &ValidationContext, loc: &Word, fptr: &FuncPtrType, left: &Value, rights: [&Value], nbNamed: usize, candidate: bool = false)-> (&Value, u32)
-//         throws ErrorMsg
-//     {
-//         {
-//             // Name parameters are not usable on fptr, delegate or lambda functions
-//             if (nbNamed != 0us) self.throwUnknwonNamed (rights [0us .. nbNamed]);
-
-//             if (fptr.getParameters ().len != rights.len) {
-//                 throw copy ErrorMsg::fatal (loc, self.formatTooFew (rights.len, fptr.getParameters ().len));
-//             }
-
-//             let (n_params, score) = self.validateTypeParameterList (alias context, fptr.getReferences (), fptr.getLazys (), fptr.getParameters (), rights);
-//             (copy FuncPtrCallValue (loc, fptr.getRetType (), left,  n_params), score)
-//         } catch {
-//             err: &ErrorMsg => {
-//                 if (!candidate) throw err;
-//                 throw copy ErrorMsg::note (left.loc, format (ValidateErrorMessage::CANDIDATE_ARE, self.prettyName (left)), notes-> copy [err], oneLine-> true, withLoc-> true);
-//             }
-//         }
-//     }
-
-//     /**
-//      * Validate a delegate call
-//      * @params:
-//      *    - context: the context of the validation
-//      *    - loc: the location of the call
-//      *    - left: the left operand
-//      *    - rights: the right operands
-//      *    - candidate: add the candidate_are not in case of failure ?
-//      * @returns:
-//      *   - .0: the call
-//      *   - .1: the score of the call
-//      * @throws: &ErrorMsg, if the call is not possible
-//      */
-//     fn validateDelegateType (self, dmut context: &ValidationContext, loc: &Word, delegate: &DelegateType, left: &Value, rights: [&Value], nbNamed: usize, candidate: bool = false)-> (&Value, u32)
-//         throws ErrorMsg
-//     {
-//         match left {
-//             m: &MethodDelegateValue => {
-//                 return self.validateMethodDelegateCall (alias context, loc, m, rights, nbNamed, candidate-> candidate);
-//             }
-//         }
-
-//         {
-//             // Name parameters are not usable on fptr, delegate or lambda functions
-//             if (nbNamed != 0us) self.throwUnknwonNamed (rights [0us .. nbNamed]);
-//             if (delegate.getParameters ().len != rights.len) {
-//                 throw copy ErrorMsg::fatal (loc, self.formatTooFew (rights.len, delegate.getParameters ().len));
-//             }
-
-//             let (n_params, score) = self.validateTypeParameterList (alias context, delegate.getReferences (), delegate.getLazys (), delegate.getParameters (), rights);
-//             let (call, func) = match left {
-//                 n: &NameDelegateValue => {
-//                     let fstParam = n.getClosure ();
-//                     let func = n.getPrototype ();
-
-//                     (copy CallValue (loc, delegate.getRetType (), func, copy [fstParam] ~ n_params), func)
-//                 }
-//                 _ => {
-//                     let fptr = copy FuncPtrType (loc, delegate.getReferences (), delegate.getLazys (), delegate.getParameters (), delegate.getRetType ());
-//                     let clPtr = copy PointerType (loc, copy VoidType (loc));
-
-
-//                     let fstParam: &Value = copy StructFieldAccessValue (loc, clPtr, left, DelegateKeys::CLOSURE);
-//                     let func = copy StructFieldAccessValue (loc, fptr, left, DelegateKeys::FUNC);
-
-//                     (copy FuncPtrCallValue (loc, delegate.getRetType (), func, copy [fstParam] ~ n_params), func)
-//                 }
-//             };
-
-//             if delegate.canBeNull () {
-//                 let test = copy CmpPointerOperatorValue (loc, BinaryOperators::NOT_EQUAL, func, copy NullValue (loc));
-//                 let cond = copy ConditionalValue (loc, delegate.getRetType (), test, call, UNIT_VALUE);
-//                 return (cond, score);
-//             } else {
-//                 return (call, score);
-//             }
-//         } catch {
-//             err: &ErrorMsg => {
-//                 if (!candidate) throw err;
-//                 throw copy ErrorMsg::note (left.loc, format (ValidateErrorMessage::CANDIDATE_ARE, self.prettyName (left)), notes-> copy [err], oneLine-> true, withLoc-> true);
-//             }
-//         }
-//     }
-
-//     /*!
-//      * ====================================================================================================
-//      * ====================================================================================================
-//      * =====================================          METHOD          =====================================
-//      * ====================================================================================================
-//      * ====================================================================================================
-//      */
-
-//     /**
-//      * Validate the call of a method of a class
-//      * @params:
-//      *     - context: the context of the validation
-//      *     - loc: the location of the call
-//      *     - rights: the right operands
-//      *     - candidate: add the candidate_are error in case of failure ?
-//      * @returns:
-//      *     - .0: the call
-//      *     - .1: the score of the call
-//      * @throws: &ErrorMsg, if the call is impossible
-//      */
-//     fn validateMethodDelegateCall (self, dmut context: &ValidationContext, loc: &Word, meth: &MethodDelegateValue, rights: [&Value], nbNamed: usize, candidate: bool = false)-> (&Value, u32)
-//         throws ErrorMsg
-//     {
-//         if (meth.isAddressed ()) throw copy ErrorMsg::fatal (meth.getAddressedLoc (), format (ValidateErrorMessage::UNECESSARY_ADDRESS_METHOD));
-
-//         let (call, score) = self.validatePrototype (alias context, loc, meth.getPrototype (), rights, nbNamed, candidate-> candidate);
-//         {
-//             match call {
-//                 c: &CallValue => {
-//                     if (meth.getPrototype ().isUnsafe ()) {
-//                         context:.verifyUnsafeContext (meth.getPrototype ().loc, msg-> ValidateErrorMessage::UNSAFE_CALL);
-//                     }
-
-//                     let addScore = if (meth.getPrototype ().isMutable ()) { 1u32 } else { 0u32 };
-//                     (copy MethodCallValue (c.loc, c.getType (), meth, c.getParameters (), addParams-> c.getAddParameters ()), score + meth.getPrototype ().getTemplateScore () + addScore)
-//                 }
-//                 _ => panic;
-//             }
-//         } catch {
-//             err: &ErrorMsg => {
-//                 if (!candidate) throw err;
-//                 throw copy ErrorMsg::note (loc, format (ValidateErrorMessage::CANDIDATE_ARE, self.prettyName (meth)), notes-> copy [err], oneLine-> true, withLoc-> true);
-//             }
-//         }
-//     }
-
-//     /**
-//      * Validate the call of a fake method (method on something that is not a class, e.g. range, map, etc.)
-//      * @params
-//      *     - context: the context of the validation
-//      *     - loc: the location of the call
-//      *     - rights: the right operands
-//      *     - candidate: add the candidate_are error in case of failure ?
-//      * @returns:
-//      *     - .0: the call
-//      *     - .1: the score of the call
-//      * @throws: &ErrorMsg, if the call is impossible
-//      * */
-//     fn validateFakeMethodDelegateCall (self, dmut context: &ValidationContext, loc: &Word, meth: &FakeMethodDelegateValue, rights: [&Value], nbNamed: usize, candidate: bool = false)-> (&Value, u32)
-//         throws ErrorMsg
-//     {
-//         {
-//             let protoParams = meth.getPrototype ().getParameters ()[1us .. $];
-//             let (params, rest) = self.validateParameterListSort (loc, protoParams, rights, nbNamed, isVariadic-> false);
-//             let (_, n_params, score) = self.validateTypeParameterList (alias context, loc, protoParams, params, verifType-> true, verifMemory-> true, isLambda-> false);
-
-//             if (meth.getPrototype ().isUnsafe ()) {
-//                 context:.verifyUnsafeContext (meth.loc, msg-> ValidateErrorMessage::UNSAFE_CALL);
-//             }
-
-//             (copy CallValue (loc, meth.getPrototype ().getRetType (), meth.getPrototype (), copy [meth.getClosure ()] ~ n_params, addParams-> rest), score + meth.getPrototype ().getTemplateScore ())
-//         }  catch {
-//             err: &ErrorMsg => {
-//                 if (!candidate) throw err;
-//                 throw copy ErrorMsg::note (meth.loc, format (ValidateErrorMessage::CANDIDATE_ARE, self.prettyName (meth)), notes-> copy [err], oneLine-> true, withLoc-> true);
-//             }
-//         }
-//     }
-
-
-//     /*!
-//      * ====================================================================================================
-//      * ====================================================================================================
-//      * =====================================          CTORS          ======================================
-//      * ====================================================================================================
-//      * ====================================================================================================
-//      */
-
-//     /**
-//      * Validate the call of a ctor of a class
-//      * @params:
-//      *    - context: the context of the validation
-//      *    - loc: the location of the call
-//      *    - ctor: the ctor to call
-//      *    - rights: the right operands
-//      *    - candidate: add the candidate_are error in case of failure ?
-//      * @returns:
-//      *   - .0: the call
-//      *   - .1: the score of the call
-//      * @throws: &ErrorMsg, if the call is not possible
-//      */
-//     fn validateCtorDelegateCall (self, dmut context: &ValidationContext, loc: &Word, ctor: &CtorDelegateValue, rights: [&Value], nbNamed: usize, candidate: bool = false, inCopy: bool = false)-> (&Value, u32)
-//         throws ErrorMsg
-//     {
-//         if (!inCopy) {
-//             match ctor.getInstanceType () {
-//                 c: &ClassPtrType => { // 'A ()', where A is a class must be written 'copy A ()'
-//                     if (!c.isStruct ()) throw copy ErrorMsg::fatal (loc, format (ValidateErrorMessage::CTOR_CLASS_STACK, c),
-//                                                                notes-> copy [copy ErrorMsg::note (loc, format (ValidateErrorMessage::ENCLOSE_COPY_CLASS_CTOR), oneLine-> true)]);
-//                 }
-//             }
-//         } else if context.isDynamicDeep () {
-//             match ctor.getInstanceType () {
-//                 c: &ClassPtrType => { // 'dcopy A ()', where A is a class must be written 'copy A ()'
-//                     if (!c.isStruct ()) throw copy ErrorMsg::fatal (loc, format (ValidateErrorMessage::CTOR_CLASS_DCOPY, c),
-//                                                                notes-> copy [copy ErrorMsg::note (context.getDynamicExpr ().loc, format (ValidateErrorMessage::SIMPLE_COPY_CLASS_CTOR))]);
-//                 }
-//             }
-//         }
-
-//         let (call, score) = self.validatePrototype (alias context, loc, ctor.getPrototype (), rights, nbNamed, candidate-> candidate);
-//         match call {
-//             c: &CallValue => { // It should be a call, otherwise an error has been thrown
-//                 if (ctor.getPrototype ().isUnsafe ()) {
-//                     context:.verifyUnsafeContext (ctor.getPrototype ().loc, msg-> ValidateErrorMessage::UNSAFE_CALL);
-//                 }
-
-//                 (copy CtorCallValue (c.loc, ctor.getInstanceType (), ctor, c.getParameters (), addParams-> c.getAddParameters ()), score + ctor.getPrototype ().getTemplateScore ()) // replace the prototype by the delegate
-//             }
-//             _ => { panic; }
-//         }
-//     }
-
-//     /*!
-//      * ====================================================================================================
-//      * ====================================================================================================
-//      * ===================================          TEMPLATES          ====================================
-//      * ====================================================================================================
-//      * ====================================================================================================
-//      */
-
-//     /**
-//      * Validate a call where left value is a template, and thus needs a specialization
-//      * @params:
-//      *    - context: the context of the validation
-//      *    - loc: the location of the call
-//      *    - left: the template value
-//      *    - rights: the list of values used to call the template value
-//      *    - candidate: if true add the candidate_are error in case of failure (for multsym error handling)
-//      * @returns:
-//      *    - .0: the call value
-//      *    - .1: the symbol that was created by the template validation
-//      *    - .2: the score of the call
-//      * @throws:
-//      *    - &ErrorMsg: if the call if not possible
-//      */
-//     fn validateTemplateCall (self, dmut context: &ValidationContext, loc: &Word, left: &Value, rights: [&Value], nbNamed: usize, candidate: bool = false)-> (&Value, TemplateRewriter, u32)
-//         throws ErrorMsg
-//     {
-//         match left {
-//             m: &MethodDelegateTemplateValue => {
-//                 return self.validateTemplateCallMethod (alias context, loc, m, rights, nbNamed, candidate-> candidate);
-//             }
-//             c: &CtorDelegateTemplateValue => {
-//                 return self.validateTemplateCallCtor (alias context, loc, c, rights, nbNamed, candidate-> candidate);
-//             }
-//             t: &TemplateRefValue => match t.getSymbol ().getContent ().getContent () {
-//                 f: &FunctionDecl => {
-//                     return self.validateTemplateCallFunction (alias context, loc, t, f, rights, nbNamed, candidate-> candidate);
-//                 }
-//                 _ => {
-//                     throw copy ErrorMsg::fatal (left.loc, format (ValidateErrorMessage::IS_NOT_CALLABLE, self.prettyName (t)));
-//                 }
-//             }
-//             _ => {
-//                 println ("TODO: ", left.__typeinfo__.name);
-//                 panic;
-//             }
-//         }
-//     }
-
-//     /**
-//      * Validate a call on a template value that contains a function declaration
-//      * @params:
-//      *    - context: the context of the declaration
-//      *    - loc: the location of the call
-//      *    - left: the template ref that is called
-//      *    - func: the function contained in the template ref (left.getSymbol ().getContent ().getContent ())
-//      *    - rights: the list of parameters passed to the call
-//      * @returns:
-//      *    - .0: the call value
-//      *    - .1: the symbol that was created by the template validation
-//      *    - .2: the score of the call
-//      * @throws:
-//      *    - &ErrorMsg: if the call failed (from template solving, declaration, or simply cannot be called with the parameters)
-//      */
-//     fn validateTemplateCallFunction (self, dmut context: &ValidationContext, loc: &Word, left: &TemplateRefValue, func: &FunctionDecl, rights: [&Value], nbNamed: usize, candidate: bool = false)-> (&Value, TemplateRewriter, u32)
-//         throws ErrorMsg
-//     {
-//         {
-//             // the function is not validated thus we don't have real prototype to use, so we transform the informations we have into something usable
-//             let argList = self.createTemplatePrototypeValues (alias context, left, func.getFunctionProto ().getParameters ());
-//             let (params, rest) = self.validateParameterListSort (loc, argList, rights, nbNamed, isVariadic-> true); // we use the fake prototype to sort the parameters, at least we have the names
-
-//             // Perform the template specialization, and get the rewriter, and the finalParameters (in the correct order, and tupled if needed)
-//             let rewriter = context:.getTemplateSolver ().validateImplicitValue (alias context, loc, left, params ~ rest);
-
-//             {
-//                 // Validate the rewrite of the prototype (only the prototype, in order to get the score)
-//                 let (proto, hasTest) = context:.getTemplateDeclarator ():.finalizeFunctionPrototype (alias context, loc, left, rewriter, func);
-//                 let (finalParams, postRest) = self.validateParameterListSort (loc, proto.getParameters (), rights, nbNamed, isVariadic-> false);
-
-//                 // Normal call can be performed now
-//                 let (_, n_params, score) = self.validateTypeParameterList (alias context, loc, proto.getParameters (), finalParams, verifType-> true, verifMemory-> true, isLambda-> false);
-
-//                 if (proto.isUnsafe ()) {
-//                     context:.verifyUnsafeContext (proto.loc, msg-> ValidateErrorMessage::UNSAFE_CALL);
-//                 }
-
-//                 let oldScore = match left.getSymbol ().getTemplateMapper () {
-//                     Ok (map: _) => { map.getScore () }
-//                     _ => { 0u32 }
-//                 };
-
-//                 // We have a call, a rewriter and a score to return
-//                 (copy CallValue (loc, proto.getRetType (), proto, n_params, addParams-> postRest),
-//                  rewriter,
-//                  oldScore + score + rewriter.getScore () + if (hasTest) { 1u32 } else { 0u32 })
-//             } catch {
-//                 err: &ErrorMsg => {
-//                     let nErr = err.withNote (copy [copy ErrorMsg::note (loc, format (ValidateErrorMessage::TEMPLATE_SPE, rewriter), oneLine-> true)]);
-//                     throw nErr;
-//                 }
-//             }
-//         } catch {
-//             err: &ErrorMsg => {
-//                 if (!candidate) throw err; // as for normal call, template call might be in multsymbol, so we don't add candidate error
-//                 throw copy ErrorMsg::note (func.loc, format (ValidateErrorMessage::CANDIDATE_ARE, self.prettyName (left)), notes-> copy [err], oneLine-> true, withLoc-> true); // alone call, add the candidate are error
-//             }
-//         }
-//     }
-
-//     /**
-//      * Validate the call to a template method
-//      * @params:
-//      *    - context: the context of the validation
-//      *    - loc: the location of the call
-//      *    - left: the method being called
-//      *    - rights: the list of parameters passed to the call
-//      * @returns:
-//      *    - .0: the call value
-//      *    - .1: the symbol that was created by the template validation
-//      *    - .2: the score of the call
-//      * @throws:
-//      *    - &ErrorMsg: if the call failed (from template solving, declaration, or simply cannot be called with the parameters)
-//      * */
-//     fn validateTemplateCallMethod (self, dmut context: &ValidationContext, loc: &Word, left: &MethodDelegateTemplateValue, rights: [&Value], nbNamed: usize, candidate: bool = false)-> (&Value, TemplateRewriter, u32)
-//         throws ErrorMsg
-//     {
-//         {
-//             let func = left.getPrototype ().getFunction ();
-
-//             // the function is not validated thus we don't have real prototype to use, so we transform the informations we have into something usable
-//             let argList = self.createTemplatePrototypeValues (alias context, left.getPrototype (), func.getFunctionProto ().getParameters ()[1us .. $]);
-//             let (params, rest) = self.validateParameterListSort (loc, argList, rights, nbNamed, isVariadic-> true); // we use the fake prototype to sort the parameters, at least we have the names
-
-//             // Perform the template specialization, and get the rewriter, and the finalParameters (in the correct order, and tupled if needed)
-//             let rewriter = context:.getTemplateSolver ().validateImplicitValue (alias context, loc, left.getPrototype (), params ~ rest, forMethod-> true);
-
-//             {
-//                 // Validate the rewrite of the prototype (only the prototype, in order to get the score)
-//                 let (proto, hasTest) = context:.getTemplateDeclarator ():.finalizeFunctionPrototype (alias context, loc, left.getPrototype (), rewriter, func);
-//                 let (finalParams, postRest) = self.validateParameterListSort (loc, proto.getParameters (), rights, nbNamed, isVariadic-> false);
-
-//                 // Normal call can be performed now
-//                 let (_, n_params, score) = self.validateTypeParameterList (alias context, loc, proto.getParameters (), finalParams, verifType-> true, verifMemory-> true, isLambda-> false);
-
-//                 if (proto.isUnsafe ()) {
-//                     context:.verifyUnsafeContext (proto.loc, msg-> ValidateErrorMessage::UNSAFE_CALL);
-//                 }
-
-//                 let dgV = copy MethodDelegateValue (loc, proto.asOf!{&MethodPrototypeValue} (), closure-> left.getClosure (), direct-> true, vtableIndex-> 0us, isStruct-> left.isStruct ());
-//                 let oldScore = match left.getPrototype ().getSymbol ().getTemplateMapper () {
-//                     Ok (map: _) => { map.getScore () }
-//                     _ => { 0u32 }
-//                 };
-
-//                 // We have a call, a rewriter and a score to return
-//                 let mut addScore = 0u32;
-//                 if (hasTest) addScore += 1u32;
-//                 if (dgV.getPrototype ().isMutable ()) addScore += 1u32;
-
-//                 (copy MethodCallValue (loc, proto.getRetType (), dgV, n_params, addParams-> postRest),
-//                  rewriter,
-//                  oldScore + score + rewriter.getScore () + addScore)
-//             } catch {
-//                 err: &ErrorMsg => {
-//                     let nErr = err.withNote (copy [copy ErrorMsg::note (loc, format (ValidateErrorMessage::TEMPLATE_SPE, rewriter), oneLine-> true)]);
-//                     throw nErr;
-//                 }
-//             }
-//         } catch {
-//             err: &ErrorMsg => {
-//                 if (!candidate) throw err; // as for normal call, template call might be in multsymbol, so we don't add candidate error
-//                 throw copy ErrorMsg::note (left.loc, format (ValidateErrorMessage::CANDIDATE_ARE, self.prettyName (left)), notes-> copy [err], oneLine-> true, withLoc-> true); // alone call, add the candidate are error
-//             }
-//         }
-//     }
-
-
-//     /**
-//      * Validate the call to a template constructor
-//      * @params:
-//      *    - context: the context of the validation
-//      *    - loc: the location of the call
-//      *    - left: the ctor being called
-//      *    - rights: the list of parameters passed to the call
-//      * @returns:
-//      *    - .0: the call value
-//      *    - .1: the symbol that was created by the template validation
-//      *    - .2: the score of the call
-//      * @throws:
-//      *    - &ErrorMsg: if the call failed (from template solving, declaration, or simply cannot be called with the parameters)
-//      * */
-//     fn validateTemplateCallCtor (self, dmut context: &ValidationContext, loc: &Word, left: &CtorDelegateTemplateValue, rights: [&Value], nbNamed: usize, candidate: bool = false)-> (&Value, TemplateRewriter, u32)
-//         throws ErrorMsg
-//     {
-//         {
-//             let func = left.getPrototype ().getCtor ();
-
-//             // the function is not validated thus we don't have real prototype to use, so we transform the informations we have into something usable
-//             let argList = self.createTemplatePrototypeValues (alias context, left.getPrototype (), func.getFunctionProtoDecl ().getParameters ());
-//             let (params, rest) = self.validateParameterListSort (loc, argList, rights, nbNamed, isVariadic-> true); // we use the fake prototype to sort the parameters, at least we have the names
-
-//                         // Perform the template specialization, and get the rewriter, and the finalParameters (in the correct order, and tupled if needed)
-//             let rewriter = context:.getTemplateSolver ().validateImplicitValue (alias context, loc, left.getPrototype (), params ~ rest, forMethod-> true);
-
-//             {
-//                 // Validate the rewrite of the prototype (only the prototype, in order to get the score)
-//                 let (proto, hasTest) = context:.getTemplateDeclarator ():.finalizeCtorPrototype (alias context, loc, left.getPrototype (), rewriter, func);
-//                 let (finalParams, postRest) = self.validateParameterListSort (loc, proto.getParameters (), rights, nbNamed, isVariadic-> false);
-
-//                 // Normal call can be performed now
-//                 let (_, n_params, score) = self.validateTypeParameterList (alias context, loc, proto.getParameters (), finalParams, verifType-> true, verifMemory-> true, isLambda-> false);
-//                 if (proto.isUnsafe ()) {
-//                     context:.verifyUnsafeContext (proto.loc, msg-> ValidateErrorMessage::UNSAFE_CALL);
-//                 }
-
-//                 let dgV = copy CtorDelegateValue (loc, left.getInstanceType (), proto.asOf!{&CtorPrototypeValue} (), instance-> left.getInstance (), nextCtor-> left.getNextCtor ());
-//                 let oldScore = match left.getPrototype ().getSymbol ().getTemplateMapper () {
-//                     Ok (map: _) => { map.getScore () }
-//                     _ => { 0u32 }
-//                 };
-
-//                 // We have a call, a rewriter and a score to return
-//                 (copy CtorCallValue (loc, dgV.getInstanceType (), dgV, n_params, addParams-> postRest),
-//                  rewriter,
-//                  oldScore + score + rewriter.getScore () + if (hasTest) { 1u32 } else { 0u32 })
-//             } catch {
-//                 err: &ErrorMsg => {
-//                     let nErr = err.withNote (copy [copy ErrorMsg::note (loc, format (ValidateErrorMessage::TEMPLATE_SPE, rewriter), oneLine-> true)]);
-//                     throw nErr;
-//                 }
-//             }
-//         } catch {
-//             err: &ErrorMsg => {
-//                 if (!candidate) throw err; // as for normal call, template call might be in multsymbol, so we don't add candidate error
-//                 throw copy ErrorMsg::note (left.loc, format (ValidateErrorMessage::CANDIDATE_ARE, self.prettyName (left)), notes-> copy [err], oneLine-> true, withLoc-> true); // alone call, add the candidate are error
-//             }
-//         }
-//     }
-
-
-//     /**
-//      * Create a list of prototype value from an unvalidated function
-//      * @params:
-//      *    - context: the context of the validation
-//      *    - arguments: the list of expression of the prototype
-//      * @returns: the list of protovalues
-//      */
-//     fn createTemplatePrototypeValues (self, dmut context: &ValidationContext, left: &TemplateRefValue, arguments: [&VarDeclExpr])-> [&ProtoVarValue]
-//     {
-//         let mut result: [&ProtoVarValue] = [];
-//         context:.pushReferent (alias context:.getSymbolFromRef (left.getSymbol ())); // we push the referent to be in the template prototype context
-//         context:.enterForeign (isFnBody-> false);
-
-//         for arg in arguments {
-//             context:.enterBlock ();
-
-//             // We validate what can be validated, and let what cannot be validated as it is
-//             let (isMut, isRef, isLazy, type, value) = context:.getFunctionValidator ().validateTemplateParamDecl (alias context, arg);
-//             let nbConsume = match arg.getType () {
-//                 lst: &TypeListWrapperExpr => { cast!u32 (lst.getTypes ().len) }
-//                 _ => 1u32
-//             };
-
-//             let paramGen = copy ProtoVarValue (arg.loc, type, value, isMut, isRef, isLazy-> isLazy, isSelf-> false, nbConsume-> nbConsume);
-//             result ~= [paramGen];
-//             {
-//                 context:.quitBlock (warnUnused-> false);
-//             } catch { _ => panic; }
-//         }
-
-//         context:.exitForeign ();
-//         context:.popReferent ();
-
-
-//         result
-//     }
-
-//     /*!
-//      * ====================================================================================================
-//      * ====================================================================================================
-//      * ==================================          LAMBDA VALUE          ==================================
-//      * ====================================================================================================
-//      * ====================================================================================================
-//      */
-
-//     /**
-//      * Validate a call on an lambda value
-//      * @params:
-//      *    - context: the context of the validation
-//      *    - loc: the location of the call
-//      *    - lmbd: the lambda to call
-//      *    - rights: the parameters of the call
-//      *    - candidate: append the candidate error in case of failure ?
-//      * @returns:
-//      *    - .0: the call
-//      *    - .1: the score of the call
-//      * @throws: &ErrorMsg, if the call is not possible
-//      */
-//     fn validateLambdaCall (self, dmut context: &ValidationContext, loc: &Word, lmbd: &LambdaValue, rights: [&Value], nbNamed: usize, candidate: bool = false)-> (&Value, u32)
-//         throws ErrorMsg
-//     {
-//         // Name parameters are not usable on fptr, delegate or lambda functions
-//         if (nbNamed != 0us) self.throwUnknwonNamed (rights [0us .. nbNamed]);
-
-//         if (rights.len != lmbd.getParameters ().len) {
-//             throw copy ErrorMsg::fatal (loc, format (ValidateErrorMessage::UNDEFINED_CALL_OP, self.prettyName (lmbd), self.formatParamsWithTypes (rights)));
-//         }
-
-//         let mut types: [&Type] = copy [i.getType () for i in rights];
-//         let (proto, frame) = context:.getLambdaValidator ():.validateLambdaBody (alias context, lmbd, types);
-//         {
-//             let ret = self.validateCall (alias context, loc, proto, rights, nbNamed-> 0us, candidate-> candidate);
-//             context:.getLambdaValidator ().insertGenerator (alias context, frame);
-//             return ret;
-//         } catch {
-//             err: &ErrorMsg => throw err;
-//         }
-//     }
-
-//     /*!
-//      * ====================================================================================================
-//      * ====================================================================================================
-//      * ================================          TYPE PARAMETERS          =================================
-//      * ====================================================================================================
-//      * ====================================================================================================
-//      */
-
-
-//     /**
-//      * Validate the list of paramters where prototype only have types, (e.g. delegate or funcptr)
-//      * @params:
-//      *    - arguments: the list of parameters of the prototype
-//      *    - parameters: the list of parameters used to call the prototype
-//      * @returns: the score of the call
-//      * @throws: &ErrorMsg, if the parameters are not usable
-//      */
-//     fn validateTypeParameterList (self, dmut context: &ValidationContext, references: [bool], lazys: [bool], arguments: [&Type], parameters: [&Value])-> ([&Value], u32)
-//         throws ErrorMsg
-//     {
-//         let mut errors: [&ErrorMsg] = [];
-//         let mut score = 0u32;
-//         let mut values: [&Value] = [];
-
-//         for i in 0us .. arguments.len {
-//             {
-//                 let ch = context:.verifyCompatibleTypeWithValue (parameters [i].loc, arguments [i], parameters [i], byReference-> references [i]);
-//                 context.verifyMemoryOwner (parameters [i].loc, arguments [i], ch, construct-> true, byReference-> references [i], byLazy-> lazys [i]);
-//                 values ~= [ch];
-
-//                 if (ch is parameters [i] || ch of ReferencerValue) {
-//                     score += Scores::TYPE_NO_CHANGE;
-//                 } else score += Scores::TYPE;
-
-//                 if (references [i]) {
-//                     score += Scores::MUT;
-//                 }
-
-//                 score += ch.getType ().maxMutabilityDistance () - ch.getType ().mutabilityDistance (arguments [i]);
-//             } catch {
-//                 err: &ErrorMsg => {
-//                     errors ~= [err];
-//                 }
-//             }
-//         }
-
-//         if (errors.len != 0us) throw copy ErrorMsg::list (errors);
-//         (values, score)
-//     }
-
-
-//     /**
-//      * Validate the type of the parameters
-//      * @params:
-//      *   - context: the context of the validation
-//      *   - loc: the location of the call
-//      *   - arguments: the list of arguments of the prototype
-//      *   - parameters: the list of parameters passed to the prototype
-//      *   - verifType: verify the equality of the types
-//      *   - verifMemory: verify that the memory const, alias, etc are respected
-//      *   - isLambda: the prototype is a lambda prototype
-//      * @returns:
-//      *   - .0: the list of types of the parameters
-//      *   - .1: the score of the call
-//      */
-//     fn validateTypeParameterList (self, dmut context: &ValidationContext, loc: &Word, arguments: [&ProtoVarValue], parameters: [&Value], verifType: bool = true, verifMemory: bool = true, isLambda: bool = false)-> ([&Type], [&Value], u32)
-//         throws ErrorMsg
-//     {
-//         let mut types: [&Type] = [];
-//         let mut values: [&Value] = [];
-//         let mut errors: [&ErrorMsg] = [];
-//         let mut score = 0u32;
-
-//         for i in 0us .. arguments.len {
-//             let argType = arguments[i].getType ();
-
-//             if (isLambda && argType of NoneType) {
-//                 types ~= [parameters [i].getType ().clone (0u32)];
-//             } else {
-//                 {
-//                     let ch = if (verifType) {
-//                         context:.verifyCompatibleTypeWithValue (parameters [i].loc, argType, parameters [i], byReference-> arguments [i].isReference ())
-//                     } else {
-//                         parameters [i]
-//                     }
-
-//                     if (verifMemory) {
-//                         context.verifyMemoryOwner (parameters [i].loc, argType, ch, construct-> true, byReference-> arguments [i].isReference (), byLazy-> arguments[i].isLazy ());
-//                     }
-
-//                     values ~= [ch];
-
-//                     if (ch is parameters [i] || ch of ReferencerValue) {
-//                         score += Scores::TYPE_NO_CHANGE;
-//                     } else score += Scores::TYPE;
-
-//                     if (arguments [i].isReference ()) {
-//                         score += Scores::MUT;
-//                     }
-
-//                     score += ch.getType ().maxMutabilityDistance () - ch.getType ().mutabilityDistance (argType);
-//                 } catch {
-//                     err: &ErrorMsg => {
-//                         errors ~= [err.withNote (copy [copy ErrorMsg::note (loc, format (ValidateErrorMessage::PARAMETER_NAME, arguments [i]), oneLine-> true)])];
-//                     }
-//                 }
-//             }
-//         }
-
-//         if (errors.len != 0us) throw copy ErrorMsg::list (errors);
-//         (types, values, score)
-//     }
-
-//     /*!
-//      * ====================================================================================================
-//      * ====================================================================================================
-//      * ================================          PARAMETER ORDER          =================================
-//      * ====================================================================================================
-//      * ====================================================================================================
-//      */
-
-//     /**
-//      * Sort the parameter passed to the prototype according to the arguments list
-//      * @params:
-//      *   - arguments: the list of parameters of the prototype
-//      *   - parameters: the list of values passed to the call
-//      *   - nbNamed: the number of named parameters in the parameter list (assuming they are placed at the beginning of the slice)
-//      *   - isVariadic: true iif the number of parameter can be higher than the number of arguments
-//      * @returns:
-//      *   - .0: the list of parameters (in the correct order)
-//      *   - .1: the list of parameters that are associated to no arguments (in the correct order), @info: named parameters cannot be in this list
-//      * @throws:
-//      *   - &ErrorMsg: if the parameters don't fit for the argument list
-//      */
-//     fn validateParameterListSort (self, loc: &Word, arguments: [&ProtoVarValue], parameters: [&Value], nbNamed: usize, isVariadic: bool = false)-> ([&Value], [&Value])
-//         throws ErrorMsg
-//     {
-//         let mut result: [mut &Value] = copy [UNIT_VALUE ; arguments.len];
-//         let mut errors: [&ErrorMsg] = [];
-//         for i in 0us .. nbNamed {
-//             let index = self.findNamedParameter (arguments, parameters [i].asOf!{&NamedValue} ());
-//             match result [index] {
-//                 UnitValue () => { result [index] = parameters [i].asOf!{&NamedValue} ().getValue (); }
-//                 ot: _ => {
-//                     errors ~= [copy ErrorMsg::fatal (parameters [i].loc,
-//                                                      end-> ot.loc,
-//                                                      format (ValidateErrorMessage::MULTIPLE_NAMED_PARAM, parameters [i].asOf!{&NamedValue} ().getName ()))];
-//                 }
-//             }
-//         }
-
-//         if (errors.len != 0us) throw copy ErrorMsg::list (errors);
-//         let indexes = self.constructRestArguments (arguments, alias result);
-
-//         // Count the number of values that will be consumed by the arguments that are unset
-//         let mut needing = 0us;
-//         for i in indexes {
-//             needing += cast!usize (arguments [i].getNbConsume ());
-//         }
-
-//         // Needing must be exactly parameters.len if this is not variadic
-//         // Otherwise it (needing) can be lower than parameters.len
-//         if (needing > (parameters.len - nbNamed)) || (!isVariadic && needing < (parameters.len - nbNamed)) {
-//             needing += (arguments.len - indexes.len);
-//             throw copy ErrorMsg::fatal (loc, self.formatTooFew (parameters.len, needing));
-//         }
-
-//         let mut paramIndex = nbNamed;
-//         for i in indexes {
-//             if arguments [i].getNbConsume () == 1us {
-//                 result [i] = parameters [paramIndex];
-//                 paramIndex += 1us;
-//             } else {
-//                 let mut tuValues: [mut &Value] = copy [UNIT_VALUE ; arguments [i].getNbConsume ()];
-//                 let mut tuTypes: [mut &Type] = copy [NONE_TYPE ; arguments [i].getNbConsume ()];
-//                 for j in 0us .. tuValues.len {
-//                     tuValues [j] = parameters [paramIndex + j];
-//                     tuTypes [j] = parameters [paramIndex + j].getType ();
-//                 }
-
-//                 let tu = copy TupleValue (parameters [paramIndex].loc, copy TupleType (parameters [paramIndex].loc, tuTypes), tuValues);
-//                 result [i] = tu;
-//                 paramIndex += tuValues.len;
-//             }
-//         }
-
-//         (result, parameters [paramIndex .. $])
-//     }
-
-
-//     /**
-//      * Construct the set of arguments that have no value yet
-//      * @info: for parameters with a default value, put it in sets, and does not return it
-//      * @returns:
-//      *    - sets: the actualized list of already set values
-//      *    - .0: the indexes of the protovar values that have no associated value
-//      * */
-//     fn constructRestArguments (self, arguments: [&ProtoVarValue], mut sets: [mut &Value])-> [usize] {
-//         let mut unsetLocs: [usize] = [];
-//         for i, v in sets match v {
-//             UnitValue () => {
-//                 if (arguments [i].getDefaultValue () !of UnitValue) {
-//                     sets [i] = arguments [i].getDefaultValue ();
-//                 } else {
-//                     unsetLocs ~= [i];
-//                 }
-//             }
-//         }
-
-//         unsetLocs
-//     }
-
-//     /**
-//      * Find the index of the prototype var associated with the value parameter
-//      * @params:
-//      *    - arguments: the list of protovar arguments
-//      *    - value: the value passed as a parameter
-//      * @returns: the index of the protovar
-//      * @throws:
-//      *    - &ErrorMsg: if there is no protovar with the correct name
-//      * */
-//     fn findNamedParameter (self, arguments: [&ProtoVarValue], value: &NamedValue)-> usize
-//         throws ErrorMsg
-//     {
-//         for i, v in arguments {
-//             if v.getName () == value.getName () {
-//                 return i;
-//             }
-//         }
-
-//         throw copy ErrorMsg::fatal (value.loc, format (ValidateErrorMessage::NO_PARAMETER_NAMED, value.getName ()));
-//     }
-
-//     /**
-//      * Throw an error message for the unkown named parameters
-//      * @params:
-//      *   - parameters: the list of named parameters (assuming that it only contains NamedValue)
-//      * */
-//     fn throwUnknwonNamed (self, parameters: [&Value])
-//         throws ErrorMsg
-//     {
-//         let mut res: [&ErrorMsg] = [];
-//         for it in parameters match it {
-//             n: &NamedValue => {
-//                 res ~= [copy ErrorMsg::fatal (it.loc, format (ValidateErrorMessage::NO_PARAMETER_NAMED, n.getName ()))];
-//             }
-//             _ => panic;
-//         }
-
-//         throw copy ErrorMsg::list (res);
-//     }
-
-
-//     /*!
-//      * ====================================================================================================
-//      * ====================================================================================================
-//      * ======================================          MISC          ======================================
-//      * ====================================================================================================
-//      * ====================================================================================================
-//      */
-
-//     /**
-//      * Transform a value into a printable string, with correct debug informations
-//      * @params:
-//      *    - v: the value
-//      * @returns: a string, that can be put in an error message
-//      */
-//     pub fn prettyName (self, v: &Value)-> [c8] {
-//         match v {
-//             m: &MultSymValue => {
-//                 if (m.getValues ().len == 1us) return self.prettyName (m.getValues ()[0]);
-//             }
-//             vdecl: &VarDeclValue => {
-//                 match vdecl.getVarType () {
-//                     LambdaType () => {
-//                         return format ("%", vdecl.getValue (), tags-> FormatTags (withParams-> true));
-//                     }
-//                 }
-//             }
-//             vref: &VarRefValue => {
-//                 match vref.getType () {
-//                     LambdaType () => {
-//                         return self.prettyName (vref.getValue ());
-//                     }
-//                     _ => {
-//                         return format ("%: %", v, v.getType ());
-//                     }
-//                 }
-//             }
-//             p: &NameDelegateValue => {
-//                 return format ("%", p, tags-> FormatTags (withParams-> true));
-//             }
-//             f: &FakeMethodDelegateValue => {
-//                 return format ("%", f, tags-> FormatTags (withParams-> true));
-//             }
-//             p: &ProtoFuncPtrValue => {
-//                 return format ("%", p.getType (), tags-> FormatTags (withParams-> true))
-//             }
-//             t: &TemplateRefValue => {
-//                 match t.getSymbol ().getContent ().getContent () {
-//                     f: &FunctionDecl => {
-//                         return format ("% %%",
-//                                        t.getSymbol ().getPath ().toStr (),
-//                                        t.getSymbol ().getContent ().getParameters (),
-//                                        f.getFunctionProto ());
-//                     }
-//                 }
-//             }
-//             t: &MethodDelegateTemplateValue => {
-//                 return format ("%", t.getPrototype (), tags-> FormatTags (withParams-> true));
-//             }
-//             c: &CallValue => {
-//                 return format ("%", c.getType (), tags-> FormatTags (withParams-> true));
-//             }
-//             c: &MethodCallValue => {
-//                 return format ("%", c.getType (), tags-> FormatTags (withParams-> true));
-//             }
-//             m: &ModuleRefValue => {
-//                 return format ("mod %", m, tags-> FormatTags (withParams-> true));
-//             }
-//             lmbd: &LambdaValue => {
-//                 let dmut str = copy StringStream ();
-//                 for i, j in lmbd.getParameters () {
-//                     if (i != 0us) str:.write (", ");
-//                     str:.write (format ("%", j));
-//                 }
-//                 return format ("lambda |%|", str[]);
-//             }
-//         }
-
-//         format ("%", v, tags-> FormatTags (withParams-> true))
-//     }
-
-//     /**
-//      * Transform right operands values, into printable string with value and types
-//      * @params:
-//      *     - v: the values to transform
-//      * */
-//     pub fn formatParamsWithTypes (self, v: [&Value])-> [c8] {
-//         let dmut stream = copy Formatter ();
-//         stream:.write ('{');
-//         for i, j in v {
-//             if (i != 0us) stream:.write (", ");
-//             stream:.write (format ("%(y): %(y)", j, j.getType (), tags-> FormatTags (forParams-> true)));
-//         }
-//         stream:.write ('}');
-
-//         stream[]
-//     }
-
-//     /**
-//      * Create the error message saying that too few or too many parameters are provided to the function
-//      * @params:
-//      *    - provided: the number of parameters provided to the call
-//      *    - expected: the number of parameters expected by the call
-//      * @returns: the error message correctly conjugated
-//      * */
-//     fn formatTooFew (self, provided: usize, expected: usize)-> [c8] {
-//         let isOrP = if (provided == 1us) { "is" } else { "are" };
-//         let isOrE = if (expected == 1us) { "is" } else { "are" };
-
-//         format (ValidateErrorMessage::TOO_FEW_PARAMETERS, expected, isOrE, provided, isOrP)
-//     }
-
-// }
-
 
