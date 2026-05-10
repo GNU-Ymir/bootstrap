@@ -1,0 +1,265 @@
+/*
+ * Implements semantic validation for the unary address-of operator `&` in Ymir.
+ *
+ * <hr>
+ * 
+ * @Package: ymirc        
+ * @Module: and
+ * @File: and.yr
+ * @Author(s):
+ *   - fatal: not a git repository (or any of the parent directories): .git
+ *
+ * @Created (YYYY-MM-DD): fatal: not a git repository (or any of the parent directories): .git
+ * @Copyright (C) 2021–2026 GNU-Ymir
+ * @License
+ *   ```text
+ *   This file is part of the Ymir language project.
+ *
+ *   Ymir is free software: you can redistribute it and/or modify it
+ *   under the terms of the GNU General Public License as published by
+ *   the Free Software Foundation, either version 3 of the License, or
+ *   (at your option) any later version.
+ *
+ *   Ymir is distributed in the hope that it will be useful,
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *   GNU General Public License for more details.
+ *
+ *   You should have received a copy of the GNU General Public License
+ *   along with Ymir.  If not, see <https://www.gnu.org/licenses/>.
+ *   ```
+ */
+
+in and;
+
+use ymirc::lexing::{word, keys};
+use ymirc::syntax::expression::operator;
+use ymirc::semantic::validator;
+use ymirc::semantic::generator::{value::_, type::_};
+
+use ymirc::errors::message;
+use ymirc::utils::format;
+
+/**
+ * UnaryAndValidation
+ *
+ * Provides semantic validation for the unary address-of operator:
+ *
+ *      &value
+ *
+ * Supports:
+ *   - Taking the address of a normal value.
+ *   - Taking the address of a method delegate (method → function pointer).
+ *   - Taking the address of a function prototype (proto → function pointer).
+ *
+ * This module:
+ *   - Validates operand semantics and move rules.
+ *   - Handles special rules for method delegates (throwers, unsafe, struct closures).
+ *   - Handles prototype conversion to ProtoFuncPtrValue.
+ *   - Constructs AddressValue for normal values.
+ *
+ */
+pub mod UnaryAndValidation {
+
+    /**
+     * Validate a unary address-of expression.
+     *
+     * @params:
+     *   - context: validation context
+     *   - op:      unary expression containing the operand
+     *
+     * @returns:
+     *   A &Value representing the result of the address-of operation.
+     *
+     * @throws:
+     *   ErrorMsg if the operand cannot be addressed or violates rules for
+     *   method delegates or prototypes.
+     */
+    pub fn validate (dmut context: &ValidationContext, op: &UnaryExpr)-> &Value
+        throws ErrorMsg
+    {
+        let value = {
+            context:.enterCall (op);
+            ValueValidation::validate(alias context, op.value, noReduce-> true)
+        } exit {
+            context:.exitCall ();
+        };
+
+        if let m: &MethodDelegateValue = value {
+            return UnaryAndValidation::validateFromMethodDg (alias context, op.loc, m, op);
+        }
+
+        if let p: &PrototypeValue = value {
+            return UnaryAndValidation::validateFromProto (op.loc, p);
+        }
+        
+        return UnaryAndValidation::validateAddress (op.loc, value);        
+    }
+
+    /**
+     * Validate address-of on a normal value.
+     *
+     * Behavior:
+     *   - Verifies move/borrow rules for taking the address of a value.
+     *   - Determines whether the pointed type must be cloned (immutability rules).
+     *   - Constructs a mutable PointerType to the operand.
+     *   - Returns an AddressValue referencing the operand.
+     *
+     * @params:
+     *   - loc:   operator location
+     *   - value: operand value
+     *
+     * @returns:
+     *   A &Value representing the pointer to the operand.
+     *
+     * @throws:
+     *   ErrorMsg if the operand cannot be moved or borrowed.
+     */
+    fn validateAddress (loc: &Word, value: &Value)-> &Value
+        throws ErrorMsg
+    {
+        MemoryVerification::verifyLeftOperandMove (loc, value,
+                                                   allowImmutable-> true,
+                                                   allowSelf-> true);
+
+        let innerType = if MemoryVerification::checkLeftOperandMove (value,
+                                                                     allowImmutable-> false,
+                                                                     allowSelf-> true)
+        {
+            value.type
+        } else {
+            value.type.clone (0)
+        };
+
+        let ptr = copy PointerType (loc, innerType, isMutable-> true);
+        return copy AddressValue (loc, ptr, value);
+    }
+
+    /**
+     * Validate address-of on a method delegate.
+     *
+     * Behavior:
+     *   - Rejects taking the address of an already-addressed method delegate.
+     *   - Rejects method delegates whose prototypes:
+     *        • declare throwers
+     *        • are unsafe
+     *   - Rejects method delegates whose closure entity is movable.
+     *   - Applies struct-specific rules:
+     *        • Taking &method on a struct requires being inside a copy expression.
+     *        • Deep-copy contexts forbid this operation.
+     *   - Produces a clone of the method delegate marked as addressed.
+     *
+     * @params:
+     *   - context: validation context
+     *   - loc:     operator location
+     *   - m:       method delegate value
+    - un:      unary expression (used for copy/deep-copy checks)
+     *
+     * @returns:
+     *   A &Value representing the addressed method delegate.
+     *
+     * @throws:
+     *   ErrorMsg if any of the above constraints are violated.
+     */
+    fn validateFromMethodDg(dmut context: &ValidationContext, loc: &Word, m: &MethodDelegateValue, un: &UnaryExpr)-> &Value
+        throws ErrorMsg
+    {
+        if m.isAddressed {
+            throw copy ErrorMsg::fatal (m.addressLoc, format (ValidateErrorMessage::UNECESSARY_ADDRESS_METHOD));
+        }
+
+        if m.proto.throwers.len != 0 {
+            let notes = copy [copy ErrorMsg::note (i.loc, format (ValidateErrorMessage::THROWING, i.type))
+                              for i in m.proto.throwers];
+
+            throw copy ErrorMsg::fatal (loc, format (ValidateErrorMessage::FUNCTION_TO_FPTR_THROWING, m,
+                                                     tags-> FormatTags (withParams-> true)),
+                                        notes-> notes);
+        }
+
+        if m.proto.isUnsafe {
+            throw copy ErrorMsg::fatal (loc, format (ValidateErrorMessage::FUNCTION_TO_FPTR_UNSAFE, m,
+                                                     tags-> FormatTags (withParams-> true)));
+        }
+
+        if m.closure.type.isMovable {
+            throw copy ErrorMsg::fatal (loc, format (ValidateErrorMessage::FUNCTION_TO_FPTR_ENTITY));
+        }
+
+        if m.isStruct {
+            if (!context.isInCopy (un)) {
+                throw copy ErrorMsg::fatal (loc, format (ValidateErrorMessage::FUNCTION_TO_FPTR_RECORD),
+                                            notes-> copy [copy ErrorMsg::note (loc, format (ValidateErrorMessage::ENCLOSE_COPY_LST),
+                                                                               oneLine-> true)]);
+                
+            }
+
+            if (context.isInDeepCopy ()) {
+                throw copy ErrorMsg::fatal (loc, format (ValidateErrorMessage::FUNCTION_TO_FPTR_RECORD_DCOPY),
+                                            notes-> copy [copy ErrorMsg::note (context.getCopyExpr ().loc, format (ValidateErrorMessage::SIMPLE_COPY_DCOPY_REPLACE))]);
+            }            
+        }
+
+        return m.cloneAsAddressed (loc);        
+    }
+
+    /**
+     * Validate address-of on a function prototype.
+     *
+     * Behavior:
+     *   - Only function prototypes may be converted to function pointers.
+     *     Constructors, destructors, methods, and name prototypes are rejected.
+     *   - Rejects prototypes that:
+     *        • declare throwers
+     *        • are unsafe
+     *   - Extracts parameter types, reference flags, lazy flags, and return type.
+     *   - Constructs a ProtoFuncPtrValue representing the function pointer.
+     *
+     * @params:
+     *   - loc:   operator location
+     *   - proto: prototype value
+     *
+     * @returns:
+     *   A &Value representing the function pointer.
+     *
+     * @throws:
+     *   ErrorMsg if the prototype is not a function or violates safety rules.
+     */
+    fn validateFromProto(loc: &Word, proto: &PrototypeValue)-> &Value
+        throws ErrorMsg
+    {
+        let isFunc = match proto {
+            CtorPrototypeValue () => { false }
+            DtorPrototypeValue () => { false }
+            MethodPrototypeValue () => { false }
+            NamePrototypeValue () => { false }
+            _ => { true }
+        };
+
+        if !isFunc {
+            throw copy ErrorMsg::fatal (loc, format (ValidateErrorMessage::UNDEFINED_UN_OP, loc.str, proto,
+                                                     tags-> FormatTags (withParams-> true)));            
+        }
+
+        if proto.throwers.len != 0 {
+            let notes = copy [copy ErrorMsg::note (i.loc, format (ValidateErrorMessage::THROWING, i.type))
+                              for i in proto.throwers];
+            
+            throw copy ErrorMsg::fatal (loc, format (ValidateErrorMessage::FUNCTION_TO_FPTR_THROWING, proto,
+                                                     tags-> FormatTags (withParams-> true)),
+                                        notes-> notes);
+        }
+
+        if proto.isUnsafe {
+            throw copy ErrorMsg::fatal (loc, format (ValidateErrorMessage::FUNCTION_TO_FPTR_UNSAFE, proto,
+                                                     tags-> FormatTags (withParams-> true)));
+        }
+
+        let types = copy [v.type for v in proto.params];
+        let references = copy [v.isReference for v in proto.params];
+        let lazys = copy [v.isLazy for v in proto.params];
+        let retType = proto.retType;
+
+        return copy ProtoFuncPtrValue (loc, proto, references, lazys, types, retType);
+    }
+}
