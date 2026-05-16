@@ -1,0 +1,348 @@
+/*
+ * Implements semantic validation for range list comprehensions.
+ *
+ * This module handles:
+ *   - validating iterator variables for range iteration,
+ *   - supporting both list-mode and tuple-mode comprehensions,
+ *   - computing compile-time iteration counts using RangeInterpret,
+ *   - constructing LoopValue structures for dynamic list comprehensions,
+ *   - constructing TupleValue results for tuple-mode comprehensions,
+ *   - propagating copy-mode and mutability rules.
+ *
+ * Range list comprehensions iterate over integer sequences defined by(fst,
+ * scd, step, contains) and support both dynamic and compile-time evaluation
+ * paths.
+ *
+ * <hr>
+ *
+ * @Package: ymirc
+ * @Module: ymirc::semantic::validator::value::compose::slicefor::range
+ * @File: ymirc/semantic/validator/value/compose/slicefor/range.yr
+ * @Author(s):
+ *   - Emile Cadorel <ecadorel@gmail.com>
+ *
+ * @Created(YYYY-MM-DD): 2026-05-16
+ * @Copyright(C) 2021–2026 GNU-Ymir
+ * @License
+ *   ```text
+ *   This file is part of the Ymir language project.
+ *
+ *   Ymir is free software: you can redistribute it and/or modify it
+ *   under the terms of the GNU General Public License as published by
+ *   the Free Software Foundation, either version 3 of the License, or
+ *   (at your option) any later version.
+ *
+ *   Ymir is distributed in the hope that it will be useful,
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *   GNU General Public License for more details.
+ *
+ *   You should have received a copy of the GNU General Public License
+ *   along with Ymir.  If not, see <https://www.gnu.org/licenses/>.
+ *   ```
+ */
+
+in range;
+
+use ymirc::lexing::{keys, word};
+
+use ymirc::syntax::expression::_;
+use ymirc::semantic::{validator, interpret};
+
+use ymirc::errors::_;
+use ymirc::semantic::generator::{value::_, type::_};
+
+use ymirc::utils::{format, bigint};
+
+/**
+ * RangeListComprValidation module
+ *
+ * Provides semantic validation for list comprehensions applied to ranges.
+ * Range comprehensions support:
+ *
+ *   - list-mode: dynamic or static allocation depending on literal usage,
+ *   - tuple-mode: compile-time iteration producing a TupleValue.
+ *
+ * Responsibilities:
+ *   - validate iterator variables for range iteration,
+ *   - compute iteration counts using RangeInterpret::reduceLen,
+ *   - construct LoopValue structures for list-mode,
+ *   - construct TupleValue results for tuple-mode,
+ *   - propagate copy-mode semantics and detect invalid configurations.
+ */
+pub mod RangeListComprValidation {
+
+    /**
+     * Validate a list comprehension applied to a range.
+     *
+     * Ensures that exactly one iterator variable is provided, enters a new
+     * block scope, and dispatches to either list-mode or tuple-mode handlers.
+     * Errors raised inside the comprehension body are captured and re-thrown
+     * after block cleanup.
+     *
+     * @params:
+     *   - context:    validation context
+     *   - range:      the range value being iterated
+     *   - rangeType:  the type of the range
+     *   - floop:      the SliceForAllocatorExpr describing the comprehension
+     *   - inCopy:     whether the comprehension is evaluated in copy-mode
+     *
+     * @returns:
+     *   - the resulting comprehension value
+     *
+     * @throws:
+     *   - ErrorMsg if the number of iterator variables is invalid
+     *   - ErrorMsg if validation fails inside the comprehension
+     */
+    pub fn validate(dmut context: &ValidationContext,
+                    range:        &Value,
+                    rangeType:    &RangeType,
+                    floop:        &SliceForAllocatorExpr,
+                    inCopy:       bool)-> &Value
+        throws ErrorMsg
+    {
+        if floop.vars.len != 1 {
+            throw copy ErrorMsg::fatal(floop.loc, format(ValidateErrorMessage::UNDEF_FOR_LOOP_OPERATOR, floop.vars.len, rangeType));
+        }
+
+        inCopy;
+        let mut errors: (&ErrorMsg)? = none;
+        context:.enterBlock();
+        let result = {
+            if floop.isTuple {
+                RangeListComprValidation::validateInnerForTuple(alias context, range, rangeType, floop)
+            } else {
+                RangeListComprValidation::validateInnerForList(alias context, range, rangeType, floop,
+                                                               inCopy-> inCopy)
+            }
+        } catch {
+            err => {
+                errors = (err)?;
+                UNIT_VALUE
+            }
+        };
+
+        {
+            context:.quitBlock(warnUnused-> !(errors.hasValue));
+        } catch {
+            err => {
+                errors = (err)?;
+            }
+        }
+
+        if let Ok(err) = errors {
+            throw err;
+        }
+
+        return result;
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ======================================          LIST          ======================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Validate a list-mode comprehension over a range.
+     *
+     * @params:
+     *   - context:      validation context
+     *   - range:        the range value
+     *   - rangeType:    the range type
+     *   - floop:        comprehension expression
+     *   - inCopy:       copy-mode flag
+     *
+     * @returns:
+     *   - the resulting list comprehension value
+     *
+     * @throws:
+     *   - ErrorMsg if allocation or loop construction fails
+     */
+    fn validateInnerForList(dmut context: &ValidationContext,
+                            range:        &Value,
+                            rangeType:    &RangeType,
+                            floop:        &SliceForAllocatorExpr,
+                            inCopy:       bool)-> &Value
+        throws ErrorMsg
+    {
+        let loc = floop.loc;
+        let (fst, scd, step, contains) = ValueCreation::createRangeUnwrap(range, rangeType, reduce-> true);
+        let nbIteration = RangeInterpret::reduceLen(alias context.cteInterpret, loc, fst, scd, step, contains);
+
+        if !inCopy {
+            SliceForComposeValidation::computeCteLen(alias context, floop.iter.loc, nbIteration,
+                                                     fromType-> rangeType,
+                                                     forTuple-> false);
+        }
+
+        let (lp, resultRef, resultDecl, resultType, withoutLoop) = {
+            RangeListComprValidation::validateInnerLoopForList(alias context, loc, rangeType, floop, fst, step, nbIteration,
+                                                               inCopy-> inCopy)
+        };
+
+        if withoutLoop {
+            return lp;
+        }
+
+        let values = copy [resultDecl, lp, resultRef];
+        let innerBlk = copy ListComprValue(loc, resultType, copy BlockValue(loc, resultType, values));
+        if inCopy {
+            return copy CopierValue(loc, resultType, innerBlk, isDone-> true);
+        }
+
+        return innerBlk;
+    }
+
+    /**
+     * Build the loop structure for a list-mode range comprehension.
+     *
+     * Constructs the full loop using:
+     *   - an iteration counter,
+     *   - a precomputed iteration count,
+     *   - RangeForLoopValidation::validateIteratorVar for the user iterator,
+     *   - RangeForLoopValidation::validateIncrement for index/step logic,
+     *   - SliceForComposeValidation::validateResultValueDecl for result allocation.
+     *
+     * Steps:
+     *   1. Declare nbIter and iter variables.
+     *   2. Bind iterator variables for the user-provided identifier.
+     *   3. Validate the inner expression and infer its type.
+     *   4. Build the loop body: index update, assignment, increment.
+     *   5. Construct the LoopValue and wrap it in a BlockValue.
+     *
+     * @params:
+     *   - context:      validation context
+     *   - loc:          source location
+     *   - rangeType:    the range type
+     *   - floop:        comprehension expression
+     *   - fst:          first element of the range
+     *   - step:         step value of the range
+     *   - nbIteration:  number of iterations
+     *   - inCopy:       copy-mode flag
+     *
+     * @returns:
+     *   - (loopBlock, resultRef, resultDecl, resultType, withoutLoop)
+     *
+     * @throws:
+     *   - ErrorMsg if iterator validation or loop construction fails
+     */
+    fn validateInnerLoopForList(dmut context: &ValidationContext,
+                                loc: &Word,
+                                rangeType: &RangeType,
+                                floop: &SliceForAllocatorExpr,
+                                fst: &Value,
+                                step: &Value,
+                                nbIteration: &Value,
+                                inCopy: bool)-> (&Value, &Value, &Value, &Type, bool)
+        throws ErrorMsg
+    {
+        let nbIterDecl = copy VarDeclValue(loc.locate(ForLoopKeys::NB_ITER), USIZE_TYPE, nbIteration,
+                                           isMutable-> false);
+        let iterDecl = copy VarDeclValue(loc.locate(ForLoopKeys::ITER), USIZE_TYPE, copy IntValue(loc, USIZE_TYPE, 0),
+                                         isMutable-> true);
+
+        let iterVref = VariableCreation::createVarFromDecl(iterDecl, canCte-> false, isIterator-> true);
+        let nbIterVref = VariableCreation::createVarFromDecl(nbIterDecl, canCte-> true);
+
+        let (indexVref, indexDecl, _) = RangeForLoopValidation::validateIteratorVar(alias context, loc, rangeType, floop.vars[0]);
+
+        let innerValue = ValueValidation::validate(alias context, floop.value);
+        if innerValue.isFullLiteral {
+            let mut result: &Value = UNIT_VALUE;
+            if inCopy {
+                result = SliceComposeValidation::validateDynamicAlloc(alias context, loc, innerValue, nbIteration);
+            } else {
+                result = SliceComposeValidation::validateStaticAlloc(alias context, loc, innerValue, nbIteration);
+            }
+
+            return (result, UNIT_VALUE, UNIT_VALUE, VOID_TYPE, true);
+        }
+
+        let innerType = TypeInference::inferImplicitMutability(innerValue.type, innerValue);
+        let (increment, setIndex, test) = RangeForLoopValidation::validateIncrement(alias context, loc, iterVref, nbIterVref, indexVref, fst, step);
+        let (resultDecl, resultVRef, resultAccess, resultType) = {
+            SliceForComposeValidation::validateResultValueDecl(alias context, loc, innerType, indexVref, nbIteration,
+                                                               fromType-> rangeType,
+                                                               inCopy-> inCopy)
+        }
+
+        let set = copy AffectValue(loc, resultAccess.type, resultAccess, innerValue);
+        let blk = copy BlockValue(loc, VOID_TYPE, copy [setIndex, set, increment]);
+        let lp = copy LoopValue(loc, VOID_TYPE, test, blk);
+
+        let retLp = copy BlockValue(loc, VOID_TYPE, copy [indexDecl, lp]);
+
+        return (retLp, resultVRef, resultDecl, resultType, false);
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * =====================================          TUPLE          ======================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Validate a tuple-mode comprehension over a range.
+     *
+     * Performs compile-time iteration over the range length. For each index:
+     *   - computes the current value using fst + index * step,
+     *   - constructs a compile-time block for the comprehension body,
+     *   - validates the resulting expression,
+     *   - accumulates the value and inferred type into tuple buffers.
+     *
+     * Produces a new TupleValue with one element per iteration.
+     *
+     * @params:
+     *   - context:      validation context
+     *   - range:        the range value
+     *   - rangeType:    the range type
+     *   - floop:        comprehension expression
+     *
+     * @returns:
+     *   - the resulting TupleValue
+     *
+     * @throws:
+     *   - ErrorMsg if any iteration fails
+     */
+    fn validateInnerForTuple(dmut context: &ValidationContext,
+                             range:        &Value,
+                             rangeType:    &RangeType,
+                             floop:        &SliceForAllocatorExpr)-> &Value
+        throws ErrorMsg
+    {
+        let loc = floop.loc;
+        let mut values: [&Value] = [];
+        let mut types: [&Type] = [];
+
+        let (fst, scd, step, contains) = ValueCreation::createRangeUnwrap(range, rangeType, reduce-> true);
+        let nbIteration = RangeInterpret::reduceLen(alias context.cteInterpret, loc, fst, scd, step, contains);
+
+        let tabSize = SliceForComposeValidation::computeCteLen(alias context, loc, nbIteration,
+                                                               fromType-> rangeType,
+                                                               forTuple-> false);
+
+        let stepI = context.cteInterpret:.computeInt(step);
+        let fstI = context.cteInterpret:.computeInt(fst);
+
+        let mut index = copy BigInt(0);
+        while (index < tabSize) {
+            let current = copy IntValue(loc, rangeType.start, index * stepI + fstI);
+            let blkExpr = ForLoopValidation::createCurrentCteBlock(alias context, floop.value, rangeType,
+                                                                   copy [floop.vars[0]], copy [current]);
+
+            let innerValue = ValueValidation::validate(alias context, blkExpr);
+
+            TupleComposeValidation::addTupleType(innerValue, ref values, ref types);
+
+            index += 1;
+        }
+
+        let resultType = copy TupleType(loc, types, isMutable-> true);
+        return copy TupleValue(loc, resultType, values);
+    }
+}
