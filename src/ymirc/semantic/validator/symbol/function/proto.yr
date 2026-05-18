@@ -1,0 +1,440 @@
+/*
+ * Implements semantic validation for function prototypes.
+ *
+ * This module handles:
+ *   - validation of parameter declarations(types, mutability, decorators),
+ *   - validation of the `self` parameter for methods,
+ *   - validation of return types,
+ *   - extraction of attribute locations,
+ *   - construction of ProtoVarDeclValue entries for parameters,
+ *   - enforcement of reference/lazy/mutability rules,
+ *   - detection of invalid default values.
+ *
+ * <hr>
+ *
+ * @Package: ymirc
+ * @Module: ymirc::semantic::validator::symbol::function::proto
+ * @File: ymirc/semantic/validator/symbol/function/proto.yr
+ * @Author(s):
+ *   - Emile Cadorel <ecadorel@gmail.com>
+ *
+ * @Created(YYYY-MM-DD): 2026-05-18
+ * @Copyright(C) 2021–2026 GNU-Ymir
+ * @License
+ *   ```text
+ *   This file is part of the Ymir language project.
+ *
+ *   Ymir is free software: you can redistribute it and/or modify it
+ *   under the terms of the GNU General Public License as published by
+ *   the Free Software Foundation, either version 3 of the License, or
+ *   (at your option) any later version.
+ *
+ *   Ymir is distributed in the hope that it will be useful,
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *   GNU General Public License for more details.
+ *
+ *   You should have received a copy of the GNU General Public License
+ *   along with Ymir.  If not, see <https://www.gnu.org/licenses/>.
+ *   ```
+ */
+
+in proto;
+
+use ymirc::lexing::{word, tokens, keys};
+
+use ymirc::syntax::{declaration::_, expression::_};
+use ymirc::semantic::{symbol, validator};
+use ymirc::semantic::generator::{value::_, type::_};
+
+use ymirc::errors::_;
+use ymirc::utils::format;
+
+/**
+ * FunctionPrototypeValidation module
+ *
+ * Provides semantic validation for function prototypes, including:
+ *
+ *   - parameter type validation,
+ *   - parameter decorator validation(mut/ref/lazy),
+ *   - default-value validation and type inference,
+ *   - return type validation,
+ *   - method-specific handling of the `self` parameter,
+ *   - construction of ProtoVarDeclValue entries,
+ *   - error aggregation for multi-parameter validation.
+ *
+ * This module is used during prototype analysis before function bodies
+ * are validated.
+ */
+pub mod FunctionPrototypeValidation {
+
+    /**
+     * Retrieve the source location of a specific attribute from a list.
+     *
+     * Iterates through the attribute list and returns the location of the
+     * first attribute matching `which`. If not found, returns EOF_WORD.
+     *
+     * @params:
+     *   - attrs: list of AttributeWord entries
+     *   - which: attribute to search for
+     *
+     * @returns:
+     *   - the location of the attribute, or EOF_WORD if absent
+     */
+    pub fn getAttributeLoc(attrs: [AttributeWord], which: Attributes)-> &Word {
+        for it in attrs {
+            if (it.attr == which) {
+                return it.loc;
+            }
+        }
+
+        return EOF_WORD;
+    }
+
+    /**
+     * Validate the `self` parameter declaration for a method.
+     *
+     * Enforces the following rules:
+     *   - `self` cannot be declared `ref` or `lazy`,
+     *   - `self` cannot be declared `dmut`,
+     *   - mutability of `self` determines the mutability of the class instance,
+     *   - struct methods receive `self` by reference.
+     *
+     * Constructs a ProtoVarDeclValue representing the validated `self` parameter.
+     *
+     * @params:
+     *   - vdecl: VarDeclExpr for the `self` parameter
+     *   - cref:  ClassRefType of the enclosing class
+     *
+     * @returns:
+     *   - a ProtoVarDeclValue representing the validated `self` parameter
+     *
+     * @throws:
+     *   - ErrorMsg if invalid decorators are used on `self`
+     */
+    pub fn validateSelfParamDecl(vdecl: &VarDeclExpr, cref: &ClassRefType)-> &ProtoVarDeclValue
+        throws ErrorMsg
+    {
+        let isMutable = vdecl.isMutable;
+        if (!vdecl.isLazyOrRef.isEof) { // ref,lazy self has no meaning
+            throw copy ErrorMsg::fatal(vdecl.isLazyOrRef,
+                                       format(ValidateErrorMessage::UNDEF_DECORATOR_TYPE, vdecl.isLazyOrRef.str));
+        }
+
+        if (vdecl.isDeeplyMutable) { // dmut self neither
+            throw copy ErrorMsg::fatal(vdecl.isMutOrDmut,
+                                       format(ValidateErrorMessage::UNDEF_DECORATOR_TYPE, vdecl.isMutOrDmut.str));
+        }
+
+        return validateSelfParamDecl(vdecl.loc, cref, vdecl.isMutable);
+    }
+
+    /**
+     * Validate the `self` parameter declaration for a method or a ctor.
+     * Constructs a ProtoVarDeclValue representing the validated `self` parameter.
+     *
+     * @params:
+     *   - loc:   the location of the declaration
+     *   - cref:  ClassRefType of the enclosing class
+     *   - isMutable: true iff the self parameter is mutable(deeply mutable)
+     *
+     * @returns:
+     *   - a ProtoVarDeclValue representing the validated `self` parameter
+     */
+    pub fn validateSelfParamDecl(loc: &Word, cref: &ClassRefType, isMutable: bool)-> &ProtoVarDeclValue {
+        let clPtr = cref.createInstance(isMutable, isMutable); // mut in that case means dmut
+        return copy ProtoVarDeclValue(vdecl.loc, clPtr, UNIT_VALUE,
+                                      isMutable-> isMutable,
+                                      isReference-> cref.sym.isStruct,
+                                      isLazy-> false,
+                                      isSelf-> true,
+                                      nbConsume-> 1);
+    }
+
+    /**
+     * Validate a list of `throws` expressions and convert them into Thrower entries.
+     *
+     * This function ensures that each expression in the `throwers` list denotes
+     * a valid exception class. The validation rules are:
+     *
+     *   - The expression must resolve to a class type.
+     *   - The class must be an instance of, or derive from, the root exception type.
+     *   - Throwing a class *pointer* is illegal and always produces an error.
+     *   - Non-class types are rejected.
+     *
+     * @params:
+     *   - context:   validation context
+     *   - loc:       location of the `throws` clause
+     *   - throwers:  list of expressions appearing in the `throws` clause
+     *
+     * @returns:
+     *   - a list of Thrower entries, one for each valid exception type
+     *
+     * @throws:
+     *   - ErrorMsg::list if any throw expression is invalid
+     *     (invalid class, pointer thrown, non-exception class, etc.)
+     */
+    pub fn validateThrowers(dmut context: &ValidationContext,
+                            loc:          &Word,
+                            throwers:     [&Expression])-> [Thrower]
+        throws ErrorMsg
+    {
+        if (throwers.len == 0us) return [];
+
+        let mut errors: [&ErrorMsg] = [];
+        let mut rets: [Thrower] = [];
+        let exceptionType = TypeCreation::createExceptionType(alias context, loc-> loc);
+        let innerExc = exceptionType.inner;
+
+        for th in throwers {
+            {
+                let type = TypeValidation::validate(alias context, th);
+                match type {
+                    cptr: &ClassRefType => {
+                        if (TypeVerification::isAncestor(exceptionType, cptr) || TypeVerification::isDirectInstance(exceptionType, cptr)) {
+                            rets ~= [Thrower(th.loc, type)];
+                        } else {
+                            errors ~= [copy ErrorMsg::fatal(th.loc,
+                                                            end-> exceptionType.loc,
+                                                            format(ValidateErrorMessage::NOT_AN_EXCEPTION_CLASS, cptr, innerExc))];
+                        }
+                    }
+                    cptr: &ClassPtrType => {
+                        errors ~= [copy ErrorMsg::fatal(th.loc, format(ValidateErrorMessage::CLASS_THROW_PTR, type))];
+                        if (TypeVerification::isAncestor(exceptionType, cptr) || TypeVerification::isDirectInstance(exceptionType, cptr)) {
+                            rets ~= [Thrower(th.loc, type)];
+                        } else {
+                            errors ~= [copy ErrorMsg::fatal(th.loc,
+                                                            end-> exceptionType.loc,
+                                                            format(ValidateErrorMessage::NOT_AN_EXCEPTION_CLASS, cptr.inner, innerExc))];
+                        }
+                    }
+                    _ => {
+                        errors ~= [copy ErrorMsg::fatal(th.loc, format(ValidateErrorMessage::NOT_A_CLASS, type))];
+                    }
+                }
+            } catch {
+                err => {
+                    errors ~= [err];
+                }
+            }
+        }
+
+        if (errors.len != 0us) {
+            throw copy ErrorMsg::list(errors);
+        }
+
+        return rets;
+    }
+
+
+    /**
+     * Validate all parameters and the return type of a function prototype.
+     *
+     * @warning:
+     *    insert the declared variables in the current context
+     *
+     * @params:
+     *   - context:    validation context
+     *   - loc:        location of the function prototype
+     *   - sym:        function symbol
+     *   - proto:      the FunctionPrototype
+     *   - forMethod:  whether this is a method(skip `self` param)
+     *   - withValue:  whether default values should be validated
+     *
+     * @returns:
+     *   - (returnType, parameterList)
+     *
+     * @throws:
+     *   - ErrorMsg::list if any parameter or return type validation fails
+     */
+    pub fn validateParamsAndRetType(dmut context: &ValidationContext,
+                                   loc:          &Word,
+                                   sym:          &Symbol,
+                                   proto:        FunctionPrototype,
+                                   forMethod:    bool = false,
+                                   withValue:    bool = true)-> (&Type, [&ProtoVarDeclValue])
+        throws ErrorMsg
+    {
+        let mut errors: [&ErrorMsg] = [];
+
+        let withValue2 = (withValue && (sym !in context.functionContext));
+        context.functionContext:.insert(sym);
+        let resultParams = {
+            FunctionPrototypeValidation::validateParameters(alias context,
+                                                            proto,
+                                                            errors-> ref errors,
+                                                            forMethod-> forMethod,
+                                                            withValue-> withValue2)
+        } exit {
+            context.functionContext:.remove(sym);
+        }
+
+        let retType = FunctionPrototypeValidation::validateRetType(alias context, loc, proto,
+                                                                   errors-> ref errors);
+        if errors.len != 0 {
+            throw copy ErrorMsg::list(errors);
+        }
+
+        return (retType, resultParams);
+    }
+
+    /**
+     * Validate all parameter declarations of a function prototype.
+     *
+     * For each parameter:
+     *   - validate its type and decorators,
+     *   - validate its default value(if any),
+     *   - compute its consumption count(for tuple-typed parameters),
+     *   - construct a ProtoVarDeclValue,
+     *   - insert it into the local context.
+     *
+     * If `forMethod` is true, the first parameter(`self`) is skipped.
+     *
+     * Errors are collected and returned to the caller for aggregation.
+     *
+     * @params:
+     *   - context:    validation context
+     *   - proto:      the FunctionPrototype
+     *   - errors:     reference to an error accumulator
+     *   - forMethod:  whether this is a method
+     *   - withValue:  whether default values should be validated
+     *
+     * @returns:
+     *   - list of ProtoVarDeclValue entries
+     */
+    fn validateParameters(dmut context: &ValidationContext,
+                          proto:        FunctionPrototype,
+                          ref mut errors:   [&ErrorMsg],
+                          forMethod:    bool = false,
+                          withValue:    bool = true)-> [&ProtoVarDeclValue]
+    {
+
+        let mut resultParams: [&ProtoVarDeclValue] = [];
+
+        let mut params = proto.params;
+        if forMethod { // extract self param for methods
+            params = proto.params[1 .. $];
+        }
+
+        for param in params {
+            let (isMutable, isReference, isLazy, type, value) = FunctionPrototypeValidation::validateParamDecl(alias context, param,
+                                                                                                               withValue-> withValue);
+            let nbConsume = match param.type {
+                lst: &TypeListWrapperExpr => { cast!u32(lst.types.len) }
+                _ => 1u32
+            };
+
+            let paramGen = copy ProtoVarDeclValue(param.loc, type, value,
+                                                  isMutable-> isMutable,
+                                                  isReference-> isReference,
+                                                  isLazy-> isLazy,
+                                                  isSelf-> false,
+                                                  nbConsume-> nbConsume);
+            resultParams ~= [paramGen];
+            context:.insertLocal(paramGen.loc, paramGen.loc.str, paramGen);
+        } catch {
+            err => {
+                errors ~= [err];
+            }
+        }
+
+        return resultParams;
+    }
+
+    /**
+     * Validate a single parameter declaration.
+     *
+     * @params:
+     *   - context:    validation context
+     *   - vdecl:      parameter declaration expression
+     *   - withValue:  whether default values should be validated
+     *
+     * @returns:
+     *   - (isMutable, isReference, isLazy, type, defaultValue)
+     *
+     * @throws:
+     *   - ErrorMsg if type validation fails
+     *   - ErrorMsg if default value is invalid
+     */
+    fn validateParamDecl(dmut context: &ValidationContext,
+                         vdecl: &VarDeclExpr,
+                         withValue: bool = true)-> (bool, bool, bool, &Type, &Value)
+        throws ErrorMsg
+    {
+        let retType = {
+            TypeValidation::validateForVarDecl(alias context, vdecl.type, vdecl,
+                                               canBeRef-> true,
+                                               canBeLazy-> true)
+        } catch {
+            err => {
+                throw copy ErrorMsg::note(vdecl.loc, format(ValidateErrorMessage::VALIDATING),
+                                          notes-> copy [err]);
+            }
+        }
+
+        TypeVerification::verifyMutableParam(vdecl.isMutOrDmut, retType, vdecl.isRef);
+        TypeVerification::verifyNonVoid(vdecl.type.loc, retType, construct-> true);
+
+        let mut retValue: &Value = UNIT_VALUE;
+        if withValue && vdecl.value !of EmptyExpr {
+            if vdecl.isRef {
+                throw copy ErrorMsg::fatal(vdecl.name,
+                                           end-> vdecl.isLazyOrRef,
+                                           format(ValidateErrorMessage::DEFAULT_VAR_REF),
+                                           notes-> copy [copy ErrorMsg::note(vdecl.value.loc, "")]);
+            }
+
+            if (vdecl.name == Keys::UNDER) {
+                throw copy ErrorMsg::fatal(vdecl.name, format(ValidateErrorMessage::DEFAULT_VAR_NO_NAME),
+                                           notes-> copy [copy ErrorMsg::note(vdecl.value.loc, "")]);
+            }
+
+            let value = ValueValidation::validate(alias context, vdecl.value);
+            retValue = TypeInference::inferValueForType(alias context, vdecl.loc, value, retType,
+                                                        byReference-> false);
+        }
+
+        return (retType.isMutable, vdecl.isRef, vdecl.isLazy, retType, retValue);
+    }
+
+    /**
+     * Validate the return type of a function prototype.
+     *
+     * If no return type is specified, defaults to `void`. Otherwise:
+     *   - validate the type,
+     *   - ensure it is complete(no forward/incomplete types),
+     *   - append any errors to the provided error list.
+     *
+     * @params:
+     *   - context: validation context
+     *   - loc:     location of the return type
+     *   - proto:   the FunctionPrototype
+     *   - errors:  error accumulator
+     *
+     * @returns:
+     *   - the validated return type, or NONE_TYPE if validation failed
+     */
+    fn validateRetType(dmut context: &ValidationContext,
+                       loc: &Word,
+                       proto: FunctionPrototype,
+                       ref mut errors: [&ErrorMsg])-> &Type
+    {
+        {
+            let t = if proto.retType of EmptyExpr {
+                copy VoidType(loc)
+            } else {
+                TypeValidation::validate(alias context, proto.retType)
+            };
+
+            TypeVerification::verifyComplete(t.loc, t, construct-> false);
+            return t;
+        } catch {
+            err => {
+                errors ~= [err];
+            }
+        };
+
+        return NONE_TYPE;
+    }
+}
