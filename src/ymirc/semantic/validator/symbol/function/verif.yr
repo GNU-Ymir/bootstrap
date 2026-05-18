@@ -1,0 +1,464 @@
+/*
+ * Implements semantic verification for function and constructor prototypes.
+ *
+ * This module handles:
+ *   - detection of infinite constructor redirection,
+ *   - verification of allowed/forbidden attributes on functions, methods, and dtors,
+ *   - detection of function definition collisions,
+ *   - verification of declared vs. thrown exceptions,
+ *   - verification of the `main` function signature,
+ *   - structural comparison of function prototypes.
+ *
+ * <hr>
+ *
+ * @Package: ymirc
+ * @Module: ymirc::semantic::validator::symbol::function::verif
+ * @File: ymirc/semantic/validator/symbol/function/verif.yr
+ * @Author(s):
+ *   - Emile Cadorel <ecadorel@gmail.com>
+ *
+ * @Created(YYYY-MM-DD): 2026-05-18
+ * @Copyright(C) 2021–2026 GNU-Ymir
+ * @License
+ *   ```text
+ *   This file is part of the Ymir language project.
+ *
+ *   Ymir is free software: you can redistribute it and/or modify it
+ *   under the terms of the GNU General Public License as published by
+ *   the Free Software Foundation, either version 3 of the License, or
+ *   (at your option) any later version.
+ *
+ *   Ymir is distributed in the hope that it will be useful,
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *   GNU General Public License for more details.
+ *
+ *   You should have received a copy of the GNU General Public License
+ *   along with Ymir.  If not, see <https://www.gnu.org/licenses/>.
+ *   ```
+ */
+
+in verif;
+
+use ymirc::lexing::{word, tokens, keys};
+
+use ymirc::syntax::declaration::_;
+use ymirc::semantic::validator;
+use ymirc::semantic::symbol;
+use ymirc::semantic::generator::{value::_, type::_};
+
+use ymirc::errors::_;
+use ymirc::utils::format;
+
+/**
+ * FunctionVerification module
+ *
+ * Performs post-validation semantic checks on function and constructor
+ * prototypes. These checks ensure:
+ *
+ *   - attributes are valid for the kind of function(ctor, dtor, method),
+ *   - constructors do not infinitely redirect to each other,
+ *   - function definitions do not collide with existing ones,
+ *   - declared `throws` clauses match actual thrown exceptions,
+ *   - the `main` function has a valid signature.
+ *
+ */
+pub mod FunctionVerification {
+
+    /**
+     * Verify that a constructor does not infinitely redirect to itself.
+     *
+     * @params:
+     *   - ctor: constructor prototype to verify
+     *
+     * @throws:
+     *   - ErrorMsg if an infinite redirection cycle is detected
+     */
+    pub fn verifyCtorInfiniteRecursion(ctor: &CtorPrototypeValue)
+        throws ErrorMsg
+    {
+        let mut entered: [&Symbol => mut()] = copy [];
+        FunctionVerification::verifyInfiniteRecursionCtor(ctor, ref entered);
+    }
+
+    /**
+     * Verify that a function’s attributes are allowed for general functions.
+     *
+     * Allowed attributes:
+     *   - UNSAFE
+     *   - INLINE
+     *
+     * Any other attribute triggers an error.
+     *
+     * @params:
+     *   - attributes: list of AttributeWord entries
+     *
+     * @throws:
+     *   - ErrorMsg::list if any attribute is undefined
+     */
+    pub fn verifyUndefAttributesFunction(attributes: [AttributeWord])
+        throws ErrorMsg
+    {
+        let mut errors: [&ErrorMsg] = [];
+        for it in attributes match it.attr {
+            Attributes::UNSAFE => {}
+            Attributes::INLINE => {}
+            _ => {
+                errors ~= [copy ErrorMsg::fatal(it.loc, format(ValidateErrorMessage::UNDEFINED_ATTRIBUTE, it.attr))];
+            }
+        }
+
+        if (errors.len != 0us) {
+            throw copy ErrorMsg::list(errors);
+        }
+    }
+
+    /**
+     * Verify that a destructor has no attributes.
+     *
+     * All attributes are forbidden for destructors.
+     *
+     * @params:
+     *   - attributes: list of AttributeWord entries
+     *
+     * @throws:
+     *   - ErrorMsg::list if any attribute is present
+     */
+    pub fn verifyUndefAttributesDtor(attributes: [AttributeWord])
+        throws ErrorMsg
+    {
+        let mut errors: [&ErrorMsg] = [];
+        for it in attributes {
+            errors ~= [copy ErrorMsg::fatal(it.loc, format(ValidateErrorMessage::UNDEFINED_ATTRIBUTE, it.attr))];
+        }
+
+        if (errors.len != 0us) {
+            throw copy ErrorMsg::list(errors);
+        }
+    }
+
+    /**
+     * Verify that a method’s attributes are allowed.
+     *
+     * Allowed attributes:
+     *   - UNSAFE
+     *   - FINAL
+     *   - INLINE
+     *   - FIELD
+     *
+     * Any other attribute triggers an error.
+     *
+     * @params:
+     *   - attributes: list of AttributeWord entries
+     *
+     * @throws:
+     *   - ErrorMsg::list if any attribute is undefined
+     */
+    pub fn verifyUndefAttributesMethod(attributes: [AttributeWord])
+        throws ErrorMsg
+    {
+        let mut errors: [&ErrorMsg] = [];
+        for it in attributes match it.attr {
+            Attributes::UNSAFE => {}
+            Attributes::FINAL => {}
+            Attributes::INLINE => {}
+            Attributes::FIELD => {}
+            _ => {
+                errors ~= [copy ErrorMsg::fatal(it.loc, format(ValidateErrorMessage::UNDEFINED_ATTRIBUTE, it.attr))];
+            }
+        }
+
+        if (errors.len != 0us) {
+            throw copy ErrorMsg::list(errors);
+        }
+    }
+
+    /**
+     * Verify that a function definition does not collide with an existing one.
+     *
+     * A collision occurs when:
+     *   - another function with the same name exists in the same file,
+     *   - and its prototype is “similar” (same parameter types, mutability,
+     *     ref/lazy flags).
+     *
+     * @params:
+     *   - sym:       symbol representing the enclosing scope
+     *   - name:      function name
+     *   - prototype: prototype of the function being defined
+     *
+     * @throws:
+     *   - ErrorMsg if a colliding function definition is found
+     */
+    pub fn verifyFunctionCollision(sym: &Symbol, name: [c8], prototype: &PrototypeValue)
+        throws ErrorMsg
+    {
+        let dmut mayCollide = sym.referent.getLocalSymbols(name, protection-> Protection::PRIVATE);
+        for f in mayCollide[] if let iF: &FunctionSymbol = f {
+            if let p: &PrototypeValue = iF.frameProto && FunctionVerification::isFuncSimilar(p, prototype) {
+                throw copy ErrorMsg::fatal(p.loc,
+                                           end-> prototype.loc,
+                                           format(ValidateErrorMessage::COLLIDING_FUNCTION_DEFINITION, p, prototype,
+                                                  tags-> FormatTags(withParams-> true)));
+            }
+        }
+    }
+    /**
+     * Verify that thrown exceptions match the declared `throws` clause.
+     *
+     * @params:
+     *   - loc:      location of the function
+     *   - name:     function name
+     *   - thrown:   list of exceptions actually thrown
+     *   - expected: list of exceptions declared in the prototype
+     *
+     * @throws:
+     *   - ErrorMsg::list if mismatches exist
+     */
+    pub fn verifyThrowing(loc:          &Word,
+                          name:         &SymbolPath,
+                          thrown:       [Thrower],
+                          expected:     [Thrower])
+        throws ErrorMsg
+    {
+        let (notFound, unused) = FunctionVerification::listUnusedThrows(thrown, expected);
+        let mut lst: [&Type] = [];
+        let mut errors: [mut &ErrorMsg] = [];
+
+        for i in notFound {
+            let mut found = false;
+            for index, j in lst {
+                if i.type == j {
+                    found = true;
+                    errors[index] = errors[index].withNote(copy [copy ErrorMsg::note(i.loc, ""s8)]);
+                    break;
+                }
+            }
+
+            if (!found) {
+                errors ~= [copy ErrorMsg::fatal(loc, format(ValidateErrorMessage::THROWS_NOT_DECLARED, name.toStr(), i.type),
+                                                notes-> copy [copy ErrorMsg::note(i.loc, ""s8)])];
+                lst ~= [i.type];
+            }
+        }
+
+        for i in unused {
+            errors ~= [copy ErrorMsg::fatal(loc, format(ValidateErrorMessage::THROWS_NOT_USED, name.toStr(), i.type),
+                                            notes-> copy [copy ErrorMsg::note(i.loc, ""s8)])];
+        }
+
+        if (errors.len != 0us) {
+            throw copy ErrorMsg::list(errors);
+        }
+    }
+
+    /**
+     * Verify that the `main` function has a valid signature.
+     *
+     * Rules:
+     *   - at most one parameter,
+     *   - if one parameter exists, it must be UTF-8,
+     *   - return type must be void or compatible with i32.
+     *
+     * @params:
+     *   - loc:     location of the `main` function
+     *   - params:  list of parameter declarations
+     *   - retType: return type
+     *
+     * @throws:
+     *   - ErrorMsg::list if the signature is invalid
+     */
+    pub fn verifyMainPrototype(loc: &Word, params: [&ProtoVarDeclValue], retType: &Type)
+        throws ErrorMsg
+    {
+        let mut errors: [&ErrorMsg] = [];
+        if (params.len > 1us) {
+            errors ~= [copy ErrorMsg::fatal(params[1us].loc,
+                                            ValidateErrorMessage::MAIN_FUNCTION_ONE_ARG)];
+        }
+
+        if (params.len == 1us) {
+            TypeVerification::verifyCompatible(loc, params[0].loc, UTF8_TYPE, params[0].type);
+        } catch {
+            err => {
+                errors ~= [err];
+            }
+        }
+
+        if retType !of VoidType {
+            TypeVerification::verifyCompatible(loc, retType.loc, I32_TYPE, retType);
+        } catch {
+            err => {
+                errors ~= [err];
+            }
+        }
+
+        if (errors.len != 0us) {
+            throw copy ErrorMsg::list(errors);
+        }
+    }
+
+    /**
+     * Determine whether two function prototypes are “similar”.
+     *
+     * Two prototypes are similar if:
+     *   - they originate from the same file,
+     *   - they have the same number of parameters,
+     *   - each parameter has the same type,
+     *   - each parameter has the same mutability,
+     *   - each parameter has the same lazy/reference flags.
+     *
+     * @params:
+     *   - left:  first prototype
+     *   - right: second prototype
+     *
+     * @returns:
+     *   - true if the prototypes are similar
+     */
+    fn isFuncSimilar(left: &PrototypeValue, right: &PrototypeValue)-> bool {
+        if (left.sym.path.file != right.sym.path.file) {
+            return false;
+        }
+
+        if (left.params.len != right.params.len) {
+            return false;
+        }
+
+        for i in 0us .. left.params.len {
+            if (left.params[i].type != right.params[i].type) {
+                return false;
+            }
+
+            if (!left.params[i].type.sameMutability(right.params[i].type)) {
+                return false;
+            }
+
+            if (left.params[i].isLazy != right.params[i].isLazy) {
+                return false;
+            }
+
+            if (left.params[i].isReference != right.params[i].isReference) {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    /**
+     * Recursively verify that constructor redirection does not form a cycle.
+     *
+     * Tracks visited constructors in `entered`. If a constructor redirects to
+     * one already in the set, an infinite recursion error is raised.
+     *
+     * @params:
+     *   - ctor:    constructor prototype
+     *   - entered: map of visited constructor symbols
+     *
+     * @throws:
+     *   - ErrorMsg if a redirection cycle is detected
+     */
+    fn verifyInfiniteRecursionCtor(ctor: &CtorPrototypeValue, ref mut entered: [&Symbol => mut()])
+        throws ErrorMsg
+    {
+        entered[ctor.sym] = ();
+        {
+            let ctorSym = if let c: &CtorSymbol = ctor.sym {
+                c
+            } else {
+                return;
+            }
+
+            let redirect = if let r: &CtorCallValue = ctorSym.body {
+                r
+            } else {
+                return;
+            }
+
+            let redirectSym = if let r: &CtorSymbol = redirect.delegate.proto.sym {
+                r
+            } else {
+                return;
+            }
+
+            if (redirectSym in entered) {
+                throw copy ErrorMsg::fatal(redirect.loc,
+                                           format(ValidateErrorMessage::CTOR_INFINITE_REDIRECTION, redirect.delegate.proto,
+                                                  tags-> FormatTags(withParams-> true)));
+            }
+
+            if (redirectSym.hasRedirect) {
+                FunctionVerification::verifyInfiniteRecursionCtor(redirect.delegate.proto,
+                                                                  entered-> ref entered);
+            } catch {
+                err: &ErrorMsg => {
+                    throw copy ErrorMsg::fatal(redirect.loc,
+                                               format(ValidateErrorMessage::CTOR_INFINITE_REDIRECTION, redirect.delegate.proto,
+                                                      tags-> FormatTags(withParams-> true)),
+                                               notes-> copy [err]);
+                }
+            }
+        } exit {
+            entered:.remove(ctor.sym);
+        }
+    }
+
+    /**
+     * Compare thrown vs. declared exceptions.
+     *
+     * Computes:
+     *   - exceptions thrown but not declared,
+     *   - exceptions declared but not thrown.
+     *
+     * Type matching uses:
+     *   - direct instance checks,
+     *   - ancestor checks.
+     *
+     * @params:
+     *   - thrown:   list of thrown exceptions
+     *   - expected: list of declared exceptions
+     *
+     * @returns:
+     *   - (notFound, unused)
+     */
+    fn listUnusedThrows(thrown: [Thrower], expected: [Thrower])-> ([Thrower], [Thrower])
+        throws ErrorMsg
+    {
+        let dmut notFound: [Thrower] = [];
+        for i in thrown {
+            let mut found = false;
+            for j in expected  {
+                if TypeVerification::isDirectInstance(i.type, j.type) {
+                    found = true;
+                    break;
+                } else if TypeVerification::isAncestor(j.type, i.type) {
+                    found = true;
+                    break;
+                }
+            }
+
+            if !found {
+                notFound ~= [i];
+            }
+        }
+
+        let dmut unused   : [Thrower] = [];
+        for i in expected {
+            let mut found = false;
+            for j in thrown {
+                if (TypeVerification::isDirectInstance(i.type, j.type)) {
+                    found = true;
+                    break;
+                } else if (TypeVerification::isAncestor(i.type, j.type)) {
+                    found = true;
+                    break;
+                }
+            }
+
+            if !found {
+                unused ~= [i];
+            }
+        }
+
+        return (notFound, unused);
+    }
+}
