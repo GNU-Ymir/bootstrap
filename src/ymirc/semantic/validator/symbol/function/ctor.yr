@@ -1,5 +1,51 @@
+/*
+ * Implements semantic validation for constructors.
+ *
+ * This module handles:
+ *   - prototype validation for constructors(with or without body),
+ *   - validation of parameters, attributes, and throwers,
+ *   - struct-constructor vs class-constructor dispatch,
+ *   - template-rewriter integration for instantiated constructors,
+ *   - construction of CtorPrototypeValue entries,
+ *   - enforcement of classRef context during validation.
+ *
+ * Constructor validation is split between:
+ *   - StructCtorValidation  (value-type constructors)
+ *   - ClassCtorValidation   (reference-type constructors)
+ *
+ * <hr>
+ *
+ * @Package: ymirc
+ * @Module: ymirc::semantic::validator::symbol::function::ctor
+ * @File: ymirc/semantic/validator/symbol/function/ctor.yr
+ * @Author(s):
+ *   - Emile Cadorel <ecadorel@gmail.com>
+ *
+ * @Created(YYYY-MM-DD): 2026-05-13
+ * @Copyright(C) 2021–2026 GNU-Ymir
+ * @License
+ *   ```text
+ *   This file is part of the Ymir language project.
+ *
+ *   Ymir is free software: you can redistribute it and/or modify it
+ *   under the terms of the GNU General Public License as published by
+ *   the Free Software Foundation, either version 3 of the License, or
+ *   (at your option) any later version.
+ *
+ *   Ymir is distributed in the hope that it will be useful,
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *   GNU General Public License for more details.
+ *
+ *   You should have received a copy of the GNU General Public License
+ *   along with Ymir.  If not, see <https://www.gnu.org/licenses/>.
+ *   ```
+ */
+
+
 in ctor;
 
+use ymirc::syntax::{expression::_, declaration::_};
 use ymirc::semantic::{validator, template_};
 use ymirc::semantic::{generator::_, symbol};
 use ymirc::semantic::generator::{value::_, type::_};
@@ -8,16 +54,314 @@ use ymirc::errors::_;
 use ymirc::utils::{format, log};
 use ymirc::lexing::{word, tokens, keys};
 
-use std::{stream, io};
+use ymirc::semantic::validator::symbol::function::{_, ctor::_};
 
+/*!
+ * ====================================================================================================
+ * ====================================================================================================
+ * ====================================          SUBMODS          =====================================
+ * ====================================================================================================
+ * ====================================================================================================
+ */
+
+mod struct_;
+mod class_;
+mod fields;
+
+/*!
+ * ====================================================================================================
+ * ====================================================================================================
+ * ======================================          ROOT          ======================================
+ * ====================================================================================================
+ * ====================================================================================================
+ */
+
+/**
+ * CtorValidation module
+ *
+ * Provides semantic validation for constructors. This includes:
+ *
+ *   - prototype-only validation(no body),
+ *   - full validation including constructor body,
+ *   - validation of parameters, attributes, and throwers,
+ *   - dispatch to StructCtorValidation or ClassCtorValidation,
+ *   - construction of CtorPrototypeValue entries,
+ *   - template-rewriter integration for instantiated constructors.
+ *
+ * Constructor validation is performed in a classRef-aware foreign context
+ * to ensure correct handling of `self`, mutability, and class-specific rules.
+ */
 pub mod CtorValidation {
 
-    pub fn validateProto(dmut context: &ValidationContext, dmut sym: &CtorSymbol, cref: &ClassRefType)-> &CtorPrototypeValue
+    /**
+     * Validate the prototype of a constructor symbol, without validating its body.
+     *
+     * If the constructor already has a cached frame prototype, it is returned
+     * immediately. Otherwise:
+     *
+     * @params:
+     *   - context:   validation context
+     *   - sym:       constructor symbol
+     *   - cref:      ClassRefType of the enclosing class
+     *   - withValue: whether default values should be validated
+     *
+     * @returns:
+     *   - the CtorPrototypeValue for the constructor
+     *
+     * @throws:
+     *   - ErrorMsg if prototype validation fails
+     */
+    pub fn validateProto(dmut context: &ValidationContext,
+                         dmut sym:     &CtorSymbol,
+                         cref:         &ClassRefType,
+                         withValue:    bool = true)-> &CtorPrototypeValue
         throws ErrorMsg
     {
-        context;
-        sym;
-        panic;
+        if let v: &CtorPrototypeValue = sym.frameProto {
+            return v;
+        }
+
+        context:.pushReferent(alias sym);
+        context:.enterForeign(isFnBody-> false, classRef-> cref);
+        {
+            return CtorValidation::validate(alias context, alias sym, cref,
+                                            validateBody-> false,
+                                            withValue-> withValue);
+        } catch {
+            err => {
+                throw copy ErrorMsg::fatal(sym.loc, format(ValidateErrorMessage::VALIDATING_SYMBOL, sym.path.toStr()),
+                                           notes-> copy [err]);
+            }
+        } exit {
+            context:.exitForeign();
+            context:.popReferent();
+        }
     }
 
+    /**
+     * Validate the prototype of a constructor declaration(non-symbol version).
+     *
+     * Used when validating a constructor declaration directly, such as during
+     * template instantiation.
+     *
+     * @params:
+     *   - context:  validation context
+     *   - sym:      symbol representing the constructor
+     *   - func:     constructor declaration
+     *   - cref:     ClassRefType of the enclosing class
+     *   - rewriter: template rewriter for instantiated constructors
+     *
+     * @returns:
+     *   - the constructed CtorPrototypeValue
+     *
+     * @throws:
+     *   - ErrorMsg if prototype validation fails
+     */
+    pub fn validateProto(dmut context: &ValidationContext,
+                         dmut sym:     &Symbol,
+                         func:         &CtorDecl,
+                         cref:         &ClassRefType,
+                         rewriter:     TemplateRewriter)-> &CtorPrototypeValue
+        throws ErrorMsg
+    {
+        let mut errors: (&ErrorMsg)? = none;
+        let mut params: [&ProtoVarDeclValue] = [];
+        let mut throwers: [Thrower] = [];
+
+        context:.pushReferent(alias sym);
+        context:.enterForeign(isFnBody-> false, classRef-> cref);
+        {
+            throwers = FunctionPrototypeValidation::validateThrowers(alias context, func.throwerLoc, func.throwers);
+            FunctionVerification::verifyUndefAttributesCtor(func.attrs);
+            context:.enterBlock();
+            {
+                let (_, params_) = FunctionPrototypeValidation::validateParamsAndRetType(alias context, func.loc, sym, func.proto,
+                                                                                        forMethod-> false);
+                params = params_;
+            } exit {
+                context:.safeQuitBlock();
+            }
+        } catch {
+            err => {
+                errors = (err)?;
+            }
+        } exit {
+            context:.exitForeign();
+            context:.popReferent();
+        }
+
+        if let Ok(err) = errors {
+            throw copy ErrorMsg::fatal(sym.loc, format(ValidateErrorMessage::VALIDATING_SYMBOL, sym.path.toStr()),
+                                       notes-> copy [err]);
+        }
+
+        return copy CtorPrototypeValue(sym.loc, sym, params, throwers,
+                                       rename-> func.name.str,
+                                       classRef-> cref,
+                                       attrs-> func.attrs,
+                                       fromTemplate-> rewriter?);
+    }
+
+    /**
+     * Validate a constructor symbol, including its body.
+     *
+     * @params:
+     *   - context: validation context
+     *   - sym:     constructor symbol
+     *   - cref:    ClassRefType of the enclosing class
+     *
+     * @throws:
+     *   - ErrorMsg if validation fails
+     */
+    pub fn validate(dmut context: &ValidationContext, dmut sym: &CtorSymbol, cref: &ClassRefType)
+        throws ErrorMsg
+    {
+        context:.pushReferent(alias sym);
+        context:.enterForeign(isFnBody-> false, classRef-> cref);
+        {
+            CtorValidation::validate(alias context, alias sym, cref,
+                                     validateBody-> true);
+        } catch {
+            err => {
+                throw copy ErrorMsg::fatal(sym.loc, format(ValidateErrorMessage::VALIDATING_SYMBOL, sym.path.toStr()),
+                                           notes-> copy [err]);
+            }
+        } exit {
+            context:.exitForeign();
+            context:.popReferent();
+        }
+    }
+
+    /**
+     * Core constructor validation routine.
+     *
+     * If validateBody is true:
+     *   - dispatch to StructCtorValidation or ClassCtorValidation depending
+     *     on whether the class is a struct or a reference type.
+     *
+     * If validateBody is false:
+     *   - validate throwers,
+     *   - validate constructor attributes,
+     *   - validate parameters(with or without default values),
+     *   - construct a CtorPrototypeValue with template-rewriter info.
+     *
+     * @params:
+     *   - context:      validation context
+     *   - sym:          constructor symbol
+     *   - cref:         ClassRefType of the enclosing class
+     *   - validateBody: whether to validate the constructor body
+     *   - withValue:    whether default values should be validated
+     *
+     * @returns:
+     *   - the CtorPrototypeValue for the constructor
+     *
+     * @throws:
+     *   - ErrorMsg if validation fails
+     */
+    fn validate(dmut context: &ValidationContext,
+                dmut sym:     &CtorSymbol,
+                cref:         &ClassRefType,
+                validateBody: bool = false,
+                withValue:    bool = true)-> &CtorPrototypeValue
+        throws ErrorMsg
+    {
+        if validateBody {
+            if cref.sym.isStruct {
+                return StructCtorValidation::validate(alias context, alias sym, cref);
+            } else {
+                return ClassCtorValidation::validate(alias context, alias sym, cref);
+            }
+        }
+
+        let mut errors: (&ErrorMsg)? = none;
+        let mut params: [&ProtoVarDeclValue] = [];
+        let mut throwers: [Thrower] = [];
+
+        let func = sym.decl;
+        throwers = FunctionPrototypeValidation::validateThrowers(alias context, func.throwerLoc, func.throwers);
+        FunctionVerification::verifyUndefAttributesCtor(func.attrs);
+
+        context:.enterBlock();
+        {
+            let (_, params_) = FunctionPrototypeValidation::validateParamsAndRetType(alias context, func.loc, sym, func.proto,
+                                                                                    forMethod-> false,
+                                                                                    withValue-> withValue);
+            params = params_;
+        } catch {
+            err => {
+                errors = (err)?;
+            }
+        } exit {
+            context:.safeQuitBlock();
+        }
+
+        if let Ok(err) = errors {
+            throw copy ErrorMsg::fatal(sym.loc, format(ValidateErrorMessage::VALIDATING_SYMBOL, sym.path.toStr()),
+                                       notes-> copy [err]);
+        }
+
+        let mut rewriter: (TemplateRewriter)? = none;
+        if let Ok(map) = sym.templateMapper {
+            rewriter = TemplateRewriter(map)?;
+        }
+
+        return copy CtorPrototypeValue(sym.loc, sym, params, throwers,
+                                       rename-> func.name.str,
+                                       classRef-> cref,
+                                       attrs-> func.attrs,
+                                       fromTemplate-> rewriter);
+    }
+
+    /**
+     * Create a constructor-delegate value for a class constructor call.
+     *
+     * This function resolves the appropriate constructor overload on a class,
+     * optionally applies template arguments, and returns a callable delegate
+     * representing that constructor. It is used by both struct and class
+     * constructor validation when performing redirect calls or field-based
+     * initialization.
+     *
+     * @params:
+     *   - context:        validation context
+     *   - loc:            source location of the constructor call
+     *   - cref:           ClassRefType of the class whose constructor is invoked
+     *   - selfVref:       VarRefValue representing `self` (or the constructed object)
+     *   - nextDg:         next delegate in a redirect chain (default: UNIT_VALUE)
+     *   - renameLoc:      optional location of a named constructor (default: EOF)
+     *   - templateParams: optional list of template arguments
+     *
+     * @returns:
+     *   - a Value representing the resolved (and possibly templated) constructor delegate
+     *
+     * @throws:
+     *   - ErrorMsg if constructor resolution fails or template arguments are invalid
+     */
+    pub fn createCtorDelegate(dmut context:   &ValidationContext,
+                              loc:            &Word,
+                              cref:           &ClassRefType,
+                              selfVref:       &VarRefValue,
+                              nextDg:         &Value = UNIT_VALUE,
+                              renameLoc:      &Word = EOF_WORD,
+                              templateParams: [&Expression] = [])-> &Value
+        throws ErrorMsg
+    {
+        let rename = if renameLoc.isEof {
+            ""
+        } else {
+            renameLoc.str
+        };
+
+        let ctors = ClassStaticFieldValidation::validateCtors(alias context, loc, cref,
+                                                              name-> rename,
+                                                              selfParam-> selfVref,
+                                                              nextDg-> nextDg,
+                                                              fromSubType-> true);
+
+        if templateParams.len == 0 {
+            return ctors;
+        }
+
+        let list = TemplateValidation::validateArgumentList(alias context, templateParams);
+        return TemplateValidation::validateCall(alias context, loc, ctors, list);
+    }
 }
