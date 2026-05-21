@@ -1,0 +1,366 @@
+/*
+ * Implements semantic validation for struct constructors.
+ *
+ * This module handles:
+ *   - validation of struct-constructor parameters, attributes, and throwers,
+ *   - validation of pre-construction logic(field initialization or redirect),
+ *   - validation of the constructor body,
+ *   - construction of the final CtorPrototypeValue,
+ *   - generation of the constructor frame(FrameGenerator),
+ *   - detection of illegal redirect patterns and field re-initialization,
+ *   - integration with template instantiation.
+ *
+ * <hr>
+ *
+ * @Package: ymirc
+ * @Module: ymirc::semantic::validator::symbol::function::ctor::struct_
+ * @File: ymirc/semantic/validator/symbol/function/ctor/struct_.yr
+ * @Author(s):
+ *   - Emile Cadorel <ecadorel@gmail.com>
+ *
+ * @Created(YYYY-MM-DD): 2026-05-21
+ * @Copyright(C) 2021–2026 GNU-Ymir
+ * @License
+ *   ```text
+ *   This file is part of the Ymir language project.
+ *
+ *   Ymir is free software: you can redistribute it and/or modify it
+ *   under the terms of the GNU General Public License as published by
+ *   the Free Software Foundation, either version 3 of the License, or
+ *   (at your option) any later version.
+ *
+ *   Ymir is distributed in the hope that it will be useful,
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *   GNU General Public License for more details.
+ *
+ *   You should have received a copy of the GNU General Public License
+ *   along with Ymir.  If not, see <https://www.gnu.org/licenses/>.
+ *   ```
+ */
+
+in struct_;
+
+use ymirc::syntax::{expression::_, declaration::_};
+use ymirc::semantic::{validator, template_};
+use ymirc::semantic::{generator::_, symbol};
+use ymirc::semantic::generator::{value::_, type::_};
+
+use ymirc::errors::_;
+use ymirc::utils::{format, log};
+use ymirc::lexing::{word, tokens, keys};
+
+use ymirc::semantic::validator::symbol::function::{_, ctor::_};
+
+/**
+ * StructCtorValidation module
+ *
+ * Provides semantic validation for struct constructors. Responsibilities:
+ *
+ *   - validate constructor parameters and return type(always void),
+ *   - validate throwers and constructor attributes,
+ *   - validate pre-construction logic:
+ *        * field initializers,
+ *        * redirect constructors,
+ *   - validate the constructor body,
+ *   - generate the constructor frame,
+ *   - detect illegal redirect patterns and infinite recursion,
+ *   - ensure fields are not initialized twice.
+ *
+ */
+pub mod StructCtorValidation {
+
+    /**
+     * Validate a struct constructor, including its body.
+     *
+     * Errors are captured and re-thrown after block cleanup.
+     *
+     * @params:
+     *   - context: validation context
+     *   - sym:     constructor symbol
+     *   - cref:    ClassRefType of the struct
+     *
+     * @returns:
+     *   - the CtorPrototypeValue for the constructor
+     *
+     * @throws:
+     *   - ErrorMsg if validation fails
+     */
+    pub fn validate(dmut context: &ValidationContext,
+                    dmut sym:     &CtorSymbol,
+                    cref:         &ClassRefType)-> &CtorPrototypeValue
+        throws ErrorMsg
+    {
+        let func = sym.decl;
+        let throwers = FunctionPrototypeValidation::validateThrowers(alias context, func.throwerLoc, func.throwers);
+        FunctionVerification::verifyUndefAttributesCtor(func.attrs);
+
+        let mut errors: (&ErrorMsg)? = none;
+        let mut params: [&ProtoVarDeclValue] = [];
+
+        let mut preConstruct: &Value = UNIT_VALUE;
+        let mut body: &Value = UNIT_VALUE;
+        let mut hasRedirect: bool = false;
+
+
+        context:.enterBlock();
+
+        let selfParam = FunctionPrototypeValidation::validateSelfParamDecl(func.loc, cref, true);
+        let cptr = cref.createInstance(true, true);
+        {
+            let (_, params_) = FunctionPrototypeValidation::validateParamsAndRetType(alias context, func.loc, sym, func.proto,
+                                                                                    forMethod-> false,
+                                                                                    withValue-> true);
+
+            let (preConstruct_, body_, hasRedirect_) = StructCtorValidation::validateBody(alias context, sym, func, cptr.inner, selfParam, throwers);
+
+            params = params_;
+            preConstruct = preConstruct_;
+            body = body_;
+            hasRedirect = hasRedirect_;
+        } catch {
+            err => {
+                errors = (err)?;
+            }
+        }
+
+        {
+            context:.quitBlock(warnUnused-> (!errors.hasValue));
+        } catch {
+            err => {
+                errors = (err)?;
+            }
+        }
+
+        if let Ok(err) = errors {
+            throw copy ErrorMsg::fatal(sym.loc, format(ValidateErrorMessage::VALIDATING_SYMBOL, sym.path.toStr()),
+                                       notes-> copy [err]);
+        }
+
+        return StructCtorValidation::finalize(alias context,
+                                              alias sym,
+                                              func,
+                                              cref,
+                                              selfParam,
+                                              params,
+                                              throwers,
+                                              preConstruct,
+                                              body,
+                                              hasRedirect);
+    }
+
+    /**
+     * Finalize a validated struct constructor. If the constructor has a body,
+     * generate a FrameGenerator and insert it in the global context.
+     *
+     * @params:
+     *   - context:      validation context
+     *   - sym:          constructor symbol
+     *   - func:         constructor declaration
+     *   - cref:         ClassRefType of the struct
+     *   - selfParam:    validated `self` parameter
+     *   - params:       validated parameters
+     *   - throwers:     validated throwers
+     *   - preConstruct: validated pre-construction block
+     *   - body:         validated body block
+     *   - hasRedirect:  whether the constructor redirects to another constructor
+     *
+     * @returns:
+     *   - the constructed CtorPrototypeValue
+     *
+     * @throws:
+     *   - ErrorMsg if finalization fails
+     */
+    fn finalize(dmut context: &ValidationContext,
+                dmut sym:     &CtorSymbol,
+                func:         &CtorDecl,
+                cref:         &ClassRefType,
+                selfParam:    &ProtoVarDeclValue,
+                params:       [&ProtoVarDeclValue],
+                throwers:     [Thrower],
+                preConstruct: &Value,
+                body:         &Value,
+                hasRedirect:  bool)-> &CtorPrototypeValue
+        throws ErrorMsg
+    {
+        if (func.body !of EmptyExpr) {
+            let frame = copy FrameGenerator(func.loc,
+                                            implLoc-> cref.sym.loc,
+                                            sym.path,
+                                            copy [selfParam] ~ params,
+                                            VOID_TYPE,
+                                            body,
+                                            FrameKind::CTOR,
+                                            isWeak-> (sym.isWeak || cref.sym.isWeak),
+                                            templateMapper-> sym.templateMapper);
+
+            context:.insertGenerator(alias sym, frame);
+        }
+
+        let mut rewriter: (TemplateRewriter)? = none;
+        if let Ok(map) = sym.templateMapper {
+            rewriter = TemplateRewriter(map)?;
+        }
+
+        let gen = copy CtorPrototypeValue(sym.loc, sym, params, throwers, cref,
+                                          rename-> func.name.str,
+                                          attrs-> func.attrs,
+                                          fromTemplate-> rewriter);
+
+        sym:.setFrameProto(gen, preConstruct, hasRedirect);
+        if (hasRedirect) {
+            FunctionVerification::verifyCtorInfiniteRecursion(gen);
+        }
+
+        return gen;
+    }
+
+    /**
+     * Validate the body of a struct constructor.
+     *
+     * @params:
+     *   - context:   validation context
+     *   - sym:       constructor symbol
+     *   - func:      constructor declaration
+     *   - cref:      ClassRefType of the struct
+     *   - selfParam: validated `self` parameter
+     *   - throwers:  declared throwers
+     *
+     * @returns:
+     *   - (preConstructBlock, bodyBlock, hasRedirect)
+     *
+     * @throws:
+     *   - ErrorMsg if validation fails
+     */
+    fn validateBody(dmut context: &ValidationContext,
+                    sym:          &CtorSymbol,
+                    func:         &CtorDecl,
+                    cref:         &ClassRefType,
+                    selfParam:    &ProtoVarDeclValue,
+                    throwers:     [Thrower])-> (&Value, &Value, bool)
+        throws ErrorMsg
+    {
+        logging::info("Validate struct ctor %", sym.path);
+
+        let selfVref = VariableCreation::createVarFromDecl(selfParam,
+                                                           isSelf-> true,
+                                                           isReference-> true);
+
+        context:.enterCtorPreBody();
+
+        let (preConstruct, preThrowers, hasRedirect) = StructCtorValidation::validatePreCtor(alias context, func, cref, selfVref);
+
+        context:.insertLocal(selfParam.loc, selfParam.name, selfParam, canShadow-> true);
+        context:.getLocal(selfParam.loc, selfParam.name, canBeInClosure-> false); // get to flag the variable as used
+
+
+        let body = FunctionValidation::validateBody(alias context, sym.path, func, VOID_TYPE, throwers,
+                                                    preThrowing-> preThrowers,
+                                                    isUnsafe-> sym.isUnsafe);
+        let bodyBlk = copy BlockValue(func.loc, VOID_TYPE, copy [preConstruct, body]);
+
+        return (preConstruct, bodyBlk, hasRedirect);
+    }
+
+    /**
+     * Validate the pre-construction phase of a struct constructor.
+     *
+     * Two cases:
+     *   1. Redirect constructor
+     *   2. Field constructor
+     *
+     * @params:
+     *   - context:  validation context
+     *   - func:     constructor declaration
+     *   - cref:     ClassRefType of the struct
+     *   - selfVref: VarRefValue for `self`
+     *
+     * @returns:
+     *   - (preConstructBlock, hasRedirect)
+     *
+     * @throws:
+     *   - ErrorMsg if redirect is invalid or fields are mis-initialized
+     */
+    fn validatePreCtor(dmut context: &ValidationContext,
+                       func: &CtorDecl,
+                       cref: &ClassRefType,
+                       selfVref: &VarRefValue)-> (&Value, [Thrower], bool)
+        throws ErrorMsg
+    {
+        if let Ok(redirect) = func.redirect {
+            if redirect.isSelf {
+                let call = StructCtorValidation::validateRedirectCtor(alias context, func, cref, selfVref, redirect);
+                return (call, call.throwers, true);
+            }
+
+            throw copy ErrorMsg::fatal(redirect.loc, format(ValidateErrorMessage::NO_SUPER_CLASS, cref));
+        }
+
+        let mut blk: [&Value] = [];
+        let fieldCtor = CtorFieldInitValidation::validateFieldCtors(alias context, func, cref, selfVref);
+        if fieldCtor !of UnitValue {
+            blk ~= [fieldCtor];
+        }
+
+        let preCtor = copy BlockValue(func.loc, VOID_TYPE, blk);
+        return (preCtor, preCtor.throwers, false);
+    }
+
+    /**
+     * Validate a redirecting struct constructor.
+     *
+     * @params:
+     *   - context:  validation context
+     *   - func:     constructor declaration
+     *   - cref:     ClassRefType of the struct
+     *   - selfVref: VarRefValue for `self`
+     *   - redirect: RedirectCtor descriptor
+     *
+     * @returns:
+     *   - the validated redirect call value
+     *
+     * @throws:
+     *   - ErrorMsg::list if redirect is invalid or fields are illegally initialized
+     */
+    pub fn validateRedirectCtor(dmut context: &ValidationContext,
+                                func:         &CtorDecl,
+                                cref:         &ClassRefType,
+                                selfVref:     &VarRefValue,
+                                redirect:     RedirectCtor,
+                                nextDg:       &Value = UNIT_VALUE)-> &Value
+        throws ErrorMsg
+    {
+        let mut errors: [&ErrorMsg] = [];
+        let mut callValue: &Value = UNIT_VALUE;
+
+        let rights: [&Value] = copy [ValueValidation::validate(alias context, v) for v in redirect.params];
+
+        {
+            let ctorDg = CtorValidation::createCtorDelegate(alias context, redirect.loc, cref, selfVref,
+                                                            nextDg-> nextDg,
+                                                            renameLoc-> redirect.name,
+                                                            templateParams-> redirect.templateParams);
+
+
+            callValue = CallValidation::validate(alias context, redirect.loc, ctorDg, rights,
+                                                 inCopy-> true);
+        } catch {
+            err => {
+                errors ~= [copy ErrorMsg::fatal(redirect.loc, format(ValidateErrorMessage::UNDEFINED_REDIRECT_CALL_CTOR, rights),
+                                                notes-> copy [err])];
+            }
+        }
+
+
+        for f in func.fields {
+            errors ~= [copy ErrorMsg::fatal(f.loc, format(ValidateErrorMessage::ALREADY_INIT_BY_CTOR_REDIRECT, f.name.str),
+                                            notes-> copy [copy ErrorMsg::note(redirect.loc, "")])];
+        }
+
+        if errors.len != 0 {
+            throw copy ErrorMsg::list(errors);
+        }
+
+        return callValue;
+    }
+}
