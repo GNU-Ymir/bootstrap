@@ -1,0 +1,547 @@
+/*
+ * Implements semantic validation for class constructors.
+ *
+ * This module handles:
+ *   - validation of class-constructor parameters, attributes, and throwers,
+ *   - validation of pre-construction logic(redirect, ancestor call, field init),
+ *   - validation of the constructor body,
+ *   - generation of the constructor frame(FrameGenerator),
+ *   - creation and propagation of the NEXT delegate for inheritance chains,
+ *   - detection of illegal redirect patterns and infinite recursion,
+ *   - integration with template instantiation.
+ *
+ * Class constructors differ from struct constructors in that:
+ *   - they may call ancestor constructors,
+ *   - they may redirect to another constructor of the same class,
+ *   - they receive a NEXT delegate when the class is not final,
+ *   - they must initialize inherited fields before their own body executes.
+ *
+ * <hr>
+ *
+ * @Package: ymirc
+ * @Module: ymirc::semantic::validator::symbol::function::ctor::class_
+ * @File: ymirc/semantic/validator/symbol/function/ctor/class_.yr
+ * @Author(s):
+ *   - Emile Cadorel <ecadorel@gmail.com>
+ *
+ * @Created(YYYY-MM-DD): 2026-05-23
+ * @Copyright(C) 2021–2026 GNU-Ymir
+ * @License
+ *   ```text
+ *   This file is part of the Ymir language project.
+ *
+ *   Ymir is free software: you can redistribute it and/or modify it
+ *   under the terms of the GNU General Public License as published by
+ *   the Free Software Foundation, either version 3 of the License, or
+ *   (at your option) any later version.
+ *
+ *   Ymir is distributed in the hope that it will be useful,
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *   GNU General Public License for more details.
+ *
+ *   You should have received a copy of the GNU General Public License
+ *   along with Ymir.  If not, see <https://www.gnu.org/licenses/>.
+ *   ```
+ */
+
+in class_;
+
+use ymirc::syntax::{expression::_, declaration::_};
+use ymirc::semantic::{validator, template_};
+use ymirc::semantic::{generator::_, symbol};
+use ymirc::semantic::generator::{value::_, type::_};
+
+use ymirc::errors::_;
+use ymirc::utils::{format, log};
+use ymirc::lexing::{word, tokens, keys};
+
+use ymirc::semantic::validator::symbol::function::{_, ctor::_};
+
+/**
+ * ClassCtorValidation module
+ *
+ * Provides semantic validation for class constructors. Responsibilities:
+ *
+ *   - validate constructor parameters, attributes, and throwers,
+ *   - validate redirecting constructors(`this(...)`),
+ *   - validate ancestor constructor calls(`super(...)`),
+ *   - validate field initialization when no redirect occurs,
+ *   - generate the NEXT delegate for inheritance chains,
+ *   - validate the constructor body,
+ *   - construct the final CtorPrototypeValue and constructor frame,
+ *   - detect infinite redirect cycles.
+ *
+ * Class constructors support inheritance and therefore require more complex
+ * pre-construction logic than struct constructors.
+ *
+ */
+pub mod ClassCtorValidation {
+
+    /**
+     * Validate a class constructor, including its body.
+     *
+     * @params:
+     *   - context: validation context
+     *   - sym:     constructor symbol
+     *   - cref:    ClassRefType of the class
+     *
+     * @returns:
+     *   - the CtorPrototypeValue for the constructor
+     *
+     * @throws:
+     *   - ErrorMsg if validation fails
+     */
+    pub fn validate(dmut context: &ValidationContext,
+                    dmut sym: &CtorSymbol,
+                    cref: &ClassRefType)-> &CtorPrototypeValue
+        throws ErrorMsg
+    {
+        let func = sym.decl;
+        let throwers = FunctionPrototypeValidation::validateThrowers(alias context, func.throwerLoc, func.throwers);
+        FunctionVerification::verifyUndefAttributesCtor(func.attrs);
+
+
+        let mut errors: (&ErrorMsg)? = none;
+        let mut params: [&ProtoVarDeclValue] = [];
+
+        let mut preConstruct: &Value = UNIT_VALUE;
+        let mut body: &Value = UNIT_VALUE;
+        let mut hasRedirect: bool = false;
+
+        context:.enterBlock();
+
+        // Class ctor have a delegate as last parameters if the class is not final
+        // This delegate is called after field init, to init the fields of child class before entering ctor body
+        let dgType = copy DelegateType(func.loc, [], [], [], VOID_TYPE,
+                                       isMutable-> false,
+                                       canBeNull-> true);
+        let nextDg = copy ProtoVarDeclValue(func.loc.locate(ClassKeys::NEXT), dgType, UNIT_VALUE,
+                                            isMutable-> false,
+                                            isReference-> false,
+                                            isLazy-> false,
+                                            isSelf-> false,
+                                            nbConsume-> 1);
+        let selfParam = FunctionPrototypeValidation::validateSelfParamDecl(func.loc, cref, true);
+        let cptr = cref.createInstance(true, true);
+        {
+            let (_, params_) = FunctionPrototypeValidation::validateParamsAndRetType(alias context, func.loc, sym, func.proto,
+                                                                                    forMethod-> false,
+                                                                                    withValue-> true);
+
+            let (body_, preConstruct_, hasRedirect_) = ClassCtorValidation::validateBody(alias context, alias sym, func, cptr.inner, selfParam, params_, nextDg, throwers);
+
+            params = params_;
+            body = body_;
+            hasRedirect = hasRedirect_;
+            preConstruct = preConstruct_;
+        } catch {
+            err => {
+                errors = (err)?;
+            }
+        }
+
+
+        {
+            context:.quitBlock(warnUnused-> (!errors.hasValue));
+        } catch {
+            err => {
+                errors = (err)?;
+            }
+        }
+
+        if let Ok(err) = errors {
+            throw copy ErrorMsg::fatal(sym.loc, format(ValidateErrorMessage::VALIDATING_SYMBOL, sym.path.toStr()),
+                                       notes-> copy [err]);
+        }
+
+        return ClassCtorValidation::finalize(alias context,
+                                             alias sym,
+                                             func,
+                                             cref,
+                                             selfParam,
+                                             params,
+                                             nextDg,
+                                             throwers,
+                                             preConstruct,
+                                             body,
+                                             hasRedirect);
+    }
+
+    /**
+     * Finalize a validated class constructor.
+     *
+     * @params:
+     *   - context:      validation context
+     *   - sym:          constructor symbol
+     *   - func:         constructor declaration
+     *   - cref:         ClassRefType of the class
+     *   - selfParam:    validated `self` parameter
+     *   - params:       validated parameters
+     *   - nextDg:       NEXT delegate parameter
+     *   - throwers:     validated throwers
+     *   - preConstruct: validated pre‑construction block
+     *   - body:         validated body block
+     *   - hasRedirect:  whether the constructor redirects
+     *
+     * @returns:
+     *   - the constructed CtorPrototypeValue
+     */
+    fn finalize(dmut context: &ValidationContext,
+                dmut sym:     &CtorSymbol,
+                func:         &CtorDecl,
+                cref:         &ClassRefType,
+                selfParam:    &ProtoVarDeclValue,
+                params:       [&ProtoVarDeclValue],
+                nextDg:       &ProtoVarDeclValue,
+                throwers:     [Thrower],
+                preConstruct: &Value,
+                body:         &Value,
+                hasRedirect:  bool)-> &CtorPrototypeValue
+        throws ErrorMsg
+    {
+        if func.body !of EmptyExpr {
+            let frame = copy FrameGenerator(func.loc,
+                                            implLoc-> cref.sym.loc,
+                                            sym.path,
+                                            copy [selfParam] ~ params ~ [nextDg],
+                                            VOID_TYPE,
+                                            body,
+                                            FrameKind::CTOR,
+                                            isWeak-> (sym.isWeak || cref.sym.isWeak),
+                                            templateMapper-> sym.templateMapper);
+
+            context:.insertGenerator(alias sym, frame);
+        }
+
+        let mut rewriter: (TemplateRewriter)? = none;
+        if let Ok(map) = sym.templateMapper {
+            rewriter = TemplateRewriter(map)?;
+        }
+
+        let gen = copy CtorPrototypeValue(sym.loc, sym, params, throwers, cref,
+                                          rename-> func.name.str,
+                                          attrs-> func.attrs,
+                                          fromTemplate-> rewriter);
+
+        sym:.setFrameProto(gen, preConstruct, hasRedirect);
+        if (hasRedirect) {
+            FunctionVerification::verifyCtorInfiniteRecursion(gen);
+        }
+
+        return gen;
+    }
+
+    /**
+     * Validate the body of a class constructor.
+     *
+     * Steps:
+     *   1. Enter constructor pre-body context.
+     *   2. Validate pre-construction logic:
+     *        - redirect constructor call, or
+     *        - ancestor constructor call, or
+     *        - field initialization + NEXT delegate call.
+     *   3. Insert `self` into the local scope.
+     *   4. Validate the constructor body using FunctionValidation::validateBody.
+     *   5. Combine pre-construction and body into a single BlockValue.
+     *
+     * @params:
+     *   - context:   validation context
+     *   - sym:       constructor symbol
+     *   - func:      constructor declaration
+     *   - cref:      ClassRefType of the class
+     *   - selfParam: validated `self` parameter
+     *   - params:    validated parameters
+     *   - nextDg:    NEXT delegate parameter
+     *   - throwers:  declared throwers
+     *
+     * @returns:
+     *   - (preConstructBlock, fullBodyBlock, hasRedirect)
+     */
+    fn validateBody(dmut context: &ValidationContext,
+                    dmut sym:     &CtorSymbol,
+                    func:         &CtorDecl,
+                    cref:         &ClassRefType,
+                    selfParam:    &ProtoVarDeclValue,
+                    params:       [&ProtoVarDeclValue],
+                    nextDg:       &ProtoVarDeclValue,
+                    throwers:     [Thrower])-> (&Value, &Value, bool)
+        throws ErrorMsg
+    {
+        logging::info("Validate class ctor %", sym.path);
+
+        context:.enterCtorPreBody();
+
+        let (preBody, preThrowers, hasRedirect) = ClassCtorValidation::validatePreCtor(alias context, alias sym, func, cref, selfParam, params, nextDg);
+        let mut bodyValues: [&Value] = [];
+        if preBody !of UnitValue {
+            bodyValues ~= [preBody];
+        }
+
+        context:.insertLocal(selfParam.loc, selfParam.name, selfParam, canShadow-> true);
+        context:.getLocal(selfParam.loc, selfParam.name, canBeInClosure-> false); // get to flag the variable as used
+
+        let body = FunctionValidation::validateBody(alias context, sym.path, func, VOID_TYPE, throwers,
+                                                    preThrowing-> preThrowers,
+                                                    isUnsafe-> sym.isUnsafe);
+        bodyValues ~= [body];
+        let bodyBlk = copy BlockValue(func.loc, VOID_TYPE, bodyValues);
+
+        return (preBody, bodyBlk, hasRedirect);
+    }
+
+    /**
+     * Validate the pre-construction phase of a class constructor.
+     *
+     * Three possible cases:
+     *
+     *   1. Redirect constructor(`self(...)`):
+     *        - validate redirect call,
+     *        - return (redirectCall, redirectThrowers, true).
+     *
+     *   2. Ancestor constructor call(`super(...)`):
+     *        - validate lambda pre-body(closure for NEXT),
+     *        - validate ancestor constructor call,
+     *        - return (ancestorCall, combinedThrowers, false).
+     *
+     *   3. Normal constructor:
+     *        - validate field initializers,
+     *        - call NEXT delegate,
+     *        - return (block, block.throwers, false).
+     *
+     * @params:
+     *   - context:   validation context
+     *   - sym:       constructor symbol
+     *   - func:      constructor declaration
+     *   - cref:      ClassRefType of the class
+     *   - selfParam: validated `self` parameter
+     *   - params:    validated parameters
+     *   - nextDg:    NEXT delegate parameter
+     *
+     * @returns:
+     *   - (preConstructBlock, throwers, hasRedirect)
+     */
+    fn validatePreCtor(dmut context: &ValidationContext,
+                       dmut sym:     &CtorSymbol,
+                       func:         &CtorDecl,
+                       cref:         &ClassRefType,
+                       selfParam:    &ProtoVarDeclValue,
+                       params:       [&ProtoVarDeclValue],
+                       nextDg:       &ProtoVarDeclValue)-> (&Value, [Thrower], bool)
+        throws ErrorMsg
+    {
+        let selfVref = VariableCreation::createVarFromDecl(selfParam, isSelf-> true, isReference-> false);
+        if let Ok(redirect) = func.redirect && redirect.isSelf {
+            let nextValue = VariableCreation::createVarFromDecl(nextDg, isSelf-> false, isReference-> false);
+            let body = StructCtorValidation::validateRedirectCtor(alias context, func, cref, selfVref, redirect,
+                                                                  nextDg-> nextValue);
+
+            return (body, body.throwers, true);
+        }
+
+        if cref.hasAncestor {
+            let (dgValue, throwers) = ClassCtorValidation::validateLambdaPre(alias context, alias sym, func, cref, selfParam, params, nextDg);
+            let ancCall = ClassCtorValidation::validateAncestorCall(alias context, func, cref, selfVref, dgValue);
+
+            return (ancCall, ancCall.throwers ~ throwers, false);
+        }
+
+        if let Ok(redirect) = func.redirect {
+            throw copy ErrorMsg::fatal(redirect.loc, format(ValidateErrorMessage::NO_SUPER_CLASS, cref));
+        }
+
+        let mut blk: [&Value] = [];
+        let fieldCtor = CtorFieldInitValidation::validateFieldCtors(alias context, func, cref, selfVref);
+        if fieldCtor !of UnitValue {
+            blk ~= [fieldCtor];
+        }
+
+        let nextValue = VariableCreation::createVarFromDecl(nextDg, isSelf-> false, isReference-> false);
+        let nextCall = CallValidation::validate(alias context, nextValue.loc, nextValue, [],
+                                                inCopy-> false);
+        blk ~= [nextCall];
+
+        let body = copy BlockValue(func.loc, VOID_TYPE, blk);
+        return (body, body.throwers, false);
+    }
+
+    /**
+     * Validate a call to the ancestor constructor(`super(...)`).
+     *
+     * @params:
+     *   - context:   validation context
+     *   - func:      constructor declaration
+     *   - cref:      ClassRefType of the class
+     *   - selfVref:  VarRefValue for `self`
+     *   - dgValue:   NEXT delegate value
+     *
+     * @returns:
+     *   - the validated ancestor constructor call
+     *
+     * @throws:
+     *   - ErrorMsg if no ancestor exists or the call is invalid
+     */
+    fn validateAncestorCall(dmut context: &ValidationContext,
+                            func:         &CtorDecl,
+                            cref:         &ClassRefType,
+                            selfVref:     &VarRefValue,
+                            dgValue:      &Value)-> &Value
+        throws ErrorMsg
+    {
+        if let Ok(ancestor) = cref.ancestor {
+            let mut superLoc = func.loc;
+            let mut superParams: [&Value] = [];
+            let mut redirectName = EOF_WORD;
+            let mut templateParams: [&Expression] = [];
+            if let Ok(redirect) = func.redirect && redirect.isSuper {
+                superParams = copy [ValueValidation::validate(alias context, v) for v in redirect.params];
+                superLoc = redirect.loc;
+                redirectName = redirect.name;
+                templateParams = redirect.templateParams;
+            }
+
+            let ctorDg = CtorValidation::createCtorDelegate(alias context, superLoc, ancestor, selfVref,
+                                                            nextDg-> dgValue,
+                                                            renameLoc-> redirectName,
+                                                            templateParams-> templateParams);
+
+            return CallValidation::validate(alias context, superLoc, ctorDg, superParams,
+                                            inCopy-> false);
+        }
+
+        throw copy ErrorMsg::fatal(func.loc, format(ValidateErrorMessage::NO_SUPER_CLASS, cref));
+    }
+
+    /**
+     * Validate the lambda used to capture constructor parameters and NEXT
+     * for ancestor constructor calls.
+     *
+     * This lambda:
+     *   - captures `self`,
+     *   - captures NEXT,
+     *   - captures all constructor parameters by reference,
+     *   - initializes fields,
+     *   - calls NEXT
+     *
+     * @returns:
+     *   - (delegateValue, throwers)
+     */
+    fn validateLambdaPre(dmut context: &ValidationContext,
+                         dmut sym:     &CtorSymbol,
+                         func:         &CtorDecl,
+                         cref:         &ClassRefType,
+                         selfParam:    &ProtoVarDeclValue,
+                         params:       [&ProtoVarDeclValue],
+                         nextDg:       &ProtoVarDeclValue)-> (&Value, [Thrower])
+        throws ErrorMsg
+    {
+        let refId = value::generateUniqID();
+        let index = context.getCurrentClosingIndex();
+        let frameName = sym.path.push(format("_%_%", sym.loc.line, sym.loc.col));
+
+        context:.enterForeign(isLambda-> true, isFnBody-> true, classRef-> context.getCurrentClassReferent());
+        context:.enterCtorPreBody();
+        context:.enterBlock();
+
+        let (body, closureValue) = {
+            ClassCtorValidation::validatePreLambdaBody(alias context, func, cref, selfParam, params, nextDg,
+                                                       refId,
+                                                       index)
+        } exit {
+            context:.safeQuitBlock();
+            context:.exitForeign();
+        };
+
+        let fstParam = copy ProtoVarDeclValue(closureValue.loc.locate("#{CLOSURE-VARREF}"), closureValue.type, uniqId-> refId);
+        let frame = copy FrameGenerator(func.loc, frameName, copy [fstParam], VOID_TYPE, body, FrameKind::LMBD,
+                                        implLoc-> cref.sym.loc,
+                                        isWeak-> (sym.isWeak || cref.sym.isWeak),
+                                        templateMapper-> sym.templateMapper);
+
+
+        let proto = copy NamePrototypeValue(func.loc, implLoc-> cref.sym.loc, frameName, copy [fstParam], VOID_TYPE,
+                                            isLambda-> true);
+        let dgValue = copy NameDelegateValue(func.loc, proto,
+                                             closure-> closureValue,
+                                             refs-> [],
+                                             lazys-> [],
+                                             params-> [],
+                                             retType-> VOID_TYPE,
+                                             fromFptr-> false);
+
+        context:.insertGenerator(alias sym, frame);
+        return (dgValue, body.throwers);
+    }
+
+    /**
+     * Validate the body of the lambda used for ancestor constructor calls.
+     *
+     * @returns:
+     *   - (lambdaBody, closurePointerValue)
+     */
+    fn validatePreLambdaBody(dmut context:   &ValidationContext,
+                             func:           &CtorDecl,
+                             cref:           &ClassRefType,
+                             selfParam:      &ProtoVarDeclValue,
+                             params:         [&ProtoVarDeclValue],
+                             nextDg:         &ProtoVarDeclValue,
+                             refId:          usize,
+                             index:          usize)-> (&Value, &Value)
+        throws ErrorMsg
+    {
+        let mut errors: (&ErrorMsg)? = none;
+        let mut closureValues: [&Value] = [];
+        let mut closureTypes: [&Type] = [];
+        let mut body: &Value = UNIT_VALUE;
+        let mut closure: &Type = NONE_TYPE;
+
+        context:.enterClosure(func.loc, refId, index);
+        {
+            let selfVref = VariableCreation::createVarFromDecl(selfParam, isSelf-> true, isReference-> false);
+            let nextDgValue = VariableCreation::createVarFromDecl(nextDg, isSelf-> false, isReference-> false);
+            let closuredSelf = context:.forceInClosure(func.loc, Keys::SELF, selfVref.type, byReference-> false);
+            let closuredNext = context:.forceInClosure(func.loc, ClassKeys::NEXT, nextDgValue.type, byReference-> false);
+
+            closureValues ~= [selfVref, nextDgValue];
+            closureTypes ~= [selfParam.type, nextDg.type];
+
+            for v in params {
+                let refVar = VariableCreation::createVarFromDecl(v, isSelf-> false, isReference-> v.isReference);
+                let addrVar = copy AddressValue(v.loc, copy PointerType(refVar.loc, refVar.type, isMutable-> true), refVar);
+
+                context:.forceInClosure(func.loc, v.name, refVar.type, byReference-> true);
+                closureValues ~= [addrVar];
+                closureTypes ~= [addrVar.type];
+            }
+
+            context:.finalizeClosure();
+
+            let mut blk: [&Value] = [];
+            let fieldCtor = CtorFieldInitValidation::validateFieldCtors(alias context, func, cref, closuredSelf);
+            if fieldCtor !of UnitValue {
+                blk ~= [fieldCtor];
+            }
+
+            let nextCall = CallValidation::validate(alias context, closuredNext.loc, closuredNext, []);
+            blk ~= [nextCall];
+
+            body = copy BlockValue(func.loc, VOID_TYPE, blk);
+        } catch {
+            err => {
+                errors = (err)?;
+            }
+        } exit {
+            closure = context:.exitClosure();
+        }
+
+        if let Ok(err) = errors {
+            throw err;
+        }
+
+        let closureType = copy TupleType(closure.loc, closureTypes, isMutable-> false);
+        let ptrType = copy PointerType(closure.loc, closureType, isMutable-> false);
+        let closureValue = copy AddressValue(func.loc, ptrType, copy TupleValue(closure.loc, closureType, closureValues));
+
+        return (body, closureValue);
+    }
+}
