@@ -1,196 +1,283 @@
+/*
+ * Implements semantic validation for `def` declarations.
+ *
+ * This module handles:
+ *   - validation of value definitions(`def x = Value`),
+ *   - validation of type definitions(`def T: Type`),
+ *   - detection of forward-reference cycles,
+ *   - construction of generator values for defs,
+ *   - error propagation and wrapping for invalid definitions,
+ *   - verification of addressability for value definitions.
+ *
+ * Def validation is performed using a per-definition recursion-depth counter
+ * stored in the DefContext. This prevents infinite recursion when defs
+ * reference each other cyclically.
+
+ *
+ * <hr>
+ *
+ * @Package: ymirc
+ * @Module: ymirc::semantic::validator::symbol::def_
+ * @File: ymirc/semantic/validator/symbol/def_.yr
+ * @Author(s):
+ *   - Emile Cadorel <ecadorel@gmail.com>
+ *
+ * @Created(YYYY-MM-DD): 2026-05-26
+ * @Copyright(C) 2021–2026 GNU-Ymir
+ * @License
+ *   ```text
+ *   This file is part of the Ymir language project.
+ *
+ *   Ymir is free software: you can redistribute it and/or modify it
+ *   under the terms of the GNU General Public License as published by
+ *   the Free Software Foundation, either version 3 of the License, or
+ *   (at your option) any later version.
+ *
+ *   Ymir is distributed in the hope that it will be useful,
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *   GNU General Public License for more details.
+ *
+ *   You should have received a copy of the GNU General Public License
+ *   along with Ymir.  If not, see <https://www.gnu.org/licenses/>.
+ *   ```
+ */
+
 in def_;
 
-use ymirc::semantic::{validator, symbol, template_};
+use ymirc::semantic::{validator, symbol};
 
 use ymirc::syntax::{expression::_, declaration::_};
 use ymirc::semantic::generator::{value::_, type::_};
 
-use ymirc::lexing::keys;
 use ymirc::errors::_;
 
 use ymirc::utils::{format, log};
 use ymirc::lexing::{word, tokens};
 
-use std::{stream, io};
-
-
+/**
+ * DefValidation module
+ *
+ * Provides semantic validation for `def` declarations. Responsibilities:
+ *
+ *   - validate type definitions,
+ *   - validate value definitions,
+ *   - detect and report forward-reference cycles,
+ *   - wrap errors in VALIDATING_SYMBOL diagnostics,
+ *   - construct generator values for defs,
+ *   - reject unaddressable values(e.g., constructor delegates),
+ *   - ensure type definitions resolve to complete types.
+ *
+ */
 pub mod DefValidation {
+
+    /**
+     * Validate a `def` symbol, dispatching to either validateType() or
+     * validateValue() depending on whether the definition is a type or a value.
+     *
+     * Responsibilities:
+     *   - detect forward-reference cycles using DefContext,
+     *   - prevent infinite recursion by limiting validation depth,
+     *   - wrap errors in VALIDATING_SYMBOL diagnostics,
+     *   - store the resulting generator(Type, Value, or ErrorGenerator).
+     *
+     * @params:
+     *   - context: validation context
+     *   - sym:     DefSymbol to validate
+     *
+     * @throws:
+     *   - ErrorMsg if validation fails or forward reference is detected
+     */
     pub fn validate(dmut context: &ValidationContext, dmut sym: &DefSymbol)
         throws ErrorMsg
     {
-        context;
-        sym;
-        panic;
+        match sym.generator {
+            Value() => return;
+            Type() => return;
+            e: &ErrorGenerator => {
+                throw e.msg;
+            }
+        }
+
+        logging::info("Validate def %", sym.path);
+        let validationLevel = context.defContext.level(sym);
+        let maxLevel = if sym.decl.isValue {
+            1u32
+        } else {
+            3u32
+        };
+
+        if validationLevel >= maxLevel {
+            let error = copy ErrorMsg::fatal(sym.loc, format(ValidateErrorMessage::FORWARD_REFERENCE_AKA, sym.path));
+            sym.generator = copy ErrorGenerator(sym.loc, error);
+            throw error;
+        }
+
+        context.defContext:.set(sym, validationLevel + 1);
+        {
+            if (sym.decl.isValue) {
+                DefValidation::validateValue(alias context, alias sym);
+            } else {
+                DefValidation::validateType(alias context, alias sym);
+            }
+        } catch {
+            err: &ErrorMsg => {
+                context.defContext:.remove(sym);
+                throw err;
+            }
+        }
+
+        if validationLevel == 0 {
+            context.defContext:.remove(sym);
+        }
+    }
+
+    /**
+     * Validate a type definition(`def T: TypeExpr`).
+     *
+     * Responsibilities:
+     *   - validate the type expression,
+     *   - ensure the resulting type is complete,
+     *   - allow class references and class pointers(with struct restriction),
+     *   - wrap errors in VALIDATING_SYMBOL diagnostics,
+     *   - store the resulting type as the generator.
+     *
+     * @params:
+     *   - context: validation context
+     *   - sym:     DefSymbol representing a type definition
+     *
+     * @throws:
+     *   - ErrorMsg if type validation fails
+     */
+    fn validateType(dmut context: &ValidationContext, dmut sym: &DefSymbol)
+        throws ErrorMsg
+    {
+        context:.pushReferent(alias sym);
+        context:.enterForeign(isFnBody-> false);
+
+        let mut errors: (&ErrorMsg)? = none;
+        let mut type: &Type = NONE_TYPE;
+        {
+            let t = TypeValidation::validate(alias context, sym.decl.content, parentMutable-> false);
+            if t of ClassRefType {
+                type = t;
+            }
+            else if let c: &ClassPtrType = t {
+                if (!c.sym.isStruct) {
+                    throw copy ErrorMsg::fatal(sym.decl.content.loc, format(ValidateErrorMessage::CLASS_THROW_PTR, c));
+                }
+
+                type = c.inner;
+            }
+            else {
+                TypeVerification::verifyComplete(sym.decl.content.loc, t, false);
+                type = t;
+            }
+        } catch {
+            err => {
+                errors = (err)?;
+            }
+        } exit {
+            context:.exitForeign();
+            context:.popReferent();
+        }
+
+        if let Ok(err) = errors {
+            let error = copy ErrorMsg::fatal(sym.loc, format(ValidateErrorMessage::VALIDATING_SYMBOL, sym.path),
+                                             notes-> copy [err]);
+
+            sym.generator = copy ErrorGenerator(sym.loc, error);
+            throw error;
+        }
+
+        sym.generator = type.clone(mutLevel-> 0u32);
+    }
+
+    /**
+     * Validate a value definition(`def x = expr`).
+     *
+     * Responsibilities:
+     *   - validate the value expression,
+     *   - reject unaddressable values(e.g., constructor delegates),
+     *   - wrap errors in VALIDATING_SYMBOL diagnostics,
+     *   - store the resulting value as the generator.
+     *
+     * @params:
+     *   - context: validation context
+     *   - sym:     DefSymbol representing a value definition
+     *
+     * @throws:
+     *   - ErrorMsg if validation fails or value is unaddressable
+     */
+    fn validateValue(dmut context: &ValidationContext, dmut sym: &DefSymbol)
+        throws ErrorMsg
+    {
+        let mut errors: (&ErrorMsg)? = none;
+        context:.pushReferent(alias sym);
+        context:.enterForeign(isFnBody-> false);
+
+        let mut value: &Value = UNIT_VALUE;
+        {
+            let loc = sym.decl.content.loc;
+            let v = ValueValidation::validate(alias context, sym.decl.content);
+
+            if (DefValidation::checkUnaddressableValue(v)) {
+                throw copy ErrorMsg::fatal(sym.loc, end-> loc, format(ValidateErrorMessage::AKA_CLASS_CTOR),
+                                           notes-> copy [copy ErrorMsg::note(loc, oneLine-> true, format(ValidateErrorMessage::MAYBE_TYPE_AKA))]);
+            }
+
+            value = v;
+        } catch {
+            err: &ErrorMsg => {
+                errors = (err)?;
+            }
+        } exit {
+            context:.exitForeign();
+            context:.popReferent();
+        }
+
+        if let Ok(err) = errors {
+            let error = copy ErrorMsg::fatal(sym.loc, format(ValidateErrorMessage::VALIDATING_SYMBOL, sym.path),
+                                             notes-> copy [err]);
+            sym.generator = copy ErrorGenerator(sym.loc, error);
+            throw error;
+        }
+
+        sym.generator = value;
+    }
+
+    /**
+     * Determine whether a value is unaddressable and therefore invalid as a
+     * `def` initializer.
+     *
+     * Unaddressable values include:
+     *   - CtorDelegateValue,
+     *   - CtorDelegateTemplateValue,
+     *   - any MultSymValue containing an unaddressable value.
+     *
+     * These values represent constructor delegates, which cannot be bound to
+     * a `def` because they do not represent stable, addressable storage.
+     *
+     * @params:
+     *   - v: value to inspect
+     *
+     * @returns:
+     *   - true if the value is unaddressable
+     *   - false otherwise
+     */
+    fn checkUnaddressableValue(v: &Value)-> bool {
+        if v of CtorDelegateValue || v of CtorDelegateTemplateValue {
+            return true;
+        }
+
+        if let m: &MultSymValue = v {
+            for i in m.values {
+                if checkUnaddressableValue(i) {
+                    return true;
+                }
+            }
+        }
+
+        return false;
     }
 }
-
-//     // The list of akas currently in validation to avoid infinite recursion
-//     let mut _validation: [&Symbol => mut u32] = copy [];
-
-//     /**
-//      * Create a new empty validator
-//      */
-//     pub self () {}
-
-//     /**
-//      * Validate an aka symbol found in the symbol tree
-//      * */
-
-//     {
-//         match sym.getGenerator() {
-//             Type() => { return; }
-//             Value() => { return; }
-//             e: &ErrorGenerator => throw e.getErrorMessage();
-//         }
-
-//         logging::info("Validate def %", sym.getPath());
-//         let validationLevel = if let Ok(level) = self._validation[sym] { level } else { 0 };
-//         let maxLevel = if sym.getContent().isValue() { 1u32 } else { 3u32 };
-
-//         if validationLevel < maxLevel {
-//             self._validation[sym] = validationLevel + 1;
-
-//             {
-//                 if (sym.getContent().isValue()) {
-//                     self:.validateValue(alias context, alias sym);
-//                 } else {
-//                     self:.validateType(alias context, alias sym);
-//                 }
-//             } catch {
-//                 err: &ErrorMsg => {
-//                     self._validation:.remove(sym);
-//                     throw err;
-//                 }
-//             }
-
-//             if validationLevel == 0 {
-//                 self._validation:.remove(sym);
-//             }
-//         } else {
-//             let error = copy ErrorMsg::fatal(sym.getLoc(), format(ValidateErrorMessage::FORWARD_REFERENCE_AKA, sym.getPath()));
-//             sym:.setGenerator(copy ErrorGenerator(sym.getLoc(), error));
-//             throw error;
-//         }
-//     }
-
-//     /**
-//      * Validate an aka symbol as a type
-//      * @params:
-//      *    - context: the context of the validation
-//      *    - sym: the symbol to validate
-//      * @returns: the type contained in the aka
-//      * @throws: &ErrorMsg, if the aka is malformed, or is a value
-//      */
-//     fn validateType(mut self, dmut context: &Validator, dmut sym: &AkaSymbol)
-//         throws ErrorMsg
-//     {
-//         context:.pushReferent(alias sym);
-//         context:.enterForeign(isFnBody-> false);
-
-//         let type = {
-//             let t = context:.validateType(sym.getContent().getContent(), parentMutable-> false);
-//             match t {
-//                 c: &ClassRefType => { c }
-//                 c: &ClassPtrType => {
-//                     if (!c.isStruct()) {
-//                         throw copy ErrorMsg::fatal(sym.getContent().getContent().getLoc(), format(ValidateErrorMessage::CLASS_THROW_PTR, c));
-//                     }
-
-//                     c.getInner()
-//                 }
-//                 _ => {
-//                     context.verifyCompleteType(sym.getContent().getContent().getLoc(), t, false);
-//                     t
-//                 }
-//             }
-//         } catch {
-//             err: &ErrorMsg => {
-//                 context:.exitForeign();
-//                 context:.popReferent();
-
-//                 let error = copy ErrorMsg::fatal(sym.getLoc(), format(ValidateErrorMessage::VALIDATING_SYMBOL, sym.getPath()),
-//                                                   notes-> copy [err]);
-
-//                 sym:.setGenerator(copy ErrorGenerator(sym.getLoc(), error));
-//                 throw error;
-//             }
-//         };
-
-//         context:.exitForeign();
-//         context:.popReferent();
-
-//         sym:.setGenerator(type.clone(mutLevel-> 0u32));
-//     }
-
-//     /**
-//      * Validate an aka symbol as a value
-//      * @params:
-//      *    - context: the context of the validation
-//      *    - sym: the symbol to validate
-//      * @returns: the value contained in the aka
-//      * @throws: &ErrorMsg, if the aka is malformed, or is a type
-//      */
-//     fn validateValue(mut self, dmut context: &Validator, dmut sym: &AkaSymbol)
-//         throws ErrorMsg
-//     {
-//         context:.pushReferent(alias sym);
-//         context:.enterForeign(isFnBody-> false);
-
-//         let value = {
-//             let loc = sym.getContent().getContent().getLoc();
-//             let v = context:.validateValue(sym.getContent().getContent());
-
-//             if (self.checkUnaddressableValue(loc, v)) {
-//                 throw copy ErrorMsg::fatal(sym.getLoc(), end-> loc, format(ValidateErrorMessage::AKA_CLASS_CTOR),
-//                                        notes-> copy [copy ErrorMsg::note(loc, oneLine-> true, format(ValidateErrorMessage::MAYBE_TYPE_AKA))]);
-//             }
-
-//             v
-//         } catch {
-//             err: &ErrorMsg => {
-//                 context:.exitForeign();
-//                 context:.popReferent();
-
-//                 let error = copy ErrorMsg::fatal(sym.getLoc(), format(ValidateErrorMessage::VALIDATING_SYMBOL, sym.getPath()),
-//                                                   notes-> copy [err]);
-//                 sym:.setGenerator(copy ErrorGenerator(sym.getLoc(), error));
-//                 throw error;
-//             }
-//         };
-
-//         context:.exitForeign();
-//         context:.popReferent();
-
-//         sym:.setGenerator(value);
-//     }
-
-//     /*!
-//      * ================================================================================
-//      * ================================================================================
-//      * =========================           CHECKING           =========================
-//      * ================================================================================
-//      * ================================================================================
-//      */
-
-//     /**
-//      * Check wether the value can be used in an aka value
-//      * */
-//     fn checkUnaddressableValue(self, _: &Word, v: &Value)-> bool {
-//         match v {
-//             CtorDelegateValue() => { return true; }
-//             CtorDelegateTemplateValue() => { return true; }
-//             m: &MultSymValue => {
-//                 for i in m.getValues() {
-//                     if i of CtorDelegateValue || i of CtorDelegateTemplateValue {
-//                         return true;
-//                     }
-//                 }
-
-//                 return false;
-//             }
-//         }
-
-//         false
-//     }
-
-// }
