@@ -1,5 +1,62 @@
+/*
+ * Implements full semantic validation for lambda expressions.
+ *
+ * This module orchestrates:
+ *   - prototype validation,
+ *   - parameter-type finalization,
+ *   - closure-capture validation,
+ *   - lambda body validation,
+ *   - return-type inference,
+ *   - construction of lambda frames,
+ *   - construction of delegate or function-pointer values,
+ *   - insertion of generated frames into the validation context.
+ *
+ * Lambda validation proceeds in two phases:
+ *
+ *   Phase 1 — Prototype validation:
+ *       - validate parameter declarations,
+ *       - detect incomplete prototypes,
+ *       - construct a LambdaValue.
+ *
+ *   Phase 2 — Full validation:
+ *       - finalize parameter types,
+ *       - validate the lambda body,
+ *       - compute closure type,
+ *       - generate a FrameGenerator,
+ *       - construct the resulting delegate or function-pointer
+ *
+ * <hr>
+ *
+ * @Package: ymirc
+ * @Module: ymirc::semantic::validator::symbol::function::lambda
+ * @File: ymirc/semantic/validator/symbol/function/lambda.yr
+ * @Author(s):
+ *   - Emile Cadorel <ecadorel@gmail.com>
+ *
+ * @Created(YYYY-MM-DD): 2026-05-21
+ * @Copyright(C) 2021–2026 GNU-Ymir
+ * @License
+ *   ```text
+ *   This file is part of the Ymir language project.
+ *
+ *   Ymir is free software: you can redistribute it and/or modify it
+ *   under the terms of the GNU General Public License as published by
+ *   the Free Software Foundation, either version 3 of the License, or
+ *   (at your option) any later version.
+ *
+ *   Ymir is distributed in the hope that it will be useful,
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *   GNU General Public License for more details.
+ *
+ *   You should have received a copy of the GNU General Public License
+ *   along with Ymir.  If not, see <https://www.gnu.org/licenses/>.
+ *   ```
+ */
+
 in lambda;
 
+use ymirc::syntax::{expression::_, declaration::_};
 use ymirc::semantic::{validator, template_};
 use ymirc::semantic::{generator::_, symbol};
 use ymirc::semantic::generator::{value::_, type::_};
@@ -8,23 +65,174 @@ use ymirc::errors::_;
 use ymirc::utils::{format, log};
 use ymirc::lexing::{word, tokens, keys};
 
-use std::{stream, io};
+use ymirc::semantic::validator::symbol::function::lambda::_;
+
+/*!
+ * ====================================================================================================
+ * ====================================================================================================
+ * ====================================          SUBMODS          =====================================
+ * ====================================================================================================
+ * ====================================================================================================
+ */
+
+pub mod ::proto;
+pub mod ::body;
 pub mod ::create;
 
+/*!
+ * ====================================================================================================
+ * ====================================================================================================
+ * ======================================          ROOT          ======================================
+ * ====================================================================================================
+ * ====================================================================================================
+ */
+
+/**
+ * LambdaValidation module
+ *
+ * Provides the high-level validation pipeline for lambda expressions.
+ * Responsibilities:
+ *
+ *   - validate lambda prototypes,
+ *   - detect incomplete lambda signatures,
+ *   - construct LambdaValue instances,
+ *   - validate lambda bodies,
+ *   - infer return types,
+ *   - validate closure captures,
+ *   - generate lambda frames,
+ *   - construct delegate or function-pointer values,
+ *   - insert generated frames into the validation context.
+ *
+ */
 pub mod LambdaValidation {
 
-    pub fn validateBody(dmut context: &ValidationContext,
-                         lmbd:         &LambdaValue,
-                         params:       [&Type],
-                         forLazy:     bool = false,
-                         castClosure: bool = false)-> (&Value, &FrameGenerator)
+    /**
+     * Validate a lambda expression and return its resulting value.
+     *
+     * This is the entry point for validating a lambda expression as it appears
+     * in source code. It performs prototype validation first, then full lambda
+     * validation if the prototype is complete.
+     *
+     * @params:
+     *   - context:   validation context
+     *   - sym:       LambdaExpr from the AST
+     *   - isClosure: whether the lambda is a closure
+     *   - forLazy:   whether the lambda is used in a lazy context
+     *   - copyLoc:   location used for copy-related diagnostics
+     *
+     * @returns:
+     *   - the resulting delegate or function-pointer value
+     *
+     * @throws:
+     *   - ErrorMsg if validation fails
+     */
+    pub fn validate(dmut context: &ValidationContext,
+                    sym:          &LambdaExpr,
+                    isClosure:    bool = false,
+                    forLazy:      bool = false,
+                    copyLoc:      &Word = EOF_WORD)-> &Value
         throws ErrorMsg
     {
-        context;
-        lmbd;
-        params;
-        forLazy;
-        castClosure;
+        let frameName = context.referent.path.push(format("_%_%", sym.loc.line, sym.loc.col));
+        let (paramVars, paramTypes, retType, incomplete) = LambdaPrototypeValidation::validate(alias context, sym.proto);
+        let index = context.getCurrentClosingIndex();
+        let proto = copy LambdaValue(sym.loc,
+                                     copy LambdaType(sym.loc, paramTypes, retType),
+                                     frameName,
+                                     paramVars,
+                                     retType,
+                                     sym.body,
+                                     isClosure,
+                                     index,
+                                     copyLoc-> copyLoc);
+
+        if incomplete {
+            return proto;
+        }
+
+        let (retProto, frame) = LambdaValidation::validate(alias context, proto, paramTypes,
+                                                           forLazy-> forLazy,
+                                                           castClosure-> false);
+        LambdaCreation::insertGenerator(alias context, frame);
+        return retProto;
+    }
+
+    /**
+     * Fully validate a lambda after prototype validation.
+     *
+     * This function performs the complete lambda validation pipeline:
+     *
+     *   - finalize parameter types,
+     *   - validate the lambda body,
+     *   - compute closure type,
+     *   - generate a lambda frame,
+     *   - construct the resulting delegate or function-pointer value.
+     *
+     * @params:
+     *   - context:     validation context
+     *   - lmbd:        LambdaValue produced by prototype validation
+     *   - paramTypes:  final parameter types
+     *   - forLazy:     whether the lambda is used in a lazy context
+     *   - castClosure: whether closure is synthesized(fptr → delegate)
+     *
+     * @returns:
+     *   - (value, frame)
+     *
+     * @throws:
+     *   - ErrorMsg if validation fails
+     */
+    pub fn validate(dmut context: &ValidationContext,
+                    lmbd:        &LambdaValue,
+                    paramTypes:   [&Type],
+                    forLazy:      bool = false,
+                    castClosure:  bool = false)-> (&Value, &FrameGenerator)
+        throws ErrorMsg
+    {
+        let mut errors: (&ErrorMsg)? = none;
+        let mut proto: &Value = UNIT_VALUE;
+        let mut frame: (&FrameGenerator)? = none;
+
+        context:.enterForeign(isLambda-> true, isFnBody-> true, classRef-> context.getCurrentClassReferent());
+        context:.enterBlock();
+        {
+            let (refs, lazys, types, params) = LambdaPrototypeValidation::validateFinalParameters(alias context, lmbd, paramTypes);
+            let refId = value::generateUniqID();
+            let (body, closure, retType) = LambdaBodyValidation::validate(alias context, refId, lmbd,
+                                                                          forLazy-> forLazy,
+                                                                          castClosure-> castClosure);
+
+            let (proto_, frame_) = if let cl: &ClosureType = closure {
+                LambdaBodyValidation::createFrameWithClosure(lmbd, cl, lazys, refs, types, params, retType, body, refId, castClosure)
+            } else {
+                LambdaBodyValidation::createFrameNoClosure(lmbd, lazys, refs, types, params, retType, body)
+            };
+
+            proto = proto_;
+            frame = frame_?;
+        } catch {
+            err => {
+                errors = LambdaBodyValidation::createError(lmbd.loc, paramTypes, forLazy, err)?;
+            }
+        }
+
+        {
+            context:.quitBlock(warnUnused-> !(errors.hasValue));
+        } catch {
+            err => {
+                errors = (err)?;
+            }
+        }
+
+        context:.exitForeign();
+
+        if let Ok(err) = errors {
+            throw err;
+        }
+
+        if let Ok(fr) = frame {
+            return (proto, fr);
+        }
+
         panic;
     }
 }
