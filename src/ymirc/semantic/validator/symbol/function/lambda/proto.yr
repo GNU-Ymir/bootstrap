@@ -1,0 +1,279 @@
+/*
+ * Implements semantic validation of lambda prototypes.
+ *
+ * This module handles:
+ *   - validation of lambda parameter declarations,
+ *   - validation of lambda return types,
+ *   - detection of incomplete lambda prototypes,
+ *   - construction of ProtoVarDeclValue entries for lambda parameters,
+ *   - validation of reference and lazy modifiers,
+ *   - enforcement of non-void and mutability rules,
+ *   - error aggregation for multi-parameter validation.
+ *
+ * Lambda prototype validation is performed in a foreign context using the
+ * current class referent, ensuring correct handling of type resolution and
+ * local-scope insertion.
+ *
+ *
+ * <hr>
+ *
+ * @Package: ymirc
+ * @Module: ymirc::semantic::validator::symbol::function::lambda::proto
+ * @File: ymirc/semantic/validator/symbol/function/lambda/proto.yr
+ * @Author(s):
+ *   - Emile Cadorel <ecadorel@gmail.com>
+ *
+ * @Created(YYYY-MM-DD): 2026-05-26
+ * @Copyright(C) 2021–2026 GNU-Ymir
+ * @License
+ *   ```text
+ *   This file is part of the Ymir language project.
+ *
+ *   Ymir is free software: you can redistribute it and/or modify it
+ *   under the terms of the GNU General Public License as published by
+ *   the Free Software Foundation, either version 3 of the License, or
+ *   (at your option) any later version.
+ *
+ *   Ymir is distributed in the hope that it will be useful,
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *   GNU General Public License for more details.
+ *
+ *   You should have received a copy of the GNU General Public License
+ *   along with Ymir.  If not, see <https://www.gnu.org/licenses/>.
+ *   ```
+ */
+
+in proto;
+
+use ymirc::syntax::{expression::_, declaration::_};
+use ymirc::semantic::{validator, template_};
+use ymirc::semantic::{generator::_, symbol};
+use ymirc::semantic::generator::{value::_, type::_};
+
+use ymirc::errors::_;
+use ymirc::utils::{format, log};
+use ymirc::lexing::{word, tokens, keys};
+
+/**
+ * LambdaPrototypeValidation module
+ *
+ * Provides semantic validation for lambda prototypes. Responsibilities:
+ *
+ *   - validate parameter types and modifiers,
+ *   - validate return type,
+ *   - detect incomplete lambda prototypes,
+ *   - construct ProtoVarDeclValue entries,
+ *   - insert parameters into the local scope,
+ *   - aggregate and report validation errors.
+ *
+ * A lambda prototype is considered *incomplete* if any parameter. In such
+ * cases, the caller may defer full validation until type inference completes.
+ */
+pub mod LambdaPrototypeValidation {
+
+    /**
+     * Validate a lambda prototype and return its semantic components.
+     *
+     * Performs:
+     *   - validation of each parameter declaration,
+     *   - construction of ProtoVarDeclValue entries,
+     *   - validation of the return type(if present),
+     *   - detection of incomplete prototypes,
+     *
+     * @params:
+     *   - context: validation context
+     *   - proto:   lambda prototype(FunctionPrototype)
+     *
+     * @returns:
+     *   - (params, types, retType, incomplete)
+     *       params:     list of parameter values(ProtoVarDeclValue or ExprWrapperValue)
+     *       types:      list of parameter types
+     *       retType:    validated return type(or NONE_TYPE)
+     *       incomplete: true if any parameter or return type was EmptyExpr
+     *
+     * @throws:
+     *   - ErrorMsg::list if any parameter or return-type validation fails
+     */
+    pub fn validate(dmut context: &ValidationContext, proto: FunctionPrototype)-> ([&Value], [&Type], &Type, bool)
+        throws ErrorMsg
+    {
+        let mut errors: [&ErrorMsg] = [];
+        let mut incomplete: bool = false;
+        let mut params: [&Value] = [];
+        let mut types: [&Type] = [];
+        let mut retType: &Type = NONE_TYPE;
+
+        context:.enterForeign(isFnBody-> false, classRef-> context.getCurrentClassReferent());
+        context:.enterBlock();
+
+        for v in proto.params {
+            {
+                if v.type of EmptyExpr {
+                    incomplete = true;
+                    params ~= [copy ExprWrapperValue(v.loc, v)];
+                    types ~= [NONE_TYPE];
+                } else {
+                    let (isRef, isLazy, type) = LambdaPrototypeValidation::validateParamType(alias context, v);
+                    let paramDecl = copy ProtoVarDeclValue(v.loc, type, UNIT_VALUE, type.isMutable,
+                                                           isSelf-> false,
+                                                           isReference-> isRef,
+                                                           isLazy-> isLazy,
+                                                           nbConsume-> 1);
+                    params ~= [paramDecl];
+                    types ~= [type];
+                    context:.insertLocal(paramDecl.loc, paramDecl.name, paramDecl);
+                }
+            } catch {
+                err => {
+                    errors ~= [err];
+                }
+            }
+        }
+
+        {
+            if proto.retType !of EmptyExpr {
+                retType = TypeValidation::validate(alias context, proto.retType);
+            }
+        } catch {
+            err => {
+                errors ~= [err];
+            }
+        }
+
+        context:.safeQuitBlock();
+        context:.exitForeign();
+
+        if errors.len != 0 {
+            throw copy ErrorMsg::list(errors);
+        }
+
+        return (params, types, retType, incomplete);
+    }
+
+    /**
+     * Validate the final parameter list of a lambda after type inference.
+     *
+     * This function is called once the lambda’s parameter types have been
+     * inferred or provided externally(e.g., from a function pointer or a
+     * contextual expected type). It resolves any remaining ExprWrapperValue
+     * parameters, validates compatibility with the inferred types, and
+     * constructs the final ProtoVarDeclValue entries.
+     *
+     * @params:
+     *   - context:     validation context
+     *   - proto:       lambda value containing the prototype parameters
+     *   - paramTypes:  inferred or externally provided parameter types
+     *
+     * @returns:
+     *   - (refs, lazys, types, params)
+     *       refs:   final reference flags
+     *       lazys:  final lazy flags
+     *       types:  final parameter types
+     *       params: final ProtoVarDeclValue entries
+     *
+     * @throws:
+     *   - ErrorMsg::list if any parameter validation fails
+     */
+    pub fn validateFinalParameters(dmut context: &ValidationContext,
+                                   proto:        &LambdaValue,
+                                   paramTypes:   [&Type])-> ([bool], [bool], [&Type], [&ProtoVarDeclValue])
+        throws ErrorMsg
+    {
+        if (proto.params.len != paramTypes.len) panic;
+
+        let mut params: [&ProtoVarDeclValue] = [];
+        let mut types: [&Type] = [];
+        let mut refs: [bool] = [];
+        let mut lazys: [bool] = [];
+        let mut errors: [&ErrorMsg] = [];
+
+        for i, param in proto.params {
+            {
+                if let v: &ProtoVarDeclValue = param {
+                    TypeVerification::verifyCompatible(v.loc, paramTypes[i].loc, v.type, paramTypes[i]);
+                    params ~= [v];
+                    refs ~= [v.isReference];
+                    lazys ~= [v.isLazy];
+                    types ~= [v.type];
+
+                    context:.insertLocal(v.loc, v.name, v);
+                }
+
+                else if let w: &ExprWrapperValue = param { // prototype value is not finished, we need to validate it
+                    if let inner: &VarDeclExpr = w.expr {
+                        let vdecl = copy VarDeclExpr(w.loc, inner.name, inner.value,
+                                                     copy TypeWrapperExpr(inner.loc, paramTypes[i]),
+                                                     isLazyOrRef-> inner.isLazyOrRef,
+                                                     isMutOrDmut-> inner.isMutOrDmut);
+
+                        let (isRef, isLazy, type) = LambdaPrototypeValidation::validateParamType(alias context, vdecl);
+                        TypeVerification::verifyCompatible(vdecl.loc, paramTypes[i].loc, type, paramTypes[i]);
+                        let paramDecl = copy ProtoVarDeclValue(vdecl.loc, type, UNIT_VALUE, type.isMutable,
+                                                               isSelf-> false,
+                                                               isReference-> isRef,
+                                                               isLazy-> isLazy,
+                                                               nbConsume-> 1);
+
+                        params ~= [paramDecl];
+                        types ~= [type];
+                        refs ~= [isRef];
+                        lazys ~= [isLazy];
+
+                        context:.insertLocal(paramDecl.loc, paramDecl.name, paramDecl);
+                    } else panic;
+                } else panic;
+            } catch {
+                err: &ErrorMsg => {
+                    errors ~= [err];
+                }
+            }
+        }
+
+        if (errors.len != 0us) {
+            throw copy ErrorMsg::list(errors);
+        }
+
+        context:.setFunctionReturn(proto.retType);
+
+        return (refs, lazys, types, params);
+    }
+
+    /**
+     * Validate the type of a lambda parameter declaration.
+     *
+     * Performs:
+     *   - type validation via TypeValidation::validateForVarDecl,
+     *   - verification of mutable/reference compatibility,
+     *   - enforcement of non-void rules for parameter types.
+     *
+     * @params:
+     *   - context: validation context
+     *   - vdecl:   VarDeclExpr representing the parameter
+     *
+     * @returns:
+     *   - (isRef, isLazy, type)
+     *
+     * @throws:
+     *   - ErrorMsg::fatal if type validation fails
+     */
+    fn validateParamType(dmut context: &ValidationContext, vdecl: &VarDeclExpr)-> (bool, bool, &Type)
+        throws ErrorMsg
+    {
+        let type = {
+            TypeValidation::validateForVarDecl(alias context, vdecl.type, vdecl,
+                                               canBeRef-> true,
+                                               canBeLazy-> true)
+        } catch {
+            err => {
+                throw copy ErrorMsg::fatal(vdecl.loc, format(ValidateErrorMessage::VALIDATING),
+                                           notes-> copy [err]);
+            }
+        }
+
+        TypeVerification::verifyMutableParam(vdecl.loc, type, vdecl.isRef);
+        TypeVerification::verifyNonVoid(vdecl.loc, type, construct-> true);
+
+        return (vdecl.isRef, vdecl.isLazy, type);
+    }
+}
