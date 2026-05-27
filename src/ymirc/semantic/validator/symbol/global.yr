@@ -1,3 +1,50 @@
+/*
+ * Implements semantic validation for global variable declarations.
+ *
+ * This module handles:
+ *   - validation of external global variables,
+ *   - validation of module-local global variables,
+ *   - lazy-initialization semantics for globals,
+ *   - type validation and inference for global declarations,
+ *   - memory-ownership verification for global values,
+ *   - detection of forward-reference cycles,
+ *   - construction of GlobalVarGenerator entries,
+ *   - insertion of global generators into the validation context.
+ *
+ * Global variables may be:
+ *   - extern globals(declared but not defined),
+ *   - lazy locals(module-local globals with lazy initialization),
+ *   - thread-local globals.
+ *
+ * <hr>
+ *
+ * @Package: ymirc
+ * @Module: ymirc::semantic::validator::symbol::global
+ * @File: ymirc/semantic/validator/symbol/global.yr
+ * @Author(s):
+ *   - Emile Cadorel <ecadorel@gmail.com>
+ *
+ * @Created(YYYY-MM-DD): 2021-12-09
+ * @Copyright(C) 2021–2026 GNU-Ymir
+ * @License
+ *   ```text
+ *   This file is part of the Ymir language project.
+ *
+ *   Ymir is free software: you can redistribute it and/or modify it
+ *   under the terms of the GNU General Public License as published by
+ *   the Free Software Foundation, either version 3 of the License, or
+ *   (at your option) any later version.
+ *
+ *   Ymir is distributed in the hope that it will be useful,
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *   GNU General Public License for more details.
+ *
+ *   You should have received a copy of the GNU General Public License
+ *   along with Ymir.  If not, see <https://www.gnu.org/licenses/>.
+ *   ```
+ */
+
 in global;
 
 use ymirc::syntax::{_, declaration::_, expression::_};
@@ -8,222 +55,240 @@ use ymirc::semantic::{validator, symbol, generator::_};
 use ymirc::errors::_;
 
 use ymirc::utils::{format, log};
-use ymirc::lexing::{word, tokens, keys};
+use ymirc::lexing::{word, tokens};
 
-use std::{stream, io};
-
-
+/**
+ * GlobalVarValidation module
+ *
+ * Provides semantic validation for global variable declarations.
+ * Responsibilities:
+ *
+ *   - validate extern global declarations,
+ *   - validate module-local global declarations,
+ *   - perform type validation and inference,
+ *   - validate lazy initialization semantics,
+ *   - verify memory ownership for global values,
+ *   - detect forward-reference cycles,
+ *   - construct GlobalVarGenerator entries,
+ *   - insert generators into the validation context.
+ *
+ */
 pub mod GlobalVarValidation {
 
-    pub fn validate(dmut context: &ValidationContext, dmut sym: &GlobalVarSymbol, fromModule: bool)
+    /**
+     * Validate a global variable symbol.
+     *
+     * Responsibilities:
+     *   - detect whether validation is required,
+     *   - detect forward-reference cycles,
+     *   - validate extern or local global content,
+     *   - insert the resulting GlobalVarGenerator into the context
+     *     (only for module-local globals).
+     *
+     * @params:
+     *   - context:    validation context
+     *   - sym:        GlobalVarSymbol to validate
+     *   - inModule: whether the global belongs to the current module
+     *
+     * @throws:
+     *   - ErrorMsg if validation fails
+     */
+    pub fn validate(dmut context: &ValidationContext, dmut sym: &GlobalVarSymbol, inModule: bool)
         throws ErrorMsg
     {
-        context;
-        sym;
-        fromModule;
+        if (!GlobalVarValidation::checkValidation(context, sym)) {
+            GlobalVarValidation::validateGlobalContent(alias context, alias sym, inModule);
+        }
 
-        panic;
+        match sym.generator {
+            g: &GlobalVarGenerator => {
+                if (!sym.isExtern && inModule) {
+                    context:.insertGenerator(alias sym, g);
+                }
+            }
+            err: &ErrorGenerator => {
+                throw err.msg;
+            }
+            _ => panic;
+        }
     }
 
+    /**
+     * Validate the full content of a global variable declaration.
+     *
+     * Responsibilities:
+     *   - insert the global into the validation set,
+     *   - validate extern globals or lazy locals,
+     *   - wrap errors in VALIDATING diagnostics,
+     *   - remove the global from the validation set.
+     *
+     * @params:
+     *   - context:    validation context
+     *   - sym:        GlobalVarSymbol
+     *   - inModule: whether the global belongs to the current module
+     */
+    fn validateGlobalContent(dmut context: &ValidationContext, dmut sym: &GlobalVarSymbol, inModule: bool) {
+        logging::info("Validate global variable %", sym.path);
+
+        sym.generator = copy ErrorGenerator(sym.loc, copy ErrorMsg::fatal(sym.loc, ValidateErrorMessage::FORWARD_REFERENCE_TYPE));
+        context.globalVarContext:.insert(sym);
+
+        context:.pushReferent(alias sym);
+        context:.enterForeign(isFnBody-> false);
+
+        {
+            if (sym.isExtern) {
+                GlobalVarValidation::validateExternal(alias context, alias sym);
+            } else {
+                GlobalVarValidation::validateLazyLocal(alias context, alias sym, inModule);
+            }
+        } catch {
+            err => {
+                sym.generator = copy ErrorGenerator(sym.loc, copy ErrorMsg::fatal(sym.loc, ValidateErrorMessage::VALIDATING,
+                                                                                  notes-> copy [err]));
+            }
+        }
+
+        context:.popReferent();
+        context:.exitForeign();
+
+        context.globalVarContext:.remove(sym);
+    }
+
+    /**
+     * Validate an extern global variable declaration.
+     *
+     * Rules:
+     *   - extern globals must not have an initializer,
+     *   - extern globals must have an explicit type,
+     *   - type must be valid for global storage,
+     *   - mutability and lazy flags must be legal for globals.
+     *
+     * @params:
+     *   - context: validation context
+     *   - sym:     GlobalVarSymbol
+     *
+     * @throws:
+     *   - ErrorMsg if extern global is invalid
+     */
+    fn validateExternal(dmut context: &ValidationContext, dmut sym: &GlobalVarSymbol)
+        throws ErrorMsg
+    {
+        let v = sym.decl.var;
+        if v.value !of EmptyExpr {
+            throw copy ErrorMsg::fatal(sym.loc, format(ValidateErrorMessage::EXTERN_GLOBAL_WITH_VALUE),
+                                       end-> v.value.loc);
+        }
+
+        if v.type of EmptyExpr {
+            throw copy ErrorMsg::fatal(sym.loc, format(ValidateErrorMessage::EXTERN_GLOBAL_NO_TYPE),
+                                       end-> v.loc);
+        }
+
+
+        let type = TypeValidation::validateForVarDecl(alias context, v.type, v,
+                                                      canBeRef-> false,
+                                                      canBeLazy-> true);
+
+        TypeVerification::verifyMutableGlobal(v.isMutOrDmut, type, v.isLazy);
+
+        let gvar = copy GlobalVarGenerator(sym.loc, sym.path,
+                                           type-> type,
+                                           value-> UNIT_VALUE,
+                                           isMutable-> (v.isMutable || v.isDeeplyMutable),
+                                           isLazy-> v.isLazy,
+                                           externLang-> sym.externLang,
+                                           isWeak-> sym.isWeak,
+                                           isThreadLocal-> false);
+        sym.generator = gvar;
+    }
+
+    /**
+     * Validate a module-local global variable with lazy initialization.
+     *
+     * Responsibilities:
+     *   - validate initializer expression,
+     *   - infer type if omitted,
+     *   - validate declared type if present,
+     *   - infer value for the declared type,
+     *   - wrap the value in a LazyExpr and validate it,
+     *   - verify memory ownership,
+     *   - verify mutability rules for lazy globals,
+     *   - construct a GlobalVarGenerator,
+     *   - insert generator into the context if inModule.
+     *
+     * @params:
+     *   - context:    validation context
+     *   - sym:        GlobalVarSymbol
+     *   - inModule: whether the global belongs to the current module
+     *
+     * @throws:
+     *   - ErrorMsg if validation fails
+     */
+    fn validateLazyLocal(dmut context: &ValidationContext, dmut sym: &GlobalVarSymbol, inModule: bool)
+        throws ErrorMsg
+    {
+        let v = sym.decl.var;
+        if v.value of EmptyExpr {
+            throw copy ErrorMsg::fatal(sym.loc, format(ValidateErrorMessage::GLOBAL_NO_VALUE),
+                                       end-> v.loc);
+        };
+
+        let value = ValueValidation::validate(alias context, v.value);
+
+        let mut declType: &Type = NONE_TYPE;
+
+        if v.type of EmptyExpr {
+            declType = TypeValidation::validateForVarDecl(alias context, copy TypeWrapperExpr(value.loc, value.type), v,
+                                                          canBeRef-> false,
+                                                          canBeLazy-> true);
+        } else {
+            declType = TypeValidation::validateForVarDecl(alias context, v.type, v,
+                                                          canBeRef-> false,
+                                                          canBeLazy-> true);
+        }
+
+        let finValue = TypeInference::inferValueForType(alias context, declType.loc, value, declType,
+                                                        byReference-> false);
+
+        let intrLazy = copy LazyExpr(finValue.loc, copy ValueWrapperExpr(v.loc, finValue));
+        let lazyVal = LazyValidation::validate(alias context, intrLazy, canBeLazy-> true);
+        MemoryVerification::verifyMemoryOwner(declType.loc, declType, lazyVal,
+                                              construct-> true,
+                                              byReference-> false,
+                                              byLazy-> true);
+
+        TypeVerification::verifyMutableGlobal(v.isMutOrDmut, declType, isLazy-> true);
+
+        let gvar = copy GlobalVarGenerator(sym.loc, sym.path,
+                                           type-> declType,
+                                           value-> lazyVal,
+                                           isMutable-> (v.isMutable || v.isDeeplyMutable),
+                                           isLazy-> true,
+                                           isWeak-> sym.isWeak,
+                                           isThreadLocal-> sym.isThreadLocal);
+
+        sym.generator = gvar;
+        if (inModule) {
+            context:.insertGenerator(alias sym, gvar);
+        }
+    }
+
+    /**
+     * Determine whether a global variable is already validated or in validation.
+     *
+     * @params:
+     *   - context: validation context
+     *   - sym:     GlobalVarSymbol
+     *
+     * @returns:
+     *   - true if the global is already validated or in validation,
+     *   - false otherwise
+     */
+    fn checkValidation(context: &ValidationContext, sym: &GlobalVarSymbol)-> bool {
+        if sym.generator !of EmptyGenerator {
+            return sym in context.globalVarContext;
+        }
+        return true;
+    }
 }
-
-
-//     // The list of enum symbols currently in validation to avoid infinite recursion, and validating multiple times the same symbol
-//     let mut _validation: [&Symbol => mut()] = copy [];
-
-//     /**
-//      * Create a new empty validator
-//      * */
-//     pub self () {}
-
-//     /**
-//      * Validate a global symbol
-//      * @params:
-//      *    - context: the context of the validation
-//      *    - glb: the global variable to validate
-//      * @throws: &ErrorMsg, if the validation failed
-//      * */
-//     pub
-//     {
-//         if (!self.checkValidation(sym)) {
-//             logging::info("Validate global variable %", sym.getPath());
-//             self:.validateGlobalContent(alias context, alias sym, fromModule);
-//         }
-
-//         match sym.getGenerator() {
-//             g: &GlobalVarGenerator => {
-//                 if (!sym.isExternal() && fromModule) {
-//                     context:.insertGenerator(alias sym, g);
-//                 }
-//             }
-//             err: &ErrorGenerator => {
-//                 throw err.getErrorMessage();
-//             }
-//             _ => panic;
-//         }
-//     }
-
-//     /*!
-//      * ================================================================================
-//      * ================================================================================
-//      * =========================      CONTENT VALIDATOR       =========================
-//      * ================================================================================
-//      * ================================================================================
-//      */
-
-//     /**
-//      * Validate the global variable
-//      * @info: in case of error instead of throwing an exception, puts an ErrorGenerator in the symbol
-//      * @params:
-//      *    - context: the context of the validation
-//      *    - sym: the symbol to validate
-//      * */
-//     fn validateGlobalContent(mut self, dmut context: &Validator, dmut sym: &GlobalSymbol, fromModule: bool) {
-//         // If the validation of the global variable is not finished
-//         // a recursive reference will lead to a an infinite loop, we want to avoid that
-
-//         sym:.setGenerator(copy ErrorGenerator(sym.getLoc(),
-//                                                 copy ErrorMsg::fatal(sym.getLoc(), ValidateErrorMessage::FORWARD_REFERENCE_TYPE)));
-//         self._validation[sym] = ();
-
-//         context:.pushReferent(alias sym);
-//         context:.enterForeign(isFnBody-> false);
-
-//         {
-//             if (sym.isExternal()) {
-//                 self.validateExternal(alias context, alias sym);
-//             } else {
-//                 self.validateLazyLocal(alias context, alias sym, fromModule);
-//             }
-//         } catch {
-//             err: &ErrorMsg => {
-//                 sym:.setGenerator(copy ErrorGenerator(sym.getLoc(), copy ErrorMsg::fatal(sym.getLoc(), ValidateErrorMessage::VALIDATING, notes-> copy [err])));
-//             }
-//         }
-
-//         context:.popReferent();
-//         context:.exitForeign();
-
-//         self._validation:.remove(sym);
-//     }
-
-//     /**
-//      * Validate the global variable assuming it is a global static external variable(from C language for example)
-//      * @params:
-//      *    - context: the context of the validation
-//      *    - sym: the symbol to validate
-//      * */
-//     fn validateExternal(self, dmut context: &Validator, dmut sym: &GlobalSymbol)
-//         throws ErrorMsg
-//     {
-//         let v = sym.getContent().getContent();
-//         match v.getValue() {
-//             EmptyExpression() => {}
-//             value: _ => {
-//                 throw copy ErrorMsg::fatal(sym.getLoc(), end-> value.getLoc(), format(ValidateErrorMessage::EXTERN_GLOBAL_WITH_VALUE));
-//             }
-//         }
-
-//         let type = match v.getType() {
-//             EmptyExpression() => {
-//                 throw copy ErrorMsg::fatal(sym.getLoc(), end-> v.getLoc(), format(ValidateErrorMessage::EXTERN_GLOBAL_NO_TYPE));
-//             }
-//             t: _ => {
-//                 context:.validateTypeForVarDecl(t, v, canBeRef-> false, canBeLazy-> true)
-//             }
-//         };
-
-//         if (v.isLazy() && type.isMutable() && !type.needExplicitAlias()) {
-//             throw copy ErrorMsg::fatal(v.getMutOrDmutLocation(), ValidateErrorMessage::MUTABLE_LAZY_VAR);
-//         }
-
-//         let gvar = copy GlobalVarGenerator(sym.getLoc(),
-//                                             sym.getPath(),
-//                                             type-> type,
-//                                             value-> UNIT_VALUE,
-//                                             isMutable-> (v.isMutable() || v.isDeeplyMutable()),
-//                                             isLazy-> v.isLazy(),
-//                                             externLang-> sym.getExternalLanguage(),
-//                                             isWeak-> sym.isWeak(),
-//                                             isThreadLocal-> false);
-
-//         sym:.setGenerator(gvar);
-//     }
-
-//     /**
-//      * Validate the global variable assuming it is declared localy and it is a lazy variable
-//      * @params:
-//      *    - context: the context of the validation
-//      *    - sym: the symbol to validate
-//      * */
-//     fn validateLazyLocal(self, dmut context: &Validator, dmut sym: &GlobalSymbol, fromModule: bool)
-//         throws ErrorMsg
-//     {
-//         let v = sym.getContent().getContent();
-//         match v.getValue() {
-//             EmptyExpression() => {
-//                 throw copy ErrorMsg::fatal(sym.getLoc(), end-> v.getLoc(), format(ValidateErrorMessage::GLOBAL_NO_VALUE));
-//             }
-//         };
-
-//         let value = context:.validateValue(v.getValue());
-
-//         let declType = match v.getType() {
-//             EmptyExpression() => {
-//                 context:.validateTypeForVarDecl(copy TypeWrapperExpr(value.getLoc(), value.getType()), v, canBeRef-> false, canBeLazy-> true)
-//             }
-//             t: _ => {
-//                 context:.validateTypeForVarDecl(t, v, canBeRef-> false, canBeLazy-> true)
-//             }
-//         };
-
-//         let finValue = context:.verifyCompatibleTypeWithValue(declType.getLoc(), declType, value, byReference-> false);
-//         let content = copy ValueWrapperExpr(v.getLoc(), finValue);
-//         let intrLazy = copy IntrinsicExpr(finValue.getLoc(), IntrinsicKeys::LAZY, content);
-
-//         let lazyVal = context:.getValueValidator().validateLazy(alias context, intrLazy, content, canBeLazy-> true);
-//         context.verifyMemoryOwner(declType.getLoc(), declType, lazyVal, construct-> true, byReference-> false, byLazy-> true);
-
-//         if (declType.isMutable() && !declType.needExplicitAlias()) {
-//             throw copy ErrorMsg::fatal(v.getMutOrDmutLocation(), ValidateErrorMessage::MUTABLE_LAZY_VAR);
-//         }
-
-//         let gvar = copy GlobalVarGenerator(sym.getLoc(),
-//                                             sym.getPath(),
-//                                             type-> declType,
-//                                             value-> lazyVal,
-//                                             isMutable-> (v.isMutable() || v.isDeeplyMutable()),
-//                                             isLazy-> true,
-//                                             isWeak-> sym.isWeak(),
-//                                             isThreadLocal-> sym.isThreadLocal());
-
-//         sym:.setGenerator(gvar);
-//         if (fromModule) {
-//             context:.insertGenerator(alias sym, gvar);
-//         }
-//     }
-
-//     /*!
-//      * ================================================================================
-//      * ================================================================================
-//      * =========================           CHECKING           =========================
-//      * ================================================================================
-//      * ================================================================================
-//      */
-
-//     /**
-//      * @returns: true if the global variable was already validated, or is currently in validation
-//      */
-//     fn checkValidation(self, sym: &GlobalSymbol)-> bool {
-//         match sym.getGenerator() {
-//             EmptyGenerator() => { // The global variable has no value, but maybe it is currently in validation(recursive global var validation)
-//                 if sym in self._validation {
-//                     return true;
-//                 }
-
-//                 false
-//             }
-//             _ => { true }
-//         }
-//     }
-// }
