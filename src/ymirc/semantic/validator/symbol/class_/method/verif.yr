@@ -1,0 +1,411 @@
+/*
+ *
+ * Implements semantic verification for class methods, focusing on:
+ *   - direct method collisions between classes and their ancestors,
+ *   - override legality(return types, protection, final, field-method rules),
+ *   - trait-based override constraints,
+ *   - thrower compatibility,
+ *   - method signature similarity checks.
+ *
+ * <hr>
+ *
+ * @Package: ymirc
+ * @Module: ymirc::semantic::validator::symbol::class_::method::verif
+ * @File: ymirc/semantic/validator/symbol/class_/method/verif.yr
+ * @Author(s):
+ *   - Emile Cadorel <ecadorel@gmail.com>
+ *
+ * @Created(YYYY-MM-DD): 2026-05-27
+ * @Copyright(C) 2021–2026 GNU-Ymir
+ * @License
+ *   ```text
+ *   This file is part of the Ymir language project.
+ *
+ *   Ymir is free software: you can redistribute it and/or modify it
+ *   under the terms of the GNU General Public License as published by
+ *   the Free Software Foundation, either version 3 of the License, or
+ *   (at your option) any later version.
+ *
+ *   Ymir is distributed in the hope that it will be useful,
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *   GNU General Public License for more details.
+ *
+ *   You should have received a copy of the GNU General Public License
+ *   along with Ymir.  If not, see <https://www.gnu.org/licenses/>.
+ *   ```
+ */
+
+in verif;
+
+use ymirc::semantic::{symbol, declarator, validator};
+use ymirc::semantic::generator::{value::_, type::_};
+use ymirc::errors::_;
+use ymirc::lexing::{word, keys};
+
+use ymirc::utils::format;
+
+use ymirc::semantic::validator::symbol::class_::method::_;
+
+/**
+ * ClassMethodVerification module
+ *
+ * Provides semantic verification for class methods. Responsibilities:
+ *
+ *   - detect illegal redefinitions inside the same class,
+ *   - enforce explicit `over` keyword for overrides,
+ *   - verify return-type compatibility,
+ *   - verify thrower compatibility,
+ *   - enforce protection-level rules,
+ *   - reject overrides of final methods,
+ *   - enforce field-method override rules,
+ *   - enforce trait override rules,
+ *   - detect signature similarity between methods.
+ *
+ */
+pub mod ClassMethodVerification {
+
+    /**
+     * Verify direct method collisions between a class and its ancestor.
+     *
+     * Responsibilities:
+     *   - enforce trait override rules,
+     *   - detect illegal redefinitions inside the same class,
+     *   - verify return-type compatibility,
+     *   - enforce explicit `over` keyword,
+     *   - enforce protection-level compatibility,
+     *   - reject overrides of final methods,
+     *   - enforce field-method override rules,
+     *   - verify thrower compatibility,
+     *   - ensure override methods have a body.
+     *
+     * Rules enforced:
+     *   - redefining a method in the same class without traits → error,
+     *   - overriding requires `over`,
+     *   - cannot override private-parent methods,
+     *   - override must preserve protection level,
+     *   - cannot override final methods,
+     *   - field methods must override field methods(and vice-versa),
+     *   - override must declare compatible throwers,
+     *   - override must not be empty.
+     *
+     * @throws:
+     *   - ErrorMsg if any override rule is violated
+     */
+    pub fn verifyCollisionDirect(oldMethod: &MethodPrototypeValue,
+                                 nMethod:   &MethodPrototypeValue,
+                                 oldProt:   MethodProtection,
+                                 nProt:     MethodProtection,
+                                 isOver:    bool)
+        throws ErrorMsg
+    {
+        ClassMethodVerification::verifyOverrideInTrait(oldMethod, nMethod, isOver);
+        if (oldMethod.classRef == nMethod.classRef) {
+            if oldMethod.traitSym of EmptySymbol && nMethod.traitSym of EmptySymbol {
+                throw copy ErrorMsg::fatal(nMethod.loc, format(ValidateErrorMessage::COLLIDING_METHOD_DEFINITION, nMethod, oldMethod,
+                                                               tags-> FormatTags(withParams-> true)),
+                                           end-> oldMethod.loc);
+            }
+        }
+
+        // Override must return a type of the same size and compatible
+        ClassMethodVerification::verifyOverrideReturn(oldMethod, nMethod);
+
+        // Simple collision, over is not written in the definition of the method
+        if (!isOver) {
+            throw copy ErrorMsg::fatal(nMethod.loc, format(ValidateErrorMessage::IMPLICIT_OVERRIDE, nMethod, oldMethod,
+                                                           tags-> FormatTags(withParams-> true)),
+                                       end-> oldMethod.loc);
+        }
+
+        // override prv method is impossible, child class does not have access to ancestor private methods
+        if (oldProt == MethodProtection::PRV_PARENT) {
+            throw copy ErrorMsg::fatal(nMethod.loc, format(DeclareErrorMessage::PRIVATE_IN_THIS_CONTEXT, oldMethod,
+                                                           tags-> FormatTags(withParams-> true)),
+                                       end-> oldMethod.loc);
+        }
+
+        // override a pub method, mut be pub
+        if (nProt != oldProt) {
+            throw copy ErrorMsg::fatal(nMethod.loc, format(ValidateErrorMessage::OVERRIDE_MISMATCH_PROTECTION, ClassMethodVerification::toStr(nProt), nMethod, ClassMethodVerification::toStr(oldProt),
+                                                           tags-> FormatTags(withParams-> true)),
+                                       end-> oldMethod.loc);
+        }
+
+        // override a final method is impossible(that's the definition of final)
+        if (oldMethod.isFinal) {
+            throw copy ErrorMsg::fatal(nMethod.loc, format(ValidateErrorMessage::OVERRIDE_FINAL, oldMethod,
+                                                           tags-> FormatTags(withParams-> true)),
+                                       end-> oldMethod.loc);
+        }
+
+        // Field method can only be override by field method
+        if (oldMethod.isField && !nMethod.isField) {
+            throw copy ErrorMsg::fatal(nMethod.loc, format(ValidateErrorMessage::OVERRIDE_FIELD_NO_FIELD, nMethod, oldMethod,
+                                                           tags-> FormatTags(withParams-> true)),
+                                       notes-> copy [copy ErrorMsg::note(oldMethod.fieldLoc, end-> oldMethod.loc, "")]);
+        }
+
+        // A field method can only override a field method
+        if (!oldMethod.isField && nMethod.isField) {
+            throw copy ErrorMsg::fatal(nMethod.loc, format(ValidateErrorMessage::OVERRIDE_NO_FIELD_BY_FIELD, nMethod, oldMethod,
+                                                           tags-> FormatTags(withParams-> true)),
+                                       end-> nMethod.fieldLoc,
+                                       notes-> copy [copy ErrorMsg::note(oldMethod.fieldLoc, "")]);
+        }
+
+        // Check that the declared throwers are compatible
+        ClassMethodVerification::verifyOverrideThrowings(oldMethod, nMethod);
+
+        // Override methods must have a body
+        if (nMethod.isEmpty) {
+            throw copy ErrorMsg::fatal(nMethod.loc, format(ValidateErrorMessage::OVERRIDE_EMPTY, nMethod, oldMethod,
+                                                           tags-> FormatTags(withParams-> true)));
+        }
+    }
+
+    /**
+     * Verify override legality in the presence of traits.
+     *
+     * Responsibilities:
+     *   - prevent overriding trait methods outside trait implementations,
+     *   - prevent overriding non-trait methods inside trait implementations,
+     *   - detect collisions between trait methods,
+     *   - prevent multiple overrides of the same trait method.
+     *
+     * Rules:
+     *   - If trait symbols differ:
+     *        * overriding trait method outside trait impl → error,
+     *        * overriding non-trait method inside trait impl → error,
+     *        * redefining two trait methods → error.
+     *   - If trait symbols match:
+     *        * overriding a trait method twice → error.
+     *
+     * @throws:
+     *   - ErrorMsg if trait override rules are violated
+     */
+    fn verifyOverrideInTrait(oldMethod: &MethodPrototypeValue,
+                             nMethod:   &MethodPrototypeValue,
+                             isOver:    bool)
+        throws ErrorMsg
+    {
+        if (oldMethod.traitSym !is nMethod.traitSym) {
+            if oldMethod.traitSym !of EmptySymbol && isOver {
+                throw copy ErrorMsg::fatal(nMethod.loc, format(ValidateErrorMessage::OVERRIDE_TRAIT_OUTSIDE, oldMethod, nMethod,
+                                                               tags-> FormatTags(withParams-> true)),
+                                           end-> oldMethod.loc);
+            }
+
+            if nMethod.traitSym !of EmptySymbol && isOver {
+                throw copy ErrorMsg::fatal(nMethod.loc, format(ValidateErrorMessage::OVERRIDE_NON_TRAIT_INSIDE, oldMethod, nMethod,
+                                                               tags-> FormatTags(withParams-> true)),
+                                           end-> oldMethod.loc);
+            }
+
+            if nMethod.traitSym !of EmptySymbol && oldMethod.traitSym !of EmptySymbol {
+                throw copy ErrorMsg::fatal(nMethod.loc, format(ValidateErrorMessage::COLLIDING_METHOD_DEFINITION, nMethod, oldMethod,
+                                                               tags-> FormatTags(withParams-> true)),
+                                           end-> oldMethod.loc);
+            }
+        }
+
+        if (oldMethod.traitSym is nMethod.traitSym && oldMethod.traitSym of TraitSymbol) {
+            if (oldMethod.isOver) { // was an override, and come from a trait, then it was necessarily defined inside an impl
+                throw copy ErrorMsg::fatal(nMethod.loc, format(ValidateErrorMessage::OVERRIDE_MULTIPLE_TIMES_TRAIT, nMethod,
+                                                               tags-> FormatTags(withParams-> true)),
+                                           end-> oldMethod.loc);
+            }
+        }
+    }
+
+    /**
+     * Verify return-type compatibility for method overrides.
+     *
+     * Rules:
+     *   - return types must be identical OR
+     *   - the new return type must be inferable as a subtype of the old one
+     *     via TypeInference::inferBranching(),
+     *   - mutability must match.
+     *
+     * On failure:
+     *   - throw OVERRIDE_INCOMPATIBLE_RETURN_TYPE with nested diagnostics.
+     *
+     * @throws:
+     *   - ErrorMsg if return types are incompatible
+     */
+    fn verifyOverrideReturn(oldMethod: &MethodPrototypeValue, nMethod:   &MethodPrototypeValue)
+        throws ErrorMsg
+    {
+        let oldRT = oldMethod.retType;
+        let nRT = nMethod.retType;
+        {
+            if (oldRT != nRT) {
+                let infer = TypeInference::inferBranching(oldRT.loc, nRT.loc, oldRT, nRT);
+                if (infer != oldRT) {
+                    throw copy ErrorMsg::fatal(oldRT.loc, end-> nRT.loc, format(ValidateErrorMessage::INCOMPATIBLE_TYPE, oldRT, nRT));
+                }
+            } else if (!oldRT.sameMutability(nRT)) {
+                throw copy ErrorMsg::fatal(oldRT.loc, end-> nRT.loc, format(ValidateErrorMessage::INCOMPATIBLE_TYPE, oldRT, nRT));
+            }
+        } catch {
+            err => {
+                throw copy ErrorMsg::fatal(nMethod.loc,
+                                           format(ValidateErrorMessage::OVERRIDE_INCOMPATIBLE_RETURN_TYPE, nMethod, oldMethod,
+                                                  tags-> FormatTags(withParams-> true)),
+                                           notes-> copy [err]);
+            }
+        }
+    }
+
+    /**
+     * Verify thrower compatibility for method overrides.
+     *
+     * Rules:
+     *   - every thrower declared in the overriding method must be:
+     *        * a direct instance of a thrower in the base method, OR
+     *        * an ancestor of one of the base throwers.
+     *   - otherwise → THROWS_NOT_DECLARED_OVER error.
+     *
+     * On mismatch:
+     *   - aggregate all unlisted throwers,
+     *   - throw OVERRIDE_MISMATCH_THROWERS with detailed notes.
+     *
+     * @throws:
+     *   - ErrorMsg if thrower sets are incompatible
+     */
+    fn verifyOverrideThrowings(oldMethod: &MethodPrototypeValue, nMethod: &MethodPrototypeValue)
+        throws ErrorMsg
+    {
+        let mut unlisted: [&ErrorMsg] = [];
+        for thr in nMethod.throwers {
+            let mut found = false;
+            for superThr in oldMethod.throwers {
+                if (TypeVerification::isDirectInstance(thr.type, superThr.type)) {
+                    found = true;
+                    break;
+                }
+                if TypeVerification::isAncestor(superThr.type, thr.type) {
+                    found = true;
+                    break;
+                }
+            }
+
+            if !found {
+                let notes = copy [copy ErrorMsg::note(anc.loc, format(ValidateErrorMessage::THROWING, anc.type), oneLine-> true)
+                                  for anc in oldMethod.throwers];
+
+                unlisted ~= [copy ErrorMsg::fatal(thr.loc, format(ValidateErrorMessage::THROWS_NOT_DECLARED_OVER, thr.type),
+                                                  notes-> notes)];
+            }
+        }
+
+        if (unlisted.len != 0) {
+            throw copy ErrorMsg::fatal(oldMethod.loc,
+                                       format(ValidateErrorMessage::OVERRIDE_MISMATCH_THROWERS, nMethod, oldMethod,
+                                              tags-> FormatTags(withParams-> true)),
+                                       notes-> copy [copy ErrorMsg::note(oldMethod.fieldLoc, "")] ~ unlisted);
+        }
+    }
+
+    /**
+     * Determine whether two method prototypes are structurally similar.
+     * This is used to detect ambiguous overloads or conflicting definitions.
+     *
+     * @returns:
+     *   - true  if the methods are similar,
+     *   - false otherwise
+     */
+    pub fn areSimilar(left: &MethodPrototypeValue, right: &MethodPrototypeValue)-> bool {
+        if (left.sym.path.file != right.sym.path.file) {
+            return false;
+        }
+
+        if (left.isMutable != right.isMutable) {
+            return false;
+        }
+
+        if (left.params.len != right.params.len) {
+            return false;
+        }
+
+        for i in 0us .. left.params.len {
+            if (left.params[i].type != right.params[i].type) {
+                return false;
+            }
+
+            if (!left.params[i].type.sameMutability(right.params[i].type)) {
+                return false;
+            }
+
+            if (left.params[i].isLazy != right.params[i].isLazy) {
+                return false;
+            }
+
+            if (left.params[i].isReference != right.params[i].isReference) {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    /**
+     * Produce a list of candidate methods that are likely intended override targets.
+     *
+     * This helper is used when an override fails(e.g., missing `over`, wrong
+     * signature, or no matching ancestor method). It scans the class vtable and
+     * returns a list of diagnostic notes pointing to methods whose names are
+     * similar to the method being validated.
+     *
+     * @params:
+     *   - left:   the method being validated(potential override)
+     *   - vtable: the class vtable to search for candidates
+     *   - tr:     the trait context(default: EMPTY_SYMBOL)
+     *
+     * @returns:
+     *   - a list of ErrorMsg notes describing candidate methods
+     */
+    pub fn findCandidateOver(left:   &MethodPrototypeValue,
+                             vtable: &Vtable,
+                             tr:     &Symbol = EMPTY_SYMBOL)-> [&ErrorMsg] {
+        let mut notes: [&ErrorMsg] = [];
+
+        let name = left.sym.path.file;
+        for v in vtable.methods {
+            let iname = v.sym.path.file;
+            let sameContext = (tr is v.traitSym) || (tr of EmptySymbol && v.traitSym of EmptySymbol);
+            if (sameContext) {
+                let mut add = false;
+                if (name.len <= 3us) {
+                    add = (name == iname);
+                } else {
+                    let levDist = string::levenshteinDistance(name, iname);
+                    add = (levDist <= 3us);
+                };
+
+                if (add) {
+                    notes ~= [copy ErrorMsg::note(v.loc, format(ValidateErrorMessage::CANDIDATE_ARE, v,
+                                                                tags-> FormatTags(withParams-> true)),
+                                                  oneLine-> true,
+                                                  withLoc-> true)];
+                }
+            }
+        }
+
+        return notes;
+    }
+
+    /**
+     * Convert a MethodProtection enum to its keyword string.
+     *
+     * @returns:
+     *   - "pub", "prot", or "prv"
+     */
+    fn toStr(protection: MethodProtection)-> [c8] {
+        match protection {
+            MethodProtection::PUB => { Keys::PUBLIC }
+            MethodProtection::PROT => { Keys::PROTECTED }
+            _ => { Keys::PRIVATE }
+        }
+    }
+}
