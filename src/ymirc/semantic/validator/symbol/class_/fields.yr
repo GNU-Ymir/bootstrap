@@ -1,4 +1,60 @@
+/*
+ * Implements semantic validation for class fields.
+ *
+ * This module handles:
+ *   - validation of local field declarations,
+ *   - type checking and value inference for field initializers,
+ *   - enforcement of class-level restrictions on field types,
+ *   - detection of field shadowing within the class,
+ *   - detection of field collisions with ancestor fields,
+ *   - detection of field–method name collisions,
+ *   - construction of VarDeclValue entries for class layout,
+ *   - integration with ClassFieldVerification for structural checks.
+ *
+ * Field validation occurs before layout validation and before method/ctor
+ * finalization. It ensures that all fields of a class are well-typed,
+ * non-conflicting, and legal with respect to the class’s representation
+ * (entity, struct, overlaid, etc.).
+ *
+ * <hr>
+ *
+ * @Package: ymirc
+ * @Module: ymirc::semantic::validator::symbol::class_::fields
+ * @File: ymirc/semantic/validator/symbol/class_/fields.yr
+ * @Author(s):
+ *   - Emile Cadorel <ecadorel@gmail.com>
+ *
+ * @Created(YYYY-MM-DD): 2026-05-26
+ * @Copyright(C) 2021–2026 GNU-Ymir
+ * @License
+ *   ```text
+ *   This file is part of the Ymir language project.
+ *
+ *   Ymir is free software: you can redistribute it and/or modify it
+ *   under the terms of the GNU General Public License as published by
+ *   the Free Software Foundation, either version 3 of the License, or
+ *   (at your option) any later version.
+ *
+ *   Ymir is distributed in the hope that it will be useful,
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *   GNU General Public License for more details.
+ *
+ *   You should have received a copy of the GNU General Public License
+ *   along with Ymir.  If not, see <https://www.gnu.org/licenses/>.
+ *   ```
+ */
+
 in fields;
+
+use ymirc::syntax::expression::_;
+use ymirc::semantic::{symbol, declarator, validator};
+use ymirc::semantic::generator::{value::_, type::_};
+use ymirc::errors::_;
+use ymirc::lexing::{word, keys};
+
+use ymirc::utils::format;
+use ymirc::semantic::validator::symbol::class_::fields::_;
 
 /*!
  * ====================================================================================================
@@ -18,6 +74,159 @@ mod ::verif;
  * ====================================================================================================
  */
 
+/**
+ * ClassFieldValidation module
+ *
+ * Provides the main validation pipeline for class fields. Responsibilities:
+ *
+ *   - validate all local fields declared in a class,
+ *   - perform type validation and value inference for field declarations,
+ *   - enforce class-specific constraints on field types,
+ *   - detect shadowing between fields declared in the same class,
+ *   - detect collisions with ancestor fields,
+ *   - detect collisions with methods(vtable entries),
+ *   - produce the final list of VarDeclValue entries for the class.
+ *
+ */
 pub mod ClassFieldValidation {
 
+    /**
+     * Validate all fields of a class, including collisions with ancestor fields
+     * and collisions with methods.
+     *
+     * @params:
+     *   - context:  validation context
+     *   - sym:      class symbol
+     *   - ancestor: optional ClassRefType of the ancestor
+     *   - precary:  whether to suppress errors and return success flag
+     *
+     * @returns:
+     *   - true  if validation succeeded or precary mode is active,
+     *   - false otherwise
+     *
+     * @throws:
+     *   - ErrorMsg if validation fails and precary mode is disabled
+     */
+    pub fn validate(dmut context: &ValidationContext,
+                    dmut sym:     &ClassSymbol,
+                    ancestor:     (&ClassRefType)?,
+                    precary:      bool)-> bool
+        throws ErrorMsg
+    {
+        let dmut cref = alias sym.classRefUnwrapped;
+        let (localFields, success) = ClassFieldValidation::validateLocalFields(alias context, alias sym, alias cref, precary);
+        if let Ok(cl) = ancestor {
+            ClassFieldVerification::verifyCollisions(cl.fields, localFields);
+        }
+
+        ClassFieldVerification::verifyCollisionsMethods(localFields, cref.vtable);
+        return success;
+    }
+
+    /**
+     * Validate all fields declared directly in the class.
+     *
+     * @params:
+     *   - context: validation context
+     *   - sym:     class symbol
+     *   - cref:    class reference type
+     *   - precary: whether to suppress errors
+     *
+     * @returns:
+     *   - (fields, successFlag)
+     *
+     * @throws:
+     *   - ErrorMsg if validation fails and precary mode is disabled
+     */
+    fn validateLocalFields(dmut context: &ValidationContext,
+                           dmut sym:     &ClassSymbol,
+                           dmut cref:    &ClassRefType,
+                           precary:      bool)-> ([&VarDeclValue], bool)
+        throws ErrorMsg
+    {
+        context:.enterForeign(isFnBody-> false); // A new foreign, we don't wan't to pollute current context
+        context:.enterBlock(); // A block, we will add variable definitions
+
+        let mut errors: [&ErrorMsg]         = [];
+        let mut names: [[c8] => mut &Word] = copy [];
+        let mut fields: [mut &VarDeclValue] = copy [copy VarDeclValue(f.loc, ERROR_TYPE, UNIT_VALUE, isMutable-> false) for f in sym.fields];
+
+        cref:.setLocalFields(fields);
+
+        for i, f in sym.fields {
+            {
+                // Fields are just like variable decls
+                let (isMut, isLazy, type, value) = ClassFieldValidation::validateDecl(alias context, f,
+                                                                                      noValue-> precary);
+                ClassFieldVerification::verifyDeclarable(sym, type);
+                let dmut field = copy VarDeclValue(f.loc, type, value,
+                                                   isMutable-> isMut,
+                                                   isLazy-> isLazy);
+
+                ClassFieldVerification::verifyShadow(field, names);
+                names[field.name] = field.loc;
+                fields[i] = field;
+            } catch {
+                err => {
+                    errors ~= [err];
+                }
+            }
+        }
+
+        context:.safeQuitBlock();
+        context:.exitForeign();
+
+        if (!precary && !context.classContext.forcePrecary && errors.len != 0us) {
+            throw copy ErrorMsg::list(errors);
+        }
+
+        cref:.setLocalFields(fields);
+        return (fields, errors.len == 0);
+    }
+
+    /**
+     * Validate a single field declaration.
+     *
+     * @params:
+     *   - context: validation context
+     *   - vdecl:   VarDeclExpr representing the field
+     *   - noValue: whether to skip initializer validation
+     *
+     * @returns:
+     *   - (isMutable, isLazy, type, value)
+     *
+     * @throws:
+     *   - ErrorMsg if type or value validation fails
+     */
+    fn validateDecl(dmut context: &ValidationContext,
+                    vdecl:        &VarDeclExpr,
+                    noValue:      bool = false)-> (bool, bool, &Type, &Value)
+        throws ErrorMsg
+    {
+        let type = {
+            TypeValidation::validateForVarDecl(alias context, vdecl.type, vdecl,
+                                               canBeRef-> false,
+                                               canBeLazy-> true)
+        } catch {
+            err: &ErrorMsg => {
+                throw copy ErrorMsg::note(vdecl.loc, format(ValidateErrorMessage::VALIDATING),
+                                          notes-> copy [err]);
+            }
+        };
+
+        let mut value: &Value = UNIT_VALUE;
+        if vdecl.value !of EmptyExpr && !noValue {
+            if (vdecl.loc == Keys::UNDER) {  // TODO ??
+                throw copy ErrorMsg::fatal(vdecl.loc, format(ValidateErrorMessage::DEFAULT_VAR_NO_NAME),
+                                           notes-> copy [copy ErrorMsg::note(vdecl.value.loc, ""s8)]);
+            }
+
+            value = ValueValidation::validate(alias context, vdecl.value);
+            value = TypeInference::inferValueForType(alias context, vdecl.loc, value, type,
+                                                     byReference-> false);
+        }
+
+        TypeVerification::verifyNonVoid(vdecl.type.loc, type, construct-> true);
+        return (type.isMutable, vdecl.isLazy, type, value);
+    }
 }
