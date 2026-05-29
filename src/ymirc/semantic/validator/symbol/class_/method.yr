@@ -1,3 +1,285 @@
+/*
+ * Implements semantic validation and construction of the class vtable.
+ *
+ * This module orchestrates the full method-validation pipeline:
+ *
+ *   1. Retrieve ancestor vtable entries.
+ *   2. Retrieve trait-implementation methods.
+ *   3. Validate methods declared directly in the class.
+ *   4. Validate methods declared inside trait implementations.
+ *   5. Enforce override rules and detect collisions.
+ *   6. Enforce abstract-method completeness.
+ *   7. Install the final vtable into the ClassRefType.
+ *
+ * <hr>
+ *
+ * @Package: ymirc
+ * @Module: ymirc::semantic::validator::symbol::class_::method
+ * @File: ymirc/semantic/validator/symbol/class_/method.yr
+ * @Author(s):
+ *   - Emile Cadorel <ecadorel@gmail.com>
+ *
+ * @Created(YYYY-MM-DD): 2026-05-29
+ * @Copyright(C) 2021–2026 GNU-Ymir
+ * @License
+ *   ```text
+ *   This file is part of the Ymir language project.
+ *
+ *   Ymir is free software: you can redistribute it and/or modify it
+ *   under the terms of the GNU General Public License as published by
+ *   the Free Software Foundation, either version 3 of the License, or
+ *   (at your option) any later version.
+ *
+ *   Ymir is distributed in the hope that it will be useful,
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *   GNU General Public License for more details.
+ *
+ *   You should have received a copy of the GNU General Public License
+ *   along with Ymir.  If not, see <https://www.gnu.org/licenses/>.
+ *   ```
+ */
+
 in method;
 
+use ymirc::syntax::declaration::_;
+use ymirc::semantic::generator::{value::_, type::_};
+use ymirc::semantic::{symbol, validator, declarator};
+
+use ymirc::lexing::word;
+use ymirc::errors::_;
+use ymirc::utils::format;
+
+use ymirc::semantic::validator::symbol::class_::method::_;
+
+/*!
+ * ====================================================================================================
+ * ====================================================================================================
+ * ====================================          SUBMODS          =====================================
+ * ====================================================================================================
+ * ====================================================================================================
+ */
+
 mod ::verif;
+mod ::model;
+mod ::ancestor;
+mod ::trait_;
+
+pub mod ::impl_;
+
+/*!
+ * ====================================================================================================
+ * ====================================================================================================
+ * ======================================          ROOT          ======================================
+ * ====================================================================================================
+ * ====================================================================================================
+ */
+
+/**
+ * ClassMethodValidation module
+ *
+ * Provides the main validation pipeline for class methods and vtable
+ * construction. Responsibilities:
+ *
+ *   - merge ancestor vtable entries,
+ *   - merge trait-implementation methods,
+ *   - validate direct class methods,
+ *   - validate implementation-override methods,
+ *   - detect and validate overrides,
+ *   - detect illegal redefinitions,
+ *   - enforce abstract-method completeness,
+ *   - install the final vtable into the ClassRefType.
+ *
+ */
+pub mod ClassMethodValidation {
+
+    /**
+     * Validate all methods of the class and install the final vtable.
+     *
+     * @params:
+     *   - context:   validation context
+     *   - sym:       class symbol
+     *   - ancestor:  optional ancestor ClassRefType
+     *   - inModule:  whether to insert methods into add‑method list
+     *   - withValue: whether to validate method bodies
+     *
+     * @throws:
+     *   - ErrorMsg if vtable construction or abstract‑method enforcement fails
+     */
+    pub fn validateVtable(dmut context: &ValidationContext,
+                          dmut sym:     &ClassSymbol,
+                          ancestor:     (&ClassRefType)?,
+                          inModule:     bool,
+                          withValue:    bool)
+        throws ErrorMsg
+    {
+        let dmut cref = alias sym.classRefUnwrapped;
+
+        let vtable = ClassMethodValidation::validateVtable(alias context, alias sym, cref, ancestor,
+                                                           inModule-> inModule,
+                                                           withValue-> withValue);
+
+        let mut notes: [&ErrorMsg] = [];
+        if (!sym.isAbstract) {
+            for m in vtable.methods if m.isEmpty {
+                notes ~= [copy ErrorMsg::note(m.loc, format(ValidateErrorMessage::EMPTY_METHOD_NO_ABSTRACT, m,
+                                                            tags-> FormatTags(withParams-> true)),
+                                              oneLine-> true,
+                                              withLoc-> true)];
+            }
+
+            if (notes.len != 0us) {
+                throw copy ErrorMsg::fatal(sym.loc, format(ValidateErrorMessage::NON_ABSTRACT_NOT_COMPLETE, cref),
+                                           notes-> notes);
+            }
+        }
+
+        cref:.setVtable(vtable.methods,
+                        vtable.methodProts,
+                        vtable.localImplementedTraits,
+                        (vtable.localImplementedTraits ~ vtable.ancestorImplementedTraits),
+                        vtable.templateMethods,
+                        vtable.templateMethodProts);
+    }
+
+    /**
+     * Construct the vtable for the class.
+     *
+     * @returns:
+     *   - the constructed Vtable
+     *
+     * @throws:
+     *   - ErrorMsg if any phase of vtable construction fails
+     */
+    fn validateVtable(dmut context: &ValidationContext,
+                      dmut sym:     &ClassSymbol,
+                      cref:         &ClassRefType,
+                      ancestor:     (&ClassRefType)?,
+                      inModule:     bool,
+                      withValue:    bool)-> dmut &Vtable
+        throws ErrorMsg
+    {
+        let dmut vtable = copy Vtable();
+
+        // Ok, this part is complex, so hang in there.
+
+        // Retreive the vtable of the ancestor, the vtable of the current class is an update of it, and same symbols must be located at the same place
+        ClassMethodAncestorValidation::retreiveAncestorVtable(ancestor, alias vtable);
+
+        // Create the vector containing all the methods defined in implemented traits
+        let implemented = ClassMethodTraitValidation::retreiveImplsVtable(alias context, sym, cref, alias vtable,
+                                                                          withValue-> withValue);
+
+        // At this point, vtable contains:
+        //  1) All the methods declared in ancestor class
+        //  2) All the methods declared in implemented traits
+        // There is no method declared in the class (either new, over, of impl over) in the vtable
+        // So we start by validating the methods that are declared outside implementations
+        ClassMethodValidation::validateDirectVtable(alias context, sym, cref, alias vtable,
+                                                    withValue-> withValue);
+
+        // An now the methods that are declared inside implementations(overriding)
+        ClassMethodImplValidation::validateImplsVtable(alias context, cref, implemented, alias vtable,
+                                                       withValue-> withValue);
+
+        // Insert the symbol of the methods that has to be fully validated if the class is "in module"
+        // These symbols are the methods that are declared inside the class (new, over or impl over)
+        if inModule {
+            // if it is an empty symbol, then the method was declared in ancestor or trait, and put in the class as it was(not over)
+            for dmut meth in alias vtable.methodsToValidate if meth !of EmptySymbol {
+                sym:.insertAddMethod(alias meth); // The method is new or overriden
+            }
+        }
+
+        return alias vtable;
+    }
+
+
+    /**
+     * Validate methods declared directly inside the class.
+     *
+     * @throws:
+     *   - ErrorMsg::list if any direct method fails validation
+     */
+    fn validateDirectVtable(dmut context: &ValidationContext,
+                            sym:          &ClassSymbol,
+                            cref:         &ClassRefType,
+                            dmut vtable:  &Vtable,
+                            withValue:    bool)
+        throws ErrorMsg
+    {
+        let mut errors: [&ErrorMsg] = [];
+        for it in sym.getAllLocalSymbols(protection-> Protection::PRIVATE, sorted-> true) { // traverse all the function defined inside the class
+            {
+                if let func: &FunctionSymbol = it {
+                    let dmut mutFunc: &FunctionSymbol = context:.getFunctionFromRef(func);
+                    ClassMethodValidation::validateDirectVtableMethod(alias context, alias mutFunc, cref, alias vtable,
+                                                                      withValue-> withValue); // validate the redefinition for the vtable
+                }
+
+                else if let t: &TemplateSymbol = it {
+                    if let f: &FunctionDecl = t.decl.decl {
+                        let methProt = to!{MethodProtection}(t.protection);
+
+                        for at in f.attrs { // attributes are not applicable to template methods
+                            errors ~= [copy ErrorMsg::fatal(at.loc, format(DeclareErrorMessage::UNDEFINED_ATTRIBUTE_FOR_TEMPLATE_METHOD, at.attr),
+                                                            notes-> copy [copy ErrorMsg::note(f.loc, format(DeclareErrorMessage::DECLARED_HERE))])];
+                        }
+
+                        vtable.templateMethodProts ~= [methProt];
+                        vtable.templateMethods ~= [copy TemplateRefMethodValue(t.loc, cref.sym, t)];
+                    }
+                }
+            } catch {
+                err => {
+                    errors ~= [err];
+                }
+            }
+        }
+
+        if (errors.len != 0us) {
+            throw copy ErrorMsg::list(errors);
+        }
+    }
+
+    /**
+     * Validate and merge a single method declared directly in the class.
+     *
+     * @throws:
+     *   - ErrorMsg if override rules are violated or no override target exists
+     */
+    fn validateDirectVtableMethod(dmut context: &ValidationContext,
+                                  dmut func:    &FunctionSymbol,
+                                  cref:         &ClassRefType,
+                                  dmut vtable:  &Vtable,
+                                  withValue:    bool)
+        throws ErrorMsg
+    {
+        let meth = MethodValidation::validateProto(alias context, alias func, cref,
+                                                   withValue-> withValue);
+        let methProt = to!{MethodProtection}(func.protection);
+
+        for i, it in vtable.methods { // traverse the vtable, and verify that there is no collision
+            if ClassMethodVerification::areSimilar(meth, it) { // Verify that there is no collision between the method, and the other method, there can be multiple factors(different protection, missing override, over outside trait, ...)
+                ClassMethodVerification::verifyCollisionDirect(it, meth, vtable.methodProts[i], methProt, func.isOver);
+
+                // Thre is a collision, but it is an acceptable one, it is an proper override
+                vtable.methods[i] = meth; // we update the vtable
+                vtable.methodsToValidate[i] = alias func; // We add the method to the methods to rewrite
+
+                return;
+            }
+        }
+
+        if (func.isOver) {
+            let candidates = ClassMethodVerification::findCandidateOver(meth, vtable);
+            throw copy ErrorMsg::fatal(meth.loc, format(ValidateErrorMessage::OVERRIDE_NOTHING, meth),
+                                       notes-> candidates);
+        }
+
+        // There is no override here, its a new method, we just add it at the end of the vtable
+        vtable.methods ~= [meth];
+        vtable.methodsToValidate ~= [alias func];
+        vtable.methodProts ~= [methProt];
+    }
+}

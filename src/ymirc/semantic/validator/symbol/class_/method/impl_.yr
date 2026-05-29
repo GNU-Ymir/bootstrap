@@ -1,0 +1,258 @@
+/*
+ * Retrieves and validates methods declared inside trait implementations.
+ *
+ * This module handles:
+ *   - locating all `impl Trait` blocks inside the class,
+ *   - validating the trait reference,
+ *   - retrieving all methods declared inside each implementation,
+ *   - validating each implementation method prototype,
+ *   - merging implementation methods into the class vtable,
+ *   - enforcing trait-override rules(no implicit override across traits),
+ *   - tracking which traits are implemented locally by the class.
+ *
+ * <hr>
+ *
+ * @Package: ymirc
+ * @Module: ymirc::semantic::validator::symbol::class_::method::impl_
+ * @File: ymirc/semantic/validator/symbol/class_/method/impl_.yr
+ * @Author(s):
+ *   - Emile Cadorel <ecadorel@gmail.com>
+ *
+ * @Created(YYYY-MM-DD): 2026-05-29
+ * @Copyright(C) 2021–2026 GNU-Ymir
+ * @License
+ *   ```text
+ *   This file is part of the Ymir language project.
+ *
+ *   Ymir is free software: you can redistribute it and/or modify it
+ *   under the terms of the GNU General Public License as published by
+ *   the Free Software Foundation, either version 3 of the License, or
+ *   (at your option) any later version.
+ *
+ *   Ymir is distributed in the hope that it will be useful,
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *   GNU General Public License for more details.
+ *
+ *   You should have received a copy of the GNU General Public License
+ *   along with Ymir.  If not, see <https://www.gnu.org/licenses/>.
+ *   ```
+ */
+
+in impl_;
+
+use ymirc::syntax::declaration::_;
+use ymirc::semantic::generator::{value::_, type::_};
+use ymirc::semantic::{symbol, validator};
+
+use ymirc::lexing::word;
+use ymirc::errors::_;
+use ymirc::utils::format;
+
+use ymirc::semantic::validator::symbol::class_::method::_;
+
+/**
+ * ClassMethodImplRetrieve module
+ *
+ * Retrieves and validates trait-implementation methods for a class.
+ * Responsibilities:
+ *
+ *   - detect all `impl Trait` blocks declared in the class,
+ *   - validate the trait reference,
+ *   - retrieve all methods declared inside each implementation,
+ *   - validate implementation method prototypes,
+ *   - merge implementation methods into the vtable,
+ *   - detect illegal implicit overrides across traits,
+ *   - record locally implemented traits for final vtable installation.
+ *
+ */
+pub mod ClassMethodImplValidation {
+
+    /**
+     * Validate trait-implementation declarations(`impl Trait for Class`)
+     * without retrieving or validating any methods.
+     *
+     * @params:
+     *   - context:  validation context
+     *   - sym:      class symbol
+     *   - ancestor: optional ancestor ClassRefType
+     *
+     * @throws:
+     *   - ErrorMsg::list if any `impl` declaration is invalid
+     */
+    pub fn validateSimple(dmut context: &ValidationContext,
+                          dmut sym:     &ClassSymbol,
+                          ancestor:     (&ClassRefType)?)
+        throws ErrorMsg
+    {
+        let dmut cref = alias sym.classRefUnwrapped;
+        let mut implemented: [&TraitRefType] = [];
+        let mut errors: [&ErrorMsg] = [];
+
+        let mut ancestorImpl: [&TraitRefType] = [];
+        if let Ok(ancCref) = ancestor {
+            ancestorImpl = ancCref.allImplementedTraits;
+        }
+
+        for it in sym.getAllLocalSymbols(protection-> Protection::PRIVATE, sorted-> true) {
+            {
+                if let im: &ImplSymbol = it {
+                    let tr = TypeValidation::validate(alias context, im.decl.who);
+                    for i in implemented {
+                        if i == tr {
+                            throw copy ErrorMsg::fatal(im.loc, format(ValidateErrorMessage::IMPL_MULTIPLE_TIMES, tr, cref),
+                                                       notes-> copy [copy ErrorMsg::note(i.loc, format(ValidateErrorMessage::HERE))]);
+                        }
+                    }
+
+                    if let trRef: &TraitRefType = tr {
+                        implemented ~= [trRef];
+                    } else {
+                        throw copy ErrorMsg::fatal(tr.loc, format(ValidateErrorMessage::IMPL_NO_TRAIT, tr));
+                    }
+                }
+            } catch {
+                err => {
+                    errors ~= [err];
+                }
+            }
+        }
+
+        if (errors.len != 0us) {
+            throw copy ErrorMsg::list(errors);
+        }
+
+        cref:.setImpls(implemented, ancestorImpl ~ implemented);
+    }
+
+    /**
+     * Retrieve and validate all trait-implementation methods declared in the class.
+     *
+     * @params:
+     *   - context:   validation context
+     *   - sym:       class symbol
+     *   - cref:      class reference type
+     *   - withValue: whether to validate method bodies
+     *   - vtable:    vtable being constructed
+     *
+     * @returns:
+     *   - list of (ImplSymbol, TraitRefType) pairs
+     *
+     * @throws:
+     *   - ErrorMsg::list if any implementation method fails validation
+     */
+    pub fn validateImplsVtable(dmut context:   &ValidationContext,
+                               cref:           &ClassRefType,
+                               implemented:    [(&ImplSymbol, &TraitRefType)],
+                               dmut vtable: &Vtable,
+                               withValue:      bool)
+        throws ErrorMsg
+    {
+        let mut errors: [&ErrorMsg] = [];
+        for im in implemented { // Validate the overriden methods inside implementations
+            ClassMethodImplValidation::validateImplVtable(alias context, im._0, im._1, cref, alias vtable,
+                                                          withValue-> withValue);
+        } catch {
+            err => {
+                errors ~= [err];
+            }
+        }
+
+        if (errors.len != 0us) {
+            throw copy ErrorMsg::list(errors);
+        }
+    }
+
+    /**
+     * Retrieve and validate all methods inside a single trait implementation.
+     *
+     * @params:
+     *   - context:   validation context
+     *   - loc:       location of the `impl` keyword
+     *   - tr:        type expression of the trait being implemented
+     *   - cref:      class reference type
+     *   - withValue: whether to validate method bodies
+     *   - vtable:    vtable being constructed
+     *
+     * @returns:
+     *   - the validated TraitRefType
+     *
+     * @throws:
+     *   - ErrorMsg::list if any implementation method fails validation
+     *   - ErrorMsg if the `impl` target is not a trait
+     */
+    fn validateImplVtable(dmut context: &ValidationContext,
+                          im:           &ImplSymbol,
+                          trRef:        &TraitRefType,
+                          cref:        &ClassRefType,
+                          dmut vtable:  &Vtable,
+                          withValue:    bool)
+        throws ErrorMsg
+    {
+        let mut errors: [&ErrorMsg] = [];
+
+        for it in im.getAllLocalSymbols(protection-> Protection::PRIVATE, sorted-> true) { // Traverse the list of methods overriden in the implementation
+            if let func: &FunctionSymbol = it {
+                let dmut mutFunc = context:.getFunctionFromRef(func);
+                ClassMethodImplValidation::validateImplVtableMethod(alias context, alias mutFunc, cref, trRef, alias vtable,
+                                                                    withValue-> withValue);
+            } catch {
+                err => {
+                    errors ~= [err];
+                }
+            }
+        }
+
+        if (errors.len != 0us) {
+            throw copy ErrorMsg::list(errors);
+        }
+    }
+
+    /**
+     * Validate and merge a single method declared inside a trait implementation.
+     *
+     * @params:
+     *   - context:   validation context
+     *   - loc:       location of the `impl` block
+     *   - func:      function symbol inside the implementation
+     *   - cref:      class reference type
+     *   - trRef:     trait reference type
+     *   - withValue: whether to validate method bodies
+     *   - vtable:    vtable being constructed
+     *
+     * @throws:
+     *   - ErrorMsg if override rules are violated
+     */
+    fn validateImplVtableMethod(dmut context: &ValidationContext,
+                                dmut func:    &FunctionSymbol,
+                                cref:         &ClassRefType,
+                                trRef:        &TraitRefType,
+                                dmut vtable:  &Vtable,
+                                withValue:    bool)
+        throws ErrorMsg
+    {
+        let meth = MethodValidation::validateProto(alias context, alias func, cref,
+                                                   traitRef-> trRef,
+                                                   withValue-> withValue);
+        let methProt = to!{MethodProtection} (func.protection);
+
+        for i, it in vtable.methods { // traverse the vtable, and verify that there is no collision
+            if (ClassMethodVerification::areSimilar(meth, it)) { // Verify that there is no collision between the method, and the other method, there can be multiple factors(different protection, missing override, over outside trait, ...)
+                ClassMethodVerification::verifyCollisionDirect(it, meth, vtable.methodProts[i], methProt, func.isOver);
+
+                // Thre is a collision, but it is an acceptable one, it is an proper override
+                vtable.methods[i] = meth; // we update the vtable
+                vtable.methodsToValidate[i] = alias func; // We add the method to the methods to rewrite
+
+                return;
+            }
+        }
+
+        // There is no method in the trait definition that could be overriden by this method, so it must not be defined inside an impl
+        let candidates = ClassMethodVerification::findCandidateOver(meth, vtable,
+                                                                    tr-> trRef.sym);
+
+        throw copy ErrorMsg::fatal(meth.loc, format(ValidateErrorMessage::OVERRIDE_NOTHING, meth),
+                                   notes-> candidates);
+    }
+}

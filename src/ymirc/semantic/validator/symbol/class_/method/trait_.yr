@@ -1,0 +1,214 @@
+/*
+ * Retrieves and merges trait-implementation methods into the class vtable.
+ *
+ * This module handles:
+ *   - locating all `impl Trait` blocks declared in the class,
+ *   - validating the trait reference,
+ *   - retrieving all methods declared inside each implementation,
+ *   - validating implementation method prototypes,
+ *   - merging implementation methods into the class vtable,
+ *   - enforcing trait-override rules(no implicit override across traits),
+ *   - recording locally implemented traits for final vtable installation.
+ *
+ * <hr>
+ *
+ * @Package: ymirc
+ * @Module: ymirc::semantic::validator::symbol::class_::method::trait_
+ * @File: ymirc/semantic/validator/symbol/class_/method/trait_.yr
+ * @Author(s):
+ *   - Emile Cadorel <ecadorel@gmail.com>
+ *
+ * @Created(YYYY-MM-DD): 2026-05-29
+ * @Copyright(C) 2021–2026 GNU-Ymir
+ * @License
+ *   ```text
+ *   This file is part of the Ymir language project.
+ *
+ *   Ymir is free software: you can redistribute it and/or modify it
+ *   under the terms of the GNU General Public License as published by
+ *   the Free Software Foundation, either version 3 of the License, or
+ *   (at your option) any later version.
+ *
+ *   Ymir is distributed in the hope that it will be useful,
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *   GNU General Public License for more details.
+ *
+ *   You should have received a copy of the GNU General Public License
+ *   along with Ymir.  If not, see <https://www.gnu.org/licenses/>.
+ *   ```
+ */
+
+in trait_;
+
+use ymirc::syntax::declaration::_;
+use ymirc::semantic::generator::{value::_, type::_};
+use ymirc::semantic::{symbol, validator};
+
+use ymirc::lexing::word;
+use ymirc::errors::_;
+use ymirc::utils::format;
+
+use ymirc::semantic::validator::symbol::class_::method::_;
+
+/**
+ * ClassMethodTraitValidation module
+ *
+ * Retrieves and validates trait-implementation methods for a class.
+ *
+ * Responsibilities:
+ *   - detect all `impl Trait` blocks declared in the class,
+ *   - validate the trait reference,
+ *   - retrieve and validate all methods declared inside each implementation,
+ *   - merge implementation methods into the vtable,
+ *   - detect illegal implicit overrides across traits,
+ *   - record locally implemented traits for final vtable installation.
+ */
+pub mod ClassMethodTraitValidation {
+
+    /**
+     * Retrieve and validate all trait-implementation methods declared in the class.
+     *
+     * Responsibilities:
+     *   - iterate over all local symbols and detect ImplSymbol entries,
+     *   - validate the trait reference via TypeValidation::validate(),
+     *   - retrieve and validate all methods inside each implementation via
+     *     retreiveImplVtable(),
+     *   - collect errors and throw them as a batch,
+     *   - record locally implemented traits in vtable.localImplementedTraits.
+     *
+     * Output:
+     *   - returns a list of (ImplSymbol, TraitRefType) pairs,
+     *     used later by ClassMethodImplValidation.
+     *
+     * @throws:
+     *   - ErrorMsg::list if any implementation method fails validation
+     */
+    pub fn retreiveImplsVtable(dmut context:   &ValidationContext,
+                               sym:            &ClassSymbol,
+                               cref:           &ClassRefType,
+                               withValue:      bool,
+                               dmut vtable: &Vtable)-> [(&ImplSymbol, &TraitRefType)]
+        throws ErrorMsg
+    {
+        let mut implemented: [(&ImplSymbol, &TraitRefType)] = [];
+        let mut errors: [&ErrorMsg] = [];
+
+        for it in sym.getAllLocalSymbols(protection-> Protection::PRIVATE, sorted-> true) {
+            {
+                match it {
+                    im: &ImplSymbol => { // If there is an implementation, then we need to validated its vtable
+                        let tr = TypeValidation::validate(alias context, im.decl.who);
+                        let ret = ClassMethodTraitValidation::retreiveImplVtable(alias context, im.loc, tr, cref, alias vtable,
+                                                                                 withValue-> withValue);
+                        implemented ~= [(im, ret)];
+                    }
+                }
+            } catch {
+                err => {
+                    errors ~= [err];
+                }
+            }
+        }
+
+        if (errors.len != 0us) {
+            throw copy ErrorMsg::list(errors);
+        }
+
+        for i in implemented {
+            vtable.localImplementedTraits ~= [i._1];
+        }
+
+        return implemented;
+    }
+
+    /**
+     * Retrieve and validate all methods inside a single trait implementation.
+     *
+     * Rules:
+     *   - If the `impl` target is not a trait → IMPL_NO_TRAIT.
+     *
+     * @returns:
+     *   - the validated TraitRefType
+     *
+     * @throws:
+     *   - ErrorMsg::list if any implementation method fails validation
+     *   - ErrorMsg if the `impl` target is not a trait
+     */
+    fn retreiveImplVtable(dmut context:   &ValidationContext,
+                          loc:            &Word,
+                          tr:             &Type,
+                          cref:           &ClassRefType,
+                          withValue:      bool,
+                          dmut vtable: &Vtable)-> &TraitRefType
+        throws ErrorMsg
+    {
+
+        if let trRef: &TraitRefType = tr {
+            let mut errors: [&ErrorMsg] = [];
+            for it in trRef.sym.getAllLocalSymbols(protection-> Protection::PRIVATE, sorted-> true) {
+                let dmut mSym = alias context:.getSymbolFromRef(it);
+                if let dmut f: &FunctionSymbol = alias mSym { // Method definition
+                    {
+                        ClassMethodTraitValidation::retreiveImplVtableMethod(alias context, loc, alias f, cref, trRef, withValue, alias vtable);
+                    } catch {
+                        err => {
+                            errors ~= [err];
+                        }
+                    }
+                }
+            }
+
+            if (errors.len != 0us) {
+                throw copy ErrorMsg::list(errors);
+            }
+
+            return trRef;
+        }
+
+        throw copy ErrorMsg::fatal(tr.loc, format(ValidateErrorMessage::IMPL_NO_TRAIT, tr));
+    }
+
+    /**
+     * Validate and merge a single method declared inside a trait implementation.
+     *
+     * @throws:
+     *   - ErrorMsg if override rules are violated
+     */
+    fn retreiveImplVtableMethod(dmut context:   &ValidationContext,
+                                loc:            &Word,
+                                dmut func:      &FunctionSymbol,
+                                cref:          &ClassRefType,
+                                trRef:          &TraitRefType,
+                                withValue:      bool,
+                                dmut vtable: &Vtable)
+        throws ErrorMsg
+    {
+        // Validate the prototype of the method
+        let meth = MethodValidation::validateProto(alias context, alias func, cref, trRef,
+                                                   withValue-> withValue);
+
+        // Create a delegate type, in order to compare the methods of the vtable
+        // The idea behind the following loop is that if a an ancestor has
+        // already implemented the trait, we have to replace the implemented
+        // methods by this new implementation
+        for i, vt in vtable.methods {
+            if (ClassMethodVerification::areSimilar(meth, vt)) { // we already have a method with the same name
+                if (vt.traitSym != trRef.sym) { // They are not from the same trait, (or not from a trait at all)
+                    throw copy ErrorMsg::fatal(loc, format(ValidateErrorMessage::IMPLICIT_OVERRIDE_BY_TRAIT, vt),
+                                               notes-> copy [copy ErrorMsg::note(vt.loc, end-> meth.loc, "")]);
+                } else { // They come from the same trait, then we replace the old version
+                    vtable.methods[i] = meth;
+                    vtable.methodsToValidate[i] = alias func;
+
+                    return;
+                }
+            }
+        }
+
+        // The method is new(not implemented by an ancestor)
+        vtable.methods ~= [meth];
+        vtable.methodsToValidate ~= [alias func];
+        vtable.methodProts ~= [to!{MethodProtection}(func.protection)];
+    }
+}
