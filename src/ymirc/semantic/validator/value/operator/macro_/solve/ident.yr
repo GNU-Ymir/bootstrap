@@ -1,0 +1,262 @@
+/*
+ * Implements solving logic for `MacroIdentExpr`, the identifier-based
+ * matching construct used in Ymir macro rules.
+ *
+ * A `MacroIdentExpr` can represent:
+ *
+ *   - a reference to a user-defined macro rule(local macro symbols),
+ *   - a reference to a built-in macro identifier(ANY, CHAR, IDENT, STRING,
+ *     TOKEN, LITERAL, OPERAND, EXPR),
+ *   - a fallback literal-syntax matcher using the SyntaxVisitor.
+ *
+ * <hr>
+ *
+ * @Package: ymirc
+ * @Module: ymirc::semantic::validator::value::operator::macro_::solve::ident
+ * @File: ymirc/semantic/validator/value/operator/macro_/solve/ident.yr
+ * @Author(s):
+ *   - Emile Cadorel <ecadorel@gmail.com>
+ *
+ * @Created(YYYY-MM-DD): 2026-06-01
+ * @Copyright(C) 2021–2026 GNU-Ymir
+ * @License
+ *   ```text
+ *   This file is part of the Ymir language project.
+ *
+ *   Ymir is free software: you can redistribute it and/or modify it
+ *   under the terms of the GNU General Public License as published by
+ *   the Free Software Foundation, either version 3 of the License, or
+ *   (at your option) any later version.
+ *
+ *   Ymir is distributed in the hope that it will be useful,
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *   GNU General Public License for more details.
+ *
+ *   You should have received a copy of the GNU General Public License
+ *   along with Ymir.  If not, see <https://www.gnu.org/licenses/>.
+ *   ```
+ */
+
+in ident;
+
+use ymirc::lexing::{word, keys, tokens};
+use ymirc::syntax::{errors, visitor, declaration::_, expression::_};
+use ymirc::semantic::{symbol, validator};
+use ymirc::semantic::generator::value::_;
+
+use ymirc::errors::message;
+use ymirc::utils::{format, string};
+
+use ymirc::semantic::validator::value::operator::macro_::{_, solve::_};
+
+/**
+ * MacroIdentSolving module
+ *
+ * Provides solving logic for identifier‑based macro patterns.
+ *
+ */
+pub mod MacroIdentSolving {
+
+    /**
+     * Solve a `MacroIdentExpr` against the input string.
+     *
+     * @returns:
+     *   - (MacroMapper, [c8])
+     *
+     * @throws:
+     *   - ErrorMsg::list if multiple rule attempts fail,
+     *   - ErrorMsg::fatal if multiple rules match,
+     *   - ErrorMsg from built-in identifier solving.
+     */
+    pub fn solve(dmut context: &ValidationContext,
+                 loc:          &Word,
+                 msym:         &MacroRefValue,
+                 mid:          &MacroIdentExpr,
+                 str:          [c8],
+                 full:         MacroContent,
+                 ruleIndex:    usize)-> (MacroMapper, [c8])
+        throws ErrorMsg
+    {
+        let mut values: [MacroMapper] = [];
+        let mut lefts: [&MacroRuleSymbol] = [];
+        let mut rests: [[c8]] = [];
+        let mut errors: [&ErrorMsg] = [];
+
+        for it in msym.sym.getAllLocalSymbols(protection-> Protection::PRIVATE) {
+            if let mct: &MacroRuleSymbol = it {
+                if (mct.path.file == mid.loc.str) {
+                    {
+                        let (localMapper, rest) = MacroSolving::solveRule(alias context, loc, msym, mct, str, full, ruleIndex + 1us);
+                        values ~= [localMapper];
+                        rests ~= [rest];
+                        lefts ~= [mct];
+                    }
+                } catch {
+                    err => {
+                        errors ~= [err];
+                    }
+                }
+            }
+        }
+
+        if (values.len == 0) {
+            if (errors.len == 0)
+                return MacroIdentSolving::solveKnwonIdent(loc, msym, mid, str, full);
+            else {
+                throw copy ErrorMsg::list(errors);
+            }
+        }
+
+        if (values.len != 1) {
+            let mut candidates = copy [copy ErrorMsg::note(i.loc, format(ValidateErrorMessage::CANDIDATE_ARE, i.path))
+                                       for i in lefts];
+
+            let eLoc = full.computeLoc(loc, str);
+            throw copy ErrorMsg::fatal(eLoc, format(ValidateErrorMessage::WORKS_WITH_BOTH),
+                                       end-> mid.loc,
+                                       notes-> candidates);
+        }
+
+        return (values[0], rests[0]);
+    }
+
+    /**
+     * Solve a built-in macro identifier.
+     *
+     * Built-in identifiers include:
+     *
+     *   - ANY      → any single character
+     *   - CHAR     → escaped or unescaped character
+     *   - IDENT    → identifier token
+     *   - STRING   → string literal
+     *   - TOKEN    → any token from TOKEN_LIST
+     *   - LITERAL  → literal expression
+     *   - OPERAND  → simple operand
+     *   - EXPR     → simple expression
+     *
+     * @throws:
+     *   - ErrorMsg::fatal if the identifier is unknown or parsing fails
+     */
+    fn solveKnwonIdent(loc: &Word,
+                       msym: &MacroRefValue,
+                       mid: &MacroIdentExpr,
+                       str: [c8],
+                       full: MacroContent)-> (MacroMapper, [c8])
+        throws ErrorMsg
+    {
+        let ident = stripUnders(mid.loc.str);
+        match ident {
+            MacroKnownRuleKeys::ANY => {
+                return MacroIdentSolving::solveAny(loc, mid, str, full);
+            }
+            MacroKnownRuleKeys::CHAR => {
+                return MacroIdentSolving::solveChar(loc, mid, str, full);
+            }
+        }
+
+        let dmut visitor = copy SyntaxVisitor::fromStr(loc.filename, str);
+        match ident {
+            MacroKnownRuleKeys::IDENT => {
+                visitor:.readIdentifier();
+            }
+            MacroKnownRuleKeys::STRING => {
+                MacroIdentSolving::readString(alias visitor);
+            }
+            MacroKnownRuleKeys::TOKEN => {
+                visitor:.readTokens(tokens::__TOKEN_LIST__);
+            }
+            MacroKnownRuleKeys::LITERAL => {
+                let (token, _) = visitor:.readToken();
+                ExpressionVisitor::readLiteral(token);
+            }
+            MacroKnownRuleKeys::OPERAND => {
+                ExpressionVisitor::readOperandSimple0(alias visitor);
+            }
+            MacroKnownRuleKeys::EXPR => {
+                ExpressionVisitor::readExpressionSimple(alias visitor, 0);
+            }
+            _ => {
+                let eLoc = full.computeLoc(loc, str);
+                throw copy ErrorMsg::fatal(eLoc, format(ValidateErrorMessage::UNDEFINED_RULE_MACRO, msym, mid.loc.str),
+                                           end-> mid.loc);
+            }
+        }
+
+        let seek = visitor:.getLexer().getSeek();
+        let (inMap, rest) = if (seek < str.len) {
+            (str[0 .. seek],
+             str[seek .. $])
+        } else {
+            (str, "")
+        };
+
+        return (MacroMapper(inMap), rest);
+    }
+
+    /**
+     * Match a single character.
+     *
+     * Behavior:
+     *   - if input is empty → mismatch,
+     *   - extract first character,
+     *   - unescape quotes,
+     *   - return mapper containing the escaped character.
+     *
+     * @throws:
+     *   - ErrorMsg::fatal if input is empty
+     */
+    fn solveChar(loc: &Word, mid: &MacroIdentExpr, str: [c8], full: MacroContent)-> (MacroMapper, [c8])
+        throws ErrorMsg
+    {
+        if (str.len == 0) {
+            let eLoc = full.computeLoc(loc, str);
+            throw copy ErrorMsg::fatal(eLoc, format(ValidateErrorMessage::MACRO_DOES_NOT_MATCH, str, MacroKnownRuleKeys::ANY),
+                                       end-> mid.loc);
+        }
+
+        let ch = Utf::unescape(str[0 .. 1]);
+        return (MacroMapper(ch), str[1us .. $]);
+    }
+
+    /**
+     * Match any single character.
+     *
+     * @throws:
+     *   - ErrorMsg::fatal if input is empty
+     */
+    fn solveAny(loc: &Word, mid: &MacroIdentExpr, str: [c8], full: MacroContent)-> (MacroMapper, [c8])
+        throws ErrorMsg
+    {
+        if (str.len == 0us) {
+            let eLoc = full.computeLoc(loc, str);
+            throw copy ErrorMsg::fatal(eLoc, format(ValidateErrorMessage::MACRO_DOES_NOT_MATCH, str, MacroKnownRuleKeys::ANY),
+                                       end-> mid.loc);
+        }
+
+
+        return (MacroMapper(str[0 .. 1]), str[1us .. $]);
+    }
+
+    /**
+     * Validate and consume a string literal using SyntaxVisitor.
+     *
+     */
+    fn readString(dmut visitor: &SyntaxVisitor)
+        throws ErrorMsg
+    {
+        let (token, _) = visitor:.readToken();
+        if let str: &StringWord = token {
+            if str.open == Tokens::DQUOTE {
+                if !str.suffix.isEof {
+                    throw copy ErrorMsg::fatal(str.suffix, format(SyntaxErrorMessage::UNEXPECTED, str.suffix.str));
+                }
+                return;
+            }
+
+            throw copy ErrorMsg::fatal(str.open, format(SyntaxErrorMessage::UNEXPECTED, str.open.str));
+        }
+
+        throw copy ErrorMsg::fatal(token, format(SyntaxErrorMessage::UNEXPECTED, token.str));
+    }
+}
