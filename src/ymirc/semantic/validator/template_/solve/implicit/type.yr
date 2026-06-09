@@ -1,0 +1,247 @@
+/*
+ * Implicit template solving for type-level expressions(TypeExpr).
+ *
+ * TemplateImplicitTypeSolving handles implicit template inference for
+ * expressions whose syntactic form represents a type rather than a value.
+ *
+ * <hr>
+ *
+ * @Package: ymirc
+ * @Module: ymirc::semantic::validator::template_::solve::implicit::type
+ * @File: ymirc/semantic/validator/template_/solve/implicit/type.yr
+ * @Author(s):
+ *   - Emile Cadorel <ecadorel@gmail.com>
+ *
+ * @Created(YYYY-MM-DD): 2026-06-09
+ * @Copyright(C) 2021–2026 GNU-Ymir
+ * @License
+ *   ```text
+ *   This file is part of the Ymir language project.
+ *
+ *   Ymir is free software: you can redistribute it and/or modify it
+ *   under the terms of the GNU General Public License as published by
+ *   the Free Software Foundation, either version 3 of the License, or
+ *   (at your option) any later version.
+ *
+ *   Ymir is distributed in the hope that it will be useful,
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *   GNU General Public License for more details.
+ *
+ *   You should have received a copy of the GNU General Public License
+ *   along with Ymir.  If not, see <https://www.gnu.org/licenses/>.
+ *   ```
+ */
+
+in type;
+
+
+use ymirc::syntax::{_, declaration::_, expression::_};
+use ymirc::semantic::generator::{value::_, type::_};
+
+use ymirc::semantic::{validator, template_, symbol};
+
+use ymirc::lexing::{word, keys};
+use ymirc::errors::_;
+
+use ymirc::utils::format;
+
+use ymirc::semantic::validator::template_::solve::{_, implicit::_};
+
+/**
+ * TemplateImplicitTypeSolving module
+ *
+ * Provides implicit template solving for type-level expressions.
+ *
+ */
+pub mod TemplateImplicitTypeSolving {
+
+    /**
+     * Dispatch implicit solving based on the concrete TypeExpr variant.
+     *
+     * If no rule matches, returns an empty TemplateSolution.
+     *
+     * @returns:
+     *   - TemplateSolution(mapper, nbConsumed)
+     */
+    pub fn solveType(dmut context: &ValidationContext,
+                     templates:    [&Expression],
+                     typeExpr:     &TypeExpr,
+                     types:        [&Type])-> TemplateSolution
+        throws ErrorMsg
+    {
+        match typeExpr {
+            f: &FutureTypeExpr => {
+                return TemplateImplicitTypeSolving::solveTypeFromFuture(alias context, templates, f, types);
+            }
+            r: &RangeTypeExpr => {
+                return TemplateImplicitTypeSolving::solveTypeFromRange(alias context, templates, r, types);
+            }
+            f: &FunctionPtrTypeExpr => {
+                return TemplateImplicitTypeSolving::solveTypeFromFptr(alias context, templates, f, types);
+            }
+            d: &DecoratedTypeExpr => {
+                return TemplateImplicitSolving::solveType(alias context, templates, d.content, types);
+            }
+        }
+
+        return TemplateSolution(TemplateMapper(), 1);
+    }
+
+    /**
+     * Solve implicit template bindings for a future type:
+     *     future-> T
+     *
+     */
+    fn solveTypeFromFuture(dmut context: &ValidationContext,
+                           templates:    [&Expression],
+                           fut:          &FutureTypeExpr,
+                           types:        [&Type])-> TemplateSolution
+        throws ErrorMsg
+    {
+        if (types.len >= 1us) {
+            let type = TypeCreation::createEnumUnwrap(types[0]);
+            if let ft: &FutureType = type {
+                let solution = TemplateImplicitSolving::solveType(alias context,
+                                                                  templates,
+                                                                  fut.retType,
+                                                                  copy [ft.retType]);
+                return TemplateSolution(solution.mapper, 1);
+            }
+        }
+
+        return TemplateSolution(TemplateMapper(), 1);
+    }
+
+    /**
+     * Solve implicit template bindings for a range type:
+     *     ..T
+     *
+     */
+    fn solveTypeFromRange(dmut context: &ValidationContext,
+                          templates:    [&Expression],
+                          range:        &RangeTypeExpr,
+                          types:        [&Type])-> TemplateSolution
+        throws ErrorMsg
+    {
+        if (types.len >= 1us) {
+            let type = TypeCreation::createEnumUnwrap(types[0]);
+            if let rng: &RangeType = type {
+                let solution = TemplateImplicitSolving::solveType(alias context,
+                                                                  templates,
+                                                                  range.type,
+                                                                  rng.inners);
+                return TemplateSolution(solution.mapper, 1);
+            }
+        }
+
+        return TemplateSolution(TemplateMapper(), 1us);
+    }
+
+    /**
+     * Solve implicit template bindings for a function pointer type:
+     *     fn (params...)-> ret
+     *
+     * @returns:
+     *   - TemplateSolution with merged mapper.
+     */
+    fn solveTypeFromFptr(dmut context: &ValidationContext,
+                         templates:    [&Expression],
+                         fptrType:     &FunctionPtrTypeExpr,
+                         types:        [&Type])-> TemplateSolution
+        throws ErrorMsg
+    {
+        if types.len == 0 {
+            return TemplateSolution(TemplateMapper(), 1);
+        }
+
+        let type = TypeCreation::createEnumUnwrap(types[0]);
+        if let l: &LambdaType = type {
+            return TemplateImplicitTypeSolving::solveTypeFromLambda(alias context, templates, fptrType, l);
+        }
+
+        let (params, retType) = match type {
+            d: &DelegateType => { (d.params, d.retType) }
+            f: &FuncPtrType => { (f.params, f.retType) }
+            _ => {
+                return TemplateSolution(TemplateMapper(), 1);
+            }
+        };
+
+        if (fptrType.params.len > params.len) {
+            return TemplateSolution(TemplateMapper(), 1us);
+        }
+
+        let mut consumed = 0us;
+        let mut retMapper = TemplateMapper();
+        let mut syntTemplate = templates;
+
+        for i in 0us .. fptrType.params.len {
+            let v = fptrType.params[i];
+            let currentParam = TemplateRewriting::rewrite(retMapper, v.type);
+            let rest = params.len - consumed;
+            let syntaxRest = (fptrType.params.len - i) - 1us;
+
+            let consomableTypes = params[consumed .. consumed + (rest - syntaxRest)];
+            let local = TemplateImplicitSolving::solveType(alias context,
+                                                           syntTemplate,
+                                                           currentParam,
+                                                           consomableTypes);
+
+            retMapper:.merge(local.mapper);
+            consumed += cast!usize(local.nbConsumed);
+            syntTemplate = TemplateRewriting::rewriteTemplateParams(retMapper, syntTemplate);
+        }
+
+        let retParam = TemplateRewriting::rewrite(retMapper, fptrType.retType);
+        let local = TemplateImplicitSolving::solveType(alias context,
+                                                       syntTemplate,
+                                                       retParam,
+                                                       copy [retType]);
+        retMapper:.merge(local.mapper);
+        return TemplateSolution(retMapper, 1us);
+    }
+
+    /**
+     * Solve implicit template bindings for a function pointer type, where the
+     * associated type is a lambda.
+     *
+     * @returns:
+     *   - TemplateSolution with merged mapper.
+     */
+    fn solveTypeFromLambda(dmut context: &ValidationContext,
+                           templates:    [&Expression],
+                           fptrType:     &FunctionPtrTypeExpr,
+                           lmbd:         &LambdaType)-> TemplateSolution
+        throws ErrorMsg
+    {
+        let (params, retType) = (lmbd.params, lmbd.retType);
+        let mut retMapper = TemplateMapper();
+        if (fptrType.params.len != params.len) {
+            return TemplateSolution(retMapper, 1);
+        }
+
+        for i in 0us .. fptrType.params.len {
+            let v = fptrType.params[i];
+            let currentParam = TemplateRewriting::rewrite(retMapper, v.type);
+            if (params[i] !of NoneType) {
+                let local = TemplateImplicitSolving::solveType(alias context,
+                                                               templates,
+                                                               currentParam,
+                                                               params[i .. i + 1]);
+                retMapper:.merge(local.mapper);
+            }
+        }
+
+        if (retType !of NoneType) {
+            let currentParam = TemplateRewriting::rewrite(retMapper, fptrType.retType);
+            let local = TemplateImplicitSolving::solveType(alias context,
+                                                           templates,
+                                                           currentParam,
+                                                           copy [retType]);
+            retMapper:.merge(local.mapper);
+        }
+
+        return TemplateSolution(retMapper, 1us);
+    }
+}
