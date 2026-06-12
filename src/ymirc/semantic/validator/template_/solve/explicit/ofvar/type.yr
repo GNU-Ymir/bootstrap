@@ -1,0 +1,262 @@
+/*
+ * Explicit template solving for type-level expressions(TypeExpr).
+ *
+ * TemplateExplicitOfTypeSolving handles explicit template inference when
+ * the user provides a type expression as a template argument and the
+ * compiler must match it against an expected type. This includes:
+ *
+ *   - FutureTypeExpr
+ *   - RangeTypeExpr
+ *   - FunctionPtrTypeExpr(fn / delegate)
+ *   - DecoratedTypeExpr   (mut, dmut, etc.)
+ *
+ * <hr>
+ *
+ * @Package: ymirc
+ * @Module: ymirc::semantic::validator::template_::solve::explicit::ofvar::type
+ * @File: ymirc/semantic/validator/template_/solve/explicit/ofvar/type.yr
+ * @Author(s):
+ *   - Emile Cadorel <ecadorel@gmail.com>
+ *
+ * @Created(YYYY-MM-DD): 2026-06-12
+ * @Copyright(C) 2021–2026 GNU-Ymir
+ * @License
+ *   ```text
+ *   This file is part of the Ymir language project.
+ *
+ *   Ymir is free software: you can redistribute it and/or modify it
+ *   under the terms of the GNU General Public License as published by
+ *   the Free Software Foundation, either version 3 of the License, or
+ *   (at your option) any later version.
+ *
+ *   Ymir is distributed in the hope that it will be useful,
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *   GNU General Public License for more details.
+ *
+ *   You should have received a copy of the GNU General Public License
+ *   along with Ymir.  If not, see <https://www.gnu.org/licenses/>.
+ *   ```
+ */
+
+in type;
+
+use ymirc::syntax::{_, declaration::_, expression::_};
+use ymirc::semantic::generator::{value::_, type::_};
+
+use ymirc::semantic::{validator, template_, symbol};
+
+use ymirc::lexing::{word, keys};
+use ymirc::errors::_;
+
+use ymirc::utils::format;
+
+use ymirc::semantic::validator::template_::solve::{_, explicit::_};
+
+/**
+ * TemplateExplicitOfTypeSolving module
+ *
+ * Provides explicit template solving for type-level expressions.
+ *
+ * Supported type expressions:
+ *   - FutureTypeExpr
+ *   - RangeTypeExpr
+ *   - FunctionPtrTypeExpr
+ *   - DecoratedTypeExpr
+ *
+ * This module is used exclusively by TemplateExplicitSolving.
+ */
+pub mod TemplateExplicitOfTypeSolving {
+
+    /**
+     * Dispatch explicit solving based on the concrete TypeExpr variant.
+     *
+     * If no rule matches, fallback to TemplateExplicitOfVarSolving::solveOfSpecFallback().
+     *
+     * @returns:
+     *   - TemplateSolution(mapper, nbConsumed)
+     */
+    pub fn solve(dmut context: &ValidationContext,
+                 name:         &Word,
+                 alls:         [&Expression],
+                 expr:         &TypeExpr,
+                 type:         &Type)-> TemplateSolution
+        throws ErrorMsg
+    {
+        match expr {
+            f: &FutureTypeExpr => {
+                return TemplateExplicitOfTypeSolving::solveFuture(alias context, alls, f, type);
+            }
+            r: &RangeTypeExpr => {
+                return TemplateExplicitOfTypeSolving::solveRange(alias context, alls, r, type);
+            }
+            f: &FunctionPtrTypeExpr => {
+                return TemplateExplicitOfTypeSolving::solveFuncPtr(alias context, alls, f, type);
+            }
+            d: &DecoratedTypeExpr => {
+                return TemplateExplicitOfTypeSolving::solveDeco(alias context, name, alls, d, type)
+            }
+        }
+
+        return TemplateExplicitOfVarSolving::solveOfSpecFallback(alias context, name, expr, type);
+    }
+
+    /**
+     * Solve explicit template bindings for a future type:
+     *     future T
+     *
+     */
+    fn solveFuture(dmut context: &ValidationContext,
+                   alls:         [&Expression],
+                   fut:          &FutureTypeExpr,
+                   type:         &Type)-> TemplateSolution
+        throws ErrorMsg
+    {
+        let unwrap = TypeCreation::createEnumUnwrap(type);
+        let local = match unwrap {
+            c: &FutureType => {
+                TemplateExplicitOfVarSolving::solveOfSpec(alias context, fut.retType.loc, alls, fut.retType, copy [c.retType])
+            }
+            _ => {
+                throw copy ErrorMsg::fatal(fut.loc, format(ValidateErrorMessage::TEMPLATE_SPECIALIZATION_FAILS, fut, type));
+            }
+        };
+
+        // Complete the type, and verify that it is correctly set
+        let finalType = TemplateRewriting::rewrite(local.mapper, fut);
+        let ofType = TypeValidation::validate(alias context, finalType);
+        TypeVerification::verifyCompatible(fut.loc, type.loc, ofType, type);
+
+        let mut retMapper = TemplateMapper(score-> TemplateScore::VAR);
+        retMapper:.merge(local.mapper);
+
+        return TemplateSolution(retMapper, 1);
+    }
+
+    /**
+     * Solve explicit template bindings for a range type:
+     *     range T
+     *
+     */
+    fn solveRange(dmut context: &ValidationContext,
+                  alls:         [&Expression],
+                  range:        &RangeTypeExpr,
+                  type:         &Type)-> TemplateSolution
+        throws ErrorMsg
+    {
+        let unwrap = TypeCreation::createEnumUnwrap(type);
+        let local = match unwrap {
+            c: &RangeType => {
+                TemplateExplicitOfVarSolving::solveOfSpec(alias context, range.type.loc, alls, range.type, c.inners[0 .. 1])
+            }
+            _ => {
+                throw copy ErrorMsg::fatal(range.loc, format(ValidateErrorMessage::TEMPLATE_SPECIALIZATION_FAILS, range, type));
+            }
+        };
+
+        let mut retMapper = TemplateMapper(score-> TemplateScore::VAR);
+        let finalType = TemplateRewriting::rewrite(local.mapper, range);
+        let ofType = TypeValidation::validate(alias context, finalType);
+        TypeVerification::verifyCompatible(range.loc, type.loc, ofType, type);
+        retMapper:.merge(local.mapper);
+
+        return TemplateSolution(retMapper, 1);
+    }
+
+    /**
+     * Solve explicit template bindings for a function pointer type:
+     *     fn (params...)-> ret
+     *     delegate(params...)-> ret
+     *
+     */
+    fn solveFuncPtr(dmut context: &ValidationContext,
+                    alls:         [&Expression],
+                    fptr:         &FunctionPtrTypeExpr,
+                    type:         &Type)-> TemplateSolution
+        throws ErrorMsg
+    {
+        let unwrap = TypeCreation::createEnumUnwrap(type);
+        let (params, retType) = match (fptr.isDelegate, unwrap) {
+            (false, f: &FuncPtrType) => {
+                (f.params, f.retType)
+            }
+            (true, d: &DelegateType) => {
+                (d.params, d.retType)
+            }
+            _ => {
+                throw copy ErrorMsg::fatal(fptr.loc, format(ValidateErrorMessage::TEMPLATE_SPECIALIZATION_FAILS, fptr, type));
+            }
+        };
+
+        if (fptr.params.len > params.len) {
+            throw copy ErrorMsg::fatal(type.loc, format(ValidateErrorMessage::TEMPLATE_SPECIALIZATION_FAILS, fptr, type),
+                                       notes-> copy [copy ErrorMsg::fatal(fptr.loc, format(ValidateErrorMessage::INCOMPATIBLE_TYPE, fptr, type))]);
+        }
+
+        let mut consumed = 0us;
+        let mut retMapper = TemplateMapper(score-> TemplateScore::TYPE);
+        let mut syntTemplate = alls;
+
+        for i in 0us .. fptr.params.len {
+            let v = fptr.params[i];
+
+            let currentParam = TemplateRewriting::rewrite(retMapper, v.type);
+            let rest = params.len - consumed;
+            let syntaxRest = (fptr.params.len - i) - 1us;
+            let consomableTypes = params[consumed .. consumed + (rest - syntaxRest)];
+
+            let local = TemplateExplicitOfVarSolving::solveOfSpec(alias context, currentParam.loc, syntTemplate, currentParam, consomableTypes);
+
+            retMapper:.merge(local.mapper);
+            consumed += cast!usize(local.nbConsumed);
+            syntTemplate = TemplateRewriting::rewriteTemplateParams(retMapper, syntTemplate);
+        }
+
+        let retParam = TemplateRewriting::rewrite(retMapper, fptr.retType);
+        let local = TemplateExplicitOfVarSolving::solveOfSpec(alias context, retParam.loc, syntTemplate, retParam, copy [retType]);
+        retMapper:.merge(local.mapper);
+
+        let finalType = TemplateRewriting::rewrite(retMapper, fptr);
+        let ofType = TypeValidation::validate(alias context, finalType);
+        TypeVerification::verifyCompatible(fptr.loc, type.loc, ofType, type);
+
+        return TemplateSolution(retMapper, 1);
+    }
+
+    /**
+     * Solve explicit template bindings for a decorated type:
+     *     mut T
+     *     dmut T
+     *
+     */
+    fn solveDeco(dmut context: &ValidationContext,
+                 name:         &Word,
+                 alls:         [&Expression],
+                 deco:         &DecoratedTypeExpr,
+                 type:         &Type)-> TemplateSolution
+        throws ErrorMsg
+    {
+        let hasMut = deco.kind == Decorators::MUT;
+        let hasDmut = deco.kind == Decorators::DMUT;
+
+        let local = TemplateExplicitOfVarSolving::solveOfSpec(alias context, deco.loc, alls, deco.content, copy [type]);
+        if (hasDmut && !type.isDeeplyMutable) {
+            throw copy ErrorMsg::fatal(deco.loc, format(ValidateErrorMessage::DISCARD_CONST));
+
+        }
+
+        if (hasMut && !type.isMutable) {
+            throw copy ErrorMsg::fatal(deco.loc, format(ValidateErrorMessage::DISCARD_CONST));
+        }
+
+        let mut resultMapper = TemplateMapper(score-> TemplateScore::VAR * 2us);
+        resultMapper:.merge(local.mapper);
+        if (name.isName) {
+            resultMapper:.insert(name.str, TemplateSolvingUtils::createTypeWrapper(deco.loc, type),
+                                 mutable-> hasMut,
+                                 deeplyMut-> hasDmut);
+        }
+
+        return TemplateSolution(resultMapper, 1);
+    }
+}
