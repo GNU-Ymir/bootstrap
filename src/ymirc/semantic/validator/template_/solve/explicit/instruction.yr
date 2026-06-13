@@ -1,0 +1,323 @@
+/*
+ * Explicit template solving for instruction-level template parameters.
+ *
+ * TemplateExplicitInstructionSolving handles template parameters that appear
+ * in instruction-like contexts, such as:
+ *
+ *     T: type = expr
+ *     V: value = expr
+ *     F: fn(...)-> ... = lambda
+ *
+ * <hr>
+ *
+ * @Package: ymirc
+ * @Module: ymirc::semantic::validator::template_::solve::explicit::instruction
+ * @File: ymirc/semantic/validator/template_/solve/explicit/instruction.yr
+ * @Author(s):
+ *   - Emile Cadorel <ecadorel@gmail.com>
+ *
+ * @Created(YYYY-MM-DD): 2026-06-13
+ * @Copyright(C) 2021–2026 GNU-Ymir
+ * @License
+ *   ```text
+ *   This file is part of the Ymir language project.
+ *
+ *   Ymir is free software: you can redistribute it and/or modify it
+ *   under the terms of the GNU General Public License as published by
+ *   the Free Software Foundation, either version 3 of the License, or
+ *   (at your option) any later version.
+ *
+ *   Ymir is distributed in the hope that it will be useful,
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *   GNU General Public License for more details.
+ *
+ *   You should have received a copy of the GNU General Public License
+ *   along with Ymir.  If not, see <https://www.gnu.org/licenses/>.
+ *   ```
+ */
+
+in instruction;
+
+use ymirc::syntax::{_, declaration::_, expression::_};
+use ymirc::semantic::generator::{value::_, type::_};
+
+use ymirc::semantic::{validator, template_, symbol};
+
+use ymirc::lexing::{word, keys};
+use ymirc::errors::_;
+
+use ymirc::utils::format;
+
+use ymirc::semantic::validator::template_::solve::{_, explicit::_};
+
+/**
+ * TemplateExplicitInstructionSolving module
+ *
+ * Provides explicit template solving for instruction‑shaped template
+ * parameters(VarDeclExpr).
+ *
+ * This module is used exclusively by TemplateExplicitSolving.
+ */
+pub mod TemplateExplicitInstructionSolving {
+
+    /**
+     * Dispatch explicit solving based on the instruction expression.
+     *
+     * @returns:
+     *   - TemplateSolution(mapper, nbConsumed)
+     */
+    pub fn solve(dmut context: &ValidationContext,
+                 alls:         [&Expression],
+                 instr:        &Expression,
+                 values:       [&Generator])-> TemplateSolution
+        throws ErrorMsg
+    {
+        if let v: &VarDeclExpr = instr {
+            return TemplateExplicitInstructionSolving::solveVarDecl(alias context, alls, v, values);
+        }
+
+        return TemplateExplicitValueSolving::solve(alias context, instr, values);
+    }
+
+    /**
+     * Solve a variable declaration used as a template parameter:
+     *
+     *     name: Type = value
+     *
+     * @throws:
+     *   - TEMPLATE_SPECIALIZATION_FAILS if no values are provided,
+     *   - USE_AS_VALUE_TEMPLATE if provided generator is not a Value.
+     */
+    fn solveVarDecl(dmut context: &ValidationContext,
+                    alls:         [&Expression],
+                    vdecl:        &VarDeclExpr,
+                    values:       [&Generator])-> TemplateSolution
+        throws ErrorMsg
+    {
+        if (values.len == 0us) {
+            throw copy ErrorMsg::fatal(vdecl.loc, format(ValidateErrorMessage::TEMPLATE_SPECIALIZATION_FAILS, vdecl, values));
+        }
+
+        if let mut val: &Value = values[0] {
+            let dmut retMapper = TemplateMapper(score-> TemplateScore::VALUE);
+            if let func: &FunctionPtrTypeExpr = vdecl.type {
+                return TemplateExplicitInstructionSolving::solveFptr(alias context, alls, vdecl, func, val);
+            }
+
+            if vdecl.type !of EmptyExpr {
+                let typeLocal = TemplateExplicitOfVarSolving::solveOfSpec(alias context, vdecl.type.loc, alls, vdecl.type, copy [val.type]);
+                let rewriteType = TemplateRewriting::rewrite(typeLocal.mapper, vdecl.type);
+                let vType = TypeValidation::validate(alias context, rewriteType);
+                val = TypeInference::inferValueForType(alias context, vdecl.type.loc, val, vType, byReference-> false);
+
+                retMapper:.merge(typeLocal.mapper);
+            }
+
+            if vdecl.value !of EmptyExpr {
+                let vVal = ValueValidation::validate(alias context, vdecl.value);
+                let cmp = BinaryComparisonValidation::validate(alias context, vdecl.loc, BinaryOperators::DEQUAL, vVal, val);
+                if (!context.cteInterpret:.computeBool(cmp)) {
+                    throw copy ErrorMsg::fatal(vdecl.loc, format(ValidateErrorMessage::TEMPLATE_SPECIALIZATION_FAILS, vdecl, values),
+                                               notes-> copy [copy ErrorMsg::fatal(vVal.loc, format(ValidateErrorMessage::INCOMPATIBLE_VALUES, vVal, val))]);
+                }
+
+                retMapper:.insert(vdecl.name.str, copy ValueWrapperExpr(vdecl.loc, val));
+            }
+
+
+            return TemplateSolution(retMapper, 1);
+        }
+
+        throw copy ErrorMsg::fatal(vdecl.loc, format(ValidateErrorMessage::TEMPLATE_SPECIALIZATION_FAILS, vdecl, values),
+                                   notes-> copy [copy ErrorMsg::fatal(values[0].loc, format(ValidateErrorMessage::USE_AS_VALUE_TEMPLATE, values[0]))]);
+    }
+
+    /**
+     * Solve a function pointer declaration:
+     *
+     *     F: fn(...)-> ... = value
+     *
+     */
+    fn solveFptr(dmut context: &ValidationContext,
+                 alls:         [&Expression],
+                 vdecl:        &VarDeclExpr,
+                 fptrType:     &FunctionPtrTypeExpr,
+                 value:        &Value)-> TemplateSolution
+        throws ErrorMsg
+    {
+        if (fptrType.isDelegate) {
+            throw copy ErrorMsg::fatal(vdecl.loc, format(ValidateErrorMessage::TEMPLATE_SPECIALIZATION_FAILS, fptrType, value.type),
+                                       notes-> copy [copy ErrorMsg::fatal(fptrType.loc, ValidateErrorMessage::CLOSURE_TEMPLATE_LAMBDA)]);
+        }
+
+        match value {
+            lmbdValue: &LambdaValue => {
+                return TemplateExplicitInstructionSolving::solveLambda(alias context, alls, vdecl, fptrType, lmbdValue);
+            }
+            nameFunc: &ProtoFuncPtrValue => {
+                return TemplateExplicitInstructionSolving::solveProto(alias context, alls, vdecl, fptrType, nameFunc);
+            }
+        }
+
+        throw copy ErrorMsg::fatal(vdecl.loc, format(ValidateErrorMessage::TEMPLATE_SPECIALIZATION_FAILS, fptrType, value.type),
+                                   notes-> copy [copy ErrorMsg::fatal(fptrType.loc, format(ValidateErrorMessage::INCOMPATIBLE_VALUES, fptrType, value))]);
+    }
+
+    /**
+     * Solve a function pointer declaration where the value is a named function.
+     *
+     */
+    fn solveProto(dmut context: &ValidationContext,
+                  alls:         [&Expression],
+                  vdecl:        &VarDeclExpr,
+                  fptrType:     &FunctionPtrTypeExpr,
+                  value:        &ProtoFuncPtrValue)-> TemplateSolution
+        throws ErrorMsg
+    {
+        let dmut retMapper = TemplateMapper(score-> TemplateScore::VALUE);
+        let local = TemplateExplicitOfVarSolving::solveOfSpec(alias context, fptrType.loc, alls, fptrType, copy [value.type]);
+        retMapper:.merge(local.mapper);
+
+        let finalType = TemplateRewriting::rewrite(retMapper, fptrType);
+        let ofType = TypeValidation::validate(alias context, finalType);
+        let ofValue = TypeInference::inferValueForType(alias context, vdecl.loc, value, ofType,
+                                                       byReference-> false);
+
+        retMapper:.insert(vdecl.name.str, copy ValueWrapperExpr(vdecl.loc, ofValue));
+
+        return TemplateSolution(retMapper, 1us);
+    }
+
+    /**
+     * Solve a function pointer declaration where the value is a lambda.
+     *
+     */
+    fn solveLambda(dmut context: &ValidationContext,
+                   alls:         [&Expression],
+                   vdecl:        &VarDeclExpr,
+                   fptrType:     &FunctionPtrTypeExpr,
+                   lmbdValue:        &LambdaValue)-> TemplateSolution
+        throws ErrorMsg
+    {
+        if (lmbdValue.isClosure) {
+            throw copy ErrorMsg::fatal(vdecl.loc, format(ValidateErrorMessage::TEMPLATE_SPECIALIZATION_FAILS, fptrType, lmbdValue),
+                                       notes-> copy [copy ErrorMsg::fatal(lmbdValue.loc, ValidateErrorMessage::CLOSURE_TEMPLATE_LAMBDA)]);
+        }
+
+        if (fptrType.params.len > lmbdValue.params.len) {
+            throw copy ErrorMsg::fatal(vdecl.loc, format(ValidateErrorMessage::TEMPLATE_SPECIALIZATION_FAILS, fptrType, lmbdValue),
+                                       notes-> copy [copy ErrorMsg::fatal(fptrType.loc, format(ValidateErrorMessage::INCOMPATIBLE_VALUES, fptrType, lmbdValue))]);
+        }
+
+        let mut retMapper = TemplateMapper(score-> TemplateScore::VALUE);
+        let (paramMapper, uncomplete, paramTypes) = TemplateExplicitInstructionSolving::solveLambdaParams(alias context, alls, fptrType, lmbdValue);
+        retMapper:.merge(paramMapper);
+
+        if (!uncomplete) {
+            TemplateExplicitInstructionSolving::finalizeLambda(alias context, alls, vdecl, fptrType, lmbdValue, paramTypes,
+                                                               ref retMapper);
+            return TemplateSolution(retMapper, 1);
+        }
+
+        if lmbdValue.retType !of NoneType {
+            let returnExpr = TemplateRewriting::rewrite(retMapper, fptrType.retType);
+            let local = TemplateExplicitOfVarSolving::solveOfSpec(alias context, returnExpr.loc, alls, returnExpr, copy [lmbdValue.retType]);
+            retMapper:.merge(local.mapper);
+        }
+
+        match TemplateRewriting::rewrite(retMapper, fptrType) {
+            fptr: &FunctionPtrTypeExpr => {
+                retMapper:.insert(vdecl.name.str, copy LambdaValueWrapperExpr(vdecl.loc, vdecl.name.str, fptr, lmbdValue));
+            }
+            _ => panic;
+        }
+
+        return TemplateSolution(retMapper, 1);
+    }
+
+    /**
+     * Solve lambda parameters against declared function pointer parameters.
+     *
+     */
+    fn solveLambdaParams(dmut context: &ValidationContext,
+                         alls:         [&Expression],
+                         fptrType:     &FunctionPtrTypeExpr,
+                         lmbdValue:    &LambdaValue)-> (TemplateMapper, bool, [&Type])
+        throws ErrorMsg
+    {
+        let mut retMapper = TemplateMapper();
+        let mut uncomplete = false;
+        let mut paramTypes: [mut &Type] = [];
+
+        if (fptrType.params.len != lmbdValue.params.len) {
+            return (retMapper, true, []);
+        }
+
+        for i, vd in fptrType.params match lmbdValue.params[i] {
+            v: &ProtoVarDeclValue => { // lambda has a type to validate
+                let tiExpr = TemplateRewriting::rewrite(retMapper, vd.type);
+                let local = TemplateExplicitOfVarSolving::solveOfSpec(alias context, tiExpr.loc, alls, tiExpr, copy [v.type]);
+                retMapper:.merge(local.mapper);
+
+                let finalExpr = TemplateRewriting::rewrite(retMapper, vd.type);
+                paramTypes ~= [TypeValidation::validate(alias context, finalExpr)];
+            }
+            _ => {
+                paramTypes ~= [NONE_TYPE];
+            }
+        }
+
+        for i, v in fptrType.params match lmbdValue.params[i] {
+            ProtoVarDeclValue() => {}
+            _ => {
+                let tiExpr = TemplateRewriting::rewrite(retMapper, v.type);
+                {
+                    paramTypes[i] = TypeValidation::validate(alias context, tiExpr);
+                } catch {
+                    _ => {
+                        uncomplete = true;
+                    }
+                }
+            }
+        }
+
+        return (retMapper, uncomplete, paramTypes);
+    }
+
+    /**
+     * Finalize lambda specialization when all parameter types are known.
+     *
+     */
+    fn finalizeLambda(dmut context:      &ValidationContext,
+                      alls:              [&Expression],
+                      vdecl:             &VarDeclExpr,
+                      fptrType:          &FunctionPtrTypeExpr,
+                      lmbdValue:         &LambdaValue,
+                      paramTypes:        [&Type],
+                      ref mut retMapper: TemplateMapper)
+        throws ErrorMsg
+    {
+        let (proto_, frame) = LambdaValidation::validate(alias context, lmbdValue, paramTypes);
+        if let proto: &ProtoFuncPtrValue = proto_ {
+            if let __fptrType: &FuncPtrType = proto.type {
+                let retType = __fptrType.retType;
+                let returnExpr = TemplateRewriting::rewrite(retMapper, fptrType.retType);
+                let local = TemplateExplicitOfVarSolving::solveOfSpec(alias context, returnExpr.loc, alls, returnExpr, copy [retType]);
+
+                LambdaCreation::insertGenerator(alias context, frame);
+                retMapper:.merge(local.mapper);
+                retMapper:.insert(vdecl.name.str, copy ValueWrapperExpr(vdecl.loc, proto));
+
+                let fptrFinal = TemplateRewriting::rewrite(retMapper, fptrType);
+                let ofType = TypeValidation::validate(alias context, fptrFinal);
+
+                TypeVerification::verifyCompatible(fptrType.loc, lmbdValue.loc, ofType, proto.type);
+
+                return;
+            }
+        }
+
+        panic;
+    }
+}
