@@ -1,0 +1,268 @@
+/*
+ * Implicit cast validation.
+ *
+ * CastImplicitValidation performs semantic validation of implicit casts
+ * between values and types. It is responsible for:
+ *
+ *   - verifying type compatibility,
+ *   - reducing values through compile-time interpretation,
+ *   - recursively validating implicit casts inside blocks, lazy values,
+ *     futures, and enum field accesses,
+ *   - delegating scalar and compound implicit casts to specialized modules,
+ *   - producing rewritten values when implicit casts succeed,
+ *   - propagating detailed diagnostics when implicit casts fail.
+ *
+ * <hr>
+ *
+ * @Package: ymirc
+ * @Module: ymirc::semantic::validator::value::operator::cast_::implicit
+ * @File: ymirc/semantic/validator/value/operator/cast_/implicit.yr
+ * @Author(s):
+ *   - Emile Cadorel <ecadorel@gmail.com>
+ *
+ * @Created(YYYY-MM-DD): 2026-06-14
+ * @Copyright(C) 2021–2026 GNU-Ymir
+ * @License
+ *   ```text
+ *   This file is part of the Ymir language project.
+ *
+ *   Ymir is free software: you can redistribute it and/or modify it
+ *   under the terms of the GNU General Public License as published by
+ *   the Free Software Foundation, either version 3 of the License, or
+ *   (at your option) any later version.
+ *
+ *   Ymir is distributed in the hope that it will be useful,
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *   GNU General Public License for more details.
+ *
+ *   You should have received a copy of the GNU General Public License
+ *   along with Ymir.  If not, see <https://www.gnu.org/licenses/>.
+ *   ```
+ */
+
+in implicit;
+
+use ymirc::syntax::expression::_;
+use ymirc::semantic::validator;
+use ymirc::semantic::generator::{value::_, type::_};
+use ymirc::errors::_;
+
+use ymirc::lexing::word;
+
+use ymirc::semantic::validator::value::operator::cast_::implicit::_;
+
+/*!
+ * ====================================================================================================
+ * ====================================================================================================
+ * ====================================          SUBMODS          =====================================
+ * ====================================================================================================
+ * ====================================================================================================
+ */
+
+
+mod ::array;
+mod ::slice;
+mod ::scalar;
+mod ::compound;
+
+/*!
+ * ====================================================================================================
+ * ====================================================================================================
+ * ======================================          ROOT          ======================================
+ * ====================================================================================================
+ * ====================================================================================================
+ */
+
+/**
+ * CastImplicitValidation module
+ *
+ * Provides the core logic for validating implicit casts.
+ *
+ */
+pub mod CastImplicitValidation {
+
+    /**
+     * Validate an implicit cast from a value to a target type.
+     *
+     * @params:
+     *   - context: validation context used for type checking and reduction
+     *   - loc:     source location of the cast
+     *   - value:   value to implicitly cast
+     *   - type:    target type for the implicit cast
+     *
+     * @returns:
+     *   - &Value: rewritten value after implicit cast
+     *
+     * @throws:
+     *   - any error produced by type verification or implicit cast failure
+     */
+    pub fn validate(dmut context: &ValidationContext,
+                    loc:          &Word,
+                    value:        &Value,
+                    type:         &Type)-> &Value
+        throws ErrorMsg
+    {
+        // If the types are compatible, no need for implicit casting
+        let err = match TypeVerification::verifyCompatible(loc, value.loc, type, value.type)? {
+            Ok() => {
+                if (TypeVerification::isProxy(type, value.type)) match context.cteInterpret:.reduce(value) {
+                    e: &EnumFieldAccessValue => { // implicit cast from enum value to inner type of the enum
+                        // types are compatible, but there might be a better specialization
+                        return CastImplicitValidation::validate(alias context, loc, e.value, type);
+                    }
+                }
+
+                // directly compatible(we return immediately the value without reduction it might be forced to no reduction - e.g. for reference)
+                return value;
+            }
+            Err(error: &ErrorMsg) => {
+                error
+            }
+            _ => panic;
+        };
+
+        // reduce the value to find the real value to implicitely cast(e.g. cast!i8(1 + 2))
+        let rvalue = context.cteInterpret:.reduce(value);
+
+        // If the value is contained within another, we need to implicitely cast inner value
+        match rvalue {
+            b: &BlockValue => {
+                return CastImplicitValidation::validateInBlock(alias context, loc, type, b, error-> err);
+            }
+            l: &LazyValue => {
+                return CastImplicitValidation::validateInLazy(alias context, loc, type, l, error-> err);
+            }
+            l: &FutureValue => {
+                return CastImplicitValidation::validateInFuture(alias context, loc, type, l, error-> err);
+            }
+            e: &EnumFieldAccessValue => {
+                { // type is not a proxy, but maybe it is implicitely castable, e.g. enum (i32)-> i8
+                    return CastImplicitValidation::validate(alias context, loc, e.value, type);
+                } catch {
+                    innerErr => {
+                        throw err.withNote(copy [innerErr]);
+                    }
+                }
+            }
+        }
+
+        // Some types allow implicit cast for specific values
+        match type {
+            s: &ScalarType => return CastImplicitScalarValidation::validate(alias context, loc, s, rvalue, error-> err);
+            c: &CompoundType => return CastImplicitCompoundValidation::validate(alias context, loc, c, rvalue, error-> err);
+        }
+
+        // Others don't
+        throw err;
+    }
+
+    /**
+     * Validate an implicit cast inside a BlockValue.
+     *
+     * @params:
+     *   - context: validation context used for recursive cast validation
+     *   - loc:     source location of the cast
+     *   - type:    target type for the implicit cast
+     *   - b:       BlockValue to validate
+     *   - error:   original compatibility error to throw if cast fails
+     *
+     * @returns:
+     *   - &Value: rewritten BlockValue
+     *
+     * @throws:
+     *   - error if the block cannot be implicitly cast
+     */
+    fn validateInBlock(dmut context: &ValidationContext,
+                       loc:          &Word,
+                       type:         &Type,
+                       b:            &BlockValue,
+                       error:        &ErrorMsg)-> &Value
+        throws ErrorMsg
+    {
+        if (b.isSet || b.noValue) throw error;
+        if (b.values.len == 0us) throw error;
+
+        let nbValues = b.values.len;
+        let prevLastVal = b.values[nbValues - 1us];
+        let lastVal = CastImplicitValidation::validate(alias context, loc, prevLastVal, type);
+
+        let allButLast = b.values[0us .. nbValues - 1us];
+        return copy BlockValue(b.loc, lastVal.type, allButLast ~ [lastVal],
+                               breakLoc-> b.breakLoc,
+                               returnLoc-> b.returnLoc);
+    }
+
+    /**
+     * Validate an implicit cast inside a LazyValue.
+     *
+     * @params:
+     *   - context: validation context used for recursive cast validation
+     *   - loc:     source location of the cast
+     *   - type:    target type for the implicit cast
+     *   - l:       LazyValue to validate
+     *   - error:   original compatibility error to throw if cast fails
+     *
+     * @returns:
+     *   - &Value: rewritten LazyValue
+     *
+     * @throws:
+     *   - error with additional notes if cast fails
+     */
+    fn validateInLazy(dmut context: &ValidationContext,
+                      loc:          &Word,
+                      type:         &Type,
+                      l:            &LazyValue,
+                      error:        &ErrorMsg)-> &Value
+        throws ErrorMsg
+    {
+        {
+            let retValue = CastImplicitValidation::validate(alias context, loc, l.value, type);
+            let content = copy ValueWrapperExpr(l.value.loc, retValue);
+            let intr = copy LazyExpr(l.loc, content);
+
+            return LazyValidation::validate(alias context, intr,
+                                            canBeLazy-> true);
+        } catch {
+            innerErr => {
+                throw error.withNote(copy [innerErr]);
+            }
+        }
+    }
+
+    /**
+     * Validate an implicit cast inside a FutureValue.
+     *
+     * @params:
+     *   - context: validation context used for recursive cast validation
+     *   - loc:     source location of the cast
+     *   - type:    target type for the implicit cast
+     *   - f:       FutureValue to validate
+     *   - error:   original compatibility error to throw if cast fails
+     *
+     * @returns:
+     *   - &Value: rewritten FutureValue
+     *
+     * @throws:
+     *   - error with additional notes if cast fails
+     */
+    fn validateInFuture(dmut context: &ValidationContext,
+                        loc:          &Word,
+                        type:         &Type,
+                        f:            &FutureValue,
+                        error:        &ErrorMsg)-> &Value
+        throws ErrorMsg
+    {
+        {
+            let retValue = CastImplicitValidation::validate(alias context, loc, f.value, type);
+            let content = copy ValueWrapperExpr(f.value.loc, retValue);
+            let intr = copy SpawnExpr(f.loc, content);
+
+            return SpawnValidation::validate(alias context, intr);
+        } catch {
+            innerErr => {
+                throw error.withNote(copy [innerErr]);
+            }
+        }
+    }
+}

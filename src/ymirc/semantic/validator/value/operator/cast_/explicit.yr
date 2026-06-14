@@ -1,0 +1,204 @@
+/*
+ * Explicit cast validation.
+ *
+ * CastExplicitValidation performs semantic validation of explicit casts between
+ * values and types. It is responsible for:
+ *
+ *   - validating explicit cast operations,
+ *   - handling enum-to-enum and enum-to-underlying-type casts,
+ *   - delegating scalar and compound casts to specialized modules,
+ *   - validating explicit casts to class pointer types,
+ *   - producing rewritten values when explicit casts succeed,
+ *   - propagating detailed diagnostics when explicit casts fail.
+ *
+ * <hr>
+ *
+ * @Package: ymirc
+ * @Module: ymirc::semantic::validator::value::operator::cast_::explicit
+ * @File: ymirc/semantic/validator/value/operator/cast_/explicit.yr
+ * @Author(s):
+ *   - Emile Cadorel <ecadorel@gmail.com>
+ *
+ * @Created(YYYY-MM-DD): 2026-06-14
+ * @Copyright(C) 2021–2026 GNU-Ymir
+ * @License
+ *   ```text
+ *   This file is part of the Ymir language project.
+ *
+ *   Ymir is free software: you can redistribute it and/or modify it
+ *   under the terms of the GNU General Public License as published by
+ *   the Free Software Foundation, either version 3 of the License, or
+ *   (at your option) any later version.
+ *
+ *   Ymir is distributed in the hope that it will be useful,
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *   GNU General Public License for more details.
+ *
+ *   You should have received a copy of the GNU General Public License
+ *   along with Ymir.  If not, see <https://www.gnu.org/licenses/>.
+ *   ```
+ */
+
+in explicit;
+
+use ymirc::syntax::expression::_;
+use ymirc::semantic::validator;
+use ymirc::semantic::generator::{value::_, type::_};
+use ymirc::errors::_;
+
+use ymirc::lexing::word;
+use ymirc::utils::format;
+
+use ymirc::semantic::validator::value::operator::cast_::{implicit, explicit::_};
+
+/*!
+ * ====================================================================================================
+ * ====================================================================================================
+ * ====================================          SUBMODS          =====================================
+ * ====================================================================================================
+ * ====================================================================================================
+ */
+
+
+mod ::compound;
+mod ::scalar;
+
+/*!
+ * ====================================================================================================
+ * ====================================================================================================
+ * ======================================          ROOT          ======================================
+ * ====================================================================================================
+ * ====================================================================================================
+ */
+
+/**
+ * CastExplicitValidation module
+ *
+ * Provides the core logic for validating explicit casts.
+ *
+ */
+pub mod CastExplicitValidation {
+
+    /**
+     * Validate an explicit cast from a value to a target type.
+     *
+     * @params:
+     *   - context: validation context used for type checking and reduction
+     *   - loc:     source location of the cast
+     *   - value:   value to explicitly cast
+     *   - type:    target type for the explicit cast
+     *
+     * @returns:
+     *   - &Value: rewritten value after explicit cast
+     *
+     * @throws:
+     *   - UNDEFINED_CAST_OP if the cast is not supported
+     *   - any error produced by type verification or cast failure
+     */
+    pub fn validate(dmut context: &ValidationContext, loc: &Word, value: &Value, type: &Type)-> &Value
+        throws ErrorMsg
+    {
+        let iLoc = if (loc.isEof) { value.loc } else { loc };
+
+        // if the value is proxied within an enum type, then the casting is ok
+        if let en: &EnumType = value.type {
+            match TypeVerification::verifyCompatible(loc, value.loc, type, value.type)? {
+                Ok() => {
+                    return TypeInference::inferValueForType(alias context, loc, value, type,
+                                                            byReference-> false);
+                }
+            }
+
+            // Imcompatible types, therefore we are not casting to the same enum, we want to make a complete cast
+            return CastExplicitValidation::validateToEnum(alias context, loc-> iLoc, type, value, en);
+        }
+
+        // It is possible to cast into the following types, with some conditions
+        let ret = match type {
+            c: &CompoundType => { CastExplicitCompoundValidation::validate(alias context, iLoc, c, value) }
+            s: &ScalarType => { CastExplicitScalarValidation::validate(iLoc, s, value) }
+            cp: &ClassPtrType => { CastExplicitValidation::validateToClass(iLoc, cp, value) }
+
+            _ => {
+                throw copy ErrorMsg::fatal(iLoc, format(ValidateErrorMessage::UNDEFINED_CAST_OP, value.type, type));
+            }
+        };
+
+        return context.cteInterpret:.reduce(ret);
+    }
+
+    /**
+     * Validate an explicit cast from a value to an enum type.
+     *
+     * @params:
+     *   - context: validation context used for type checking and reduction
+     *   - loc:     source location of the cast
+     *   - t:       target type for the explicit cast
+     *   - value:   value to cast
+     *   - en:      enum type of the original value
+     *
+     * @returns:
+     *   - &Value: rewritten value after explicit enum cast
+     *
+     * @throws:
+     *   - any error produced by implicit or explicit cast failure
+     */
+    fn validateToEnum(dmut context: &ValidationContext,
+                      loc:          &Word,
+                      t:            &Type,
+                      value:        &Value,
+                      en:           &EnumType)-> &Value
+        throws ErrorMsg
+    {
+        if TypeVerification::isProxy(t, en) match context.cteInterpret:.reduce(value) {
+            e: &EnumFieldAccessValue => {
+                return CastImplicitValidation::validate(alias context, loc, e.value, t);
+            }
+            _ => {
+                let auxType = t;
+                return copy CastValue(loc, auxType, value);
+            }
+        }
+
+        let lastLevelValue = copy CastValue(loc, en.getLastLevelProxy(), value);
+        return CastValidation::validate(alias context, loc-> loc, lastLevelValue, t);
+    }
+
+    /**
+     * Validate an explicit cast to a class pointer type.
+     *
+     * @params:
+     *   - loc:   source location of the cast
+     *   - c:     target ClassPtrType
+     *   - value: value to cast
+     *
+     * @returns:
+     *   - &Value: rewritten value after explicit class pointer cast
+     *
+     * @throws:
+     *   - UNDEFINED_CAST_OP if the value is not a class pointer
+     *   - any error produced by type compatibility verification
+     */
+    fn validateToClass(loc:          &Word,
+                       c:            &ClassPtrType,
+                       value:        &Value)-> &Value
+        throws ErrorMsg
+    {
+        if let oC: &ClassPtrType = value.type {
+            TypeVerification::verifyCompatible(loc, value.loc, c, oC,
+                                               noAncestor-> false);
+
+            let mutLevel = if (oC.inner.isMutable && oC.isMutable) {
+                2u32
+            } else if (oC.isMutable) {
+                1u32
+            } else { 0u32 };
+
+            let auxType = c.clone(mutLevel-> mutLevel);
+            return copy CastValue(loc, auxType, value, isLvalue-> true);
+        }
+
+        throw copy ErrorMsg::fatal(loc, format(ValidateErrorMessage::UNDEFINED_CAST_OP, value.type, c));
+    }
+}
