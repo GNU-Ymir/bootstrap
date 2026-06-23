@@ -1,0 +1,295 @@
+/*
+ * DelegateExpander — expands all delegate-related semantic nodes into YIL values.
+ *
+ * The DelegateExpander lowers high-level delegate constructs into concrete
+ * YILTupleValue representations. It handles:
+ *
+ *   - constructor delegates,
+ *   - name delegates,
+ *   - method delegates(direct and virtual),
+ *   - function-pointer-> delegate casts,
+ *   - fake delegates(ignored).
+ *
+ * Each delegate is expanded into a tuple:
+ *
+ *      (closure, function_pointer)
+ *
+ * with field names:
+ *
+ *      [DelegateKeys::CLOSURE, DelegateKeys::FUNC]
+ *
+ * <hr>
+ *
+ * @Package: ymirc
+ * @Module: ymirc::lint::expander::value::delegate
+ * @File: ymirc/lint/expander/value/delegate.yr
+ * @Author(s):
+ *   - Emile Cadorel <ecadorel@gmail.com>
+ *
+ * @Created(YYYY-MM-DD): 2026-06-23
+ * @Copyright(C) 2021–2026 GNU-Ymir
+ * @License
+ *   ```text
+ *   This file is part of the Ymir language project.
+ *
+ *   Ymir is free software: you can redistribute it and/or modify it
+ *   under the terms of the GNU General Public License as published by
+ *   the Free Software Foundation, either version 3 of the License, or
+ *   (at your option) any later version.
+ *
+ *   Ymir is distributed in the hope that it will be useful,
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *   GNU General Public License for more details.
+ *
+ *   You should have received a copy of the GNU General Public License
+ *   along with Ymir.  If not, see <https://www.gnu.org/licenses/>.
+ *   ```
+ */
+
+
+in delegate;
+
+use ymirc::lint::expander;
+use ymirc::lint::node::_;
+
+use ymirc::semantic::{symbol, generator::_};
+use ymirc::semantic::generator::{type::_, value::_};
+
+use ymirc::global::{core_, state};
+use ymirc::lexing::{word, keys};
+
+use ymirc::lint::expander::value::_;
+use std::io;
+
+/**
+ * DelegateExpander
+ *
+ * Expands all delegate-related semantic values into YILTupleValue nodes.
+ * Handles:
+ *
+ *   - constructor delegates,
+ *   - name delegates,
+ *   - method delegates,
+ *   - function-pointer casts to delegates.
+ *
+ * Ensures symbol registration, closure finalization, and correct pointer
+ * extraction for direct and virtual method delegates.
+ */
+pub mod DelegateExpander {
+
+    /**
+     * Finalize a delegate value.
+     *
+     * @params:
+     *   - context: the expansion context
+     *   - ctor:    the delegate value to expand
+     *   - list:    the statement list to append instructions to
+     *   - asLeft:  whether the delegate is used as an l-value
+     *
+     * @returns:
+     *   - &YILValue: the finalized delegate tuple
+     *
+     * @throws:
+     *   - panic: for invalid or unhandled delegate types
+     */
+    pub fn finalize(dmut context: &Expander, ctor: &DelegateValue, ref mut list: StmtList, asLeft: bool)-> &YILValue {
+        match context.getVariable(ctor.uniqId) {
+            Ok(u: &YILValue) => { // The call was already seen and validated
+                return u;
+            }
+        };
+
+        let mut val: &YILValue = YIL_UNIT_VALUE;
+        match ctor {
+            c: &CtorDelegateValue => {
+                val = DelegateExpander::finalizeCtorDG(alias context, c, ref list);
+            }
+            d: &NameDelegateValue => {
+                val = DelegateExpander::finalizeNameDG(alias context, d, ref list);
+            }
+            m: &MethodDelegateValue => {
+                val = DelegateExpander::finalizeMethodDG(alias context, m, ref list);
+            }
+            d: &FptrCastDelegateValue => {
+                return DelegateExpander::finalizeCastFptrToDel(alias context, d, ref list)
+            }
+            FakeMethodDelegateValue() => {
+                return YIL_UNIT_VALUE;
+            }
+        }
+
+        if val of YILUnit {
+            eprintln("internal delegate expansion error: ", ctor.__typeinfo__.name);
+            panic;
+        }
+
+        if (!asLeft && context.isInAFrame()) {
+            return ValueExpander::registerUniqValue(alias context, ctor, val, ref list);
+        }
+
+        return val;
+    }
+
+    /**
+     * Finalize a cast from function pointer to delegate.
+     *
+     * Produces a delegate tuple:
+     *
+     *      (fptr, &CALL_FPTR_AS_DG)
+     *
+     * where CALL_FPTR_AS_DG is a runtime helper used to invoke function pointers
+     * through the delegate call mechanism.
+     *
+     * @params:
+     *   - context: the expansion context
+     *   - ct:      the cast-delegate value
+     *   - list:    the statement list to append instructions to
+     *
+     * @returns:
+     *   - &YILValue: the constructed delegate tuple
+     */
+    fn finalizeCastFptrToDel(dmut context: &Expander, ct: &FptrCastDelegateValue, ref mut list: StmtList)-> &YILValue {
+        let fptr = ValueExpander::finalize(alias context, ct.value, ref list, asLeft-> false);
+        let protoRef = copy YILAddrValue(ct.loc,
+                                         YIL_PTR_VOID,
+                                         copy YILVar(ct.loc, YRuntimeFuncs::CALL_FPTR_AS_DG, YIL_VOID, 0us));
+
+        let type = context:.finalizeType(ct.type);
+        return copy YILTupleValue(ct.loc, type,
+                                  copy [fptr, protoRef],
+                                  fieldNames-> copy [DelegateKeys::CLOSURE, DelegateKeys::FUNC]);
+    }
+
+    /**
+     * Finalize a constructor delegate.
+     *
+     * Produces a delegate tuple:
+     *
+     *      (instance, &proto)
+     *
+     * where:
+     *   - instance is the finalized closure value,
+     *   - proto is the address of the constructor function.
+     *
+     * Registers symbol usage for the constructor prototype.
+     *
+     * @params:
+     *   - context: the expansion context
+     *   - ctor:    the constructor delegate value
+     *   - list:    the statement list to append instructions to
+     *
+     * @returns:
+     *   - &YILValue: the constructed delegate tuple
+     */
+    fn finalizeCtorDG(dmut context: &Expander, ctor: &CtorDelegateValue, ref mut list: StmtList)-> &YILValue {
+        let name = Mangler::mangle(ctor.proto);
+        context:.registerTouchSym(name, ctor.proto.implLoc);
+
+        let protoRef = copy YILAddrValue(ctor.loc, YIL_PTR_VOID, copy YILVar(ctor.loc, name, YIL_VOID, 0us));
+        let instance = ValueExpander::finalize(alias context, ctor.instance, ref list, asLeft-> false);
+        let type = context:.finalizeType(ctor.type);
+
+        return copy YILTupleValue(ctor.loc, type,
+                                  copy [instance, protoRef],
+                                  fieldNames-> copy [DelegateKeys::CLOSURE, DelegateKeys::FUNC]);
+    }
+
+    /**
+     * Finalize a name delegate.
+     *
+     * Produces a delegate tuple:
+     *
+     *      (closure, &proto)
+     *
+     * where:
+     *   - closure is the finalized closure expression,
+     *   - proto is the address of the named function.
+     *
+     * Registers symbol usage for the function prototype.
+     *
+     * @params:
+     *   - context: the expansion context
+     *   - name:    the name-delegate value
+     *   - list:    the statement list to append instructions to
+     *
+     * @returns:
+     *   - &YILValue: the constructed delegate tuple
+     */
+    fn finalizeNameDG(dmut context: &Expander, name: &NameDelegateValue, ref mut list: StmtList)-> &YILValue {
+        let pname = Mangler::mangle(name.proto);
+        context:.registerTouchSym(pname, name.proto.implLoc);
+
+        let protoRef = copy YILAddrValue(name.loc,
+                                         YIL_PTR_VOID,
+                                         copy YILVar(name.loc, pname, YIL_VOID, 0us));
+
+        let instance = ValueExpander::finalize(alias context, name.closure, ref list, asLeft-> false);
+        let type = context:.finalizeType(name.type);
+
+        return copy YILTupleValue(name.loc, type,
+                                  copy [instance, protoRef],
+                                  fieldNames-> copy [DelegateKeys::CLOSURE, DelegateKeys::FUNC]);
+    }
+
+    /**
+     * Finalize a method delegate.
+     *
+     * Handles both direct and virtual method delegates.
+     * Produces a delegate tuple:
+     *
+     *      (instance, function_pointer)
+     *
+     * @params:
+     *   - context: the expansion context
+     *   - meth:    the method-delegate value
+     *   - list:    the statement list to append instructions to
+     *
+     * @returns:
+     *   - &YILValue: the constructed delegate tuple
+     */
+    fn finalizeMethodDG(dmut context: &Expander, meth: &MethodDelegateValue, ref mut list: StmtList)-> &YILValue {
+        let mut inst = ValueExpander::finalize(alias context, meth.closure, ref list, asLeft-> false);
+        let type = context:.getTypeExpander():.finalizeTuple(copy [YIL_PTR_VOID, YIL_PTR_VOID],
+                                                             fieldNames-> copy [DelegateKeys::CLOSURE, DelegateKeys::FUNC]);
+
+        match meth.closure.type {
+            c: &ClassPtrType => {
+                if (c.isStruct) {
+                    if (meth.isAddressed) { // if addressed we make a copy of the tuple
+                        let retType = context:.getTypeExpander():.finalizePointer(inst.type);
+                        let instAddr = MemoryExpander::createAddress(alias context, inst, retType, ref list);
+                        let innerSize = copy YILIntValue(meth.loc, YIL_UINT_32, inst.type.size);
+
+                        let (resultVar, addrResult) = ValueExpander::createVarForBlock(alias context, c.loc, meth.closure.type, retType,
+                                                                                       ref list,
+                                                                                       getAddr-> true);
+                        list:.append(copy YILCall(c.loc,
+                                                  copy YILNameCallValue(c.loc,
+                                                                        YIL_VOID,
+                                                                        YRuntimeFuncs::DUPLICATE_TUPLE,
+                                                                        copy [addrResult, instAddr, innerSize])));
+
+                        inst = resultVar;
+                    } else { // otherwise we simply make a
+                        let retType = context:.getTypeExpander():.finalizePointer(inst.type);
+                        inst = MemoryExpander::createAddress(alias context, inst, retType, ref list);
+                    }
+                }
+            }
+        }
+
+        let fptr = if (meth.isDirect) {
+            let name = Mangler::mangle(meth.proto);
+            context:.registerTouchSym(name, meth.proto.implLoc);
+
+            copy YILAddrValue(meth.loc, YIL_PTR_VOID, copy YILVar(meth.loc, name, YIL_VOID, 0us))
+        } else {
+            CallExpander::createVtableAccess(alias context, meth.loc, inst, meth.vtableIndex, ref list)
+        }
+
+        return copy YILTupleValue(meth.loc, type,
+                                  copy [inst, fptr],
+                                  fieldNames-> copy [DelegateKeys::CLOSURE, DelegateKeys::FUNC]);
+    }
+}

@@ -1,0 +1,715 @@
+/*
+ * ControlExpander — expands all control-flow constructs into YIL instructions.
+ *
+ * The ControlExpander lowers high-level semantic control-flow nodes into
+ * concrete YIL constructs. It handles:
+ *
+ *   - blocks and inline blocks,
+ *   - conditional expressions,
+ *   - loops(compile-time and classic),
+ *   - try/catch and try/finally constructs,
+ *   - list comprehensions,
+ *   - scope-based value propagation.
+ *
+ * <hr>
+ *
+ * @Package: ymirc
+ * @Module: ymirc::lint::expander::value::control
+ * @File: ymirc/lint/expander/value/control.yr
+ * @Author(s):
+ *   - Emile Cadorel <ecadorel@gmail.com>
+ *
+ * @Created(YYYY-MM-DD): 2026-06-22
+ * @Copyright(C) 2021–2026 GNU-Ymir
+ * @License
+ *   ```text
+ *   This file is part of the Ymir language project.
+ *
+ *   Ymir is free software: you can redistribute it and/or modify it
+ *   under the terms of the GNU General Public License as published by
+ *   the Free Software Foundation, either version 3 of the License, or
+ *   (at your option) any later version.
+ *
+ *   Ymir is distributed in the hope that it will be useful,
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *   GNU General Public License for more details.
+ *
+ *   You should have received a copy of the GNU General Public License
+ *   along with Ymir.  If not, see <https://www.gnu.org/licenses/>.
+ *   ```
+ */
+
+in control;
+
+
+use ymirc::lint::expander;
+use ymirc::lint::node::_;
+
+use ymirc::semantic::{symbol, generator::_};
+use ymirc::semantic::generator::{type::_, value::_};
+
+use ymirc::global::{core_, state};
+use ymirc::lexing::word;
+
+use ymirc::lint::expander::value::_;
+use std::io;
+
+/**
+ * ControlExpander
+ *
+ * Module responsible for expanding all control-flow semantic nodes into
+ * YILValue and YILInstr sequences. It handles:
+ *
+ *   - block evaluation,
+ *   - conditional branching,
+ *   - loop expansion,
+ *   - try/catch and try/finally lowering,
+ *   - list comprehension blocks,
+ *   - scope-based value propagation and variable registration.
+ *
+ * All functions append instructions to a StmtList and return the resulting
+ * YILValue representing the control-flow expression’s value.
+ */
+pub mod ControlExpander {
+
+    /**
+     * Finalize a control-flow expression.
+     *
+     * Dispatches based on the concrete ScopeValue:
+     *   - BlockValue(set or normal),
+     *   - InlineBlockValue,
+     *   - ConditionalValue,
+     *   - LoopValue,
+     *   - TryFinallyValue,
+     *   - TryCatchValue,
+     *   - ListComprValue.
+     *
+     * Ensures each scope is expanded only once by checking the uniqId registry.
+     *
+     * @params:
+     *   - context: the expansion context
+     *   - sc:      the scope expression to expand
+     *   - list:    the statement list to append instructions to
+     *   - asLeft:  whether the scope is used as an l-value
+     *
+     * @returns:
+     *   - &YILValue: the resulting value of the scope
+     *
+     * @throws:
+     *   - panic: for unsupported scope types
+     */
+    pub fn finalize(dmut context: &Expander, sc: &ScopeValue, ref mut list: StmtList, asLeft: bool)-> &YILValue {
+        match context.getVariable(sc.uniqId) {
+            Ok(u: &YILValue) => { // The call was already seen and validated
+                return u;
+            }
+        };
+
+        match sc {
+            b: &BlockValue if b.isSet => {
+                return ControlExpander::finalizeBlockSet(alias context, b, ref list, asLeft);
+            }
+            b: &BlockValue => {
+                return ControlExpander::finalizeBlock(alias context, b, ref list);
+            }
+            b: &InlineBlockValue => {
+                return ControlExpander::finalizeInline(alias context, b, ref list);
+            }
+            c: &ConditionalValue => {
+                return ControlExpander::finalizeCond(alias context, c, ref list);
+            }
+            l: &LoopValue => {
+                return ControlExpander::finalizeLoop(alias context, l, ref list);
+            }
+            t: &TryFinallyValue => {
+                return ControlExpander::finalizeTryFinally(alias context, t, ref list);
+            }
+            t: &TryCatchValue => {
+                return ControlExpander::finalizeTryCatch(alias context, t, ref list);
+            }
+            l: &ListComprValue => {
+                return ControlExpander::finalizeBlock(alias context, l.block, ref list);
+            }
+        }
+
+        eprintln("internal scope expansion error: ", sc.__typeinfo__.name);
+        panic;
+    }
+
+    /**
+     * Finalize a conditional branch into YIL instructions.
+     *
+     * Emits:
+     *   - a YILCondJmp testing the condition,
+     *   - a "then" block,
+     *   - an optional "else" block,
+     *   - a final join label.
+     *
+     * Optionally inserts coverage instrumentation.
+     *
+     * @params:
+     *   - loc:       source location of the conditional
+     *   - context:   the expansion context
+     *   - list:      the statement list to append instructions to
+     *   - test:      the YILValue representing the test condition
+     *   - thenLoc:   source location of the "then" branch
+     *   - thenList:  list of statements for the "then" branch
+     *   - elseLoc:   source location of the "else" branch
+     *   - elseList:  list of statements for the "else" branch
+     *   - cover:     whether to emit coverage calls(default: true)
+     *
+     * @returns:
+     *   - void
+     */
+    pub fn finalizeCond(loc:          &Word,
+                        dmut context: &Expander,
+                        ref mut list: StmtList,
+                        test:         &YILValue,
+                        thenLoc:      &Word,
+                        thenList:     StmtList,
+                        elseLoc:      &Word,
+                        elseList:     StmtList,
+                        cover:        bool = true) {
+
+        let thenLabel = copy YILLabel(loc, "then"s8, context:.generateLblId());
+        let endLabel = copy YILLabel(loc, "end"s8, context:.generateLblId());
+        let elseLabel = if (elseList.len != 0us) {
+            copy YILLabel(loc, "else"s8, context:.generateLblId())
+        } else {
+            endLabel
+        };
+
+        list:.append(copy YILCondJmp(loc, test, thenLabel, elseLabel));
+        list:.append(thenLabel);
+        if cover {
+            ValueExpander::generateCoverageCall(alias context, thenLoc, ref list);
+        }
+        list:.append(thenList);
+
+        if (elseList.len != 0us) {
+            list:.append(copy YILGoto(loc, endLabel));
+            list:.append(elseLabel);
+            if cover {
+                ValueExpander::generateCoverageCall(alias context, elseLoc, ref list);
+            }
+            list:.append(elseList);
+        }
+
+        list:.append(endLabel);
+    }
+
+    /**
+     * Finalize a block used as a "set" expression.
+     *
+     * Expands the block via finalizeSet and registers the resulting value if
+     * used as an r-value.
+     *
+     * @params:
+     *   - context: the expansion context
+     *   - b:       the block value
+     *   - list:    the statement list to append instructions to
+     *   - asLeft:  whether the block is used as an l-value
+     *
+     * @returns:
+     *   - &YILValue: the resulting value of the block
+     */
+    pub fn finalizeBlockSet(dmut context: &Expander, b: &BlockValue, ref mut list: StmtList, asLeft: bool)-> &YILValue {
+        let retVal = ControlExpander::finalizeSet(alias context, b, ref list);
+        if (!asLeft) {
+            return ValueExpander::registerUniqValue(alias context, b, retVal.type, retVal, ref list);
+        }
+
+        return retVal;
+    }
+
+    /**
+     * Finalize a normal block.
+     *
+     * Creates a result variable, enters a new scope, expands the block body,
+     * assigns the final value into the result variable, and emits either:
+     *   - a flattened block, or
+     *   - a YILTryFinally if the block contains destructors.
+     *
+     * Registers the result variable under the block’s uniqId.
+     *
+     * @params:
+     *   - context: the expansion context
+     *   - b:       the block value
+     *   - list:    the statement list to append instructions to
+     *
+     * @returns:
+     *   - &YILValue: the result variable
+     */
+    pub fn finalizeBlock(dmut context: &Expander, b: &BlockValue, ref mut list: StmtList)-> &YILValue {
+        let mut innerList = StmtList();
+
+        let retType = context:.finalizeType(b.type);
+        let (resultVar, _) = ValueExpander::createVarForBlock(alias context, b.loc, b.type, retType, ref list);
+        context:.enterBlock();
+
+        let retVal = ControlExpander::finalizeSet(alias context, b, ref innerList);
+        OperatorExpander::finalizeAffect(b.loc, resultVar, retVal, ref innerList);
+
+        context:.exitBlock();
+
+        if (innerList.hasDestroy) {
+            list:.append(copy YILTryFinally(b.loc, innerList[], innerList.getToDestroy()));
+        } else {
+            // Block without scope guards can be flattened, there is no variable shadowing anymore
+            list:.append(innerList); // copy BlockValue(b.loc, VOID_TYPE, innerList, noValue-> true));
+        }
+
+        if (resultVar !of YILUnit) {
+            context:.registerVariable(b.uniqId, resultVar);
+        }
+
+        resultVar
+    }
+
+    /**
+     * Finalize an inline block expression.
+     *
+     * Inline blocks execute their contained values in order inside a special
+     * “inline-return” scope. In this scope, any `return` statement is rewritten
+     * into:
+     *
+     *      resultVar = <value>;
+     *      goto inline_end;
+     *
+     * rather than producing a real function return.
+     *
+     * @params:
+     *   - context: the expansion context
+     *   - i:       the inline block value to expand
+     *   - list:    the statement list to append instructions to
+     *
+     * @returns:
+     *   - &YILValue: the result variable of the inline block, or YIL_UNIT_VALUE
+     *
+     * @throws:
+     *   - nothing
+     */
+    pub fn finalizeInline(dmut context: &Expander,
+                          i:            &InlineBlockValue,
+                          ref mut list: StmtList)-> &YILValue
+    {
+        let retType = context:.finalizeType(i.type);
+        let mut resultVar: &YILValue = YIL_UNIT_VALUE;
+
+        if (retType !of YILVoid) {
+            let (resultVar_, _) =
+                ValueExpander::createVarForBlock(alias context,
+                                                 i.loc,
+                                                 i.type,
+                                                 retType,
+                                                 ref list);
+            resultVar = resultVar_;
+        }
+
+        let endLabel = copy YILLabel(i.loc, "inline_end"s8, context:.generateLblId());
+        context:.enterInline(resultVar, endLabel);
+
+        let mut innerList = StmtList();
+        for v in i.values {
+            ValueExpander::finalize(alias context, v, ref innerList, asLeft-> false);
+        }
+        context:.exitInline();
+
+        list:.append(innerList);
+        list:.append(endLabel);
+
+        return resultVar;
+    }
+
+    /**
+     * Finalize a try/finally construct.
+     *
+     * Expands:
+     *   - the try block(with optional fail-flag variable),
+     *   - optional embedded try/catch inside the try block,
+     *   - the finally block,
+     *   - emits a YILTryFinally if the finally block is non-empty.
+     *
+     * Registers the result variable for the try block.
+     *
+     * @params:
+     *   - context: the expansion context
+     *   - t:       the try/finally value
+     *   - list:    the statement list to append instructions to
+     *
+     * @returns:
+     *   - &YILValue: the value produced by the try block
+     */
+    pub fn finalizeTryFinally(dmut context: &Expander, t: &TryFinallyValue, ref mut list: StmtList)-> &YILValue {
+        let mut tryP = StmtList();
+
+        let vdecl = t.failVar;
+        if (vdecl !of UnitValue) { // let #_failed = true;
+            ValueExpander::finalize(alias context, vdecl, ref list, asLeft-> false);
+        }
+
+        context:.enterBlock();
+        let mut tryVal: &YILValue = YIL_UNIT_VALUE;
+        let mut isCatch = false;
+
+        if let c: &TryCatchValue = t.tryBlock {
+            let mut aff: &Value = vdecl;
+            if (vdecl !of UnitValue) {
+                if let v: &VarDeclValue = vdecl {
+                    let vref = copy VarRefValue(v.loc, v.loc, v.varType, v.uniqId, isSelf-> false, canCte-> false);
+                    aff = copy AffectValue(t.loc, v.varType, vref, copy BoolValue(t.loc, false));
+                } else panic;
+            }
+
+            tryVal = ControlExpander::finalizeTryCatch(alias context, c, ref tryP, aff-> aff);
+            isCatch = true;
+        } else {
+            tryVal = ValueExpander::finalize(alias context, t.tryBlock, ref tryP, asLeft-> false);
+        }
+
+        let type = context:.finalizeType(t.tryBlock.type);
+        let (varTry, _) = ValueExpander::createVarForBlock(alias context, t.tryBlock.loc, t.tryBlock.type, type, ref list);
+        if (varTry !of YILUnit) {
+            context:.registerVariable(t.tryBlock.uniqId, varTry);
+            OperatorExpander::finalizeAffect(t.tryBlock.loc, varTry, tryVal, ref tryP);
+        }
+
+        if (!isCatch && vdecl !of UnitValue) { // #_failed = false;
+            if let v: &VarDeclValue = vdecl {
+                let vref = copy VarRefValue(v.loc, v.loc, v.varType, v.uniqId, isSelf-> false, canCte-> false);
+                let aff = copy AffectValue(t.loc, v.varType, vref, copy BoolValue(t.loc, false));
+
+                ValueExpander::finalize(alias context, aff, ref tryP, asLeft-> false);
+            } else panic;
+        }
+
+        context:.exitBlock();
+        context:.enterBlock();
+
+        let mut finP = StmtList();
+        ValueExpander::finalize(alias context, t.finalBlock, ref finP, asLeft-> false);
+
+        if (finP[].len != 0) {
+            let tryF = copy YILTryFinally(t.loc, tryP[], finP[]);
+            list:.append(tryF);
+        } else {
+            list:.append(tryP[]);
+        }
+
+        context:.exitBlock();
+        if (varTry !of YILUnit) {
+            context:.registerVariable(t.uniqId, varTry);
+        }
+
+        return varTry; // return the value generated by the try part
+    }
+
+    /**
+     * Finalize a try/catch construct.
+     *
+     * Expands:
+     *   - the try block,
+     *   - the catch variable declaration,
+     *   - the catch block,
+     *   - emits a YILTryCatch instruction.
+     *
+     * Optionally applies an affectation before entering the catch block.
+     *
+     * @params:
+     *   - context: the expansion context
+     *   - t:       the try/catch value
+     *   - list:    the statement list to append instructions to
+     *   - aff:     optional affectation executed before the catch block
+     *
+     * @returns:
+     *   - &YILValue: the result variable for the try/catch expression
+     */
+    pub fn finalizeTryCatch(dmut context: &Expander, t: &TryCatchValue, ref mut list: StmtList, aff: &Value = UNIT_VALUE)-> &YILValue {
+        let mut tryP = StmtList();
+
+        context:.enterBlock();
+        let tryVal = ValueExpander::finalize(alias context, t.tryBlock, ref tryP, asLeft-> false);
+
+        let type = context:.finalizeType(t.tryBlock.type);
+        let (varTry, _) = ValueExpander::createVarForBlock(alias context, t.tryBlock.loc, t.tryBlock.type, type, ref list);
+        if (varTry !of YILUnit) {
+            context:.registerVariable(t.tryBlock.uniqId, varTry);
+            OperatorExpander::finalizeAffect(t.tryBlock.loc, varTry, tryVal, ref tryP);
+        }
+
+        if (aff !of UnitValue) {
+            ValueExpander::finalize(alias context, aff, ref tryP, asLeft-> false);
+        }
+        context:.exitBlock();
+
+        let mut catchP = StmtList();
+        context:.enterBlock();
+
+        ValueExpander::finalize(alias context, t.catchVar, ref catchP, asLeft-> false);
+        if let ctVarValue: &VarDeclValue = t.catchVar {
+            let varref = ValueExpander::finalize(alias context,
+                                                 copy VarRefValue(ctVarValue.loc, ctVarValue.loc, ctVarValue.varType, ctVarValue.uniqId,
+                                                                  isSelf-> false,
+                                                                  canCte-> false),
+                                                 ref catchP,
+                                                 asLeft-> false);
+
+            catchP:.append(copy YILAffect(t.catchVar.loc, varref, copy YILBeginCatch(t.loc, YRuntimeFuncs::BEGIN_CATCH)));
+
+            let catchVal = ValueExpander::finalize(alias context, t.catchBlock, ref catchP, asLeft-> false);
+            OperatorExpander::finalizeAffect(t.catchBlock.loc, varTry, catchVal, ref catchP);
+
+            context:.exitBlock();
+
+            let ctVarType = context:.finalizeType(ctVarValue.varType);
+            let tryCatch = copy YILTryCatch(t.loc, ctVarType, tryP[], catchP[]);
+            list:.append(tryCatch);
+
+            if (varTry !of YILUnit) {
+                context:.registerVariable(t.uniqId, varTry);
+            }
+
+            return varTry;
+        }
+
+        panic;
+    }
+
+    /**
+     * Finalize a block "set" expression.
+     *
+     * Sequentially finalizes all values in the block and returns the last one.
+     *
+     * @params:
+     *   - context: the expansion context
+     *   - s:       the block value
+     *   - list:    the statement list to append instructions to
+     *
+     * @returns:
+     *   - &YILValue: the last value of the block
+     */
+    pub fn finalizeSet(dmut context: &Expander, s: &BlockValue, ref mut list: StmtList)-> &YILValue {
+        let mut finVal: &YILValue = YIL_UNIT_VALUE;
+        for i in 0us .. s.values.len {
+            let inner = s.values[i];
+            finVal = ValueExpander::finalize(alias context, inner, ref list, asLeft-> false);
+        }
+
+        return finVal;
+    }
+
+    /**
+     * Finalize a conditional expression.
+     *
+     * Creates a result variable, expands the test, expands both branches in
+     * separate scopes, assigns branch results into the result variable, and
+     * emits the control-flow structure via finalizeCond().
+     *
+     * Registers the result variable under the conditional’s uniqId.
+     *
+     * @params:
+     *   - context: the expansion context
+     *   - c:       the conditional value
+     *   - list:    the statement list to append instructions to
+     *
+     * @returns:
+     *   - &YILValue: the result variable
+     */
+    pub fn finalizeCond(dmut context: &Expander, c: &ConditionalValue, ref mut list: StmtList)-> &YILValue {
+        let type = context:.finalizeType(c.type);
+        let (var, _) = ValueExpander::createVarForBlock(alias context, c.loc, c.type, type, ref list);
+
+        let mut ifList = StmtList();
+        let mut elseList = StmtList();
+
+        // Maybe calls from this test are evaluated in the else cond
+        // If there are calls in there, we need to validate them first
+        let test = ValueExpander::finalize(alias context, c.test, ref list, asLeft-> false);
+        let mut testVar: &YILValue = test;
+        if (test !of YILVar && test !of YILIntValue) {
+            let (testVar_, _) = ValueExpander::createVarForBlock(alias context,
+                                                                 c.test.loc,
+                                                                 c.test.type,
+                                                                 test.type,
+                                                                 ref list,
+                                                                 withValue-> test);
+            testVar = testVar_;
+        }
+
+        context:.enterBlock();
+        let ifVal = ValueExpander::finalize(alias context, c.thenv, ref ifList, asLeft-> false);
+        context:.exitBlock();
+
+        context:.enterBlock();
+        let elseVal = ValueExpander::finalize(alias context, c.elsev, ref elseList, asLeft-> false);
+        context:.exitBlock();
+
+        if (var !of YILUnit) {
+            if (ifVal !of YILUnit) { // can happen if the if val is returner/breaker
+                OperatorExpander::finalizeAffect(c.loc, var, ifVal, ref ifList);
+            }
+            if (elseVal !of YILUnit) { // if the else val is a returner/breaker or just does not have a value
+                OperatorExpander::finalizeAffect(c.loc, var, elseVal, ref elseList);
+            }
+        }
+
+        ControlExpander::finalizeCond(c.loc, alias context,  ref list,
+                                      testVar,
+                                      c.thenv.loc,
+                                      ifList,
+                                      c.elsev.loc,
+                                      elseList);
+
+        if (var !of YILUnit) {
+            context:.registerVariable(c.uniqId, var);
+        }
+
+        return var;
+    }
+
+    /**
+     * Finalize a loop expression.
+     *
+     * Dispatches to:
+     *   - finalizeCteForLoop for compile-time loops,
+     *   - finalizeClassicLoop for runtime loops.
+     *
+     * @params:
+     *   - context: the expansion context
+     *   - l:       the loop value
+     *   - list:    the statement list to append instructions to
+     *
+     * @returns:
+     *   - &YILValue: the loop’s result variable
+     */
+    pub fn finalizeLoop(dmut context: &Expander, l: &LoopValue, ref mut list: StmtList)-> &YILValue {
+        if (l.isCteFor) {
+            return ControlExpander::finalizeCteForLoop(alias context, l, ref list);
+        }
+
+        return ControlExpander::finalizeClassicLoop(alias context, l, ref list);
+    }
+
+    /**
+     * Finalize a compile-time "for" loop.
+     *
+     * Iterates over the block’s values, generating a "next" label for each
+     * iteration, expanding the body, and assigning the final iteration’s value
+     * into the loop result variable.
+     *
+     * @params:
+     *   - context: the expansion context
+     *   - l:       the loop value
+     *   - list:    the statement list to append instructions to
+     *
+     * @returns:
+     *   - &YILValue: the loop result variable
+     */
+    pub fn finalizeCteForLoop(dmut context: &Expander, l: &LoopValue, ref mut list: StmtList)-> &YILValue {
+        let type = context:.finalizeType(l.type);
+        let (var, _) = ValueExpander::createVarForBlock(alias context, l.loc, l.type, type, ref list);
+
+        let endLabel = copy YILLabel(l.loc, "end"s8, context:.generateLblId());
+
+        context:.enterBlock();
+
+        if let blk: &BlockValue = l.value {
+            for i, v in blk.values {
+                let nextLabel = copy YILLabel(l.loc, "next", context:.generateLblId());
+                context:.enterLoop(var, nextLabel, endLabel);
+
+                let mut innerList = StmtList();
+                let innerValue = ValueExpander::finalize(alias context, v,
+                                                         asLeft-> false,
+                                                         list-> ref innerList);
+
+                if (var !of YILUnit && !l.value.isBreaker && i == blk.values.len - 1) {
+                    OperatorExpander::finalizeAffect(l.value.loc, var, innerValue,
+                                                     ref innerList);
+                }
+                innerList:.append(nextLabel);
+                list:.append(innerList);
+                context:.exitLoop();
+            }
+        } else panic;
+
+        context:.exitBlock();
+
+        list:.append(endLabel);
+        return var;
+    }
+
+    /**
+     * Finalize a classic runtime loop.
+     *
+     * Expands:
+     *   - the test expression,
+     *   - the loop body,
+     *   - loop labels(beg, test, end),
+     *   - conditional jumps,
+     *   - coverage instrumentation.
+     *
+     * Registers the loop result variable under the loop’s uniqId.
+     *
+     * @params:
+     *   - context: the expansion context
+     *   - l:       the loop value
+     *   - list:    the statement list to append instructions to
+     *
+     * @returns:
+     *   - &YILValue: the loop result variable
+     */
+    pub fn finalizeClassicLoop(dmut context: &Expander, l: &LoopValue, ref mut list: StmtList)-> &YILValue {
+        let type = context:.finalizeType(l.type);
+        let (varref, _) = ValueExpander::createVarForBlock(alias context, l.loc, l.type, type, ref list);
+
+        let mut testList = StmtList();
+        // test is in its own list, because we need to validate it right away
+        // But it has to be placed after the test label
+        let test = ValueExpander::finalize(alias context, l.test, ref testList, asLeft-> false);
+
+        context:.enterBlock();
+        let mut loopList = StmtList();
+        let endLabel = copy YILLabel(l.loc, "end"s8, context:.generateLblId());
+        let begLabel = copy YILLabel(l.loc, "beg"s8, context:.generateLblId());
+        let testLabel = copy YILLabel(l.loc, "test"s8, context:.generateLblId());
+
+        if (test !of YILUnit) {
+            context:.enterLoop(varref, testLabel, endLabel);
+        } else {
+            context:.enterLoop(varref, begLabel, endLabel);
+        }
+
+        let contentVal = ValueExpander::finalize(alias context, l.value, ref loopList, asLeft-> false);
+        if (varref !of YILUnit && !l.value.isBreaker && test !of YILUnit) {
+            OperatorExpander::finalizeAffect(l.loc, varref, contentVal, ref loopList);
+        }
+
+        context:.exitLoop();
+        context:.exitBlock();
+
+        if (test !of YILUnit) {
+            list:.append(copy YILGoto(l.loc, testLabel));
+        }
+
+        list:.append(begLabel);
+        ValueExpander::generateCoverageCall(alias context, l.value.loc, ref list);
+        list:.append(loopList);
+
+        if (test !of YILUnit) {
+            list:.append(testLabel);
+            list:.append(testList);
+            list:.append(copy YILCondJmp(l.loc, test, begLabel, endLabel));
+        } else {
+            list:.append(copy YILGoto(l.loc, begLabel));
+        }
+
+        list:.append(endLabel);
+        if (varref !of YILUnit) {
+            context:.registerVariable(l.uniqId, varref);
+        }
+
+        return varref;
+    }
+}

@@ -1,0 +1,601 @@
+/*
+ * MemoryExpander — expands memory-related operations into YIL values.
+ *
+ * The MemoryExpander lowers high-level memory constructs into concrete
+ * YILValue and YILInstr nodes. It handles:
+ *
+ *   - address-of operations(&),
+ *   - dereferencing(*),
+ *   - reference creation,
+ *   - lazy value construction,
+ *   - copying of slices, maps, and tuples,
+ *   - mover semantics for class instances,
+ *   - future spawning,
+ *   - aliasing and copier/dereferencer operators.
+ *
+ * It ensures correct pointer depth handling, avoids double-addressing,
+ * and guarantees that heavy operations(copy, spawn) are executed only once
+ * by registering unique values.
+ *
+ * <hr>
+ *
+ * @Package: ymirc
+ * @Module: ymirc::lint::expander::value::memory
+ * @File: ymirc/lint/expander/value/memory.yr
+ * @Author(s):
+ *   - Emile Cadorel <ecadorel@gmail.com>
+ *
+ * @Created(YYYY-MM-DD): 2026-06-23
+ * @Copyright(C) 2021–2026 GNU-Ymir
+ * @License
+ *   ```text
+ *   This file is part of the Ymir language project.
+ *
+ *   Ymir is free software: you can redistribute it and/or modify it
+ *   under the terms of the GNU General Public License as published by
+ *   the Free Software Foundation, either version 3 of the License, or
+ *   (at your option) any later version.
+ *
+ *   Ymir is distributed in the hope that it will be useful,
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *   GNU General Public License for more details.
+ *
+ *   You should have received a copy of the GNU General Public License
+ *   along with Ymir.  If not, see <https://www.gnu.org/licenses/>.
+ *   ```
+ */
+
+
+in memory;
+
+use ymirc::lint::expander;
+use ymirc::lint::node::_;
+
+use ymirc::semantic::{symbol, generator::_};
+use ymirc::semantic::generator::{type::_, value::_};
+
+use ymirc::global::{core_, state};
+use ymirc::lexing::{word, keys};
+
+use ymirc::lint::expander::value::_;
+use std::io;
+
+/**
+ * MemoryExpander
+ *
+ * Expands all memory-related semantic nodes into YILValue expressions.
+ * Handles address creation, dereferencing, reference creation, lazy values,
+ * copying of composite types, mover semantics, and future spawning.
+ *
+ * All functions append instructions to a StmtList and return the resulting
+ * YILValue representing the memory operation.
+ */
+pub mod MemoryExpander {
+
+    /**
+     * Finalize a memory operation.
+     *
+     * Dispatches based on the concrete memory operator:
+     *   - AddressValue,
+     *   - AliaserValue,
+     *   - ClassAliaserValue,
+     *   - CopierValue,
+     *   - DereferencerValue,
+     *   - ReferencerValue,
+     *   - LazyValue,
+     *   - FutureValue,
+     *   - MoverValue.
+     *
+     * @params:
+     *   - context: the expansion context
+     *   - mem:     the memory operator value
+     *   - list:    the statement list to append instructions to
+     *   - asLeft:  whether the operation is used as an l-value
+     *
+     * @returns:
+     *   - &YILValue: the result of the memory operation
+     *
+     * @throws:
+     *   - panic: for unsupported memory operator types
+     */
+    pub fn finalize(dmut context: &Expander, mem: &MemoryValue, ref mut list: StmtList, asLeft: bool)-> &YILValue {
+        match mem {
+            a: &AddressValue => {
+                return MemoryExpander::finalizeAddress(alias context, a, ref list);
+            }
+            a: &AliaserValue => {
+                return ValueExpander::finalize(alias context, a.value, ref list, asLeft-> asLeft);
+            }
+            c: &ClassAliaserValue => {
+                return ValueExpander::finalize(alias context, c.value, ref list, asLeft-> asLeft);
+            }
+            c: &CopierValue => {
+                return MemoryExpander::finalizeCopier(alias context, c, ref list);
+            }
+            d: &DereferencerValue => {
+                return MemoryExpander::finalizeDeref(alias context, d, ref list, asLeft-> asLeft);
+            }
+            r: &ReferencerValue => {
+                return MemoryExpander::finalizeRef(alias context, r, ref list);
+            }
+            l: &LazyValue => {
+                return MemoryExpander::finalizeLazy(alias context, l, ref list);
+            }
+            f: &FutureValue => {
+                return MemoryExpander::finalizeFuture(alias context, f, ref list);
+            }
+            m: &MoverValue => {
+                return MemoryExpander::finalizeMover(alias context, m, ref list);
+            }
+        }
+
+        eprintln("internal memory expansion error: ", mem.__typeinfo__.name);
+        panic;
+    }
+
+    /**
+     * Finalize an address-of operation(&value).
+     *
+     * Behavior:
+     *   - expands the inner value as an l-value,
+     *   - compares pointer depths to avoid double-addressing,
+     *   - returns an address or a casted pointer as appropriate,
+     *   - falls back to createAddress when needed.
+     *
+     * @params:
+     *   - context: the expansion context
+     *   - add:     the address operator value
+     *   - list:    the statement list to append instructions to
+     *
+     * @returns:
+     *   - &YILValue: a pointer to the value
+     */
+    pub fn finalizeAddress(dmut context: &Expander, add: &AddressValue, ref mut list: StmtList)-> &YILValue {
+        let type = context:.finalizeType(add.type);
+        let value = ValueExpander::finalize(alias context, add.value, ref list, asLeft-> true);
+
+        let depthRet = context:.getTypeExpander().getPointerDepth(type);
+        let depthVal = context:.getTypeExpander().getPointerDepth(value.type);
+
+        // sometimes AddressValue are used on already constructed addresses(references, string literals, ...)
+        // So if we get a pointer value that has the same depth, meaning pointer of pointer of ...
+        // Then we can assume it is already constructed, and can be returned as it is, with a cast though
+        if (depthVal == depthRet) {
+            return copy YILCastValue(add.loc, type, value);
+        }
+
+        if let p: &YILPointer = type {
+            return MemoryExpander::createAddress(alias context, value, type-> p, ref list);
+        }
+
+        panic;
+    }
+
+    /**
+     * Finalize an address-of operation on any value.
+     *
+     * Similar to finalizeAddress but computes the pointer type automatically
+     * from the value's type.
+     *
+     * @params:
+     *   - context: the expansion context
+     *   - val:     the value to take the address of
+     *   - list:    the statement list to append instructions to
+     *
+     * @returns:
+     *   - &YILValue: a pointer to the value
+     */
+    pub fn finalizeAddressFromAny(dmut context: &Expander, val: &Value, ref mut list: StmtList)-> &YILValue {
+        let type = context:.getTypeExpander():.finalizePointer(context:.finalizeType(val.type));
+        let value = ValueExpander::finalize(alias context, val, ref list, asLeft-> true);
+
+        let depthRet = context:.getTypeExpander().getPointerDepth(type);
+        let depthVal = context:.getTypeExpander().getPointerDepth(value.type);
+
+        // sometimes AddressValue are used on already constructed addresses(references, string literals, ...)
+        // So if we get a pointer value that has the same depth, meaning pointer of pointer of ...
+        // Then we can assume it is already constructed, and can be returned as it is, with a cast though
+        if (depthVal == depthRet) {
+            return copy YILCastValue(val.loc, type, value);
+        }
+
+        return MemoryExpander::createAddress(alias context, value, type-> type, ref list);
+    }
+
+    /**
+     * Create an address for a YILValue.
+     *
+     * Behavior:
+     *   - for YILVar and YILFieldValue: returns a YILAddrValue,
+     *   - for YILUnrefValue: returns a cast of the inner value,
+     *   - otherwise stores the value in a temporary variable and returns its address.
+     *
+     * @params:
+     *   - context: the expansion context
+     *   - value:   the YILValue to take the address of
+     *   - type:    the pointer type to produce
+     *   - list:    the statement list to append instructions to
+     *
+     * @returns:
+     *   - &YILValue: the address of the value
+     */
+    pub fn createAddress(dmut context: &Expander, value: &YILValue, type: &YILPointer, ref mut list: StmtList)-> &YILValue {
+        match value {
+            v: &YILVar => {
+                return copy YILAddrValue(value.loc, type, v);
+            }
+            u: &YILUnrefValue => {
+                return copy YILCastValue(value.loc, type, u.value);
+            }
+            f: &YILFieldValue => {
+                return copy YILAddrValue(value.loc, type, f);
+            }
+        }
+
+        let (var, _) = ValueExpander::createVarForBlock(alias context, value.loc, NONE_TYPE, value.type, ref list);
+        list:.append(copy YILAffect(value.loc, var, value));
+
+        return copy YILAddrValue(var.loc, type, var);
+    }
+
+    /**
+     * Finalize a copy operation.
+     *
+     * Behavior:
+     *   - if the copy is already done, simply validates the inner value,
+     *   - otherwise dispatches based on the copied type:
+     *       * slice → finalizeCopierSlice,
+     *       * map   → finalizeCopierMap,
+     *       * tuple → finalizeCopierTuple,
+     *   - registers the result as a unique value to ensure the copy occurs once.
+     *
+     * @params:
+     *   - context: the expansion context
+     *   - c:       the copier value
+     *   - list:    the statement list to append instructions to
+     *
+     * @returns:
+     *   - &YILValue: the copied value
+     */
+    pub fn finalizeCopier(dmut context: &Expander, c: &CopierValue, ref mut list: StmtList)-> &YILValue {
+        // If the copy is a done copy, then we only need to validate its inner value
+        if (c.isDone) {
+            // assuming that it is a call, so no need to save the uniqness
+            return ValueExpander::finalize(alias context, c.value, ref list, asLeft-> false);
+        }
+
+        // otherwise, we need to call builtin functions
+        // Copy performs heavy computation with possible side effects
+        // Copy values must appear only once in the finalized code
+        match context.getVariable(c.uniqId) {
+            Ok(u: &YILValue) => { // The copy was already seen and validated
+                return u;
+            }
+        };
+
+        let mut call: &YILValue = YIL_UNIT_VALUE;
+        match c.type {
+            slc: &SliceType => {
+                call = MemoryExpander::finalizeCopierSlice(alias context, c, slc, ref list);
+            }
+            m: &MapType => {
+                call = MemoryExpander::finalizeCopierMap(alias context, c, m, ref list);
+            }
+            p: &PointerType => {
+                match p.inners[0] {
+                    t: &TupleType => {
+                        call = MemoryExpander::finalizeCopierTuple(alias context, c, t, ref list);
+                    }
+                }
+            }
+        };
+
+        if call of YILUnit {
+            eprintln("internal copier expansion error: ", c.type.__typeinfo__.name);
+            panic;
+        }
+
+        return ValueExpander::registerUniqValue(alias context, c, call, ref list);
+    }
+
+    /**
+     * Finalize a slice copy.
+     *
+     * Behavior:
+     *   - expands the slice value,
+     *   - allocates a new slice via DUPLICATE_SLICE,
+     *   - returns the new slice.
+     *
+     * @params:
+     *   - context: the expansion context
+     *   - c:       the copier value
+     *   - slc:     the slice type
+     *   - list:    the statement list to append instructions to
+     *
+     * @returns:
+     *   - &YILValue: the copied slice
+     */
+    pub fn finalizeCopierSlice(dmut context: &Expander, c: &CopierValue, slc: &SliceType, ref mut list: StmtList)-> &YILValue {
+        let value = ValueExpander::finalize(alias context, c.value, ref list, asLeft-> false);
+        if (slc.inners[0] of VoidType) {
+            return value;
+        } // copy []
+
+        let (_, ptrU) = ValueExpander::createVarForBlock(alias context, c.loc, c.value.type, value.type,
+                                                         ref list,
+                                                         withValue-> value,
+                                                         getAddr-> true);
+
+        let retType = context:.finalizeType(c.type);
+        let innerType = context:.finalizeType(slc.inners[0]);
+        let innerSize = copy YILIntValue(c.loc, YIL_UINT_32, innerType.size);
+
+        let (resultVar, addrResult) = ValueExpander::createVarForBlock(alias context, c.loc, c.type, retType,
+                                                                       ref list,
+                                                                       getAddr-> true);
+
+        list:.append(copy YILCall(c.loc,
+                                  copy YILNameCallValue(c.loc,
+                                                        YIL_PTR_VOID,
+                                                        YRuntimeFuncs::DUPLICATE_SLICE,
+                                                        copy [addrResult, ptrU, innerSize])));
+
+        return resultVar;
+    }
+
+    /**
+     * Finalize a map copy.
+     *
+     * Behavior:
+     *   - expands the map value,
+     *   - allocates a new map instance,
+     *   - emits MAP_COPY to duplicate the map contents.
+     *
+     * @params:
+     *   - context: the expansion context
+     *   - c:       the copier value
+     *   - m:       the map type
+     *   - list:    the statement list to append instructions to
+     *
+     * @returns:
+     *   - &YILValue: the copied map
+     */
+    pub fn finalizeCopierMap(dmut context: &Expander, c: &CopierValue, m: &MapType, ref mut list: StmtList)-> &YILValue {
+        let loc = c.loc;
+        let mpAddr = MemoryExpander::finalizeAddressFromAny(alias context, c.value, ref list);
+
+        let mtype = context:.finalizeType(m);
+        let vtableName = Mangler::mangleMapInfo(m);
+        context:.registerTouchSym(vtableName, m.loc);
+
+        let vtableAddr = copy YILAddrValue(loc, YIL_PTR_2_VOID, copy YILVar(loc, vtableName, YIL_PTR_VOID, 0us));
+        let (res, resultAddr) = ValueExpander::createVarForBlock(alias context, loc, NONE_TYPE, mtype,
+                                                                 ref list,
+                                                                 name-> "__map_%",
+                                                                 getAddr-> true);
+
+        list:.append(copy YILCall(loc,
+                                  copy YILNameCallValue(loc,
+                                                        YIL_VOID,
+                                                        YRuntimeFuncs::MAP_COPY,
+                                                        copy [resultAddr, vtableAddr, mpAddr])));
+
+        return res;
+    }
+
+    /**
+     * Finalize a tuple copy.
+     *
+     * Behavior:
+     *   - expands the tuple value,
+     *   - emits DUPLICATE_TUPLE to copy the tuple contents,
+     *   - returns the new tuple.
+     *
+     * @params:
+     *   - context: the expansion context
+     *   - c:       the copier value
+     *   - t:       the tuple type
+     *   - list:    the statement list to append instructions to
+     *
+     * @returns:
+     *   - &YILValue: the copied tuple
+     */
+    pub fn finalizeCopierTuple(dmut context: &Expander, c: &CopierValue, t: &TupleType, ref mut list: StmtList)-> &YILValue {
+        if (t.inners.len == 0us) {
+            return YIL_NULL_VALUE;
+        }
+
+        let value = ValueExpander::finalize(alias context, c.value, ref list, asLeft-> false);
+        let retType = context:.finalizeType(c.type);
+
+        let innerType = context:.finalizeType(t);
+        let innerSize = copy YILIntValue(c.loc, YIL_UINT_32, innerType.size);
+
+        let tuAddr = copy YILAddrValue(c.loc, retType, value);
+
+        let (resultVar, addrResult) = ValueExpander::createVarForBlock(alias context, c.loc, c.type, retType,
+                                                                       ref list,
+                                                                       getAddr-> true);
+
+        list:.append(copy YILCall(c.loc,
+                                  copy YILNameCallValue(c.loc,
+                                                        YIL_VOID,
+                                                        YRuntimeFuncs::DUPLICATE_TUPLE,
+                                                        copy [addrResult, tuAddr, innerSize])));
+
+        return resultVar;
+    }
+
+    /**
+     * Finalize a dereference operation(*value).
+     *
+     * Expands the inner value and produces a YILUnrefValue.
+     *
+     * @params:
+     *   - context: the expansion context
+     *   - d:       the dereferencer value
+     *   - list:    the statement list to append instructions to
+     *   - asLeft:  whether the dereference is used as an l-value
+     *
+     * @returns:
+     *   - &YILValue: the dereferenced value
+     */
+    pub fn finalizeDeref(dmut context: &Expander, d: &DereferencerValue, ref mut list: StmtList, asLeft: bool)-> &YILValue {
+        let value = ValueExpander::finalize(alias context, d.value,
+                                            ref list,
+                                            asLeft-> asLeft);
+        let type = context:.finalizeType(d.type);
+
+        return copy YILUnrefValue(d.loc, type, value);
+    }
+
+    /**
+     * Finalize a reference creation.
+     *
+     * Behavior:
+     *   - computes the pointer type,
+     *   - expands the inner value as an l-value,
+     *   - avoids double-addressing by comparing pointer depths,
+     *   - otherwise creates an address.
+     *
+     * @params:
+     *   - context: the expansion context
+     *   - r:       the referencer value
+     *   - list:    the statement list to append instructions to
+     *
+     * @returns:
+     *   - &YILValue: a pointer to the referenced value
+     */
+    pub fn finalizeRef(dmut context: &Expander, r: &ReferencerValue, ref mut list: StmtList)-> &YILValue {
+        // same as an addresser but storing the inner type only
+        let type = context:.getTypeExpander():.finalizePointer(context:.finalizeType(r.type));
+        let value = ValueExpander::finalize(alias context, r.value, ref list, asLeft-> true);
+
+        let depthRet = context:.getTypeExpander().getPointerDepth(type);
+        let depthVal = context:.getTypeExpander().getPointerDepth(value.type);
+
+        // sometimes references are used on already constructed addresses(references, string literals, ...)
+        // So if we get a pointer value that has the same depth, meaning pointer of pointer of ...
+        // Then we can assume it is already constructed, and can be returned as it is, with a cast though
+        if (depthVal == depthRet) {
+            return copy YILCastValue(r.loc, type, value);
+        }
+
+        return MemoryExpander::createAddress(alias context, value, type-> type, ref list);
+    }
+
+    /**
+     * Finalize a lazy value.
+     *
+     * Behavior:
+     *   - if the lazy value is already resolved, returns the stored reference,
+     *   - otherwise constructs a lazy tuple:
+     *       (is_set = 0, value = null, size, function),
+     *   - returns the lazy tuple.
+     *
+     * @params:
+     *   - context: the expansion context
+     *   - l:       the lazy value
+     *   - list:    the statement list to append instructions to
+     *
+     * @returns:
+     *   - &YILValue: the lazy tuple
+     */
+    pub fn finalizeLazy(dmut context: &Expander, l: &LazyValue, ref mut list: StmtList)-> &YILValue {
+        if let vr: &VarRefValue = l.value && l.isDone {
+            if let Ok(y) = context.getLazyRef(vr.refId) {
+                return y;
+            } else panic;
+        }
+
+        let type = context:.getTypeExpander():.finalizeLazy();
+        let delegate = ValueExpander::finalize(alias context, l.lambda, ref list, asLeft-> false);
+        let set = copy YILIntValue(l.loc, YIL_UINT_8, 0us);
+
+        let innerType = context:.finalizeType(l.type);
+        let size = copy YILIntValue(l.loc, YIL_UINT_32, innerType.size);
+
+        return copy YILTupleValue(l.loc, type, copy [set, YIL_NULL_VALUE, size, delegate],
+                                  fieldNames-> copy [LazyKeys::IS_SET, LazyKeys::VALUE, LazyKeys::SIZE, LazyKeys::FUNC]);
+    }
+
+    /**
+     * Finalize a mover operation.
+     *
+     * Behavior:
+     *   - expands the moved value as an l-value,
+     *   - resets the class instance via its constructor,
+     *   - sets the class SET field to 0,
+     *   - registers a destructor for the moved value,
+     *   - returns the moved value.
+     *
+     * @params:
+     *   - context: the expansion context
+     *   - m:       the mover value
+     *   - list:    the statement list to append instructions to
+     *
+     * @returns:
+     *   - &YILValue: the moved value
+     */
+    pub fn finalizeMover(dmut context: &Expander, m: &MoverValue, ref mut list: StmtList)-> &YILValue {
+        let what = ValueExpander::finalize(alias context, m.value, ref list, asLeft-> true);
+        let field = copy YILFieldValue(m.loc, YIL_UINT_8, what, name-> ClassKeys::SET);
+
+        let result = ValueExpander::registerUniqValue(alias context, m.value, what, ref list);
+        match m.reset {
+            c: &CtorCallValue => {
+                CallExpander::finalizeCtorCall(alias context, c, ref list);
+            }
+            _ => panic;
+        }
+
+        list:.append(copy YILAffect(m.loc, field, copy YILIntValue(m.loc, YIL_UINT_8, 0us)));
+
+        if let v: &YILVar = result {
+            ValueExpander::registerDestroy(alias context, v, m.type, ref list, implicit-> true);
+        } else panic;
+
+        return result;
+    }
+
+    /**
+     * Finalize a future spawn.
+     *
+     * Behavior:
+     *   - expands the lambda delegate,
+     *   - computes the size of the returned type,
+     *   - emits SPAWN_FUTURE(delegate, size),
+     *   - registers the result as a unique value to ensure the spawn occurs once.
+     *
+     * @params:
+     *   - context: the expansion context
+     *   - f:       the future value
+     *   - list:    the statement list to append instructions to
+     *
+     * @returns:
+     *   - &YILValue: the future instance
+     */
+    pub fn finalizeFuture(dmut context: &Expander, f: &FutureValue, ref mut list: StmtList)-> &YILValue {
+        match context.getVariable(f.uniqId) {
+            Ok(u: &YILValue) => { // The spawn was already seen and validated
+                return u;
+            }
+        };
+
+        if let ft: &FutureType = f.type {
+            let futureType = context:.finalizeType(ft);
+            let delegate = ValueExpander::finalize(alias context, f.lambda, ref list, asLeft-> false);
+
+            let innerType = context:.finalizeType(ft.retType);
+            let size = copy YILIntValue(f.loc, YIL_UINT_32, innerType.size);
+
+            let call = copy YILNameCallValue(f.loc,
+                                             futureType,
+                                             YRuntimeFuncs::SPAWN_FUTURE, copy [delegate, size]);
+
+            // We want to spawn only once, so we register it for other validations
+            return ValueExpander::registerUniqValue(alias context, f, call, ref list);
+        } else panic;
+    }
+}
