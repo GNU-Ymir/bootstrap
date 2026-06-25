@@ -1,0 +1,225 @@
+/*
+ * ClassExpander — expands class metadata(vtable and typeinfo) into YIL constants.
+ *
+ * The ClassExpander lowers class-level metadata into constant YIL values. It handles:
+ *
+ *   - generation of vtable arrays,
+ *   - generation of typeinfo tuples,
+ *   - symbol-touch tracking for dependency resolution,
+ *   - insertion of weak or strong symbols into the global symbol table.
+ *
+ * Vtables are generated only for non-abstract, non-struct classes. Typeinfo is
+ * generated for all classes. Both vtable and typeinfo constants include all
+ * referenced symbols(methods, destructors, ancestor typeinfo).
+ *
+ * <hr>
+ *
+ * @Package: ymirc
+ * @Module: ymirc::lint::expander::class_
+ * @File: ymirc/lint/expander/class_.yr
+ * @Author(s):
+ *   - Emile Cadorel <ecadorel@gmail.com>
+ *
+ * @Created(YYYY-MM-DD): 2026-06-24
+ * @Copyright(C) 2021–2026 GNU-Ymir
+ * @License
+ *   ```text
+ *   This file is part of the Ymir language project.
+ *
+ *   Ymir is free software: you can redistribute it and/or modify it
+ *   under the terms of the GNU General Public License as published by
+ *   the Free Software Foundation, either version 3 of the License, or
+ *   (at your option) any later version.
+ *
+ *   Ymir is distributed in the hope that it will be useful,
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *   GNU General Public License for more details.
+ *
+ *   You should have received a copy of the GNU General Public License
+ *   along with Ymir.  If not, see <https://www.gnu.org/licenses/>.
+ *   ```
+ */
+
+in class_;
+
+use ymirc::lint::expander;
+use ymirc::lint::node::_;
+
+use ymirc::semantic::{symbol, generator::_};
+use ymirc::semantic::generator::{type::_, value::_};
+
+use ymirc::utils::{format, list};
+
+use ymirc::global::{core_, state};
+use ymirc::lexing::keys;
+
+use ymirc::lexing::word;
+
+use std::io;
+
+/**
+ * Expands class metadata into YIL constants. Handles:
+ *
+ *   - vtable construction for non-abstract, non-struct classes,
+ *   - typeinfo construction for all classes,
+ *   - symbol-touch tracking for dependency resolution,
+ *   - insertion of weak or strong constants into the global symbol table.
+ *
+ * All functions return YILValue constants representing class metadata.
+ */
+pub mod ClassExpander {
+
+    /**
+     * Finalize class metadata.
+     *
+     * @params:
+     *   - context: the expansion context
+     *   - cl:      the class reference type
+     *
+     * @returns:
+     *   - void
+     */
+    pub fn finalizeClass(dmut context: &Expander, cl: &ClassRefType) {
+        if (!cl.sym.isStruct && !cl.sym.isAbstract) {
+            // abstract classes and structures don't have vtable
+            // abstract because some of their methods are empty
+            // and structures because their methods are not virtual
+            //
+
+            context:.enterSymbol();
+            let vtableValue = ClassExpander::finalizeClassVtable(alias context, cl);
+            let vtableName = Mangler::mangleVtable(cl);
+            let touchings = context:.exitSymbol();
+
+            // Const VTABLE
+            let cst = copy YILConstant(cl.loc,
+                                       vtableName,
+                                       vtableValue,
+                                       isWeak-> cl.sym.isWeak,
+                                       refs-> touchings);
+
+            if (cl.sym.isWeak) {
+                context:.insertWeak(vtableName, cst);
+            } else {
+                context:.insertSymbol(vtableName, cst);
+            }
+        }
+
+        context:.enterSymbol();
+        let typeinfoValue = ClassExpander::finalizeClassTypeInfo(alias context, cl);
+        let tiName = Mangler::mangleTypeInfo(cl);
+        let touchings = context:.exitSymbol();
+
+        // Const TYPEINFO
+        let cst = copy YILConstant(cl.loc,
+                                   tiName,
+                                   typeinfoValue,
+                                   isWeak-> cl.sym.isWeak,
+                                   refs-> touchings);
+
+        if (cl.sym.isWeak) {
+            context:.insertWeak(tiName, cst);
+        } else {
+            context:.insertSymbol(tiName, cst);
+        }
+    }
+
+    /**
+     * Finalize the typeinfo constant for a class.
+     *
+     * @params:
+     *   - context: the expansion context
+     *   - cl:      the class reference type
+     *
+     * @returns:
+     *   - &YILValue: the typeinfo tuple
+     */
+    pub fn finalizeClassTypeInfo(dmut context: &Expander, cl: &ClassRefType)-> &YILValue {
+        let mut list = StmtList();
+
+        let slcType = context.typeExpander:.finalizeSlice(YIL_VOID);
+
+        let ancestorSlice = match cl.ancestor {
+            Ok(anc) => {
+                let ancTIN = Mangler::mangleTypeInfo(anc);
+                context:.registerTouchSym(ancTIN, anc.loc);
+
+                let ancTIV = copy YILAddrValue(cl.loc, YIL_PTR_VOID,
+                                               copy YILVar(cl.loc, ancTIN, YIL_PTR_VOID, 0us));
+
+                let len = copy YILIntValue(cl.loc, YIL_UINT_MAX, 1us);
+                copy YILTupleValue(cl.loc, slcType, copy [len, ancTIV, YIL_NULL_VALUE],
+                                   fieldNames-> copy [SliceKeys::LEN, SliceKeys::PTR, SliceKeys::BLK_INFO])
+            }
+            _ => {
+                copy YILTupleValue(cl.loc, slcType,
+                                   copy [copy YILIntValue(cl.loc, YIL_UINT_MAX, 0us), YIL_NULL_VALUE, YIL_NULL_VALUE],
+                                   fieldNames-> copy [SliceKeys::LEN, SliceKeys::PTR, SliceKeys::BLK_INFO])
+            }
+        };
+
+        let ti = if let t: &TypeInfoValue = cl.typeInfo { t } else panic;
+        let id = ValueExpander::finalize(alias context, ti.id, ref list, asLeft-> false);
+        let size = ValueExpander::finalize(alias context, ti.size, ref list, asLeft-> false);
+        let name = ValueExpander::finalize(alias context, ti.name, ref list, asLeft-> false);
+        let type = context:.finalizeType(ti.type);
+        let fields = if let t: &YILTuple = type {
+            t.fieldNames
+        } else panic;
+
+        // Dynamic objects in the typeinfo
+        if (list.len != 0us) panic;
+
+        return copy YILTupleValue(cl.loc, type,
+                                  copy [id, size, ancestorSlice, name],
+                                  fieldNames-> fields);
+    }
+
+    /**
+     * Finalize the vtable constant for a class.
+     *
+     * @params:
+     *   - context: the expansion context
+     *   - cl:      the class reference type
+     *
+     * @returns:
+     *   - &YILValue: the vtable array
+     */
+    pub fn finalizeClassVtable(dmut context: &Expander, cl: &ClassRefType)-> &YILValue {
+        let len = cl.vtable.len + 2us; // TI, Dtor, vtable
+
+        let resultType = context.typeExpander:.finalizeArray(YIL_PTR_VOID, len);
+        let mut params: [&YILValue] = [];
+
+        let TIN = Mangler::mangleTypeInfo(cl);
+        context:.registerTouchSym(TIN, cl.loc);
+
+        let TIV = copy YILAddrValue(cl.loc, YIL_PTR_VOID, copy YILVar(cl.loc, TIN, YIL_PTR_VOID, 0us));
+        params ~= [TIV];
+
+        match cl.dtor {
+            UnitValue() => {
+                params ~= [YIL_NULL_VALUE];
+            }
+            p: &PrototypeValue => {
+                let name = Mangler::mangle(p);
+                context:.registerTouchSym(name, cl.loc);
+
+                let addr = copy YILAddrValue(p.loc, YIL_PTR_VOID, copy YILVar(p.loc, name, YIL_VOID, 0us));
+                params ~= [addr];
+            }
+            _ => panic;
+        };
+
+        for mt in cl.vtable {
+            let name = Mangler::mangle(mt);
+            context:.registerTouchSym(name, mt.loc);
+
+            let addr = copy YILAddrValue(mt.loc, YIL_PTR_VOID, copy YILVar(mt.loc, name, YIL_VOID, 0us));
+            params ~= [addr];
+        }
+
+        return copy YILArrayValue(cl.loc, resultType, params);
+    }
+}

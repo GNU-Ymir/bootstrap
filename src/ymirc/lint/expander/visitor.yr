@@ -1,55 +1,121 @@
+/*
+ * Expander — orchestrates the finalization of all semantic generators into YIL symbols.
+ *
+ * The Expander is the central coordinator of the finalization phase. It:
+ *
+ *   - receives all validated semantic generators,
+ *   - dispatches each generator to its corresponding expander module,
+ *   - manages symbol-touch tracking for dependency resolution,
+ *   - manages frame, block, loop, and inline contexts,
+ *   - manages variable and label uniq-ID allocation,
+ *   - manages lazy references and declared variables,
+ *   - manages coverage ID tracking,
+ *   - manages class-validation state,
+ *   - collects strong and weak symbols,
+ *   - resolves weak-symbol dependencies via graph traversal,
+ *   - returns the final ordered list of YIL symbols.
+ *
+ * The Expander is stateful and stack-based: entering/exiting frames, blocks,
+ * loops, and inline contexts pushes/pops state layers.
+ *
+ * <hr>
+ *
+ * @Package: ymirc
+ * @Module: ymirc::lint::expander::visitor
+ * @File: ymirc/lint/expander/visitor.yr
+ * @Author(s):
+ *   - Emile Cadorel <ecadorel@gmail.com>
+ *
+ * @Created(YYYY-MM-DD): 2024-01-27
+ * @Copyright(C) 2021–2026 GNU-Ymir
+ * @License
+ *   ```text
+ *   This file is part of the Ymir language project.
+ *
+ *   Ymir is free software: you can redistribute it and/or modify it
+ *   under the terms of the GNU General Public License as published by
+ *   the Free Software Foundation, either version 3 of the License, or
+ *   (at your option) any later version.
+ *
+ *   Ymir is distributed in the hope that it will be useful,
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *   GNU General Public License for more details.
+ *
+ *   You should have received a copy of the GNU General Public License
+ *   along with Ymir.  If not, see <https://www.gnu.org/licenses/>.
+ *   ```
+ */
+
 in visitor;
 
-use ymirc::lint::expander::{value, type, stmtlist};
-use ymirc::lint::node::{_, instr::_, global::_, type::_, value::_};
+use ymirc::lint::expander;
+use ymirc::lint::node::_;
 
-use std::{io, fs::path, algorithm::sorting};
+use ymirc::semantic::{symbol, generator::_};
+use ymirc::semantic::generator::{type::_, value::_};
 
 use ymirc::utils::{format, list};
-use ymirc::semantic::{symbol::path, generator::_};
-use ymirc::semantic::generator::type::{_,
-                                       custom::_,
-                                       native::{_, scalar::_, compound::_},
-                                       temporary::_};
-
-use ymirc::semantic::generator::value::{_,
-                                        construct::{_, delegate::_},
-                                        literal::_,
-                                        memory::_,
-                                        operator::{_, binary::_, call::_, fields::_, map::_, slice::_, unary::_},
-                                        prototypes::_,
-                                        scope::_,
-                                        syntax::_,
-                                        template::_};
 
 use ymirc::global::{core_, state};
 use ymirc::lexing::keys;
 
 use ymirc::lexing::word;
 
+use std::{io, fs::path, algorithm::sorting};
+
+/**
+ * Tracks foreign symbols referenced during the expansion of a symbol.
+ *
+ * Stored as:
+ *   content: [symbolName => modulePath]
+ */
 class Touching {
     pub let mut content: [[c8] => mut Path] = copy [];
     pub self () {}
 }
 
+/**
+ * Tracks declared variables in the current block scope.
+ *
+ * Stored as:
+ *   content: [uniqId => &YILValue]
+ */
 class DeclaredVars {
     pub let mut content: [usize => mut &YILValue] = copy [];
     pub self () {}
 }
 
+/**
+ * Tracks lazy variable references in the current block scope.
+ *
+ * Stored as:
+ *   content: [uniqId => &YILVar]
+ */
 class LazyRefs {
     pub let mut content: [usize => mut &YILVar] = copy [];
     pub self () {}
 }
 
+/**
+ * Tracks coverage locations(line/column pairs) for the current frame.
+ *
+ * Stored as:
+ *   content: [&Word]
+ */
 class CoverageLocs {
     pub let mut content: [&Word] = [];
     pub self () {}
 }
 
-
 /**
- * The expander class simplifies previously validated symbols
+ * Central orchestrator for the finalization phase. Converts semantic generators
+ * into YIL symbols, manages all contextual state(frames, blocks, loops, inline
+ * scopes, variable IDs, label IDs, lazy refs, coverage IDs), and resolves weak
+ * symbol dependencies.
+ *
+ * All expander modules(FrameExpander, ClassExpander, GlobalExpander, etc.)
+ * operate through this class.
  */
 pub class Expander {
 
@@ -80,12 +146,6 @@ pub class Expander {
      * =====================================================================================
      * =====================================================================================
      */
-
-    // The mangler used to mangle symbol names
-    let _mangler: Mangler = Mangler();
-
-    // The expander responsible for value expansions
-    let mut _valueExpander: ValueExpander; // = ValueExpander();
 
     // The expander responsible for value expansions
     let dmut _typeExpander: &TypeExpander; // = TypeExpander();
@@ -129,7 +189,13 @@ pub class Expander {
     let dmut _loopVar: &List!{&YILValue} = copy List!{&YILValue} ();
 
     // The label to exit the loop
-    let dmut _loopLabel: &List!{&YILLabel} = copy List!{&YILLabel} ();
+    let dmut _loopLabel: &List!{(&YILLabel, &YILLabel)} = copy List!{(&YILLabel, &YILLabel)} ();
+
+    // The var in which to put the result of inlined function
+    let dmut _inlineVar: &List!{&YILValue} = copy List!{&YILValue} ();
+
+    // The label to exit the current inline function
+    let dmut _inlineLabel: &List!{&YILLabel} = copy List!{&YILLabel} ();
 
     // The list of classes already validated
     let mut _classValidated: [[c8] => mut &YILType] = copy [];
@@ -147,16 +213,23 @@ pub class Expander {
      */
 
     /**
-     * Create a new empty expander
-     * */
+     * Construct a new empty expander.
+     *
+     * Initializes:
+     *   - empty symbol tables,
+     *   - empty context stacks,
+     *   - a fresh TypeExpander instance.
+     */
     pub self ()
-        with _valueExpander = ValueExpander()
-        , _typeExpander = copy TypeExpander()
+        with _typeExpander = copy TypeExpander()
     {}
 
     /**
-     * Expande a list of generators
-     * */
+     * Finalize a list of semantic generators.
+     *
+     * @returns:
+     *   - [&YILSymbol]: all finalized symbols
+     */
     pub fn finalize(mut self, generators: [&Generator])-> [&YILSymbol] {
         self._generators = generators;
         for gen in self._generators {
@@ -165,53 +238,80 @@ pub class Expander {
 
         if (state::isUnittestActive()) {
             for m, lst in self._moduleWithUnittests {
-                self:.finalizeUnitTestRegistrationFrame(m, lst);
+                UnitTestExpander::finalizeUnitTestRegistrationFrame(alias self, m, lst);
             }
 
-            self:.finalizeUnitTestCall();
+            UnitTestExpander::finalizeUnitTestCall(alias self);
         }
 
-        self:.traverseSymbolGraph()
+        return self:.traverseSymbolGraph();
     }
 
     /**
-     * @returns: the list of tuples defined during expansion
-     * */
-    pub fn getTypes(self)-> [&YILType] {
-        self._typeExpander.getTypes()
-    }
-
-    /**
-     * Expande a generator
-     * */
+     * Finalize a single generator. Dispatches based on generator type.
+     *
+     * @throws:
+     *   - panic: for unsupported generator types
+     */
     pub fn finalize(mut self, gen: &Generator) {
         match gen {
             frame: &FrameGenerator => {
-                self:.finalizeFrame(frame);
+                FrameExpander::finalizeFrame(alias self, frame);
             }
             cl: &ClassRefType => {
-                self:.finalizeClass(cl);
+                ClassExpander::finalizeClass(alias self, cl);
             }
             m: &MapInfoGenerator => {
-                self:.finalizeMapInfo(m);
+                GlobalExpander::finalizeMapInfo(alias self, m);
             }
             u: &UnitTestGenerator => {
-                self:.finalizeUnitTest(u);
+                UnitTestExpander::finalizeUnitTest(alias self, u);
             }
             g: &GlobalVarGenerator => {
-                self:.finalizeGlobalVar(g);
+                GlobalExpander::finalizeGlobalVar(alias self, g);
             }
             _ => {
+                eprintln("internal symbol expansion error: ", gen.__typeinfo.name);
                 panic;
             }
         }
     }
 
+    /**
+     * Finalize a semantic type into a YILType.
+     *
+     * Delegates to TypeExpander::finalize().
+     *
+     * @returns:
+     *   - &YILType
+     */
+    pub fn finalizeType(mut self, ty: &Type)-> &YILType {
+        self._typeExpander:.finalize(alias self, ty)
+    }
+
+
+    /*!
+     * =====================================================================================
+     * =====================================================================================
+     * =========================              GETTERS              =========================
+     * =====================================================================================
+     * =====================================================================================
+     */
 
     /**
-     * Traverse the list of finalized symbols and returned the symbols that are either non weak or touched by a non weak symbol
-     * */
-    pub fn traverseSymbolGraph(mut self)-> [&YILSymbol] {
+     * @returns: all YIL types created during expansion.
+     */
+    pub fn getTypes(self)-> [&YILType] {
+        self._typeExpander.getTypes()
+    }
+
+    /**
+     * Resolve weak-symbol dependencies and return the final ordered symbol list.
+     *
+     * @returns:
+     *   - [&YILSymbol]
+     */
+    fn traverseSymbolGraph(mut self)-> [&YILSymbol] {
         let mut consts: [mut &YILSymbol] = [];
         let mut vars: [mut &YILSymbol] = [];
         let mut frames: [mut &YILSymbol] = [];
@@ -222,7 +322,7 @@ pub class Expander {
             self._symbols = copy [];
 
             for i in syms {
-                for t in i.getReferences() if let Ok(n: &YILSymbol) = self._weakSymbols[t] {
+                for t in i.references if let Ok(n: &YILSymbol) = self._weakSymbols[t] {
                     self._symbols[t] = n;
                     self._weakSymbols:.remove(t);
                 }
@@ -237,665 +337,25 @@ pub class Expander {
         }
 
         let csts = sort(alias consts, |a, b| => {
-            a.getName() < b.getName()
+            a.name < b.name
         });
 
         let frs = sort(alias frames, |a, b| => {
-            a.getName() < b.getName()
+            a.name < b.name
         });
 
         let vrs = sort(alias vars, |a, b| => {
-            a.getName() < b.getName()
+            a.name < b.name
         });
 
-        csts ~ vrs ~ frs
-    }
-
-
-    /*!
-     * =====================================================================================
-     * =====================================================================================
-     * =========================          FRAME EXPANSION          =========================
-     * =====================================================================================
-     * =====================================================================================
-     */
-
-    /**
-     * Expande a frame generator
-     * @params:
-     *    - frame: the frame to expande
-     * */
-    pub fn finalizeFrame(mut self, frame: &FrameGenerator) {
-        let mut list = StmtList();
-
-        let module = Path(frame.getLoc().filename).stripExtension();
-        let enterCoverage = state::isCodeCoverage() && state::getPackage().isPrefix(module);
-
-        let name = self._mangler.mangle(frame);
-        let FRAME_INFO = self._mangler.mangleCoverageFrameInfo(frame);
-
-        let frameAddr = copy YILAddrValue(EOF_WORD, YIL_PTR_VOID, copy YILVar(EOF_WORD, name, YIL_VOID, 0us));
-        let frameCoverAddr = if enterCoverage {
-            copy YILAddrValue(EOF_WORD, YIL_PTR_VOID, copy YILVar(EOF_WORD, FRAME_INFO, YIL_VOID, 0us))
-        } else { YIL_UNIT_VALUE };
-
-        self:.enterSymbol();
-        self:.enterFrame(frame.getName().toStr(), frameAddr-> frameAddr, frameCoverAddr-> frameCoverAddr);
-        self:.enterBlock();
-
-        let mut parameters: [&YILVarDecl] = [];
-        for p in frame.getParameters() {
-            let varId = self:.generateVarId();
-            let mut type = self:.finalizeType(p.getType());
-            if (p.isLazy()) {
-                let lazyType = self._typeExpander:.finalizeLazy();
-
-                let decl = copy YILVarDecl(p.getLoc(), p.getLoc().str, lazyType, varId);
-                let varref = copy YILVar(p.getLoc(), p.getLoc().str, lazyType, varId);
-                parameters ~= [decl];
-
-                let addr = copy YILAddrValue(p.getLoc(), self._typeExpander:.finalizePointer(lazyType), varref);
-                self:.registerLazyRef(p.getUniqId(), varref);
-                self:.registerVariable(p.getUniqId(),
-                                        copy YILNameCallValue(p.getLoc(),
-                                                               self._typeExpander:.finalizePointer(type),
-                                                               YRuntimeFuncs::CALL_LAZY, copy [addr]));
-            } else {
-                let vref = copy YILVar(p.getLoc(), p.getLoc().str, type, varId);
-                let (finVref, finType) = if (p.isReference()) {
-                    (copy YILUnrefValue(p.getLoc(), type, vref),
-                     self._typeExpander:.finalizePointer(type))
-                } else if (p.getType().isMovable()) {
-                    self._valueExpander.registerDestroy(alias self, vref, p.getType(), ref list, implicit-> false, param-> true);
-                    (vref, type)
-                } else {
-                    (vref, type)
-                };
-
-                parameters ~= [copy YILVarDecl(p.getLoc(), p.getLoc().str, finType, varId)];
-                self:.registerVariable(p.getUniqId(), finVref);
-            }
-        }
-
-        let _ = self:.finalizeValue(frame.getBody(), ref list);
-
-        let mut body = if (list.hasDestroy()) {
-            copy YILTryFinally(frame.getBody().getLoc(), list[], list.getToDestroy())
-        } else {
-            copy YILBlock(frame.getLoc(), list[])
-        };
-
-        // In unittest we inject frame code coverage monitoring
-        if enterCoverage {
-            let loc = frame.getBody().getLoc();
-            self:.finalizeCoverageLocTable(frame);
-            self:.registerTouchSym(FRAME_INFO, loc);
-
-            let mut pre = StmtList(), mut exit = StmtList();
-            let enterVal = copy YILNameCallValue(loc, YIL_VOID, YRuntimeFuncs::COVERAGE_HIT_ENTER,
-                                                 copy [frameAddr, frameCoverAddr]);
-
-            pre:.append(copy YILCall(loc, enterVal));
-            pre:.append(body);
-
-            let exitVal = copy YILNameCallValue(loc, YIL_VOID, YRuntimeFuncs::COVERAGE_HIT_EXIT,
-                                                 copy [frameAddr, frameCoverAddr]);
-
-            exit:.append(copy YILCall(loc, exitVal));
-
-            body = copy YILTryFinally(loc, pre[], exit[]);
-        }
-
-        self:.exitBlock();
-        self:.exitFrame();
-        let touching = self:.exitSymbol();
-
-        let final = copy YILFrame(frame.getLoc(),
-                                   frame.getImplLoc(),
-                                   name,
-                                   parameters,
-                                   self:.finalizeType(frame.getReturnType()),
-                                   body-> body,
-                                   isWeak-> frame.isWeak(),
-                                   refs-> touching);
-
-        if (frame.isWeak()) {
-            self._weakSymbols[name] = final;
-        } else {
-            self._symbols[name] = final;
-        }
-
-        if (!frame.isWeak() && !state::isUnittestActive() && frame.getName().asStdPath().file() == Keys::MAIN) {
-            self:.finalizeMainCall(frame.getLoc(), name, (frame.getReturnType() of VoidType));
-        }
-    }
-
-    /**
-     * Generate the frame of the "main" function that calls the actual program main func
-     * */
-    fn finalizeMainCall(mut self, loc: &Word, name: [c8], isVoid: bool) {
-        let mut list = StmtList();
-
-        self:.enterSymbol();
-        self:.enterFrame(name);
-        self:.enterBlock();
-
-        let argsT = copy [YIL_UINT_32, YIL_PTR_VOID];
-        let argIds = copy [self:.generateVarId(), self:.generateVarId()];
-
-        let argcDecl = copy YILVarDecl(EOF_WORD, "argc", argsT[0], argIds[0]);
-        let argvDecl = copy YILVarDecl(EOF_WORD, "argv", argsT[1], argIds[1]);
-
-        let argcRef = copy YILVar(EOF_WORD, "argc", argsT[0], argIds[0]);
-        let argvRef = copy YILVar(EOF_WORD, "argc", argsT[1], argIds[1]);
-
-        let moduleFuncMain = copy YILAddrValue(EOF_WORD, YIL_PTR_VOID, copy YILVar(EOF_WORD, name, YIL_VOID, 0us));
-        let runMain = if (state::isDebugActive()) {
-            YRuntimeFuncs::RUN_MAIN_DEBUG
-        } else {
-            YRuntimeFuncs::RUN_MAIN_RELEASE
-        };
-
-        let call = copy YILNameCallValue(EOF_WORD,
-                                          YIL_SINT_32,
-                                          runMain, copy [argcRef, argvRef, moduleFuncMain]);
-
-        if (isVoid) {
-            list:.append(copy YILCall(EOF_WORD, call));
-            list:.append(copy YILReturn(EOF_WORD, copy YILIntValue(EOF_WORD, YIL_SINT_32, 0us)));
-        } else {
-            list:.append(copy YILReturn(EOF_WORD, call));
-        }
-
-        self:.registerTouchSym(name, loc);
-        self:.exitBlock();
-        self:.exitFrame();
-        let touching = self:.exitSymbol();
-
-        let final = copy YILFrame(loc,
-                                   loc,
-                                   Keys::MAIN,
-                                   copy [argcDecl, argvDecl],
-                                   YIL_SINT_32,
-                                   body-> copy YILBlock(EOF_WORD, list[]),
-                                   isWeak-> false,
-                                   refs-> touching);
-
-        self._symbols[Keys::MAIN] = final;
-    }
-
-    /*!
-     * =====================================================================================
-     * =====================================================================================
-     * ========================          UNIT TEST EXPANSION          ======================
-     * =====================================================================================
-     * =====================================================================================
-     */
-
-    /**
-     * Finalize a unit test
-     * */
-    fn finalizeUnitTest(mut self, u: &UnitTestGenerator) {
-        if (state::isUnittestActive()) {
-            let name = self._mangler.mangle(u);
-
-            self:.enterSymbol();
-            self:.enterFrame(u.getName().toStr());
-            self:.enterBlock();
-
-            let mut list = StmtList();
-            let _ = self:.finalizeValue(u.getValue(), ref list);
-
-            self:.exitBlock();
-            self:.exitFrame();
-            let touchings = self:.exitSymbol();
-
-            let final = copy YILFrame(u.getLoc(),
-                                       u.getLoc(),
-                                       name,
-                                       [],
-                                       YIL_VOID,
-                                       body-> copy YILBlock(u.getLoc(), list[]),
-                                       isWeak-> false,
-                                       refs-> touchings);
-
-            self._symbols[name] = final;
-            let p = Path(u.getLoc().filename);
-            if let Ok(mut lst: [mut(&Word, [c8], [c8])]) = alias self._moduleWithUnittests[p] {
-                lst ~= [(u.getLoc(), u.getName().toStr(), name)];
-                self._moduleWithUnittests[p] = alias lst;
-            } else {
-                self._moduleWithUnittests[p] = copy [(u.getLoc(), u.getName().toStr(), name)];
-            }
-        }
-    }
-
-    /**
-     * Finalize the package ctor that registers the unittests
-     * */
-    fn finalizeUnitTestRegistrationFrame(mut self, module: Path, lst: [(&Word, [c8], [c8])]) {
-        let packageDir = state::getPackage();
-        let modulePath = module.removePrefix(packageDir);
-
-        let loc = copy LocWord(filename-> modulePath.toStr(), 0, 0);
-        let frameName = self._mangler.manglePath(modulePath.stripExtension());
-
-        let name = Keys::UNIT_TEST_REGISTER ~ frameName;
-
-        self:.enterSymbol();
-        self:.enterFrame(Keys::UNIT_TEST_REGISTER ~ modulePath.stripExtension().toStr(sep-> "::"));
-        self:.enterBlock();
-
-        let mut list = StmtList();
-        for test in lst {
-            let (locT, nameT, mangledNameT) = test;
-            self._valueExpander.finalizeRegisterUnitTest(alias self, nameT, mangledNameT, locT, ref list);
-        }
-
-        self:.exitBlock();
-        self:.exitFrame();
-        let touchings = self:.exitSymbol();
-
-        let final = copy YILFrame(loc,
-                                   loc,
-                                   name,
-                                   [],
-                                   YIL_VOID,
-                                   body-> copy YILBlock(EOF_WORD, list[]),
-                                   isGlobalCtor-> true,
-                                   refs-> touchings);
-
-        self._symbols[Keys::UNIT_TEST_REGISTER ~ frameName] = final;
-    }
-
-    /**
-     * Finalize the main function that calls the unittests
-     * */
-    fn finalizeUnitTestCall(mut self) {
-        self:.enterSymbol();
-        self:.enterFrame("");
-        self:.enterBlock();
-
-        let argsT = copy [YIL_UINT_32, YIL_PTR_VOID];
-        let argIds = copy [self:.generateVarId(), self:.generateVarId()];
-
-        let argcDecl = copy YILVarDecl(EOF_WORD, "argc", argsT[0], argIds[0]);
-        let argvDecl = copy YILVarDecl(EOF_WORD, "argv", argsT[1], argIds[1]);
-
-        let argcRef = copy YILVar(EOF_WORD, "argc", argsT[0], argIds[0]);
-        let argvRef = copy YILVar(EOF_WORD, "argc", argsT[1], argIds[1]);
-
-        let mut list = StmtList();
-        let call = copy YILNameCallValue(EOF_WORD,
-                                          YIL_SINT_32,
-                                          YRuntimeFuncs::RUN_UNITTESTS, copy [argcRef, argvRef]);
-
-        list:.append(copy YILReturn(EOF_WORD, call));
-        self:.exitBlock();
-        self:.exitFrame();
-        let touchings = self:.exitSymbol();
-
-        let loc = copy LocWord(filename-> state::getRootModule().toStr(), 0, 0);
-        let final = copy YILFrame(loc,
-                                   loc,
-                                   Keys::MAIN,
-                                   copy [argcDecl, argvDecl],
-                                   YIL_SINT_32,
-                                   body-> copy YILBlock(EOF_WORD, list[]),
-                                   isWeak-> true,
-                                   refs-> touchings);
-
-        self._symbols[Keys::MAIN] = final;
-    }
-
-    /*!
-     * =====================================================================================
-     * =====================================================================================
-     * =========================          CLASS EXPANSION          =========================
-     * =====================================================================================
-     * =====================================================================================
-     */
-
-    /**
-     * Finalize a class reference type(vtable, and typeinfo)
-     * */
-    pub fn finalizeClass(mut self, cl: &ClassRefType) {
-        if (!cl.getSymbol().isStruct() && !cl.getSymbol().isAbstract()) {
-            // abstract classes and structures don't have vtable
-            // abstract because some of their methods are empty
-            // and structures because their methods are not virtual
-            //
-
-            self:.enterSymbol();
-            let vtableValue = self:.finalizeClassVtable(cl);
-            let vtableName = self._mangler.mangleVtable(cl);
-            let touchings = self:.exitSymbol();
-
-            // Const VTABLE
-            let cst = copy YILConstant(cl.getLoc(),
-                                        vtableName,
-                                        vtableValue,
-                                        isWeak-> cl.getSymbol().isWeak(),
-                                        refs-> touchings);
-
-            if (cl.getSymbol().isWeak()) {
-                self._weakSymbols[vtableName] = cst;
-            } else {
-                self._symbols[vtableName] = cst;
-            }
-        }
-
-        self:.enterSymbol();
-        let typeinfoValue = self:.finalizeClassTypeInfo(cl);
-        let tiName = self._mangler.mangleTypeInfo(cl);
-        let touchings = self:.exitSymbol();
-
-        // Const TYPEINFO
-        let cst = copy YILConstant(cl.getLoc(),
-                                    tiName,
-                                    typeinfoValue,
-                                    isWeak-> cl.getSymbol().isWeak(),
-                                    refs-> touchings);
-
-        if (cl.getSymbol().isWeak()) {
-            self._weakSymbols[tiName] = cst;
-        } else {
-            self._symbols[tiName] = cst;
-        }
-    }
-
-    /**
-     * Finalize the typeinfo value of a class type, to write it in the text as a global variable
-     * */
-    pub fn finalizeClassTypeInfo(mut self, cl: &ClassRefType)-> &YILValue {
-        let mut list = StmtList();
-
-        let slcType = {
-            self:.finalizeType(copy SliceType(cl.getLoc(), VOID_TYPE))
-        } catch {
-            _ => panic;
-        };
-
-        let ancestorSlice = match cl.getAncestor() {
-            Ok(anc) => {
-                let ancTIN = self._mangler.mangleTypeInfo(anc);
-                self:.registerTouchSym(ancTIN, anc.getLoc());
-
-                let ancTIV = copy YILAddrValue(cl.getLoc(), YIL_PTR_VOID,
-                                                copy YILVar(cl.getLoc(), ancTIN, YIL_PTR_VOID, 0us));
-
-                let len = copy YILIntValue(cl.getLoc(), YIL_UINT_MAX, 1us);
-                copy YILTupleValue(cl.getLoc(), slcType, copy [len, ancTIV, YIL_NULL_VALUE],
-                                    fieldNames-> copy [SliceKeys::LEN, SliceKeys::PTR, SliceKeys::BLK_INFO])
-            }
-            _ => {
-                copy YILTupleValue(cl.getLoc(), slcType,
-                                    copy [copy YILIntValue(cl.getLoc(), YIL_UINT_MAX, 0us), YIL_NULL_VALUE, YIL_NULL_VALUE],
-                                    fieldNames-> copy [SliceKeys::LEN, SliceKeys::PTR, SliceKeys::BLK_INFO])
-            }
-        };
-
-        let ti = cl.getTypeInfo().asOf!{&TypeInfoValue} ();
-        let id = self:.finalizeValue(ti.getId(), ref list);
-        let size = self:.finalizeValue(ti.getSize(), ref list);
-        let name = self:.finalizeValue(ti.getName(), ref list);
-        let type = self:.finalizeType(ti.getType());
-        let fields = if let t: &YILTuple = type {
-            t.getFieldNames()
-        } else panic;
-
-        // Dynamic objects in the typeinfo
-        if (list.len != 0us) panic;
-
-        copy YILTupleValue(cl.getLoc(), type,
-                            copy [id, size, ancestorSlice, name],
-                            fieldNames-> fields)
-    }
-
-    /**
-     * Finalize the vtable value of a class to write it in the text as a global variable
-     * */
-    pub fn finalizeClassVtable(mut self, cl: &ClassRefType)-> &YILValue {
-        let len = cl.getVtable().len + 2us; // TI, Dtor, vtable
-
-        let resultType = self._typeExpander:.finalizeArray(YIL_PTR_VOID, len);
-        let mut params: [&YILValue] = [];
-
-        let TIN = self._mangler.mangleTypeInfo(cl);
-        self:.registerTouchSym(TIN, cl.getLoc());
-
-        let TIV = copy YILAddrValue(cl.getLoc(), YIL_PTR_VOID, copy YILVar(cl.getLoc(), TIN, YIL_PTR_VOID, 0us));
-        params ~= [TIV];
-
-
-        match cl.getDestructor() {
-            UnitValue() => {
-                params ~= [YIL_NULL_VALUE];
-            }
-            p: &PrototypeValue => {
-                let name = self._mangler.mangle(p);
-                self:.registerTouchSym(name, cl.getLoc());
-
-                let addr = copy YILAddrValue(p.getLoc(), YIL_PTR_VOID, copy YILVar(p.getLoc(), name, YIL_VOID, 0us));
-                params ~= [addr];
-            }
-            _ => panic;
-        };
-
-        for mt in cl.getVtable() {
-            let name = self._mangler.mangle(mt);
-            self:.registerTouchSym(name, mt.getLoc());
-
-            let addr = copy YILAddrValue(mt.getLoc(), YIL_PTR_VOID, copy YILVar(mt.getLoc(), name, YIL_VOID, 0us));
-            params ~= [addr];
-        }
-
-        copy YILArrayValue(cl.getLoc(), resultType, params)
-    }
-
-
-    /*!
-     * =====================================================================================
-     * =====================================================================================
-     * =======================          GLOBAL VAR EXPANSION          ======================
-     * =====================================================================================
-     * =====================================================================================
-     */
-
-    /**
-     * Finalize a global variable
-     * */
-    pub fn finalizeGlobalVar(mut self, gv: &GlobalVarGenerator) {
-        let mut list = StmtList();
-        self:.enterSymbol();
-        let value = self._valueExpander.finalizeLazy(alias self, gv.getValue().asOf!{&LazyValue} (), ref list);
-        let touchings = self:.exitSymbol();
-
-        let name = self._mangler.mangleGlobalVar(gv);
-        let glb = copy YILGlobalVar(gv.getLoc(), name, value,
-                                     isWeak-> gv.isWeak(),
-                                     isThreadLocal-> gv.isThreadLocal(),
-                                     touchings);
-
-        if (gv.isWeak()) {
-            self._weakSymbols[name] = glb;
-        } else {
-            self._symbols[name] = glb;
-        }
-    }
-
-    /*!
-     * ====================================================================================================
-     * ====================================================================================================
-     * ===============================          MAP INFO EXPANSION          ===============================
-     * ====================================================================================================
-     * ====================================================================================================
-     */
-
-    /**
-     * Finalize a map information
-     * @params:
-     *    - m: the map info to finalize
-     * */
-    pub fn finalizeMapInfo(mut self, m: &MapInfoGenerator) {
-        self:.enterSymbol();
-
-        let cmpName = self._mangler.mangle(m.getCmpFunc());
-        let hashName = self._mangler.mangle(m.getHashFunc());
-        self:.registerTouchSym(cmpName, m.getLoc());
-        self:.registerTouchSym(hashName, m.getLoc());
-
-        let name = self._mangler.mangleMapInfo(m.getMapType());
-        let cmpFunc = copy YILAddrValue(m.getLoc(), YIL_PTR_VOID, copy YILVar(m.getLoc(), cmpName, YIL_VOID, 0us));
-        let hashFunc = copy YILAddrValue(m.getLoc(), YIL_PTR_VOID, copy YILVar(m.getLoc(), hashName, YIL_VOID, 0us));
-        let keyT = self:.finalizeType(m.getMapType().getInners()[0]);
-        let valT = self:.finalizeType(m.getMapType().getInners()[1]);
-
-        let pointerSize = global::state::pointerArchSize() / 8u32;
-        let remainderK = keyT.getSize() % pointerSize;
-        let keySizeI = if remainderK == 0 {
-            keyT.getSize()
-        } else { keyT.getSize() + (pointerSize - remainderK) };
-
-        let remainderV = valT.getSize() % pointerSize;
-        let valueSizeI = if remainderV == 0 {
-            valT.getSize()
-        } else { valT.getSize() + (pointerSize - remainderV) };
-
-        let keySize = copy YILIntValue(m.getLoc(), YIL_UINT_MAX, keySizeI);
-        let valSize = copy YILIntValue(m.getLoc(), YIL_UINT_MAX, valueSizeI);
-
-        let tuType = self._typeExpander:.finalizeTuple(copy [YIL_PTR_VOID, YIL_PTR_VOID, YIL_UINT_MAX, YIL_UINT_MAX]);
-        let tuValue = copy YILTupleValue(m.getLoc(), tuType, copy [cmpFunc, hashFunc, keySize, valSize]);
-
-        let touchings = self:.exitSymbol();
-
-        let cst = copy YILConstant(m.getLoc(),
-                                    name,
-                                    tuValue,
-                                    isWeak-> true,
-                                    refs-> touchings);
-
-        self._weakSymbols[name] = cst;
-    }
-
-    /*!
-     * ====================================================================================================
-     * ====================================================================================================
-     * ============================          COVERAGE LOCATIONS TABLE          ============================
-     * ====================================================================================================
-     * ====================================================================================================
-     */
-
-    /**
-     * Finalize the global constant containing frame code coverage informations
-     * @params:
-     *    - frame: the frame being monitored
-     * */
-    pub fn finalizeCoverageLocTable(mut self, frame: &FrameGenerator) {
-        let lst = self._coverageUniqIds.back();
-        let loc = frame.getBody().getLoc();
-
-        let LOC_TABLE  = self._mangler.mangleCoverageLocTable(frame);
-        let FRAME_INFO = self._mangler.mangleCoverageFrameInfo(frame);
-
-        let locInnerType = self._typeExpander:.finalizeTuple(inners-> copy [YIL_UINT_32, YIL_UINT_32]);
-        let locResultType = self._typeExpander:.finalizeArray(locInnerType, lst.content.len);
-
-        if lst.content.len != 0 {
-            let mut params: [&YILValue] = [];
-            for l in lst.content {
-                let lineVal = copy YILIntValue(loc, YIL_UINT_32, l.line);
-                let colVal = copy YILIntValue(loc, YIL_UINT_32, l.col);
-
-                let innerTu = copy YILTupleValue(loc, locInnerType, copy [lineVal, colVal]);
-                params ~= [innerTu];
-            }
-
-            let locTable = copy YILArrayValue(loc, locResultType, params);
-            self._weakSymbols[LOC_TABLE] = copy YILConstant(loc, LOC_TABLE, locTable, isWeak-> true, refs-> copy []);
-        }
-
-        {
-            let strType = self._typeExpander:.finalizeSlice(YIL_UINT_8);
-            let locSliceType = self._typeExpander:.finalizeSlice(locInnerType);
-            let frameInfoType = self._typeExpander:.finalizeTuple(inners-> copy [strType, strType, locSliceType],
-                                                                   fieldNames-> copy [CoverageInfoKeys::FILE, CoverageInfoKeys::FUNC, CoverageInfoKeys::LOCS]);
-
-            let funcStr = self._valueExpander.finalizeStrUtf8(alias self, loc, frame.getName().toStr());
-            let fileStr = self._valueExpander.finalizeStrUtf8(alias self, loc, loc.filename);
-            let locTableAddr = if lst.content.len == 0 {
-                YIL_NULL_VALUE
-            } else {
-                copy YILAddrValue(loc, YIL_PTR_VOID, copy YILVar(loc, LOC_TABLE, YIL_PTR_VOID, 0us))
-            };
-
-            let len = copy YILIntValue(loc, YIL_UINT_MAX, lst.content.len);
-            let locTableSlice = copy YILTupleValue(loc, locSliceType, copy [len, locTableAddr, YIL_NULL_VALUE],
-                                                    fieldNames-> copy [SliceKeys::LEN, SliceKeys::PTR, SliceKeys::BLK_INFO]);
-
-            let frameInfoValue = copy YILTupleValue(loc, frameInfoType, copy [fileStr, funcStr, locTableSlice],
-                                                     fieldNames-> copy [CoverageInfoKeys::FILE, CoverageInfoKeys::FUNC, CoverageInfoKeys::LOCS]);
-
-            let dmut refs: [[c8] => Path] = copy [];
-            if lst.content.len != 0 {
-                refs[LOC_TABLE] = Path(loc.filename).stripExtension();
-            }
-
-            self._weakSymbols[FRAME_INFO] = copy YILConstant(loc,
-                                                               FRAME_INFO,
-                                                               frameInfoValue,
-                                                               isWeak-> true,
-                                                               refs-> refs);
-        }
-    }
-
-
-    /*!
-     * =====================================================================================
-     * =====================================================================================
-     * ======================          TYPE/VALUE EXPANSION          =======================
-     * =====================================================================================
-     * =====================================================================================
-     */
-
-    /**
-     * Finalize a value
-     * @params:
-     *    - value: the value to finalize
-     * */
-    prv fn finalizeValue(mut self, val: &Value, ref mut list: StmtList)-> &YILValue {
-        self._valueExpander.finalize(alias self, val, ref list, asLeft-> false)
-    }
-
-    /**
-     * Finalize a type
-     * @params:
-     *    - ty: the type to finalize
-     * */
-    pub fn finalizeType(mut self, ty: &Type)-> &YILType {
-        self._typeExpander:.finalize(alias self, ty)
-    }
-
-    /*!
-     * =====================================================================================
-     * =====================================================================================
-     * =========================              GETTERS              =========================
-     * =====================================================================================
-     * =====================================================================================
-     */
-
-    /**
-     * @returns: the mangler used to mangle symbol names
-     * */
-    pub fn getMangler(self)-> Mangler {
-        self._mangler
+        return csts ~ vrs ~ frs;
     }
 
     /**
      * @returns: the expander used to finalize types
      * */
-    pub fn getTypeExpander(mut self)-> dmut &TypeExpander {
+    @field
+    pub fn typeExpander(mut self)-> dmut &TypeExpander {
         alias self._typeExpander
     }
 
@@ -908,80 +368,165 @@ pub class Expander {
      */
 
     /**
-     * @returns: the declaration of the variable containing the value of the current loop
-     * */
+     * Insert a weak symbol into the weak‑symbol table.
+     */
+    pub fn insertWeak(mut self, name: [c8], sym: &YILSymbol) {
+        self._weakSymbols[name] = sym;
+    }
+
+    /**
+     * Insert a strong symbol into the strong‑symbol table.
+     */
+    pub fn insertSymbol(mut self, name: [c8], sym: &YILSymbol) {
+        self._symbols[name] = sym;
+    }
+
+    /**
+     * @returns: the variable receiving loop break values.
+     */
     pub fn getLoopVarRef(self)-> &YILValue {
-        self._loopVar.back()
+        self._loopVar.back
     }
 
     /**
-     * @returns: the label exiting the current loop
-     * */
+     * @returns: the label used to exit the current loop.
+     */
     pub fn getLoopExitLabel(self)-> &YILLabel {
-        self._loopLabel.back()
+        self._loopLabel.back._1
     }
 
     /**
-     * Enter a loop where varref is the value of the loop
-     * */
-    pub fn enterLoop(mut self, varref: &YILValue, lbl: &YILLabel) {
+     * @returns: the label used to continue the current loop.
+     */
+    pub fn getLoopNextLabel(self)-> &YILLabel {
+        self._loopLabel.back._0
+    }
+
+    /**
+     * Enter a loop context.
+     *
+     * Pushes:
+     *   - loop result variable,
+     *   - next‑iteration label,
+     *   - exit label.
+     */
+    pub fn enterLoop(mut self, varref: &YILValue, nextLabel: &YILLabel, endLabel: &YILLabel) {
         self._loopVar:.push(varref);
-        self._loopLabel:.push(lbl);
+        self._loopLabel:.push((nextLabel, endLabel));
     }
 
     /**
-     * Exit a loop context
-     * */
+     * Exit the current loop context.
+     */
     pub fn exitLoop(mut self) {
         self._loopVar:.pop();
         self._loopLabel:.pop();
     }
 
     /**
-     * Enter a symbol definition
-     * */
-    fn enterSymbol(mut self) {
+     * Enter an inline‑function context.
+     *
+     * Pushes:
+     *   - inline result variable,
+     *   - inline exit label.
+     */
+    pub fn enterInline(mut self, varref: &YILValue, endLabel: &YILLabel) {
+        self._inlineVar:.push(varref);
+        self._inlineLabel:.push(endLabel);
+    }
+
+    /**
+     * Exit the current inline context.
+     */
+    pub fn exitInline(mut self) {
+        self._inlineVar:.pop();
+        self._inlineLabel:.pop();
+    }
+
+    /**
+     * @returns: true if currently inside an inline block.
+     */
+    pub fn isInline(self)-> bool {
+        return self._inlineVar.len != 0;
+    }
+
+    /**
+     * @returns: the inline result variable.
+     */
+    pub fn getInlineVarRef(self)-> &YILValue {
+        return self._inlineVar.back;
+    }
+
+    /**
+     * @returns: the inline exit label.
+     */
+    pub fn getInlineExitLabel(self)-> &YILLabel {
+        return self._inlineLabel.back;
+    }
+
+    /**
+     * Enter a new symbol‑tracking scope.
+     *
+     * Pushes a fresh Touching record.
+     */
+    pub fn enterSymbol(mut self) {
         self._touchings:.push(copy Touching());
     }
 
     /**
-     * Exit a symbol definitions
-     * @returns: all the foreign symbols touched by it
-     * */
-    fn exitSymbol(mut self)-> [[c8] => Path] {
-        let touchs = self._touchings.back();
+     * Exit the current symbol‑tracking scope.
+     *
+     * @returns:
+     *   - [[c8] => Path]: all foreign symbols touched in this scope.
+     */
+    pub fn exitSymbol(mut self)-> [[c8] => Path] {
+        let touchs = self._touchings.back;
         self._touchings:.pop();
 
         touchs.content
     }
 
     /**
-     * Register the touch of a foreign symbol
-     * */
+     * Register that the current symbol references another symbol.
+     *
+     * Stores:
+     *   name → modulePath(loc.filename)
+     */
     pub fn registerTouchSym(mut self, name: [c8], loc: &Word) {
-        if !self._touchings.isEmpty() {
-            self._touchings:.back().content[name] = Path(loc.filename).stripExtension();
+        if !self._touchings.isEmpty {
+            self._touchings.back.content[name] = Path(loc.filename).stripExtension();
         }
     }
 
+    /**
+     * Register that the current symbol references a class's typeinfo.
+     *
+     * Handles struct vs class pointer differences.
+     */
     pub fn registerTouchClass(mut self, cl: &Type) {
-        if let cptr: &ClassPtrType = cl if let Ok(cref) = cptr.getInner()? {
-            if (!cptr.isStruct()) {
-                let TIN = self._mangler.mangleTypeInfo(cref);
-                self:.registerTouchSym(TIN, cptr.getSymbol().getLoc());
+        if let cptr: &ClassPtrType = cl if let Ok(cref) = cptr.inner? {
+            if (!cptr.isStruct) {
+                let TIN = Mangler::mangleTypeInfo(cref);
+                self:.registerTouchSym(TIN, cptr.sym.loc);
             } else {
-                let TIN = self._mangler.mangleType(cptr, false);
-                self:.registerTouchSym(TIN, cptr.getSymbol().getLoc());
+                let TIN = Mangler::mangleType(cptr, false);
+                self:.registerTouchSym(TIN, cptr.sym.loc);
             }
         }
     }
 
     /**
-     * Enter a new frame
-     * @params:
-     *     - name: the name of the frame(not mangled)
-     * */
-    fn enterFrame(mut self, name: [c8], frameAddr: &YILValue = YIL_UNIT_VALUE, frameCoverAddr: &YILValue = YIL_UNIT_VALUE) {
+     * Enter a new frame context.
+     *
+     * Pushes:
+     *   - frame name,
+     *   - frame address,
+     *   - coverage frame address,
+     *   - fresh variable ID counter,
+     *   - fresh label ID counter,
+     *   - fresh coverage ID list.
+     */
+    pub fn enterFrame(mut self, name: [c8], frameAddr: &YILValue = YIL_UNIT_VALUE, frameCoverAddr: &YILValue = YIL_UNIT_VALUE) {
         self._frameName:.push(name);
         self._frameAddr:.push(frameAddr);
         self._frameCoverAddr:.push(frameCoverAddr);
@@ -992,9 +537,9 @@ pub class Expander {
     }
 
     /**
-     * Exit the current frame
-     * */
-    fn exitFrame(mut self) {
+     * Exit the current frame context.
+     */
+    pub fn exitFrame(mut self) {
         self._frameName:.pop();
         self._frameAddr:.pop();
         self._frameCoverAddr:.pop();
@@ -1005,172 +550,186 @@ pub class Expander {
     }
 
     /**
-     * @returns: true if we are currently inside a frame
-     * */
+     * @returns: true if currently inside a frame.
+     */
     pub fn isInAFrame(self)-> bool {
-        self._varUniqId.len != 0us
+        return self._varUniqId.len != 0us;
     }
 
     /**
-     * @returns: the name of the frame being validated
-     * */
+     * @returns: the name of the current frame.
+     */
     pub fn getCurrentFrameName(self)-> [c8] {
-        self._frameName.back()
+        return self._frameName.back;
     }
 
     /**
-     * @returns: the address of the function being validated
-     * */
+     * @returns: the address of the current frame.
+     */
     pub fn getCurrentFrameAddr(self)-> &YILValue {
-        self._frameAddr.back()
+        return self._frameAddr.back;
     }
 
     /**
-     * @returns: the address of the function being validated
-     * */
+     * @returns: the coverage‑frame address of the current frame.
+     */
     pub fn getCurrentFrameCoverageAddr(self)-> &YILValue {
-        self._frameCoverAddr.back()
+        return self._frameCoverAddr.back;
     }
 
     /**
-     * @returns: true if the frame is exporting code coverage metrics
-     * */
+     * @returns: true if the current frame emits coverage metrics.
+     */
     pub fn isInCoverageFrame(self)-> bool {
         if self._frameCoverAddr.len != 0 {
-            self._frameCoverAddr.back() !of YILUnit
-        } else {
-            false
+            return self._frameCoverAddr.back !of YILUnit;
         }
+
+        return false;
     }
 
     /**
-     * Set the uniq ids of the current frame
-     * */
+     * Restore variable and label uniq‑ID counters for the current frame.
+     */
     pub fn setUniqIds(mut self, varIds: usize, lblIds: usize) {
-        self._varUniqId:.setBack(varIds);
-        self._lblUniqId:.setBack(lblIds);
+        self._varUniqId.back = varIds;
+        self._lblUniqId.back = lblIds;
     }
 
     /**
-     * Get the uniq ids of the current frame
-     * */
+     * @returns: (nextVarId, nextLblId)
+     */
     pub fn getUniqIds(mut self)-> (usize, usize) {
-        (self._varUniqId.back(), self._lblUniqId.back())
+        return (self._varUniqId.back, self._lblUniqId.back);
     }
 
     /**
-     * @returns: the next uniq id for a variable in the current frame
-     * */
+     * @returns: the next uniq variable ID for the current frame.
+     */
     pub fn generateVarId(mut self)-> usize {
-        let id = self._varUniqId.back();
-        self._varUniqId:.setBack(id + 1);
+        let id = self._varUniqId.back;
+        self._varUniqId.back = (id + 1);
         id
     }
 
     /**
-     * @returns: the next uniq id for a label in the current frame
-     * */
+     * @returns: the next uniq label ID for the current frame.
+     */
     pub fn generateLblId(mut self)-> usize {
-        let id = self._lblUniqId.back();
-        self._lblUniqId:.setBack(id + 1);
-        id
+        let id = self._lblUniqId.back;
+        self._lblUniqId.back = (id + 1);
+        return id;
     }
 
     /**
-     * @returns: the next uniq id for a coverage call in the current frame
-     * */
+     * Register a coverage location and return its uniq ID.
+     */
     pub fn generateCoverageId(mut self, loc: &Word)-> usize {
-        let dmut lst = self._coverageUniqIds:.back();
+        let dmut lst = self._coverageUniqIds.back;
         lst.content ~= [loc];
 
-        lst.content.len - 1us
+        return lst.content.len - 1us;
     }
 
     /**
-     * Enter a new scope of variables
-     * */
+     * @returns: the coverage ID list for the current frame.
+     */
+    pub fn getCoverageUniqIds(self)-> &CoverageLocs {
+        return self._coverageUniqIds.back;
+    }
+
+    /**
+     * Enter a new block scope.
+     *
+     * Pushes:
+     *   - DeclaredVars,
+     *   - LazyRefs.
+     */
     pub fn enterBlock(mut self) {
         self._variables:.push(copy DeclaredVars());
         self._lazyRefs:.push(copy LazyRefs());
     }
 
     /**
-     * Exit a scope of variables
-     * */
+     * Exit the current block scope.
+     */
     pub fn exitBlock(mut self) {
         self._variables:.pop();
         self._lazyRefs:.pop();
     }
 
     /**
-     * Register a variable declaration in the scope
-     * @params:
-     *    - old: the uniq id of the previous declaration
-     *    - new: the uniq id of the new declaration
-     * */
-    pub fn registerVariable(mut self, old: usize, vref: &YILValue) {
-        self._variables:.back().content[old] = vref;
-    }
-
-    /**
-     * Search the id of a variable declared in the current frame
-     * @returns: the id, or None if the variable is not in the frame
-     * */
-    pub fn getVariable(self, old: usize)-> (&YILValue)? {
-        for i in self._variables[] {
-            if old in i.content {
-                if let Ok(n: &YILValue) = i.content[old] {
-                    return n?;
-                } else panic;
-            }
-        }
-
-        none
-    }
-
-    /**
-     * Register a lazy variable reference by its id
-     * */
-    pub fn registerLazyRef(mut self, old: usize, vref: &YILVar) {
-        self._lazyRefs:.back().content[old] = vref;
-    }
-
-    /**
-     * Search a lazy variable reference by its id
-     * */
-    pub fn getLazyRef(self, old: usize)-> (&YILVar)? {
-        for i in self._lazyRefs[] {
-            if old in i.content {
-                if let Ok(n: &YILVar) = i.content[old] {
-                    return n?;
-                } else panic;
-            }
-        }
-
-        none
-    }
-
-    /*!
-     * =====================================================================================
-     * =====================================================================================
-     * =======================              TYPE CONTEXT              ======================
-     * =====================================================================================
-     * =====================================================================================
+     * Register a variable reference for a uniq ID in the current frame.
      */
-
+    pub fn registerVariable(mut self, uid: usize, vref: &YILValue) {
+        self._variables.back.content[uid] = vref;
+    }
 
     /**
-     * @returns: true if the class is being validated
-     * */
+     * Search for a variable reference by uniq ID.
+     *
+     * @returns:
+     *   - (&YILValue)? — the variable reference or none.
+     */
+    pub fn getVariable(self, uid: usize)-> (&YILValue)? {
+        for i in self._variables[] {
+            if let Ok(n: &YILValue) = i.content[uid] {
+                return n?;
+            }
+        }
+
+        return none;
+    }
+
+    /**
+     * Register a lazy variable reference by uniq ID.
+     */
+    pub fn registerLazyRef(mut self, uid: usize, vref: &YILVar) {
+        self._lazyRefs.back.content[uid] = vref;
+    }
+
+    /**
+     * Search for a lazy variable reference by uniq ID.
+     *
+     * @returns:
+     *   - (&YILVar)? — the lazy reference or none.
+     */
+    pub fn getLazyRef(self, uid: usize)-> (&YILVar)? {
+        for i in self._lazyRefs[] {
+            if let Ok(n: &YILVar) = i.content[uid] {
+                return n?;
+            }
+        }
+
+        return none;
+    }
+
+    /**
+     * @returns: the YILType of a class currently being validated, or none.
+     */
     pub fn isInClassValidation(self, cr: &ClassRefType)-> (&YILType)? {
-        self._classValidated[cr.getSymbol().getPath().toStr()]
+        self._classValidated[cr.sym.path.toStr()]
     }
 
     /**
-     * Start a finalization of a class type
-     * */
+     * Register that a class type is currently being validated.
+     */
     pub fn enterClassValidation(mut self, cr: &ClassRefType, tu: &YILType) {
-        self._classValidated[cr.getSymbol().getPath().toStr()] = tu;
+        self._classValidated[cr.sym.path.toStr()] = tu;
     }
 
+    /**
+     * Register a unittest for a module.
+     *
+     * Stores:
+     *   modulePath → list of (loc, testName, mangledName)
+     */
+    pub fn insertInUnittest(mut self, modPath: Path, loc: &Word, symPath: &SymbolPath, name: [c8]) {
+        if let Ok(mut lst: [mut(&Word, [c8], [c8])]) = alias self._moduleWithUnittests[modPath] {
+            lst ~= [(loc, symPath.toStr(), name)];
+            self._moduleWithUnittests[modPath] = alias lst;
+        } else {
+            self._moduleWithUnittests[modPath] = copy [(loc, symPath.toStr(), name)];
+        }
+    }
 }

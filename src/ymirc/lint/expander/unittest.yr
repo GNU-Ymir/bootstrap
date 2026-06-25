@@ -1,0 +1,201 @@
+/*
+ * UnitTestExpander — expands unittest blocks and unittest registration frames.
+ *
+ * The UnitTestExpander lowers unittest constructs into YILFrame nodes. It handles:
+ *
+ *   - generation of a frame for each unittest block,
+ *   - insertion of unittest frames into the global symbol table,
+ *   - generation of a package-level registration frame listing all unittests,
+ *   - generation of the synthetic main() entry frame used when running unittests.
+ *
+ * Unittest frames are emitted only when unittest mode is active. Each unittest
+ * is compiled into a standalone frame with no parameters and a void return type.
+
+ *
+ * <hr>
+ *
+ * @Package: ymirc
+ * @Module: ymirc::lint::expander::unittest
+ * @File: ymirc/lint/expander/unittest.yr
+ * @Author(s):
+ *   - Emile Cadorel <ecadorel@gmail.com>
+ *
+ * @Created(YYYY-MM-DD): 2026-06-24
+ * @Copyright(C) 2021–2026 GNU-Ymir
+ * @License
+ *   ```text
+ *   This file is part of the Ymir language project.
+ *
+ *   Ymir is free software: you can redistribute it and/or modify it
+ *   under the terms of the GNU General Public License as published by
+ *   the Free Software Foundation, either version 3 of the License, or
+ *   (at your option) any later version.
+ *
+ *   Ymir is distributed in the hope that it will be useful,
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *   GNU General Public License for more details.
+ *
+ *   You should have received a copy of the GNU General Public License
+ *   along with Ymir.  If not, see <https://www.gnu.org/licenses/>.
+ *   ```
+ */
+
+in unittest;
+
+use ymirc::lint::expander::value;
+use ymirc::lint::node::_;
+
+use ymirc::semantic::{symbol, generator::_};
+use ymirc::semantic::generator::{type::_, value::_};
+
+use ymirc::utils::{format, list};
+
+use ymirc::global::{core_, state};
+use ymirc::lexing::keys;
+
+use ymirc::lexing::word;
+
+use std::{io, fs::path};
+
+/**
+ * Expands unittest blocks and unittest registration frames into YILFrame nodes.
+ * Handles unittest body expansion, symbol-touch tracking, registration of
+ * unittests, and generation of the synthetic unittest main() entry frame.
+ *
+ * All functions produce YILFrame nodes inserted into the global symbol table.
+ */
+pub mod UnitTestExpander {
+
+    /**
+     * Finalize a unittest block.
+     *
+     * @params:
+     *   - context: the expansion context
+     *   - u:       the unittest generator
+     *
+     * @returns:
+     *   - void
+     */
+    pub fn finalizeUnitTest(dmut context: &Expander, u: &UnitTestGenerator) {
+        if (state::isUnittestActive()) {
+            let name = Mangler::mangle(u);
+
+            context:.enterSymbol();
+            context:.enterFrame(u.name.toStr());
+            context:.enterBlock();
+
+            let mut list = StmtList();
+            ValueExpander::finalize(alias context, u.value, ref list, asLeft-> false);
+
+            context:.exitBlock();
+            context:.exitFrame();
+            let touchings = context:.exitSymbol();
+
+            let final = copy YILFrame(u.loc,
+                                      u.loc,
+                                      name,
+                                      [],
+                                      YIL_VOID,
+                                      body-> copy YILBlock(u.loc, list[]),
+                                      isWeak-> false,
+                                      refs-> touchings);
+
+            context:.insertSymbol(name, final);
+            let p = Path(u.loc.filename);
+            context:.insertInUnittest(p, u.loc, u.name, name);
+        }
+    }
+
+    /**
+     * Finalize the unittest registration frame for a module.
+     *
+     * @params:
+     *   - context: the expansion context
+     *   - module:  the module path
+     *   - lst:     list of (loc, testName, mangledName) triples
+     *
+     * @returns:
+     *   - void
+     */
+    pub fn finalizeUnitTestRegistrationFrame(dmut context: &Expander, module: Path, lst: [(&Word, [c8], [c8])]) {
+        let packageDir = state::package();
+        let modulePath = module.removePrefix(packageDir);
+
+        let loc = copy LocWord(filename-> modulePath.toStr(), 0, 0);
+        let frameName = Mangler::manglePath(modulePath.stripExtension());
+
+        let name = Keys::UNIT_TEST_REGISTER ~ frameName;
+
+        context:.enterSymbol();
+        context:.enterFrame(Keys::UNIT_TEST_REGISTER ~ modulePath.stripExtension().toStr(sep-> "::"));
+        context:.enterBlock();
+
+        let mut list = StmtList();
+        for test in lst {
+            let (locT, nameT, mangledNameT) = test;
+            ValueExpander::finalizeRegisterUnitTest(alias context, nameT, mangledNameT, locT, ref list);
+        }
+
+        context:.exitBlock();
+        context:.exitFrame();
+        let touchings = context:.exitSymbol();
+
+        let final = copy YILFrame(loc,
+                                  loc,
+                                  name,
+                                  [],
+                                  YIL_VOID,
+                                  body-> copy YILBlock(EOF_WORD, list[]),
+                                  isGlobalCtor-> true,
+                                  refs-> touchings);
+
+        context:.insertSymbol(Keys::UNIT_TEST_REGISTER ~ frameName, final);
+    }
+
+    /**
+     * Finalize the synthetic main() entry frame used when running unittests.
+     *
+     * @params:
+     *   - context: the expansion context
+     *
+     * @returns:
+     *   - void
+     */
+    pub fn finalizeUnitTestCall(dmut context: &Expander) {
+        context:.enterSymbol();
+        context:.enterFrame("");
+        context:.enterBlock();
+
+        let argsT = copy [YIL_UINT_32, YIL_PTR_VOID];
+        let argIds = copy [context:.generateVarId(), context:.generateVarId()];
+
+        let argcDecl = copy YILVarDecl(EOF_WORD, "argc", argsT[0], argIds[0]);
+        let argvDecl = copy YILVarDecl(EOF_WORD, "argv", argsT[1], argIds[1]);
+
+        let argcRef = copy YILVar(EOF_WORD, "argc", argsT[0], argIds[0]);
+        let argvRef = copy YILVar(EOF_WORD, "argc", argsT[1], argIds[1]);
+
+        let mut list = StmtList();
+        let call = copy YILNameCallValue(EOF_WORD,
+                                         YIL_SINT_32,
+                                         YRuntimeFuncs::RUN_UNITTESTS, copy [argcRef, argvRef]);
+
+        list:.append(copy YILReturn(EOF_WORD, call));
+        context:.exitBlock();
+        context:.exitFrame();
+        let touchings = context:.exitSymbol();
+
+        let loc = copy LocWord(filename-> state::rootModule().toStr(), 0, 0);
+        let final = copy YILFrame(loc,
+                                  loc,
+                                  Keys::MAIN,
+                                  copy [argcDecl, argvDecl],
+                                  YIL_SINT_32,
+                                  body-> copy YILBlock(EOF_WORD, list[]),
+                                  isWeak-> true,
+                                  refs-> touchings);
+
+        context:.insertSymbol(Keys::MAIN, final);
+    }
+}

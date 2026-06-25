@@ -1,0 +1,221 @@
+/*
+ * GlobalExpander — expands global variables, map-info tables, and coverage metadata.
+ *
+ * The GlobalExpander lowers global-level constructs into constant YIL values. It handles:
+ *
+ *   - global variable initialization,
+ *   - map-info table generation(hash, compare, key/value sizes),
+ *   - coverage location tables,
+ *   - coverage frame-info tables.
+ *
+ * Global variables are expanded by evaluating their initializer in a symbol-tracking
+ * scope, then emitting a YILGlobalVar constant. Map-info tables are emitted as weak
+ * constants containing function pointers and padded key/value sizes. Coverage tables
+ * are emitted only when coverage is active.
+ *
+ *
+ * <hr>
+ *
+ * @Package: ymirc
+ * @Module: ymirc::lint::expander::global
+ * @File: ymirc/lint/expander/global.yr
+ * @Author(s):
+ *   - Emile Cadorel <ecadorel@gmail.com>
+ *
+ * @Created(YYYY-MM-DD): 2026-06-24
+ * @Copyright(C) 2021–2026 GNU-Ymir
+ * @License
+ *   ```text
+ *   This file is part of the Ymir language project.
+ *
+ *   Ymir is free software: you can redistribute it and/or modify it
+ *   under the terms of the GNU General Public License as published by
+ *   the Free Software Foundation, either version 3 of the License, or
+ *   (at your option) any later version.
+ *
+ *   Ymir is distributed in the hope that it will be useful,
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *   GNU General Public License for more details.
+ *
+ *   You should have received a copy of the GNU General Public License
+ *   along with Ymir.  If not, see <https://www.gnu.org/licenses/>.
+ *   ```
+ */
+
+in global;
+
+use ymirc::lint::expander::value;
+use ymirc::lint::node::_;
+
+use ymirc::semantic::{symbol, generator::_};
+use ymirc::semantic::generator::{type::_, value::_};
+
+use ymirc::utils::{format, list};
+
+use ymirc::global::{core_, state};
+use ymirc::lexing::keys;
+
+use ymirc::lexing::word;
+
+use std::{io, fs::path};
+
+/**
+ * Expands global variables, map-info metadata, and coverage tables into YIL constants.
+ * Handles symbol-touch tracking, weak/strong insertion, and static construction of
+ * global-level data structures.
+ *
+ * All functions produce YILConstant or YILGlobalVar nodes inserted into the global
+ * symbol table.
+ */
+pub mod GlobalExpander {
+
+    /**
+     * Finalize a global variable.
+     *
+     * @params:
+     *   - context: the expansion context
+     *   - gv:      the global variable generator
+     *
+     * @returns:
+     *   - void
+     */
+    pub fn finalizeGlobalVar(dmut context: &Expander, gv: &GlobalVarGenerator) {
+        let mut list = StmtList();
+        context:.enterSymbol();
+        let value = ValueExpander::finalize(alias context, gv.value, ref list, asLeft-> false);
+        let touchings = context:.exitSymbol();
+
+        let name = Mangler::mangleGlobalVar(gv);
+        let glb = copy YILGlobalVar(gv.loc, name, value,
+                                    isWeak-> gv.isWeak,
+                                    isThreadLocal-> gv.isThreadLocal,
+                                    touchings);
+
+        if (gv.isWeak) {
+            context:.insertWeak(name, glb);
+        } else {
+            context:.insertSymbol(name, glb);
+        }
+    }
+
+    /**
+     * Finalize a map-info table.
+     *
+     * @params:
+     *   - context: the expansion context
+     *   - m:       the map-info generator
+     *
+     * @returns:
+     *   - void
+     */
+    pub fn finalizeMapInfo(dmut context: &Expander, m: &MapInfoGenerator) {
+        context:.enterSymbol();
+
+        let cmpName = Mangler::mangle(m.cmpFunc);
+        let hashName = Mangler::mangle(m.hashFunc);
+        context:.registerTouchSym(cmpName, m.loc);
+        context:.registerTouchSym(hashName, m.loc);
+
+        let name = Mangler::mangleMapInfo(m.map);
+        let cmpFunc = copy YILAddrValue(m.loc, YIL_PTR_VOID, copy YILVar(m.loc, cmpName, YIL_VOID, 0us));
+        let hashFunc = copy YILAddrValue(m.loc, YIL_PTR_VOID, copy YILVar(m.loc, hashName, YIL_VOID, 0us));
+        let keyT = context:.finalizeType(m.map.key);
+        let valT = context:.finalizeType(m.map.value);
+
+        let pointerSize = global::state::pointerArchSize() / 8u32;
+        let remainderK = keyT.size % pointerSize;
+        let keySizeI = if remainderK == 0 {
+            keyT.size
+        } else { keyT.size + (pointerSize - remainderK) };
+
+        let remainderV = valT.size % pointerSize;
+        let valueSizeI = if remainderV == 0 {
+            valT.size
+        } else { valT.size + (pointerSize - remainderV) };
+
+        let keySize = copy YILIntValue(m.loc, YIL_UINT_MAX, keySizeI);
+        let valSize = copy YILIntValue(m.loc, YIL_UINT_MAX, valueSizeI);
+
+        let tuType = context.typeExpander:.finalizeTuple(copy [YIL_PTR_VOID, YIL_PTR_VOID, YIL_UINT_MAX, YIL_UINT_MAX]);
+        let tuValue = copy YILTupleValue(m.loc, tuType, copy [cmpFunc, hashFunc, keySize, valSize]);
+
+        let touchings = context:.exitSymbol();
+
+        let cst = copy YILConstant(m.loc,
+                                   name,
+                                   tuValue,
+                                   isWeak-> true,
+                                   refs-> touchings);
+
+        context:.insertWeak(name, cst);
+    }
+
+    /**
+     * Finalize coverage location and frame-info tables.
+     *
+     * @params:
+     *   - context: the expansion context
+     *   - frame:   the frame generator for which coverage data is emitted
+     *
+     * @returns:
+     *   - void
+     */
+    pub fn finalizeCoverageLocTable(dmut context: &Expander, frame: &FrameGenerator) {
+        let lst = context.getCoverageUniqIds();
+        let loc = frame.body.loc;
+
+        let LOC_TABLE  = Mangler::mangleCoverageLocTable(frame);
+        let FRAME_INFO = Mangler::mangleCoverageFrameInfo(frame);
+
+        let locInnerType = context.typeExpander:.finalizeTuple(inners-> copy [YIL_UINT_32, YIL_UINT_32]);
+        let locResultType = context.typeExpander:.finalizeArray(locInnerType, lst.content.len);
+
+        if lst.content.len != 0 {
+            let mut params: [&YILValue] = [];
+            for l in lst.content {
+                let lineVal = copy YILIntValue(loc, YIL_UINT_32, l.line);
+                let colVal = copy YILIntValue(loc, YIL_UINT_32, l.col);
+
+                let innerTu = copy YILTupleValue(loc, locInnerType, copy [lineVal, colVal]);
+                params ~= [innerTu];
+            }
+
+            let locTable = copy YILArrayValue(loc, locResultType, params);
+            context:.insertWeak(LOC_TABLE, copy YILConstant(loc, LOC_TABLE, locTable, isWeak-> true, refs-> copy []));
+        }
+
+        {
+            let strType = context.typeExpander:.finalizeSlice(YIL_UINT_8);
+            let locSliceType = context.typeExpander:.finalizeSlice(locInnerType);
+            let frameInfoType = context.typeExpander:.finalizeTuple(inners-> copy [strType, strType, locSliceType],
+                                                                    fieldNames-> copy [CoverageInfoKeys::FILE, CoverageInfoKeys::FUNC, CoverageInfoKeys::LOCS]);
+
+            let funcStr = LiteralExpander::finalizeStrUtf8(alias context, loc, frame.name.toStr());
+            let fileStr = LiteralExpander::finalizeStrUtf8(alias context, loc, loc.filename);
+            let locTableAddr = if lst.content.len == 0 {
+                YIL_NULL_VALUE
+            } else {
+                copy YILAddrValue(loc, YIL_PTR_VOID, copy YILVar(loc, LOC_TABLE, YIL_PTR_VOID, 0us))
+            };
+
+            let len = copy YILIntValue(loc, YIL_UINT_MAX, lst.content.len);
+            let locTableSlice = copy YILTupleValue(loc, locSliceType, copy [len, locTableAddr, YIL_NULL_VALUE],
+                                                   fieldNames-> copy [SliceKeys::LEN, SliceKeys::PTR, SliceKeys::BLK_INFO]);
+
+            let frameInfoValue = copy YILTupleValue(loc, frameInfoType, copy [fileStr, funcStr, locTableSlice],
+                                                    fieldNames-> copy [CoverageInfoKeys::FILE, CoverageInfoKeys::FUNC, CoverageInfoKeys::LOCS]);
+
+            let dmut refs: [[c8] => Path] = copy [];
+            if lst.content.len != 0 {
+                refs[LOC_TABLE] = Path(loc.filename).stripExtension();
+            }
+
+            context:.insertWeak(FRAME_INFO, copy YILConstant(loc,
+                                                             FRAME_INFO,
+                                                             frameInfoValue,
+                                                             isWeak-> true,
+                                                             refs-> refs));
+        }
+    }
+}

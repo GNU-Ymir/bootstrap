@@ -1,0 +1,249 @@
+/*
+ * FrameExpander — expands function frames into YILFrame constants.
+ *
+ * The FrameExpander lowers high-level function definitions into concrete
+ * YILFrame nodes. It handles:
+ *
+ *   - parameter declaration and initialization,
+ *   - lazy and reference parameter semantics,
+ *   - destructor scheduling for movable parameters,
+ *   - frame body expansion,
+ *   - try/finally wrapping for destructor execution,
+ *   - code-coverage instrumentation(enter/exit),
+ *   - symbol-touch tracking for dependency resolution,
+ *   - insertion of weak or strong frame symbols,
+ *   - generation of the synthetic main() entry frame.
+ *
+ * <hr>
+ *
+ * @Package: ymirc
+ * @Module: ymirc::lint::expander::frame
+ * @File: ymirc/lint/expander/frame.yr
+ * @Author(s):
+ *   - Emile Cadorel <ecadorel@gmail.com>
+ *
+ * @Created(YYYY-MM-DD): 2026-06-24
+ * @Copyright(C) 2021–2026 GNU-Ymir
+ * @License
+ *   ```text
+ *   This file is part of the Ymir language project.
+ *
+ *   Ymir is free software: you can redistribute it and/or modify it
+ *   under the terms of the GNU General Public License as published by
+ *   the Free Software Foundation, either version 3 of the License, or
+ *   (at your option) any later version.
+ *
+ *   Ymir is distributed in the hope that it will be useful,
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *   GNU General Public License for more details.
+ *
+ *   You should have received a copy of the GNU General Public License
+ *   along with Ymir.  If not, see <https://www.gnu.org/licenses/>.
+ *   ```
+ */
+
+in frame;
+
+use ymirc::lint::expander;
+use ymirc::lint::node::_;
+
+use ymirc::semantic::{symbol, generator::_};
+use ymirc::semantic::generator::{type::_, value::_};
+
+use ymirc::utils::{format, list};
+
+use ymirc::global::{core_, state};
+use ymirc::lexing::keys;
+
+use ymirc::lexing::word;
+
+use std::{io, fs::path};
+
+/**
+ * Expands function frames into YILFrame constants. Handles parameter
+ * initialization, destructor scheduling, frame body expansion, coverage
+ * instrumentation, and generation of the synthetic main() entry frame.
+ *
+ * All functions produce YILFrame nodes inserted into the global symbol table.
+ */
+pub mod FrameExpander {
+
+    /**
+     * Finalize a function frame.
+     *
+     * @params:
+     *   - context: the expansion context
+     *   - frame:   the frame generator node
+     *
+     * @returns:
+     *   - void
+     */
+    pub fn finalizeFrame(dmut context: &Expander, frame: &FrameGenerator) {
+        let mut list = StmtList();
+
+        let module = Path(frame.loc.filename).stripExtension();
+        let enterCoverage = state::isCodeCoverageActive() && state::package().isPrefix(module);
+
+        let name = Mangler::mangle(frame);
+        let FRAME_INFO = Mangler::mangleCoverageFrameInfo(frame);
+
+        let frameAddr = copy YILAddrValue(EOF_WORD, YIL_PTR_VOID, copy YILVar(EOF_WORD, name, YIL_VOID, 0us));
+        let frameCoverAddr = if enterCoverage {
+            copy YILAddrValue(EOF_WORD, YIL_PTR_VOID, copy YILVar(EOF_WORD, FRAME_INFO, YIL_VOID, 0us))
+        } else { YIL_UNIT_VALUE };
+
+        context:.enterSymbol();
+        context:.enterFrame(frame.name.toStr(), frameAddr-> frameAddr, frameCoverAddr-> frameCoverAddr);
+        context:.enterBlock();
+
+        let mut parameters: [&YILVarDecl] = [];
+        for p in frame.params {
+            let varId = context:.generateVarId();
+            let mut type = context:.finalizeType(p.type);
+            if (p.isLazy) {
+                let lazyType = context.typeExpander:.finalizeLazy();
+
+                let decl = copy YILVarDecl(p.loc, p.loc.str, lazyType, varId);
+                let varref = copy YILVar(p.loc, p.loc.str, lazyType, varId);
+                parameters ~= [decl];
+
+                let addr = copy YILAddrValue(p.loc, context.typeExpander:.finalizePointer(lazyType), varref);
+                context:.registerLazyRef(p.uniqId, varref);
+                context:.registerVariable(p.uniqId,
+                                          copy YILNameCallValue(p.loc,
+                                                                context.typeExpander:.finalizePointer(type),
+                                                                YRuntimeFuncs::CALL_LAZY, copy [addr]));
+            } else {
+                let vref = copy YILVar(p.loc, p.loc.str, type, varId);
+                let (finVref, finType) = if (p.isReference) {
+                    (copy YILUnrefValue(p.loc, type, vref),
+                     context.typeExpander:.finalizePointer(type))
+                } else if (p.type.isMovable) {
+                    ValueExpander::registerDestroy(alias context, vref, p.type, ref list, implicit-> false, param-> true);
+                    (vref, type)
+                } else {
+                    (vref, type)
+                };
+
+                parameters ~= [copy YILVarDecl(p.loc, p.loc.str, finType, varId)];
+                context:.registerVariable(p.uniqId, finVref);
+            }
+        }
+
+        ValueExpander::finalize(alias context, frame.body, ref list, asLeft-> false);
+        let mut body = if (list.hasDestroy) {
+            copy YILTryFinally(frame.body.loc, list[], list.getToDestroy())
+        } else {
+            copy YILBlock(frame.loc, list[])
+        };
+
+        // In unittest we inject frame code coverage monitoring
+        if enterCoverage {
+            let loc = frame.body.loc;
+            GlobalExpander::finalizeCoverageLocTable(alias context, frame);
+            context:.registerTouchSym(FRAME_INFO, loc);
+
+            let mut pre = StmtList(), mut exit = StmtList();
+            let enterVal = copy YILNameCallValue(loc, YIL_VOID, YRuntimeFuncs::COVERAGE_HIT_ENTER,
+                                                 copy [frameAddr, frameCoverAddr]);
+
+            pre:.append(copy YILCall(loc, enterVal));
+            pre:.append(body);
+
+            let exitVal = copy YILNameCallValue(loc, YIL_VOID, YRuntimeFuncs::COVERAGE_HIT_EXIT,
+                                                copy [frameAddr, frameCoverAddr]);
+
+            exit:.append(copy YILCall(loc, exitVal));
+
+            body = copy YILTryFinally(loc, pre[], exit[]);
+        }
+
+        context:.exitBlock();
+        context:.exitFrame();
+        let touching = context:.exitSymbol();
+
+        let final = copy YILFrame(frame.loc,
+                                  frame.implLoc,
+                                  name,
+                                  parameters,
+                                  context:.finalizeType(frame.retType),
+                                  body-> body,
+                                  isWeak-> frame.isWeak,
+                                  refs-> touching);
+
+        if (frame.isWeak) {
+            context:.insertWeak(name, final);
+        } else {
+            context:.insertSymbol(name, final);
+        }
+
+        if (!frame.isWeak && !state::isUnittestActive() && frame.name.asStdPath().file() == Keys::MAIN) {
+            FrameExpander::finalizeMainCall(alias context, frame.loc, name,
+                                            isVoid-> (frame.retType of VoidType));
+        }
+    }
+
+    /**
+     * Generate the synthetic main() entry frame.
+     *
+     * @params:
+     *   - context: the expansion context
+     *   - loc:     source location
+     *   - name:    mangled name of the module's main function
+     *   - isVoid:  whether the module's main returns void
+     *
+     * @returns:
+     *   - void
+     */
+    pub fn finalizeMainCall(dmut context: &Expander, loc: &Word, name: [c8], isVoid: bool) {
+        let mut list = StmtList();
+
+        context:.enterSymbol();
+        context:.enterFrame(name);
+        context:.enterBlock();
+
+        let argsT = copy [YIL_UINT_32, YIL_PTR_VOID];
+        let argIds = copy [context:.generateVarId(), context:.generateVarId()];
+
+        let argcDecl = copy YILVarDecl(EOF_WORD, "argc", argsT[0], argIds[0]);
+        let argvDecl = copy YILVarDecl(EOF_WORD, "argv", argsT[1], argIds[1]);
+
+        let argcRef = copy YILVar(EOF_WORD, "argc", argsT[0], argIds[0]);
+        let argvRef = copy YILVar(EOF_WORD, "argc", argsT[1], argIds[1]);
+
+        let moduleFuncMain = copy YILAddrValue(EOF_WORD, YIL_PTR_VOID, copy YILVar(EOF_WORD, name, YIL_VOID, 0us));
+        let runMain = if (state::isDebugActive()) {
+            YRuntimeFuncs::RUN_MAIN_DEBUG
+        } else {
+            YRuntimeFuncs::RUN_MAIN_RELEASE
+        };
+
+        let call = copy YILNameCallValue(EOF_WORD,
+                                         YIL_SINT_32,
+                                         runMain, copy [argcRef, argvRef, moduleFuncMain]);
+
+        if (isVoid) {
+            list:.append(copy YILCall(EOF_WORD, call));
+            list:.append(copy YILReturn(EOF_WORD, copy YILIntValue(EOF_WORD, YIL_SINT_32, 0us)));
+        } else {
+            list:.append(copy YILReturn(EOF_WORD, call));
+        }
+
+        context:.registerTouchSym(name, loc);
+        context:.exitBlock();
+        context:.exitFrame();
+        let touching = context:.exitSymbol();
+
+        let final = copy YILFrame(loc,
+                                  loc,
+                                  Keys::MAIN,
+                                  copy [argcDecl, argvDecl],
+                                  YIL_SINT_32,
+                                  body-> copy YILBlock(EOF_WORD, list[]),
+                                  isWeak-> false,
+                                  refs-> touching);
+
+        context:.insertSymbol(Keys::MAIN, final);
+    }
+}
