@@ -1,0 +1,363 @@
+/*
+ * Implements semantic validation for field access on class instances in Ymir.
+ *
+ * Supported contexts:
+ *   - normal class field access
+ *   - class-field-access type(ClassFieldAccType) during constructor pre-body
+ *   - special meta-fields: typeinfo, typeid, super
+ *
+ * <hr>
+ *
+ * @Package: ymirc
+ * @Module: ymirc::semantic::validator::value::operator::fields::class_::field
+ * @File: ymirc/semantic/validator/value/operator/fields/class_/field.yr
+ * @Author(s):
+ *   - Emile Cadorel <ecadorel@gmail.com>
+ *
+ * @Created(YYYY-MM-DD): 2026-04-21
+ * @Copyright(C) 2021–2026 GNU-Ymir
+ * @License
+ *   ```text
+ *   This file is part of the Ymir language project.
+ *
+ *   Ymir is free software: you can redistribute it and/or modify it
+ *   under the terms of the GNU General Public License as published by
+ *   the Free Software Foundation, either version 3 of the License, or
+ *   (at your option) any later version.
+ *
+ *   Ymir is distributed in the hope that it will be useful,
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *   GNU General Public License for more details.
+ *
+ *   You should have received a copy of the GNU General Public License
+ *   along with Ymir.  If not, see <https://www.gnu.org/licenses/>.
+ *   ```
+ */
+
+in field;
+
+use ymirc::syntax::{_, declaration::_, expression::_};
+use ymirc::semantic::{validator, symbol, declarator};
+use ymirc::semantic::generator::{value::_, type::_};
+
+use ymirc::errors;
+use ymirc::lexing::{word, keys};
+use ymirc::utils::format;
+
+
+/**
+ * ClassFieldAccessValidation
+ *
+ * Provides semantic validation for field access on class instances.
+ *
+ * The validator:
+ *   - ensures class layout is validated(lazy layout validation)
+ *   - checks visibility(private / protected / public)
+ *   - checks aliasing rules(ClassAliaserValue forbidden)
+ *   - resolves fields in the current class or ancestors
+ *   - handles immutable class instances by cloning field types
+ *   - distinguishes struct-style and class-style field access
+ *   - supports constructor pre-body access via ClassFieldAccType
+ *   - supports meta-fields: typeinfo, typeid, super
+ *
+ * This module defines the complete semantics of class field access in Ymir.
+ */
+pub mod ClassFieldAccessValidation {
+
+
+    /**
+     * Validate field access on a class instance using a ClassRefType.
+     *
+     * @params:
+     *   - context:      validation context
+     *   - loc:          operator location
+     *   - object:       validated class instance
+     *   - cref:         class reference type
+     *   - field:        field expression
+     *   - withAncestor: whether to search ancestor classes
+     *
+     * @returns:
+     *   A &Value representing the validated field access.
+     *
+     * @throws:
+     *   ErrorMsg if the field does not exist or visibility rules are violated.
+     */
+    pub fn validate(dmut context: &ValidationContext,
+                    loc:          &Word,
+                    object:       &Value,
+                    cref:         &ClassRefType,
+                    field:        &Expression,
+                    withAncestor: bool = true)-> &Value
+        throws ErrorMsg
+    {
+        if !cref.hasTypeInfo {
+            let dmut sym: &ClassSymbol = context:.getClassFromRef(cref.sym);
+            ClassValidation::validateLayout(alias context, alias sym);
+        }
+
+        let (inPrv, inProt) = context.getCurrentClassReferentProtections(cref);
+
+        if let vf: &VarExpr = field { // Only work with varexpr
+            for v in cref.localFields {
+                if (v.name == vf.name.str) {
+                    if (cref.sym.isFieldPrivate(v.name) && !inPrv) { // The field exists but is private, and we don't have access to private fields(outside class, or ancestor)
+                        throw copy ErrorMsg::fatal(field.loc, format(DeclareErrorMessage::PRIVATE_IN_THIS_CONTEXT, v.name),
+                                                   notes-> copy [copy ErrorMsg::note(v.loc, ValidateErrorMessage::DECLARED_HERE)]);
+                    } else if (cref.sym.isFieldProtected(v.name) && !inPrv && !inProt) { // The field exists but we are outside the class definition
+                        throw copy ErrorMsg::fatal(field.loc, format(DeclareErrorMessage::PRIVATE_IN_THIS_CONTEXT, v.name),
+                                                   notes-> copy [copy ErrorMsg::note(v.loc, ValidateErrorMessage::DECLARED_HERE)]);
+                    }
+
+                    if v.varType of ErrorType {
+                        throw copy ErrorMsg::fatal(field.loc, format(ValidateErrorMessage::CLASS_FIELD_NOT_VALIDATED_YET, v.name),
+                                                   notes-> copy [copy ErrorMsg::note(v.loc, ValidateErrorMessage::FORWARD_REFERENCE_TYPE)]);
+                    }
+
+                    // If the class is immutable, the field cannot be mutable
+                    let type = if (object.type.isDeeplyMutable) { v.varType } else { v.varType.clone(0u32) };
+
+                    if (object of ClassAliaserValue) {
+                        throw copy ErrorMsg::fatal(loc, end-> field.loc, format(ValidateErrorMessage::CLASS_ALIAS_FIELD));
+                    }
+
+                    // The field is public in this context, we return the access
+                    if (cref.sym.isStruct) {
+                        return copy StructFieldAccessValue(field.loc, type, object, v.name);
+                    } else {
+                        return copy ClassFieldAccessValue(field.loc, type, object, v.name);
+                    }
+                }
+            }
+
+            if (withAncestor) {
+                if let Ok(ancRef) = cref.ancestor {
+                    return ClassFieldAccessValidation::validate(alias context, loc, object, ancRef, field);
+                }
+            }
+        }
+
+        throw copy ErrorMsg::fatal(field.loc, format(ValidateErrorMessage::CLASS_NO_FIELD, object.type, field));
+    }
+
+    /**
+     * Validate field access during constructor pre-body using ClassFieldAccType.
+     *
+     * This mode is used only inside constructor pre-body, where fields may not
+     * yet be fully validated.
+     *
+     * @params:
+     *   - context: validation context
+     *   - loc:     operator location
+     *   - object:  validated class instance
+     *   - cacc:    ClassFieldAccType describing accessible fields
+     *   - field:   field expression
+     *
+     * @returns:
+     *   A &Value representing the validated field access.
+     *
+     * @throws:
+     *   ErrorMsg if the field is not validated or visibility rules are violated.
+     */
+    pub fn validate(dmut context: &ValidationContext,
+                    loc:          &Word,
+                    object:       &Value,
+                    cacc:         &ClassFieldAccType,
+                    field:        &Expression)-> &Value
+        throws ErrorMsg
+    {
+        if !context.isInCtorPreBody() { // Only callable from pre ctor
+            panic;
+        }
+
+        let (inPrv, inProt) = context.getCurrentClassReferentProtections(cacc.classRef);
+        let cref = cacc.classRef;
+
+        if let vf: &VarExpr = field { // Only work with varexpr
+            for v in cref.localFields {
+                if (v.name == vf.name.str) {
+                    if (cref.sym.isFieldPrivate(v.name) && !inPrv) { // The field exists but is private, and we don't have access to private fields(outside class, or ancestor)
+                        throw copy ErrorMsg::fatal(field.loc, format(DeclareErrorMessage::PRIVATE_IN_THIS_CONTEXT, v.name),
+                                                   notes-> copy [copy ErrorMsg::note(v.loc, ValidateErrorMessage::DECLARED_HERE)]);
+                    } else if (cref.sym.isFieldProtected(v.name) && !inPrv && !inProt) { // The field exists but we are outside the class definition
+                        throw copy ErrorMsg::fatal(field.loc, format(DeclareErrorMessage::PRIVATE_IN_THIS_CONTEXT, v.name),
+                                                   notes-> copy [copy ErrorMsg::note(v.loc, ValidateErrorMessage::DECLARED_HERE)]);
+                    }
+
+                    if !cacc.isFieldValidated(v.name) {
+                        throw copy ErrorMsg::fatal(field.loc, format(ValidateErrorMessage::CLASS_FIELD_NOT_VALIDATED_YET, v.name),
+                                                   notes-> copy [copy ErrorMsg::note(v.loc, ValidateErrorMessage::DECLARED_HERE)]);
+                    }
+
+                    else if v.varType of ErrorType {
+                        throw copy ErrorMsg::fatal(field.loc, format(ValidateErrorMessage::CLASS_FIELD_NOT_VALIDATED_YET, v.name),
+                                                   notes-> copy [copy ErrorMsg::note(v.loc, ValidateErrorMessage::FORWARD_REFERENCE_TYPE)]);
+                    }
+
+                    // If the class is immutable, the field cannot be mutable
+                    let type = if (object.type.isDeeplyMutable) { v.varType } else { v.varType.clone(0u32) };
+
+                    if (object of ClassAliaserValue) {
+                        throw copy ErrorMsg::fatal(loc, end-> field.loc, format(ValidateErrorMessage::CLASS_ALIAS_FIELD));
+                    }
+
+                    // The field is public in this context, we return the access
+                    if (cref.sym.isStruct) {
+                        return copy StructFieldAccessValue(field.loc, type, object, v.name);
+                    } else {
+                        return copy ClassFieldAccessValue(field.loc, type, object, v.name);
+                    }
+                }
+            }
+        }
+
+        throw copy ErrorMsg::fatal(field.loc, format(ValidateErrorMessage::CLASS_NO_FIELD, object.type, field));
+    }
+
+    /**
+     * Validate access to special meta-fields on class instances.
+     *
+     * Supported meta-fields:
+     *   - typeinfo — returns the class's TypeInfo
+     *   - typeid   — returns the class's type identifier
+     *   - super    — returns a proxy to the ancestor class (if any)
+     *
+     * Behavior:
+     *   - Strip surrounding underscores from the field name.
+     *
+     * @params:
+     *   - context: validation context
+     *   - object:  validated class instance
+     *   - cref:    class reference type
+     *   - field:   field expression
+     *
+     * @returns:
+     *   A &Value representing the validated meta-field access.
+     *
+     * @throws:
+     *   ErrorMsg if the field is not a recognized meta-field.
+     */
+    pub fn validateBasic(dmut context: &ValidationContext,
+                         object:       &Value,
+                         cref:         &ClassRefType,
+                         field:        &Expression)-> &Value
+        throws ErrorMsg
+    {
+        if let v: &VarExpr = field match string::stripUnders(v.name.str) {
+            Keys::TYPEINFO => {
+                return ClassFieldAccessValidation::validateTypeInfo(alias context, field.loc, object, cref);
+            }
+            Keys::TYPEID => {
+                return ClassFieldAccessValidation::validateTypeId(field.loc, object, cref);
+            }
+            Keys::SUPER if !cref.sym.isStruct => {
+                return ClassFieldAccessValidation::validateSuper(field.loc, object, cref);
+            }
+        }
+
+        throw copy ErrorMsg::list([]);
+    }
+
+    /**
+     * Validate access to the `typeinfo` meta-field. Static access for struct,
+     * runtime access for classes.
+     *
+     * @params:
+     *   - context: validation context
+     *   - loc:     operator location
+     *   - object:  validated class instance
+     *   - cref:    class reference type
+     *
+     * @returns:
+     *   A &Value representing the class's TypeInfo.
+     */
+    fn validateTypeInfo(dmut context: &ValidationContext, loc: &Word, object: &Value, cref: &ClassRefType)-> &Value
+        throws ErrorMsg
+    {
+        if (cref.sym.isStruct) {
+            return TypeInfo::validate(alias context, object.loc, cref);
+        }
+
+        let typeinfoT = cref.typeInfo.type;
+        return copy ClassTypeInfoAccessValue(loc, typeinfoT, object-> object);
+    }
+
+    /**
+     * Validate access to the `typeid` meta-field.
+     *
+     * Behavior:
+     *   - For structs:
+     *        return StringValue containing the struct's instance name
+     *
+     *   - For classes:
+     *        - load the class's TypeInfoValue at runtime
+     *        - return the name field of the TypeInfo
+     *
+     * @params:
+     *   - loc:     operator location
+     *   - object:  validated class instance
+     *   - cref:    class reference type
+     *
+     * @returns:
+     *   A &Value representing the type identifier.
+     */
+    fn validateTypeId(loc: &Word, object: &Value, cref: &ClassRefType)-> &Value {
+        if (cref.sym.isStruct)  {
+            let content = format("%", cref.createInstance(isMutable-> object.type.isMutable,
+                                                          isInnerMutable-> object.type.isDeeplyMutable));
+
+            return copy StringValue(object.loc, content);
+        }
+
+        let typeinfoV = if let t: &TypeInfoValue = cref.typeInfo { t } else { panic; };
+        let nameT = typeinfoV.name.type;
+
+        let typeInfo = copy ClassTypeInfoAccessValue(loc, typeinfoV.type, object-> object);
+        return copy StructFieldAccessValue(loc, nameT, typeInfo, TypeInfoKeys::NAME);
+    }
+
+    /**
+     * Validate access to the `super` meta-field.
+     *
+     * Behavior:
+     *   - Ensure the access is performed on `self`
+     *   - Ensure the class has an ancestor
+     *   - Construct a SuperProxyValue that:
+     *        - wraps the ancestor instance
+     *        - preserves mutability and deep mutability
+     *        - binds the proxy to the original object
+     *
+     * @params:
+     *   - loc:     operator location
+     *   - object:  validated class instance
+     *   - cref:    class reference type
+     *
+     * @returns:
+     *   A &Value representing the super-class proxy.
+     *
+     * @throws:
+     *   ErrorMsg if:
+     *     - the access is not on `self`
+     *     - the class has no ancestor
+     */
+    fn validateSuper(loc: &Word, object: &Value, cref: &ClassRefType)-> &Value
+        throws ErrorMsg
+    {
+        if (!VariableVerification::isSelf(object)) {
+            throw copy ErrorMsg::fatal(loc,
+                                       end-> object.loc,
+                                       format(ValidateErrorMessage::SUPER_NO_SELF_CLASS, cref));
+        }
+
+
+        if let Ok(c) = cref.ancestor {
+            return copy SuperProxyValue(loc,
+                                        c.createInstance(isMutable-> object.type.isMutable, isInnerMutable-> object.type.isDeeplyMutable),
+                                        object);
+        }
+
+        throw copy ErrorMsg::fatal(loc,
+                                   end-> object.loc,
+                                   format(ValidateErrorMessage::NO_SUPER_CLASS, cref.createInstance(false, false)));
+    }
+}

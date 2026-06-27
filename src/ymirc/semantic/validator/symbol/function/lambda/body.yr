@@ -1,0 +1,304 @@
+/*
+ * Implements semantic validation of lambda bodies and construction of
+ * lambda frames and delegate values.
+ *
+ * This module handles:
+ *   - validation of lambda bodies,
+ *   - closure-capture validation,
+ *   - return-type inference for lambdas,
+ *   - construction of synthetic return statements,
+ *   - validation of throwers inside lambdas,
+ *   - creation of lambda frames with or without closures,
+ *   - construction of NameDelegateValue and ProtoFuncPtrValue results,
+ *   - error reporting for lazy and template-specialization failures.
+ *
+ * Lambda body validation is performed in a closure-aware context, allowing
+ * correct tracking of captured variables and closure types.
+ *
+ * <hr>
+ *
+ * @Package: ymirc
+ * @Module: ymirc::semantic::validator::symbol::function::lambda::body
+ * @File: ymirc/semantic/validator/symbol/function/lambda/body.yr
+ * @Author(s):
+ *   - Emile Cadorel <ecadorel@gmail.com>
+ *
+ * @Created(YYYY-MM-DD): 2026-05-26
+ * @Copyright(C) 2021–2026 GNU-Ymir
+ * @License
+ *   ```text
+ *   This file is part of the Ymir language project.
+ *
+ *   Ymir is free software: you can redistribute it and/or modify it
+ *   under the terms of the GNU General Public License as published by
+ *   the Free Software Foundation, either version 3 of the License, or
+ *   (at your option) any later version.
+ *
+ *   Ymir is distributed in the hope that it will be useful,
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *   GNU General Public License for more details.
+ *
+ *   You should have received a copy of the GNU General Public License
+ *   along with Ymir.  If not, see <https://www.gnu.org/licenses/>.
+ *   ```
+ */
+
+in body;
+
+use ymirc::syntax::{expression::_, declaration::_};
+use ymirc::semantic::{validator, template_};
+use ymirc::semantic::{generator::_, symbol};
+use ymirc::semantic::generator::{value::_, type::_};
+
+use ymirc::errors;
+use ymirc::utils::{format, log};
+use ymirc::lexing::{word, tokens, keys};
+
+use ymirc::semantic::validator::symbol::function::lambda::_;
+
+/**
+ * LambdaBodyValidation module
+ *
+ * Provides semantic validation for lambda bodies and construction of the
+ * resulting delegate or function-pointer values.
+ * Responsibilities:
+ *
+ *   - validate lambda bodies,
+ *   - validate closure captures,
+ *   - infer return types,
+ *   - enforce no-throw semantics inside lambdas,
+ *   - generate synthetic return statements,
+ *   - construct lambda frames(FrameGenerator),
+ *   - construct delegate values(NameDelegateValue),
+ *   - construct function-pointer values(ProtoFuncPtrValue),
+ *   - generate error messages for lazy and template specialization failures.
+ *
+ */
+pub mod LambdaBodyValidation {
+
+    /**
+     * Validate the body of a lambda and compute:
+     *   - the validated body value,
+     *   - the closure type(if any),
+     *   - the inferred return type.
+     *
+     * @params:
+     *   - context:     validation context
+     *   - refId:       unique id for closure variable binding
+     *   - lmbd:        lambda value
+     *   - forLazy:     whether lambda is used in a lazy context
+     *   - castClosure: whether closure is synthesized(fptr → delegate)
+     *
+     * @returns:
+     *   - (body, closureType, retType)
+     *
+     * @throws:
+     *   - ErrorMsg if validation fails or lambda contains throwers
+     */
+    pub fn validate(dmut context: &ValidationContext,
+                    refId:        usize,
+                    lmbd:         &LambdaValue,
+                    forLazy:      bool,
+                    castClosure:  bool)-> (&Value, &Type, &Type)
+        throws ErrorMsg
+    {
+        if lmbd.isClosure {
+            context:.enterClosure(lmbd.loc, refId, lmbd.index);
+        }
+
+        let mut body = {
+            ValueValidation::validate(alias context, lmbd.body)
+        } catch {
+            err => {
+                if lmbd.isClosure {
+                    context:.exitClosure();
+                }
+                throw err;
+            }
+        };
+
+        let mut retType = context.getFunctionReturn();
+        let mut closure: &Type = NONE_TYPE;
+        if (lmbd.isClosure) {
+            let ret = context:.exitClosure();
+            if (ret.types.len == 0us && !forLazy) {
+                throw copy ErrorMsg::fatal(lmbd.copyLoc, format(ValidateErrorMessage::UNECESSARY_LMBD_COPY));
+            }
+            closure = ret;
+        } else if (castClosure) {
+            closure = copy ClosureType::empty(EOF_WORD, refId);
+        }
+
+        if (!body.isReturner) { // If there is a path in the body that leads to an exit with no return
+            if retType of NoneType {
+                if (forLazy) {
+                    retType = VOID_TYPE;
+                } else {
+                    retType = body.type;
+                }
+            } else {
+                body = TypeInference::inferValueForType(alias context, retType.loc, body, retType,
+                                                        byReference-> false);
+
+                MemoryVerification::verifyMemoryOwner(retType.loc, retType, body,
+                                                      construct-> true,
+                                                      byReference-> false);
+            }
+
+            if (retType !of VoidType && retType !of NoneType) {
+                body = copy ReturnValue(body.loc, body);
+            }
+        }
+
+        if (body.throwers.len != 0us) {
+            let mut list = copy [copy ErrorMsg::note(it.loc, format("%", it.type)) for it in body.throwers];
+            throw copy ErrorMsg::fatal(lmbd.loc, format(ValidateErrorMessage::THROWS_IN_LAMBDA),
+                                       notes-> list);
+        }
+
+        return (body, closure, retType);
+    }
+
+    /**
+     * Construct a lambda frame and delegate value for a closure lambda.
+     *
+     * Steps:
+     *   1. Build a TupleType for the closure and a PointerType to it.
+     *   2. Create the implicit closure parameter(fstParam).
+     *   3. Construct a FrameGenerator with fstParam + params.
+     *   4. Construct the closure value:
+     *        - TupleValue if closure has captured values,
+     *        - NullValue otherwise.
+     *   5. Construct a NamePrototypeValue for the lambda.
+     *   6. Construct a NameDelegateValue using:
+     *        - closure value,
+     *        - reference flags,
+     *        - lazy flags,
+     *        - parameter types,
+     *        - return type.
+     *
+     * @returns:
+     *   - (delegateValue, frame)
+     *
+     * @throws:
+     *   - ErrorMsg if frame construction fails
+     */
+    pub fn createFrameWithClosure(lmbd:    &LambdaValue,
+                                  cl:      &ClosureType,
+                                  refs:    [bool],
+                                  lazys:   [bool],
+                                  types:   [&Type],
+                                  params:  [&ProtoVarDeclValue],
+                                  retType: &Type,
+                                  body:    &Value,
+                                  refId:   usize,
+                                  castClosure: bool)-> (&Value, &FrameGenerator)
+        throws ErrorMsg
+    {
+        let closureType = copy TupleType(cl.loc, cl.types, isMutable-> false);
+        let ptrType = copy PointerType(cl.loc, closureType, isMutable-> false);
+
+        // We override the uniq Id of the next variable, so all the varref to closure are refering to this proto variable
+        let fstParam = copy ProtoVarDeclValue(cl.loc.locate("#{CLOSURE-VARREF}"), ptrType, uniqId-> refId);
+        let frame = copy FrameGenerator(lmbd.loc, lmbd.loc, lmbd.name,
+                                        params-> copy [fstParam] ~ params,
+                                        retType,
+                                        body,
+                                        FrameKind::LMBD,
+                                        isWeak-> true);
+
+        let closureValue = if (cl.types.len != 0us) {
+            copy CopierValue(cl.loc,
+                             ptrType,
+                             copy TupleValue(cl.loc, closureType, cl.values))
+        } else {
+            copy NullValue(cl.loc, ptrType)
+        };
+
+        let proto = copy NamePrototypeValue(lmbd.loc, lmbd.loc, lmbd.name,
+                                            copy [fstParam] ~ params,
+                                            retType,
+                                            isLambda-> true);
+
+        let dgValue = copy NameDelegateValue(lmbd.loc, proto,
+                                             closure-> closureValue,
+                                             refs,
+                                             lazys,
+                                             types,
+                                             retType,
+                                             isFromFptr-> (castClosure && !lmbd.isClosure));
+
+        return (dgValue, frame);
+    }
+
+    /**
+     * Construct a lambda frame and function-pointer value for a non-closure lambda.
+     *
+     * Responsibilities:
+     *   - generate a FrameGenerator for the lambda,
+     *   - construct a NamePrototypeValue,
+     *   - construct a ProtoFuncPtrValue representing the resulting function pointer.
+     *
+     * This is used when the lambda does not capture any variables.
+     *
+     * @returns:
+     *   - (funcPtrValue, frame)
+     */
+    pub fn createFrameNoClosure(lmbd:    &LambdaValue,
+                                refs:    [bool],
+                                lazys:   [bool],
+                                types:   [&Type],
+                                params:  [&ProtoVarDeclValue],
+                                retType: &Type,
+                                body:    &Value)-> (&Value, &FrameGenerator)
+    {
+        let frame = copy FrameGenerator(lmbd.loc, lmbd.loc, lmbd.name,
+                                        params-> params,
+                                        retType,
+                                        body,
+                                        FrameKind::LMBD,
+                                        isWeak-> true);
+
+        let proto = copy NamePrototypeValue(lmbd.loc, lmbd.loc, lmbd.name, params, retType,
+                                            isLambda-> true);
+        let delegate = copy ProtoFuncPtrValue(lmbd.loc, proto, refs, lazys, types, retType);
+
+        return (delegate, frame);
+    }
+
+    /**
+     * Construct an error message for lambda instantiation failures.
+     *
+     * @params:
+     *   - loc:        error location
+     *   - paramTypes: list of parameter types
+     *   - forLazy:    whether the lambda is lazy
+     *   - note:       additional diagnostic note
+     *
+     * @returns:
+     *   - ErrorMsg describing the failure
+     */
+    pub fn createError(loc: &Word, paramTypes: [&Type], forLazy: bool, note: &ErrorMsg)-> &ErrorMsg {
+        let dmut stream = copy Formatter();
+        if (forLazy) {
+            for i, ti in paramTypes {
+                if (i != 0us) stream:.write(", ");
+                stream:.write(format("%", ti));
+            }
+
+            return copy ErrorMsg::fatal(loc, format(ValidateErrorMessage::LAZY_VALIDATION, stream),
+                                        notes-> copy [note]);
+        }
+
+        stream:.write('{');
+        for i, ti in paramTypes {
+            if (i != 0us) stream:.write(", ");
+            stream:.write(format("%", ti));
+        }
+        stream:.write('}');
+
+        return copy ErrorMsg::fatal(loc, format(ValidateErrorMessage::TEMPLATE_SPECIALIZATION_FAILS_SIMPLE, stream),
+                                    notes-> copy [note]);
+    }
+}

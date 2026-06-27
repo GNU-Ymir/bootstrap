@@ -1,0 +1,465 @@
+/*
+ * Declares the SliceOrArrayInterpret module, used to reduce slice or array
+ * related operations.
+ *
+ * <hr>
+ *
+ * @Package: ymirc
+ * @Module: ymirc::semantic::interpret::array
+ * @File: ymirc/semantic/interpret/array.yr
+ * @Author(s):
+ *   - Emile Cadorel <ecadorel@gmail.com>
+ *
+ * @Created(YYYY-MM-DD): 2026-03-14
+ * @Copyright(C) 2021–2026 GNU-Ymir
+ * @License
+ *   ```text
+ *   This file is part of the Ymir language project.
+ *
+ *   Ymir is free software: you can redistribute it and/or modify it
+ *   under the terms of the GNU General Public License as published by
+ *   the Free Software Foundation, either version 3 of the License, or
+ *   (at your option) any later version.
+ *
+ *   Ymir is distributed in the hope that it will be useful,
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *   GNU General Public License for more details.
+ *
+ *   You should have received a copy of the GNU General Public License
+ *   along with Ymir.  If not, see <https://www.gnu.org/licenses/>.
+ *   ```
+ */
+
+in array;
+
+use ymirc::lexing::{word, keys};
+
+use ymirc::semantic::{symbol, validator};
+use ymirc::semantic::generator::{_, value::_, type::_};
+
+use ymirc::errors;
+use ymirc::utils::{format, bigint};
+
+use std::io;
+
+/*
+ * Compile-time reduction logic for slice and array operations.
+ *
+ * This module handles:
+ *   • array access
+ *   • slice access
+ *   • slice append(~)
+ *   • slice concatenation(~ between slices/strings)
+ *   • special operators on strings(==, !=, <, >, etc.)
+ *
+ * Reduction strategy:
+ *   - Operands are reduced using `reduceInOperator` when possible.
+ *   - Literal arrays, slices, and strings allow full constant folding.
+ *   - When folding is not possible, the operator is reconstructed with
+ *     reduced operands and marked as reduced.
+ *
+ * Supports UTF-8, UTF-16, and UTF-32 string encodings.
+ *
+ */
+pub mod SliceOrArrayInterpret {
+
+    /**
+     * Dispatches slice/array operators to the appropriate reducer.
+     *
+     * Supported:
+     *   - ArrayAccessValue
+     *   - SliceAccessValue
+     *   - SliceAppendValue
+     *   - SliceConcatValue
+     *
+     * Returns the reduced value or a reconstructed operator.
+     *
+     */
+    pub fn reduceSliceOrArray(dmut context: &CompileTimeInterpret, op: &SliceOrArrayOperatorValue, inOperator: bool)-> &Value
+        throws ErrorMsg
+    {
+        inOperator; // ignored
+        match op {
+            a: &ArrayAccessValue => { return reduceArrayAccess(alias context, a); }
+            a: &SliceAccessValue => { return reduceSliceAccess(alias context, a); }
+            a: &SliceAppendValue => { return reduceSliceAppend(alias context, a); }
+            c: &SliceConcatValue => { return reduceSliceConcat(alias context, c); }
+            _ => {
+                eprintln("internal slice/array interpret error: ", op._typeinfo.name);
+                panic;
+            }
+        }
+    }
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          SPECIAL          =====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Reduces special slice/array operators, mainly string comparisons.
+     *
+     * If both operands are StringValue:
+     *   - Boolean comparisons(==, !=) fold to BoolValue.
+     *   - Ordering comparisons(<, >, <=, >=) fold to IntValue(-1, 0, 1).
+     *
+     * Otherwise, reconstructs the operator with reduced operands.
+     */
+    pub fn reduceSpe(dmut context: &CompileTimeInterpret, bin: &SpecialArrayOperatorValue)-> &Value
+        throws ErrorMsg
+    {
+        let left = context:.reduceInOperator(bin.left, checkCte-> false);
+        let right = context:.reduceInOperator(bin.right, checkCte-> false);
+
+        if let (l: &StringValue, r: &StringValue) = (left, right) {
+            if (bin.type of BoolType) { // ==, or !=
+                return SliceOrArrayInterpret::compareStringBool(bin.loc, bin.op, l, r);
+            } else { // <=, >=, etc.
+                return SliceOrArrayInterpret::compareStringInt(bin.loc, bin.op, l, r);
+            }
+        }
+
+        return copy SpecialArrayOperatorValue(bin.loc,
+                                               bin.type,
+                                               bin.op,
+                                               context:.reduce(bin.left),
+                                               context:.reduce(bin.right),
+                                               bin.call,
+                                               isReduced-> true);
+    }
+
+    /**
+     * Reduces special slice/array operators, mainly string comparisons.
+     *
+     * If both operands are StringValue:
+     *   - Boolean comparisons(==, !=) fold to BoolValue.
+     *
+     * Otherwise, reconstructs the operator with reduced operands.
+     *
+     */
+    pub fn reduceCmp(dmut context: &CompileTimeInterpret, loc: &Word, op: BinaryOperators, vleft: &Value, vright: &Value)-> (&Value?)
+        throws ErrorMsg
+    {
+        let left = context:.reduceInOperator(vleft, checkCte-> false);
+        let right = context:.reduceInOperator(vright, checkCte-> false);
+
+        if let (l: &StringValue, r: &StringValue) = (left, right) {
+            return SliceOrArrayInterpret::compareStringBool(loc, op, l, r)?;
+        }
+
+        return none;
+    }
+
+    /**
+     * Compares two strings for equality/inequality.
+     * Requires identical encoding sizes.
+     *
+     */
+    fn compareStringBool(loc: &Word, op: BinaryOperators, left: &StringValue, right: &StringValue)-> &Value {
+        if (left.encodingSize != right.encodingSize) panic;
+
+        let result = (left == right);
+        if (op == BinaryOperators::DEQUAL) {
+            return copy BoolValue(loc, result);
+        } else {
+            return copy BoolValue(loc, !result);
+        }
+    }
+
+    /**
+     * Performs lexicographical comparison of two strings.
+     * Returns -1, 0, or 1 as an IntValue.
+     *
+     */
+    fn compareStringInt(loc: &Word, _: BinaryOperators, left: &StringValue, right: &StringValue)-> &Value {
+        if (left.encodingSize != right.encodingSize) panic;
+
+        let mi = if (left.len > right.len) { left.len } else { right.len };
+
+        match left.encodingSize {
+            8u16 => {
+                for i in 0us .. mi {
+                    if (left.value.utf8[i] < right.value.utf8[i]) return copy IntValue(loc, -1is, size-> 32u16, isSigned-> true);
+                    else if (left.value.utf8[i] > right.value.utf8[i]) return copy IntValue(loc, 1is, size-> 32u16, isSigned-> true);
+                }
+
+                if (left.len > right.len) return copy IntValue(loc, 1is, size-> 32u16, isSigned-> true);
+                else if (left.len < right.len) return copy IntValue(loc, -1is, size-> 32u16, isSigned-> true);
+                return copy IntValue(loc, 0is, size-> 32u16, isSigned-> true);
+            }
+            16u16 => {
+                for i in 0us .. mi {
+                    if (left.value.utf16[i] < right.value.utf16[i]) return copy IntValue(loc, -1is, size-> 32u16, isSigned-> true);
+                    else if (left.value.utf16[i] > right.value.utf16[i]) return copy IntValue(loc, 1is, size-> 32u16, isSigned-> true);
+                }
+
+                if (left.len > right.len) return copy IntValue(loc, 1is, size-> 32u16, isSigned-> true);
+                else if (left.len < right.len) return copy IntValue(loc, -1is, size-> 32u16, isSigned-> true);
+                return copy IntValue(loc, 0is, size-> 32u16, isSigned-> true);
+            }
+            _ => {
+                for i in 0us .. mi {
+                    if (left.value.utf32[i] < right.value.utf32[i]) return copy IntValue(loc, -1is, size-> 32u16, isSigned-> true);
+                    else if (left.value.utf32[i] > right.value.utf32[i]) return copy IntValue(loc, 1is, size-> 32u16, isSigned-> true);
+                }
+
+                if (left.len > right.len) return copy IntValue(loc, 1is, size-> 32u16, isSigned-> true);
+                else if (left.len < right.len) return copy IntValue(loc, -1is, size-> 32u16, isSigned-> true);
+                return copy IntValue(loc, 0is, size-> 32u16, isSigned-> true);
+            }
+        }
+    }
+
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * =====================================          ACCESS          =====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Reduces slice indexing(slice[i]).
+     *
+     * Steps:
+     *   1. Reduce slice and index.
+     *   2. If index is an IntValue, attempt constant folding:
+     *        - ArrayValue → return element
+     *        - StringValue → return CharValue at index
+     *   3. Otherwise, rebuild the operator.
+     *
+     * Performs bounds checking and reports ARRAY_OVERFLOW.
+     *
+     */
+    fn reduceSliceAccess(dmut context: &CompileTimeInterpret, slc: &SliceAccessValue)-> &Value
+        throws ErrorMsg
+    {
+        let array = context:.reduceInOperator(slc.slice, checkCte-> false);
+        let index = context:.reduceInOperator(slc.index, checkCte-> false);
+
+        let u_index = match index {
+            i: &IntValue => {
+                {
+                    i.value.to!usize()
+                } catch {
+                    _ => throw copy ErrorMsg::fatal(i.loc,
+                                                     format(ValidateErrorMessage::OVERFLOW_CAPACITY, USIZE_TYPE, i.value, usize::max));
+                }
+            }
+            _ => {
+                return copy SliceAccessValue(loc-> slc.loc,
+                                              type-> slc.type,
+                                              slice-> context:.reduce(slc.slice),
+                                              index-> context:.reduce(slc.index),
+                                              isReduced-> true);
+            }
+        };
+
+
+        if let a: &ArrayValue = array { // Slice type, but array value(means it was an implicit cast)
+            if (a.values.len <= u_index) {
+                throw copy ErrorMsg::fatal(a.loc, format(ValidateErrorMessage::ARRAY_OVERFLOW, a.values.len, u_index));
+            }
+
+            return a.values[u_index];
+        }
+
+        if let str: &StringValue = array { // String values are slice of c8, c16, c32
+            if (str.len  <= u_index) {
+                throw copy ErrorMsg::fatal(str.loc, format(ValidateErrorMessage::ARRAY_OVERFLOW, str.len, u_index));
+            }
+
+            let chType = if let s: &SliceType = str.type {
+                if let c: &CharType = s.value { c } else { panic; }
+            } else { panic; };
+
+            return match str.encodingSize {
+                8u16 => {
+                    copy CharValue(slc.loc, chType, str.value.utf8[u_index])
+                }
+                16u16 => {
+                    copy CharValue(slc.loc, chType, str.value.utf16[u_index])
+                }
+                _ => {
+                    copy CharValue(slc.loc, chType, str.value.utf32[u_index])
+                }
+            };
+        }
+
+        return copy SliceAccessValue(loc-> slc.loc,
+                                      type-> slc.type,
+                                      slice-> context:.reduce(slc.slice),
+                                      index-> context:.reduce(slc.index),
+                                      isReduced-> true);
+    }
+
+    /**
+     * Reduces array indexing(array[i]).
+     *
+     * Supports:
+     *   - ArrayValue literals
+     *   - ArrayAllocValue([value ; size])
+     *
+     * Performs:
+     *   - index reduction
+     *   - usize conversion with overflow checks
+     *   - bounds checking
+     *   - constant folding when possible
+     *
+     * Rebuilds the operator if folding is not possible.
+     *
+     */
+    fn reduceArrayAccess(dmut context: &CompileTimeInterpret, a: &ArrayAccessValue)-> &Value
+        throws ErrorMsg
+    {
+        let value = context:.reduceInOperator(a.array, checkCte-> false);
+        let index = context:.reduceInOperator(a.index, checkCte-> false);
+
+        let u_index = match index {
+            i: &IntValue => {
+                {
+                    i.value.to!usize()
+                } catch {
+                    _ => throw copy ErrorMsg::fatal(i.loc,
+                                                     format(ValidateErrorMessage::OVERFLOW_CAPACITY, USIZE_TYPE, i.value, usize::max));
+                }
+            }
+            _ => {
+                return copy ArrayAccessValue(a.loc,
+                                              a.type,
+                                              context:.reduce(a.array),
+                                              context:.reduce(a.index),
+                                              isReduced-> true);
+            }
+        };
+
+
+        if let lit: &ArrayValue = value { // [1, 2, 3]
+            if (lit.values.len <= u_index) {
+                throw copy ErrorMsg::fatal(a.loc, format(ValidateErrorMessage::ARRAY_OVERFLOW, lit.values.len, u_index));
+            }
+
+            return lit.values[u_index];
+        }
+
+        if let lit: &ArrayAllocValue = value { // [i ; size]
+            if let len: &IntValue = lit.len {
+                if (len.value <= u_index) {
+                    throw copy ErrorMsg::fatal(a.loc, format(ValidateErrorMessage::ARRAY_OVERFLOW, len, u_index));
+                }
+
+                // 1. [value ; size][i]-> value iff(i < size),
+                // 2. if copy [value ; size]:
+                //    - then it's not cte, so we don't accept to return it
+                //    - but since it's an array access, then it should never be dynamic, otherwise it would have been a slice access
+                if (!lit.isDynamic) {
+                    return lit.value
+                }
+            }
+        }
+
+        return copy ArrayAccessValue(loc-> a.loc,
+                                      type-> a.type,
+                                      array-> context:.reduce(a.array),
+                                      index-> context:.reduce(a.index),
+                                      isReduced-> true);
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * =====================================          APPEND          =====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Reduces slice append(left ~= right).
+     *
+     * Append is inherently runtime(left is an lvalue), so only operands are
+     * reduced; the operator itself is not folded.
+     *
+     */
+    fn reduceSliceAppend(dmut context: &CompileTimeInterpret, app: &SliceAppendValue)-> &Value
+        throws ErrorMsg
+    {
+        // unlike slice concat, left value is necessarily not cte, since it is the lvalue, i.e. left = left ~ right
+        // So we can't really reduce the operation, it's a runtime operation by construction
+
+        let left = context:.reduce(app.left);
+        let right = context:.reduce(app.right);
+
+        return copy SliceAppendValue(app.loc,
+                                      app.type,
+                                      left,
+                                      right,
+                                      isReduced-> true);
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * =====================================          CONCAT          =====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Reduces slice/string concatenation.
+     *
+     * If both operands are StringValue with matching encodings, concatenates
+     * them at compile time. Otherwise, rebuilds the operator.
+     *
+     */
+    fn reduceSliceConcat(dmut context: &CompileTimeInterpret, value: &SliceConcatValue)-> &Value
+        throws ErrorMsg
+    {
+        let left = context:.reduceInOperator(value.left, checkCte-> false);
+        let right = context:.reduceInOperator(value.right, checkCte-> false);
+
+        match (left, right) {
+            (l: &StringValue, r: &StringValue) => {
+                return SliceOrArrayInterpret::concatStrings(value.loc, value.type, l, r);
+            }
+        }
+
+        return copy SliceConcatValue(value.loc,
+                                      value.type,
+                                      context:.reduce(value.left),
+                                      context:.reduce(value.right),
+                                      isReduced-> true);
+    }
+
+    /**
+     * Concatenates two StringValue literals, preserving encoding.
+     * Returns a new StringValue of the expected slice type.
+     *
+     */
+    fn concatStrings(loc: &Word, type: &Type, left: &StringValue, right: &StringValue)-> &Value {
+        if (left.encodingSize != right.encodingSize) { panic; }
+
+        let res = match left.encodingSize {
+            8u16 => {
+                StringValueContent(utf8-> left.value.utf8 ~ right.value.utf8)
+            }
+            16u16 => {
+                StringValueContent(utf16-> left.value.utf16 ~ right.value.utf16)
+            }
+            _ => {
+                StringValueContent(utf32-> left.value.utf32 ~ right.value.utf32)
+            }
+        };
+
+        if let s: &SliceType = type {
+            return copy StringValue(loc, s, res);
+        }
+
+        panic;
+    }
+
+
+}

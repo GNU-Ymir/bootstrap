@@ -1,0 +1,643 @@
+/*
+ * Implements validation for shallow and deep copy expressions in Ymir.
+ *
+ * Copying is a core semantic operation that produces new storage for values.
+ * Ymir supports two forms of copying:
+ *
+ *   - shallow copy (`copy x`)
+ *       Duplicates the outer container but preserves references to inner data.
+ *
+ *   - deep copy (`dcopy x`)
+ *       Recursively duplicates all nested structures, producing a fully
+ *       independent value.
+ *
+ * This module validates copy expressions, determines whether the value already
+ * satisfies the copy semantics, and constructs the appropriate CopierValue,
+ * SliceCtorValue, ArrayValue, or class deep-copy call.
+ *
+ * Responsibilities:
+ *   - enforce copy/dcopy restrictions(no lazy or expanded values)
+ *   - perform compile-time reduction before copying
+ *   - detect already-allocated values that do not require copying
+ *   - generate shallow copies for slices, arrays, and maps
+ *   - generate deep copies for classes, slices, arrays, and maps
+ *   - call user-defined deep-copy methods when required
+ *   - compute pointer depth for deep-copy decisions
+ *
+ * <hr>
+ *
+ * @Package: ymirc
+ * @Module: ymirc::semantic::validator::value::memory::copy_
+ * @File: ymirc/semantic/validator/value/memory/copy_.yr
+ * @Author(s):
+ *   - Emile Cadorel <ecadorel@gmail.com>
+ *
+ * @Created(YYYY-MM-DD): 2026-03-30
+ * @Copyright(C) 2021–2026 GNU-Ymir
+ * @License
+ *   ```text
+ *   This file is part of the Ymir language project.
+ *
+ *   Ymir is free software: you can redistribute it and/or modify it
+ *   under the terms of the GNU General Public License as published by
+ *   the Free Software Foundation, either version 3 of the License, or
+ *   (at your option) any later version.
+ *
+ *   Ymir is distributed in the hope that it will be useful,
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *   GNU General Public License for more details.
+ *
+ *   You should have received a copy of the GNU General Public License
+ *   along with Ymir.  If not, see <https://www.gnu.org/licenses/>.
+ *   ```
+ */
+
+in copy_;
+
+use ymirc::syntax::expression::{memory, operator, literal, compose};
+use ymirc::semantic::validator;
+use ymirc::semantic::generator::{value, value::_, type::_};
+
+use ymirc::errors;
+use ymirc::lexing::{word, keys, tokens};
+use ymirc::global::core_;
+
+use ymirc::utils::format;
+
+
+/**
+ * CopyValidation module
+ *
+ * Provides validation and construction of shallow and deep copy operations.
+ *
+ * Copy modes:
+ *
+ *   - Shallow copy (`copy x`)
+ *       - duplicates the outer container
+ *       - preserves references to inner elements
+ *       - applies to slices, arrays, maps, and constructor delegates
+ *
+ *   - Deep copy (`dcopy x`)
+ *       - recursively duplicates all nested elements
+ *       - applies to classes, slices, arrays, maps
+ *       - invokes user-defined deep-copy methods when available
+ *
+ * The module enforces:
+ *   - no copying of lazy or expanded values
+ *   - compile-time reduction before copying
+ *   - correct mutability and pointer-level semantics
+ *   - correct handling of class pointer deep-copy via trait checks
+ *   - correct handling of array and slice deep-copy via synthetic calls
+ *
+ * The validator also detects values that are already allocated and therefore
+ * do not require additional copying.
+ */
+pub mod CopyValidation {
+
+    /**
+     * Validate a copy expression.
+     *
+     * Dispatches based on the copy mode:
+     *   - deep copy (`dcopy`) => validateDeep
+     *   - shallow copy of a lambda => validateClosure
+     *   - shallow copy (default) => validateShallow
+     *
+     * @returns:
+     *   - a CopierValue or other allocated value
+     *
+     * @throws:
+     *   - ErrorMsg if the copy operation is invalid
+     */
+    pub fn validate(dmut context: &ValidationContext, mem: &CopyExpr)-> &Value
+        throws ErrorMsg
+    {
+        if mem.isDeep {
+            return CopyValidation::validateDeep(alias context, mem);
+        }
+
+        else if let lmbd: &LambdaExpr = mem.content {
+            return LambdaValidation::validate(alias context, lmbd,
+                                              isClosure-> true,
+                                              forLazy-> false,
+                                              copyLoc-> mem.loc);
+        }
+
+
+        return CopyValidation::validateShallow(alias context, mem);
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          SHALLOW          =====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Validate a shallow copy (`copy x`).
+     *
+     * Steps:
+     *   1. Validate the content(validateShallowContent).
+     *   2. If the value is already allocated, return it unchanged.
+     *   3. Otherwise, perform type-specific shallow copying:
+     *        - SliceType => validateShallowSlice
+     *        - ArrayType => validateShallowArray
+     *        - MapType => validateShallowMap
+     *   4. Constructor delegates are invoked with an empty argument list.
+     *
+     * If no shallow copy rule applies, a NO_COPY_EXIST diagnostic is emitted.
+     */
+    fn validateShallow(dmut context: &ValidationContext, mem: &CopyExpr)-> &Value
+        throws ErrorMsg
+    {
+        let content = CopyValidation::validateShallowContent(alias context, mem);
+
+        // No need to copy something that is already allocated - i.e. the copy
+        // context already informed lower level validation that the copy must be
+        // done(e.g. class ctors)
+        //
+        if (CopyValidation::isAllocated(content, deeply-> false)) {
+            return content;
+        }
+
+        // The only aliasable types that are one level copiable are slice and maps
+        match content.type {
+            s: &SliceType => return CopyValidation::validateShallowSlice(mem, content, s);
+            a: &ArrayType => return CopyValidation::validateShallowArray(mem, content, a);
+            m: &MapType => return CopyValidation::validateShallowMap   (mem, content, m);
+        }
+
+        match content {
+            c: &CtorDelegateValue => {
+                return CallValidation::validate(alias context, mem.loc, c, [], inCopy-> true);
+            }
+            c: &CtorDelegateTemplateValue => {
+                return CallValidation::validate(alias context, mem.loc, c, [], inCopy-> true);
+            }
+        }
+
+        throw copy ErrorMsg::fatal(mem.loc, format(ValidateErrorMessage::NO_COPY_EXIST, content.type));
+    }
+
+    /**
+     * Validate the content of a shallow copy.
+     *
+     * Rules:
+     *   - Expanded values cannot be copied.
+     *   - Lazy values cannot be copied.
+     *   - The value is reduced through the CTE interpreter.
+     *   - Enum wrappers are unwrapped before copying.
+     *
+     * The copy context is entered and exited around validation to inform
+     * lower-level validators that a copy is in progress.
+     *
+     * @returns:
+     *   - the reduced, unwrapped value
+     */
+    fn validateShallowContent(dmut context: &ValidationContext, mem: &CopyExpr)-> &Value
+        throws ErrorMsg
+    {
+        {
+            context:.enterCopy(mem);
+
+            let mut content = ValueValidation::validate(alias context, mem.content, canBeLazy-> true);
+            if (content of ExpandValue) {
+                throw copy ErrorMsg::fatal(mem.loc,
+                                            end-> content.loc,
+                                            format(ValidateErrorMessage::MISMATCH_COPY_EXPAND, content.type));
+            }
+
+            if (content of LazyValue) {
+                throw copy ErrorMsg::fatal(mem.loc,
+                                            end-> content.loc,
+                                            format(ValidateErrorMessage::MISMATCH_COPY_LAZY, content.type));
+            };
+
+            let reduced = context.cteInterpret:.reduce(content);
+            return ValueCreation::createEnumUnwrap(reduced);
+        } exit {
+            context:.exitCopy();
+        };
+    }
+
+    /**
+     * Construct a shallow copy of an array.
+     *
+     * A shallow array copy produces a mutable slice pointing to the same
+     * underlying array storage.
+     *
+     * Steps:
+     *   - clone the inner type to a mutable form
+     *   - construct a SliceType
+     *   - create an AddressValue pointing to the array
+     *   - construct a SliceCtorValue
+     *   - wrap the result in a CopierValue
+     */
+    fn validateShallowArray(mem: &CopyExpr, value: &Value, arr: &ArrayType)-> &Value
+        throws ErrorMsg
+    {
+        let inner = arr.value.cloneMutableUntilBorrow();
+        let type  = copy SliceType(mem.loc, inner, isMutable-> true);
+
+        let addr = copy AddressValue(mem.loc, copy PointerType(mem.loc, inner, isMutable-> false), value);
+        let ctor = copy SliceCtorValue(mem.loc,
+                                        type-> type,
+                                        ptr-> addr,
+                                        blk-> NULL_VALUE,
+                                        len-> copy IntValue(mem.loc, USIZE_TYPE, arr.len),
+                                        isImplicitAlias-> true);
+
+        return copy CopierValue(mem.loc, type, ctor);
+    }
+
+    /**
+     * Construct a shallow copy of a slice.
+     *
+     * Produces a new mutable slice pointing to the same underlying memory.
+     *
+     * @returns:
+     *   - a CopierValue wrapping the slice
+     */
+    fn validateShallowSlice(mem: &CopyExpr, value: &Value, slc: &SliceType)-> &Value
+        throws ErrorMsg
+    {
+        let inner = slc.value.cloneMutableUntilBorrow();
+        let type  = copy SliceType(mem.loc, inner, isMutable-> true);
+
+        return copy CopierValue(mem.loc, type, value);
+    }
+
+    /**
+     * Construct a shallow copy of a map.
+     *
+     * A shallow map copy duplicates the map header but preserves references to
+     * the underlying buckets.
+     *
+     * @returns:
+     *   - a CopierValue wrapping the map
+     */
+    fn validateShallowMap(mem: &CopyExpr, value: &Value, m: &MapType)-> &Value
+        throws ErrorMsg
+    {
+        let keyT = m.key;
+        let valueT = m.value.cloneMutableUntilBorrow();
+        let type = copy MapType(mem.loc, keyT, valueT, isMutable-> true);
+
+        return copy CopierValue(mem.loc, type, value);
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ======================================          DEEP          ======================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Validate a deep copy (`dcopy x`).
+     *
+     * Steps:
+     *   1. Validate the content(validateDeepContent).
+     *   2. If the value is already deeply allocated, return it unchanged.
+     *   3. Dispatch based on the type:
+     *        - ClassPtrType => validateDeepClassPtr
+     *        - SliceType => validateDeepSlice
+     *        - ArrayType => validateDeepArray
+     *        - MapType => validateDeepMap
+     *
+     * If no deep copy rule applies, a NO_COPY_EXIST diagnostic is emitted.
+     */
+    pub fn validateDeep(dmut context: &ValidationContext, mem: &CopyExpr)-> &Value
+        throws ErrorMsg
+    {
+        let content = CopyValidation::validateDeepContent(alias context, mem);
+
+        // No need to copy something that is already allocated
+        if (CopyValidation::isAllocated(content, deeply-> true)) {
+            return content;
+        }
+
+        match content.type {
+            c: &ClassPtrType => return CopyValidation::validateDeepClassPtr(alias context, mem, content, c);
+            s: &SliceType => return CopyValidation::validateDeepSlice(alias context, mem, content, s);
+            a: &ArrayType => return CopyValidation::validateDeepArray(alias context, mem, content, a);
+            m: &MapType => return CopyValidation::validateDeepMap(alias context, mem, content, m);
+        }
+
+        throw copy ErrorMsg::fatal(mem.loc, format(ValidateErrorMessage::NO_COPY_EXIST, content.type));
+    }
+
+    /**
+     * Validate the content of a deep copy.
+     *
+     * Rules:
+     *   - Expanded values cannot be deep-copied.
+     *   - Lazy values cannot be deep-copied.
+     *   - The value is reduced through the CTE interpreter.
+     *   - Enum wrappers are unwrapped before copying.
+     *
+     * The copy context is entered and exited around validation.
+     *
+     */
+    fn validateDeepContent(dmut context: &ValidationContext, mem: &CopyExpr)-> &Value
+        throws ErrorMsg
+    {
+        {
+            context:.enterCopy(mem);
+
+            let mut content = ValueValidation::validate(alias context, mem.content, canBeLazy-> true);
+            if (content of ExpandValue) {
+                throw copy ErrorMsg::fatal(mem.loc,
+                                            end-> content.loc,
+                                            format(ValidateErrorMessage::MISMATCH_DCOPY_EXPAND, content.type));
+
+            }
+
+            if (content of LazyValue) {
+                throw copy ErrorMsg::fatal(mem.loc,
+                                            end-> content.loc,
+                                            format(ValidateErrorMessage::MISMATCH_DCOPY_LAZY, content.type));
+            };
+
+            let reduced = context.cteInterpret:.reduce(content);
+            return ValueCreation::createEnumUnwrap(reduced);
+        } exit {
+            context:.exitCopy();
+        };
+    }
+
+    /**
+     * Deep-copy a class pointer.
+     *
+     * Steps:
+     *   1. Ensure the class implements the Copiable trait.
+     *   2. Synthesize a call to the `deepCopy` method.
+     *   3. Validate the call.
+     *   4. Cast the result to a deeply mutable class pointer.
+     *
+     * Produces a CopierValue wrapping the deep-copied class instance.
+     *
+     */
+    fn validateDeepClassPtr(dmut context: &ValidationContext, mem: &CopyExpr, value: &Value, cptr: &ClassPtrType)-> &Value
+        throws ErrorMsg
+    {
+        let tr = VariableCreation::createSyntaxVarFromPath(mem.loc, GlobalTraitUtils::COPIABLE_TRAIT);
+
+        let im = TypeValidation::validate(alias context, tr);
+        TypeVerification::verifyImplement(mem.loc, cptr, im);
+
+        let dcopyName = copy VarExpr(mem.loc.locate(OpOverrideNames::DCOPY), isQuoted-> true);
+        let dot = copy BinaryExpr(mem.loc.locate(Tokens::DOT),
+                                   copy ValueWrapperExpr(value.loc, value),
+                                   dcopyName);
+
+        let syntCall = copy MultOperatorExpr(mem.loc.locate(Tokens::LPAR),
+                                              mem.loc.locate(Tokens::RPAR),
+                                              op-> MultOperators::CALL,
+                                              left-> dot,
+                                              rights-> [],
+                                              canBeDotCall-> false);
+
+        let v = ValueValidation::validate(alias context, syntCall);
+        return CastValidation::validateExplicit(alias context, v.loc, v, cptr.toDeeplyMutable());
+    }
+
+    /**
+     * Deep-copy an array.
+     *
+     * If the pointer depth after deep copy is 1, fall back to shallow copy.
+     *
+     * Otherwise:
+     *   - deep-copy each element individually
+     *   - construct a new ArrayValue
+     *   - wrap it in a slice constructor
+     *   - wrap the result in a deep CopierValue
+     *
+     */
+    fn validateDeepArray(dmut context: &ValidationContext, mem: &CopyExpr, value: &Value, type: &ArrayType)-> &Value
+        throws ErrorMsg
+    {
+        if (CopyValidation::pointerLevelAfterDCopy(type) == 1) {
+            return CopyValidation::validateShallowArray(mem, value, type);
+        }
+
+        let mut params: [&Value] = [];
+        let mut innerR: &Type = NONE_TYPE;
+
+        for z in 0us .. type.len {
+            let curr = ArrayIndexValidation::validate(mem.loc, type.value, value, copy IntValue(mem.loc, USIZE_TYPE, z));
+            let dc = copy CopyExpr(mem.loc, copy ValueWrapperExpr(mem.loc, curr), isDeep-> true);
+
+            let p = CopyValidation::validateDeep(alias context, dc);
+            innerR = p.type;
+            params ~= [p];
+        }
+
+        let arrType = copy ArrayType(mem.loc, innerR, params.len, isMutable-> true);
+        let arrValue = copy ArrayValue(mem.loc, arrType, params);
+
+        let addr = copy AddressValue(mem.loc,
+                                      copy PointerType(mem.loc, innerR, isMutable-> false),
+                                      arrValue);
+
+        let slcType = copy SliceType(mem.loc, innerR, isMutable-> true);
+        let ctor = copy SliceCtorValue(mem.loc,
+                                        type-> slcType,
+                                        ptr-> addr,
+                                        blk-> NULL_VALUE,
+                                        len-> copy IntValue(mem.loc, USIZE_TYPE, arrType.len),
+                                        isImplicitAlias-> true);
+
+        return copy CopierValue(mem.loc, slcType, ctor, isDeep-> true);
+    }
+
+    /**
+     * Deep-copy a slice.
+     *
+     * If the pointer depth after deep copy is 1, fall back to shallow copy.
+     *
+     * Otherwise:
+     *   - synthesize a call to the core slice deep-copy function
+     *   - validate the call
+     *   - wrap the result in a deep CopierValue
+     *
+     */
+    fn validateDeepSlice(dmut context: &ValidationContext, mem: &CopyExpr, value: &Value, type: &SliceType)-> &Value
+        throws ErrorMsg
+    {
+        if (CopyValidation::pointerLevelAfterDCopy(type) == 1) {
+            return CopyValidation::validateShallowSlice(mem, value, type);
+        }
+
+        // Calling the core function
+        let syntVar = VariableCreation::createSyntaxVarFromPath(mem.loc, SliceUtils::DCOPY_FUNC);
+
+        // It is a template function, taking the slice type as template parameter
+        let templCall = copy TemplateCallExpr(mem.loc,
+                                               syntVar,
+                                               copy [copy TypeWrapperExpr(type.loc, type)]);
+
+        // And taking one argument, the slice itself, and it return a deep copy
+        // version of the slice(deep copying every inner elements)
+        //
+        let syntCall = copy MultOperatorExpr(mem.loc.locate(Tokens::LPAR),
+                                              mem.loc.locate(Tokens::RPAR),
+                                              MultOperators::CALL,
+                                              templCall,
+                                              copy [copy ValueWrapperExpr(value.loc, value)],
+                                              canBeDotCall-> false);
+
+        {
+            let callVal = ValueValidation::validate(alias context, syntCall);
+            return copy CopierValue(mem.loc, callVal.type, callVal, isDeep-> true, isDone-> true);
+        } catch {
+            err: &ErrorMsg => {
+                throw copy ErrorMsg::note(mem.loc, ValidateErrorMessage::VALIDATING, notes-> copy [err]);
+            }
+        }
+    }
+
+    /**
+     * Deep-copy a map.
+     *
+     * If the pointer depth after deep copy is 1, fall back to shallow copy.
+     *
+     * Otherwise:
+     *   - synthesize a call to the core map deep-copy function
+     *   - validate the call
+     *   - wrap the result in a deep CopierValue
+     *
+     */
+    fn validateDeepMap(dmut context: &ValidationContext, mem: &CopyExpr, value: &Value, type: &MapType)-> &Value
+        throws ErrorMsg
+    {
+        if (CopyValidation::pointerLevelAfterDCopy(type) == 1) {
+            return CopyValidation::validateShallowMap(mem, value, type);
+        }
+
+        // Calling the core function
+        let syntVar = VariableCreation::createSyntaxVarFromPath(mem.loc, MapUtils::DCOPY_FUNC);
+
+        // It is a template function, taking the map type as template parameter
+        //
+        let templCall = copy TemplateCallExpr(mem.loc,
+                                               syntVar,
+                                               copy [copy TypeWrapperExpr(type.loc, type.key),
+                                                     copy TypeWrapperExpr(type.loc, type.value)]);
+
+        // And taking one argument, the slice itself, and it return a deep copy
+        // version of the slice(deep copying every inner elements)
+        //
+        let syntCall = copy MultOperatorExpr(mem.loc.locate(Tokens::LPAR),
+                                              mem.loc.locate(Tokens::RPAR),
+                                              MultOperators::CALL,
+                                              templCall,
+                                              copy [copy ValueWrapperExpr(value.loc, value)],
+                                              canBeDotCall-> false);
+
+        {
+            let callVal = ValueValidation::validate(alias context, syntCall);
+            return copy CopierValue(mem.loc, callVal.type, callVal, isDeep-> true, isDone-> true);
+        } catch {
+            err: &ErrorMsg => {
+                throw copy ErrorMsg::note(mem.loc, ValidateErrorMessage::VALIDATING, notes-> copy [err]);
+            }
+        }
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * =====================================          CHECKS          =====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Determine whether a value is already allocated in a way that satisfies
+     * the copy or deep-copy operation.
+     *
+     * Examples of already-allocated values:
+     *   - CopierValue(deep or shallow depending on `deeply`)
+     *   - dynamic ArrayAllocValue
+     *   - SliceCtorValue with null pointer
+     *   - class constructor calls(non-struct classes)
+     *   - addressed struct method delegates
+     *   - map literals
+     *   - null
+     *
+     * @returns:
+     *   - true if no additional copying is required
+     */
+    fn isAllocated(alloc: &Value, deeply: bool = false)-> bool {
+        return match alloc {
+            c: &CopierValue => {
+                (c.isDeep || !deeply)
+            }
+            a: &ArrayAllocValue => {
+                (a.isDynamic && !deeply)
+            }
+            s: &SliceCtorValue => {
+                (s.ptr of NullValue) // null is allocated
+            }
+            c: &CtorCallValue => {
+                match c.type {
+                    cp: &ClassPtrType => return !cp.isStruct;
+                }
+                false
+            }
+            b: &BlockValue => {
+                if (b.values.len != 0us) {
+                    return CopyValidation::isAllocated(b.values[$ - 1]);
+                }
+
+                false
+            }
+            m: &MethodDelegateValue => {
+                (m.isStruct && m.isAddressed && !deeply)
+            }
+            MapValue() => { !deeply }
+            NullValue() => { true }
+            _ => { false }
+        }
+    }
+
+    /**
+     * Compute the pointer depth of a type after deep copying.
+     *
+     * Used to determine whether deep copy should fall back to shallow copy for
+     * slices, arrays, and maps.
+     *
+     * Rules:
+     *   - arrays, slices, and maps increase pointer depth by 1
+     *   - tuples return the maximum depth of their elements
+     *   - class pointers have depth 1
+     *   - pointers are not deep-copied(depth 0)
+     *   - enums delegate to their last-level proxy type
+     *
+     */
+    fn pointerLevelAfterDCopy(type: &Type)-> usize {
+        return match type {
+            a: &ArrayType => { 1us + CopyValidation::pointerLevelAfterDCopy(a.value) }
+            s: &SliceType => { 1us + CopyValidation::pointerLevelAfterDCopy(s.value) }
+            m: &MapType => { 1us + CopyValidation::pointerLevelAfterDCopy(m.value) }
+            t: &TupleType => {
+                let mut ret = 0us;
+                for inner in t.inners {
+                    let h = CopyValidation::pointerLevelAfterDCopy(inner);
+                    if (ret < h) ret = h;
+                }
+                ret
+            }
+            _: &ClassPtrType => { 1 }
+            e: &EnumType => {
+                CopyValidation::pointerLevelAfterDCopy(e.getLastLevelProxy())
+            }
+            PointerType() => { 0 } // pointers are not deep copied ?
+            _ => { 0 }
+        };
+    }
+}

@@ -1,0 +1,323 @@
+/*
+ * Implements semantic validation for array indexing and slicing in Ymir.
+ *
+ * Responsibilities:
+ *   - Validate integer indexing on fixed-size arrays.
+ *   - Validate range indexing(slicing) when allowed.
+ *   - Perform compile-time bounds checking when possible.
+ *   - Insert runtime bounds checks when necessary.
+ *   - Construct ArrayAccessValue, SliceCtorValue, or ArrayValue depending
+ *     on the indexing mode.
+ *   - Enforce unsafe-context restrictions for pointer arithmetic.
+ *
+ *
+ * <hr>
+ *
+ * @Package: ymirc
+ * @Module: ymirc::semantic::validator::value::operator::index::array
+ * @File: ymirc/semantic/validator/value/operator/index/array.yr
+ * @Author(s):
+ *   - Emile Cadorel <ecadorel@gmail.com>
+ *
+ * @Created(YYYY-MM-DD): 2026-03-30
+ * @Copyright(C) 2021–2026 GNU-Ymir
+ * @License
+ *   ```text
+ *   This file is part of the Ymir language project.
+ *
+ *   Ymir is free software: you can redistribute it and/or modify it
+ *   under the terms of the GNU General Public License as published by
+ *   the Free Software Foundation, either version 3 of the License, or
+ *   (at your option) any later version.
+ *
+ *   Ymir is distributed in the hope that it will be useful,
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *   GNU General Public License for more details.
+ *
+ *   You should have received a copy of the GNU General Public License
+ *   along with Ymir.  If not, see <https://www.gnu.org/licenses/>.
+ *   ```
+ */
+
+in array;
+
+use ymirc::syntax::expression::operator;
+use ymirc::semantic::validator;
+use ymirc::semantic::generator::{value::_, type::_};
+
+use ymirc::errors;
+use ymirc::lexing::{word, tokens, keys};
+
+use ymirc::utils::{format, bigint};
+
+use ymirc::semantic::validator::value::operator::index::_;
+
+/**
+ * ArrayIndexValidation
+ *
+ * Provides semantic validation for array indexing:
+ *
+ *      array[index]
+ *      array[range]
+ *
+ * Supports:
+ *   - Integer indexing with compile-time and runtime bounds checks.
+ *   - Range indexing as slice creation when inside a copy expression.
+ *   - Full range extraction(materialized array) when not in copy mode.
+ *
+ * This module:
+ *   - Validates index types.
+ *   - Performs compile-time evaluation when possible.
+ *   - Inserts runtime checks when necessary.
+ *   - Constructs the appropriate value representation for the index.
+ */
+pub mod ArrayIndexValidation {
+
+    /**
+     * Validate an array indexing operation.
+     *
+     * Supports:
+     *   - Single integer index: array[i]
+     *   - Single range index:   array[a .. b]
+     *
+     * @params:
+     *   - context:      validation context
+     *   - loc:          location of the index operator
+     *   - array:        the array value being indexed
+     *   - arrayType:    the static type of the array
+     *   - indices:      list of index expressions
+     *   - indicesTypes: list of index types
+     *   - inCopy:       whether the indexing occurs inside a copy expression
+     *
+     * @returns:
+     *   A &Value representing the result of the indexing operation.
+     *
+     * @throws:
+     *   ErrorMsg if the index type is invalid or unsupported.
+     */
+    pub fn validate(dmut context: &ValidationContext,
+                     loc:          &Word,
+                     array:        &Value,
+                     arrayType:    &ArrayType,
+                     indices:      [&Value],
+                     indicesTypes: [&Type],
+                     inCopy:       bool)-> &Value
+        throws ErrorMsg
+    {
+        if indicesTypes.len == 1 {
+            if let i: &IntType = indicesTypes[0] {
+                return validateInt(alias context, loc, array, arrayType, indices[0], i);
+            }
+
+            if let r: &RangeType = indicesTypes[0] {
+                if inCopy {
+                    return ArrayIndexValidation::validateRangeAsSlice(alias context, loc, array, arrayType, indices[0], r);
+                } else {
+                    return ArrayIndexValidation::validateRange(alias context, loc, array, arrayType, indices[0], r);
+                }
+            }
+        }
+
+        throw copy ErrorMsg::fatal(loc, format(ValidateErrorMessage::UNDEFINED_INDEX_OP, arrayType, indicesTypes));
+    }
+
+    /**
+     * Low-level array access constructor.
+     *
+     * Used by constant folding and by validateInt() to produce either:
+     *   - A direct element extraction when both index and array are constant.
+     *   - An ArrayAccessValue otherwise.
+     *
+     * @params:
+     *   - loc:   index operator location
+     *   - type:  resulting element type
+     *   - value: array value
+     *   - index: index value
+     *
+     * @returns:
+     *   A &Value representing the array access.
+     */
+    pub fn validate(loc:          &Word,
+                     type:         &Type,
+                     value:        &Value,
+                     index:        &Value)-> &Value
+    {
+        if let (i: &IntValue, arr: &ArrayValue) = (index, value) {
+            let ib = i.value.toT!{usize} ();
+            return arr.values[ib];
+        }
+
+        return copy ArrayAccessValue(loc, type, value, index);
+    }
+
+
+    /**
+     * Validate integer indexing on a fixed-size array.
+     *
+     * Performs:
+     *   - Compile-time bounds checking when possible.
+     *   - Cast of the index to usize.
+     *   - Runtime bounds check insertion when compile-time evaluation is not possible and not in unsafe context.
+     *
+     * @params:
+     *   - context:    validation context
+     *   - loc:        index operator location
+     *   - array:      array value
+     *   - arrayType:  array type(fixed-size)
+     *   - indexValue: index expression
+     *   - indexType:  integer type of the index
+     *
+     * @returns:
+     *   A &Value representing the array access.
+     */
+    fn validateInt(dmut context: &ValidationContext,
+                    loc:          &Word,
+                    array:        &Value,
+                    arrayType:    &ArrayType,
+                    indexValue:   &Value,
+                    indexType:    &IntType)-> &Value
+        throws ErrorMsg
+    {
+        let innerType = arrayType.value;
+        let arraySize = arrayType.len;
+
+        let cteTest = ValueVerification::verifyIndexOverflow(alias context, loc, arrayType, indexValue, indexType,
+                                                              maxLen-> copy IntValue(loc, USIZE_TYPE, arraySize),
+                                                              equalMax-> false);
+
+        // Index is cast into a usize(as it will have to, for pointer arithmetic)
+        let index = CastValidation::validateExplicit(alias context, indexValue.loc, indexValue, USIZE_TYPE);
+        let arrayAccess = context.cteInterpret:.reduce(ArrayIndexValidation::validate(loc, innerType, array, index));
+
+        if (!context.getUnsafeContextLoc().isEof) {
+            ValueVerification::verifyUnsafeContext(alias context, loc);
+            return arrayAccess;
+        }
+
+        if cteTest {
+            return arrayAccess;
+        }
+
+        // If the test cannot be made in cte, then add a runtime check
+        let cmp = copy CmpIntOperatorValue(loc,
+                                            BinaryOperators::INF_EQUAL,
+                                            copy IntValue(loc, USIZE_TYPE, arraySize),
+                                            index);
+
+        let cond = ValueCreation::createOutOfArrayTest(loc, cmp);
+
+        return copy BlockValue(loc, innerType, copy [cond, arrayAccess], isSet-> true);
+    }
+
+
+    /**
+     * Validate range indexing inside a copy expression, producing a slice.
+     *
+     * Behavior:
+     *   - Extract fst and scd fields of the range.
+     *   - Perform compile-time bounds checking when possible.
+     *   - Compute slice pointer and length.
+     *   - Insert runtime checks when necessary.
+     *
+     * @params:
+     *   - context:    validation context
+     *   - loc:        index operator location
+     *   - array:      array value
+     *   - arrayType:  array type
+     *   - indexValue: range expression
+     *   - indexType:  range type
+     *
+     * @returns:
+     *   A &Value representing the constructed slice.
+     */
+    fn validateRangeAsSlice(dmut context: &ValidationContext,
+                             loc:          &Word,
+                             array:        &Value,
+                             arrayType:    &ArrayType,
+                             indexValue:   &Value,
+                             indexType:    &RangeType)-> &Value
+        throws ErrorMsg
+    {
+        let slice = ValueCreation::createSliceAliasFromArray(loc, arrayType, array, mutable-> arrayType.isMutable);
+        if let slcType: &SliceType = slice.type {
+            return SliceIndexValidation::validateRange(alias context, loc, slice, slcType, indexValue, indexType);
+        } else {
+            panic;
+        }
+    }
+
+
+    /**
+     * Validate range indexing outside copy mode, producing a new array.
+     *
+     * Behavior:
+     *   - Compute fst and scd via compile-time evaluation.
+     *   - Perform strict bounds checking.
+     *   - Extract each element in the range and accumulate them.
+     *   - Construct a new ArrayValue with the extracted elements.
+     *
+     * @params:
+     *   - context:    validation context
+     *   - loc:        index operator location
+     *   - array:      array value
+     *   - arrayType:  array type
+     *   - indexValue: range expression
+     *   - indexType:  range type
+     *
+     * @returns:
+     *   A &Value representing the newly constructed array.
+     */
+    fn validateRange(dmut context: &ValidationContext,
+                      loc:          &Word,
+                      array:        &Value,
+                      arrayType:    &ArrayType,
+                      indexValue:   &Value,
+                      indexType:    &RangeType)-> &Value
+        throws ErrorMsg
+    {
+        let innerBaseType = arrayType.value;
+        let arraySize = arrayType.len;
+
+        let (fst, scd) = {
+            let fstIndex = context.cteInterpret:.computeInt(copy StructFieldAccessValue(loc, indexType, indexValue, RangeKeys::FST));
+            let scdIndex = context.cteInterpret:.computeInt(copy StructFieldAccessValue(loc, indexType, indexValue, RangeKeys::SCD));
+            (fstIndex, scdIndex)
+        } catch {
+            err: &ErrorMsg => {
+                throw copy ErrorMsg::fatal(loc, format(ValidateErrorMessage::RANGE_ON_ARRAY_NO_COPY, arrayType, indexType),
+                                            notes-> copy [err]);
+            }
+        }
+
+        if (fst < 0) throw copy ErrorMsg::fatal(loc, end-> indexValue.loc, format(ValidateErrorMessage::NEGATIVE_INT_INDEX, arrayType, fst));
+        if (scd < 0) throw copy ErrorMsg::fatal(loc, end-> indexValue.loc, format(ValidateErrorMessage::NEGATIVE_INT_INDEX, arrayType, scd));
+        if (scd > arraySize) throw copy ErrorMsg::fatal(loc, end-> indexValue.loc, format(ValidateErrorMessage::ARRAY_OVERFLOW, arraySize, scd));
+        if (fst > scd) throw copy ErrorMsg::fatal(loc, end-> indexValue.loc, format(ValidateErrorMessage::DECREASING_RANGE_ACCESS, arrayType, fst, scd));
+
+        let mut values: [&Value] = [];
+        let mut innerType: &Type = NONE_TYPE;
+        {
+            for i in fst.to!{usize} () .. scd.to!{usize} () {
+                let acc = ArrayIndexValidation::validate(loc, innerBaseType, array, copy IntValue(loc, USIZE_TYPE, i));
+                innerType = SliceComposeValidation::addArrayType(alias context, acc, innerType, ref values);
+            }
+        } catch {
+            err: _ => {
+                std::io::println(format("%", err));
+                panic;
+            }
+        }
+
+        if (innerType of NoneType) {
+            innerType = innerBaseType.cloneMutableUntilBorrow();
+        }
+
+        let finType = copy ArrayType(loc, innerType, (scd - fst).toT!{usize} (),
+                                      isMutable-> true);
+
+        return copy ArrayValue(loc, finType, values);
+    }
+
+
+}

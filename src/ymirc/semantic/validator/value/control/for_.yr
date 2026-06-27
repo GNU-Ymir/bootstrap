@@ -1,0 +1,334 @@
+/*
+ * Root semantic validator for `for` loops in Ymir.
+ * This module is the central entry point for validating `for` expressions.
+ *
+ * <hr>
+ *
+ * @Package: ymirc
+ * @Module: ymirc::semantic::validator::value::control::for_
+ * @File: ymirc/semantic/validator/value/control/for_.yr
+ * @Author(s):
+ *   - Emile Cadorel <ecadorel@gmail.com>
+ *
+ * @Created(YYYY-MM-DD): 2026-05-13
+ * @Copyright(C) 2021–2026 GNU-Ymir
+ * @License
+ *   ```text
+ *   This file is part of the Ymir language project.
+ *
+ *   Ymir is free software: you can redistribute it and/or modify it
+ *   under the terms of the GNU General Public License as published by
+ *   the Free Software Foundation, either version 3 of the License, or
+ *   (at your option) any later version.
+ *
+ *   Ymir is distributed in the hope that it will be useful,
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *   GNU General Public License for more details.
+ *
+ *   You should have received a copy of the GNU General Public License
+ *   along with Ymir.  If not, see <https://www.gnu.org/licenses/>.
+ *   ```
+ */
+
+in for_;
+
+use ymirc::lexing::{word, keys};
+
+use ymirc::syntax::expression::_;
+use ymirc::semantic::{validator, template_};
+use ymirc::semantic::generator::{value::_, type::_};
+
+use ymirc::errors;
+
+use ymirc::utils::format;
+
+use ymirc::semantic::validator::value::control::for_::_;
+
+/*!
+ * ====================================================================================================
+ * ====================================================================================================
+ * ====================================          SUBMODS          =====================================
+ * ====================================================================================================
+ * ====================================================================================================
+ */
+
+pub mod ::class_;
+pub mod ::map;
+pub mod ::range;
+pub mod ::slice;
+pub mod ::tuple;
+
+mod ::array;
+
+/*!
+ * ====================================================================================================
+ * ====================================================================================================
+ * ======================================          ROOT          ======================================
+ * ====================================================================================================
+ * ====================================================================================================
+ */
+
+
+/**
+ * ForLoopValidation
+ *
+ * Central dispatcher and helper utilities for `for` loop validation.
+ *
+ * This module:
+ *   - Validates the iterator expression and unwraps enum values.
+ *   - Detects reference and alias iteration modes.
+ *   - Dispatches to the appropriate specialized validator.
+ *   - Enforces that reference/alias decorations are actually used.
+ *   - Provides helpers for index iterator declarations and cte block rewriting.
+ */
+pub mod ForLoopValidation {
+
+    /**
+     * Validate a runtime `for` loop.
+     *
+     * @params:
+     *   - context: validation context
+     *   - floop:   for-loop expression
+     *
+     * @returns:
+     *   A &Value representing the validated loop.
+     *
+     * @throws:
+     *   ErrorMsg if the iterator type is unsupported or validation fails.
+     */
+    pub fn validate(dmut context: &ValidationContext, floop: &ForLoopExpr)-> &Value
+        throws ErrorMsg
+    {
+        if !floop.isCte.isEof {
+            return ForLoopValidation::validateCte(alias context, floop);
+        }
+
+        let mValue = ValueCreation::createEnumUnwrap(ValueValidation::validate(alias context, floop.iter,
+                                                                               canBeRef-> true));
+
+        ValueVerification::verifyNoBreaking(mValue.loc, mValue);
+        TypeVerification::verifyCompleteWithValue(mValue.loc, mValue.type, mValue,
+                                                  construct-> true);
+
+        let (byMutRef, byAlias, fVal) = match mValue {
+            r: &ReferencerValue => { (r.isMutable, false, r.value) }
+            a: &AliaserValue => { (false, true, a.value) }
+            _ => { (false, false, mValue) }
+        };
+
+        let (value, innerUseRef, innerUseAlias) = match fVal.type {
+            t: &TupleType => {
+                TupleForLoopValidation::validate(alias context, fVal, t, floop, byMutRef, byAlias)
+            }
+            s: &SliceType => {
+                SliceForLoopValidation::validate(alias context, fVal, s, floop, byMutRef, byAlias)
+            }
+            a: &ArrayType => {
+                ArrayForLoopValidation::validate(alias context, fVal, a, floop, byMutRef, byAlias)
+            }
+            m: &MapType => {
+                MapForLoopValidation::validate(alias context, fVal, m, floop, byMutRef, byAlias)
+            }
+            r: &RangeType => {
+                (RangeForLoopValidation::validate(alias context, fVal, r, floop), false, false)
+            }
+            c: &ClassPtrType => {
+                (ClassForLoopValidation::validate(alias context, fVal, c, floop, byAlias, mValue.loc), false, true)
+            }
+            _ => {
+                throw copy ErrorMsg::fatal(floop.loc,
+                                           format(ValidateErrorMessage::UNDEF_FOR_LOOP_OPERATOR, floop.vars.len, fVal.type));
+            }
+        }
+
+        if (!innerUseRef && byMutRef) {
+            throw copy ErrorMsg::fatal(mValue.loc, ValidateErrorMessage::UNECESSARY_REFERENCE);
+        }
+
+        if (!innerUseAlias && byAlias) {
+            throw copy ErrorMsg::fatal(mValue.loc, format(ValidateErrorMessage::UNECESSARY_ALIAS, mValue.type));
+        }
+
+        return value;
+    }
+
+    /**
+     * Validate a compile-time(`cte`) `for` loop.
+     *
+     * @params:
+     *   - context: validation context
+     *   - floop:   for-loop expression
+     *
+     * @returns:
+     *   A &Value representing the validated(possibly unrolled) loop.
+     *
+     * @throws:
+     *   ErrorMsg if the iterator type is unsupported or validation fails.
+     */
+    pub fn validateCte(dmut context: &ValidationContext, floop: &ForLoopExpr)-> &Value
+        throws ErrorMsg
+    {
+        let mValue = ValueCreation::createEnumUnwrap(ValueValidation::validate(alias context, floop.iter,
+                                                                               canBeRef-> true));
+
+        match mValue.type {
+            t: &TupleType => {
+                return TupleForLoopValidation::validate(alias context, mValue, t, floop,
+                                                        byMutRef-> false,
+                                                        byAlias-> false)._0;
+            }
+            r: &RangeType => {
+                return RangeForLoopValidation::validateCte(alias context, mValue, r, floop);
+            }
+        }
+
+        throw copy ErrorMsg::fatal(floop.loc, format(ValidateErrorMessage::UNDEF_CTE_FOR_LOOP_OPERATOR, floop.vars.len, mValue.type));
+    }
+
+    /**
+     * Validate an index iterator declaration for a `for` loop.
+     *
+     * Behavior:
+     *   - Forbids `lazy`, `ref`, `mut`, and `dmut` decorations on the index variable.
+     *   - Determines the index type:
+     *       • Explicit type → TypeValidation::validate()
+     *       • No type       → USIZE_TYPE
+     *   - Ensures the type is an integer, compatible with USIZE_TYPE.
+     *   - Optionally infers and adapts the initial value to the index type.
+     *   - Chooses the variable name:
+     *       • `_` → ForLoopKeys::INDEX(no insertion)
+     *       • other → original name
+     *   - Builds a VarDeclValue marked as an iterator, optionally cte.
+     *
+     * @params:
+     *   - context:  validation context
+     *   - loc:      location used for diagnostics
+     *   - vdecl:    index variable declaration
+     *   - globType: type of the iterated structure(for error messages)
+     *   - value:    initial value(default: UNIT_VALUE)
+     *   - canCte:   whether the index can be a cte iterator
+     *
+     * @returns:
+     *   (decl, insert)
+     *     - decl:   VarDeclValue for the index iterator
+     *     - insert: whether to insert the variable into the local scope
+     *
+     * @throws:
+     *   ErrorMsg if decorations are forbidden or the type is incompatible.
+     */
+    pub fn validateIndexIterDecl(dmut context: &ValidationContext,
+                                 loc:          &Word,
+                                 vdecl:        &VarDeclExpr,
+                                 globType:     &Type,
+                                 value:        &Value = UNIT_VALUE,
+                                 canCte:       bool = false)-> (&VarDeclValue, bool)
+        throws ErrorMsg
+    {
+        if !vdecl.isLazyOrRef.isEof {
+            throw copy ErrorMsg::fatal(vdecl.isLazyOrRef,
+                                       end-> loc,
+                                       format(ValidateErrorMessage::FORBID_DECO_FOR_LOOP, globType));
+        }
+
+        if !vdecl.isMutOrDmut.isEof {
+            throw copy ErrorMsg::fatal(vdecl.isMutOrDmut,
+                                       end-> loc,
+                                       format(ValidateErrorMessage::FORBID_DECO_FOR_LOOP, globType));
+        }
+
+        let vtype = if (vdecl.type !of EmptyExpr) {
+            TypeValidation::validate(alias context, vdecl.type,
+                                     parentMutable-> false)
+
+        } else {
+            USIZE_TYPE
+        };
+
+        if vtype !of IntType {
+            throw copy ErrorMsg::fatal(vdecl.loc,
+                                       end-> vdecl.type.loc,
+                                       format(ValidateErrorMessage::INCOMPATIBLE_TYPE, vtype, USIZE_TYPE));
+        }
+
+        let mut initValue = value;
+        if initValue !of UnitValue {
+            initValue = TypeInference::inferValueForType(alias context, vdecl.type.loc, initValue, vtype,
+                                                         byReference-> false);
+        }
+
+        let (name, insert) = if vdecl.name == Keys::UNDER {
+            (vdecl.name.locate(ForLoopKeys::INDEX), false)
+        } else {
+            (vdecl.name, true)
+        };
+
+        let decl = copy VarDeclValue(name, vtype, value,
+                                     isMutable-> false,
+                                     isCte-> canCte,
+                                     isIterator-> true);
+
+        return (decl, insert);
+    }
+
+    /**
+     * Build a rewritten body expression for a single cte `for` iteration.
+     *
+     * Behavior:
+     *   - For each iterator declaration in `vars`:
+     *       • Forbids any `lazy`, `ref`, `mut`, or `dmut` decoration.
+     *       • If an explicit type is provided, validates it and checks
+     *         compatibility with the corresponding value in `values`.
+     *       • Registers a template mapping from the iterator *pattern text*
+     *         (`v.loc.str`) to a ValueWrapperExpr wrapping `values[i]`.
+     *   - Constructs a TemplateMapper with all such mappings.
+     *   - Uses TemplateMapper to rewrite `block`, substituting occurrences
+     *     of the iterator patterns with their bound values for this iteration.
+     *
+     * This is used to materialize the body of a cte `for` loop for a single
+     * iteration, before validating it as a normal expression.
+     *
+     * @params:
+     *   - context:  validation context
+     *   - block:    original loop body expression
+     *   - globType: type of the iterated structure(for error messages)
+     *   - vars:     iterator variable declarations
+     *   - values:   values bound to each iterator variable for this iteration
+     *
+     * @returns:
+     *   A rewritten &Expression representing the body for this iteration.
+     *
+     * @throws:
+     *   ErrorMsg if decorations are forbidden or types are incompatible.
+     */
+    pub fn createCurrentCteBlock(dmut context: &ValidationContext,
+                                 block:        &Expression,
+                                 globType:     &Type,
+                                 vars:         [&VarDeclExpr],
+                                 values:       [&Value])-> &Expression
+        throws ErrorMsg
+    {
+        let mut mapper = TemplateMapper();
+        for i in 0us .. vars.len {
+            let v = vars[i];
+            if (!v.isLazyOrRef.isEof) {
+                throw copy ErrorMsg::fatal(v.isLazyOrRef, format(ValidateErrorMessage::FORBID_DECO_FOR_LOOP, globType));
+            }
+
+            if (!v.isMutOrDmut.isEof) {
+                throw copy ErrorMsg::fatal(v.isMutOrDmut, format(ValidateErrorMessage::FORBID_DECO_FOR_LOOP, globType));
+            }
+
+            if (v.type !of EmptyExpr) {
+                let vtype = TypeValidation::validateForVarDecl(alias context, v.type, v,
+                                                               canBeRef-> false);
+
+                TypeVerification::verifyCompatible(v.type.loc, values[i].loc, vtype, values[i].type);
+            }
+
+            mapper:.insert(v.loc.str, copy ValueWrapperExpr(values[i].loc, values[i]));
+        }
+
+        return TemplateRewriting::rewrite(mapper, block);
+    }
+}

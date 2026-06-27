@@ -1,0 +1,363 @@
+/*
+ * Implements construction utilities for semantic Values.
+ *
+ * This module provides the low-level constructors used by the semantic
+ * validator to build Values for:
+ *
+ *   - slice aliasing and slice construction,
+ *   - enum unwrapping,
+ *   - range unwrapping,
+ *   - object instantiation,
+ *   - method access on class instances,
+ *   - atomic lock/unlock helpers,
+ *   - panic-based bounds checks.
+ *
+ * These functions operate on already-validated Types and Values and are used
+ * throughout the semantic validator to synthesize runtime constructs that
+ * cannot be expressed directly in the syntax tree.
+ *
+ * <hr>
+ *
+ * @Package: ymirc
+ * @Module: ymirc::semantic::validator::value::create
+ * @File: ymirc/semantic/validator/value/create.yr
+ * @Author(s):
+ *   - Emile Cadorel <ecadorel@gmail.com>
+ *
+ * @Created(YYYY-MM-DD): 2026-05-26
+ * @Copyright(C) 2021–2026 GNU-Ymir
+ * @License
+ *   ```text
+ *   This file is part of the Ymir language project.
+ *
+ *   Ymir is free software: you can redistribute it and/or modify it
+ *   under the terms of the GNU General Public License as published by
+ *   the Free Software Foundation, either version 3 of the License, or
+ *   (at your option) any later version.
+ *
+ *   Ymir is distributed in the hope that it will be useful,
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *   GNU General Public License for more details.
+ *
+ *   You should have received a copy of the GNU General Public License
+ *   along with Ymir.  If not, see <https://www.gnu.org/licenses/>.
+ *   ```
+ */
+
+in create;
+
+use ymirc::syntax::expression::_;
+use ymirc::lexing::word;
+use ymirc::semantic::{symbol, validator, generator::{value::_, type::_}};
+use ymirc::errors;
+
+use ymirc::utils::format;
+use ymirc::global::core_;
+use ymirc::lexing::{word, keys};
+
+
+/**
+ * ValueCreation module
+ *
+ * Provides constructors for semantic Values that cannot be produced directly
+ * by syntax-tree evaluation. Responsibilities:
+ *
+ *   - create slice aliases and slice constructors,
+ *   - unwrap enums and ranges,
+ *   - instantiate class objects,
+ *   - perform method lookup on class instances,
+ *   - construct atomic lock/unlock function pairs,
+ *   - generate panic-based bounds-check expressions.
+ *
+ * These functions assume that the input Values and Types have already passed
+ * primary validation. They may throw errors when construction is semantically
+ * invalid(e.g., missing method, invalid ctor).
+ */
+pub mod ValueCreation {
+
+    /**
+     * Create a slice alias from an array Value.
+     *
+     * This does not copy the array. It creates a slice whose pointer refers
+     * directly to the array storage. This is safe only when:
+     *   - the slice is immediately copied, or
+     *   - the slice is passed to a runtime function that does not leak the
+     *     reference.
+     *
+     * @throws:
+     *   - never(array types cannot contain movable types)
+     */
+    pub fn createSliceAliasFromArray(loc: &Word, a: &ArrayType, v: &Value, mutable: bool = true)-> &Value {
+        let inner = if (mutable) {
+            a.value
+        } else { a.value.clone(0u32) };
+
+        let sliceType = {
+            copy SliceType(loc, inner, isMutable-> (inner.isMutable && mutable))
+        } catch { // array type cannot enclose movable, so inner cannot be a movable
+            _ => panic;
+        };
+
+        if (a.len != 0us) {
+            let ptrType = copy PointerType(loc, inner, isMutable-> inner.isMutable);
+            let arrayAddr = copy AddressValue(loc, ptrType, v);
+            return copy SliceCtorValue(loc,
+                                       sliceType,
+                                       arrayAddr,
+                                       copy NullValue(loc), // no blk info, array are stack located
+                                       copy IntValue(loc, USIZE_TYPE, a.len),
+                                       isImplicitAlias-> false);
+        }
+
+        let nl = copy NullValue(loc);
+        return copy SliceCtorValue(loc,
+                                   sliceType,
+                                   nl,
+                                   nl, // blk info is empty since slice is empty
+                                   copy IntValue(loc, USIZE_TYPE, 0),
+                                   isImplicitAlias-> false);
+    }
+
+    /**
+     * Create a slice containing exactly one element.
+     *
+     * Useful for operations such as appending a single element to a slice.
+     *
+     * Behavior:
+     *   - constructs a temporary array of length 1,
+     *   - delegates to createSliceAliasFromArray().
+     *
+     * @throws:
+     *   - ErrorMsg if slice construction fails
+     */
+    pub fn createSliceFromSingleValue(loc: &Word, v: &Value, mutable: bool = true)-> &Value
+        throws ErrorMsg
+    {
+        let arrType = copy ArrayType(loc, v.type, 1us, isMutable-> mutable);
+
+        return ValueCreation::createSliceAliasFromArray(loc,
+                                                        arrType,
+                                                        copy ArrayValue(loc, arrType, copy [v]));
+    }
+
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ======================================          ENUM          ======================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Unwrap an enum value to its underlying representation.
+     *
+     */
+    pub fn createEnumUnwrap(value: &Value)-> &Value {
+        if let en: &EnumType = value.type {
+            if let v: &EnumFieldAccessValue = value {
+                return ValueCreation::createEnumUnwrap(v.value);
+            }
+
+            return copy CastValue(value.loc, en.getLastLevelProxy(), value);
+        }
+
+        return value;
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * =====================================          RANGES          =====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+
+    /**
+     * Extract the components of a range Value.
+     *
+     * @returns:
+     *   - (fst, scd, step, contains)
+     *
+     * @throws:
+     *   - ErrorMsg if reduction fails
+     */
+    pub fn createRangeUnwrap(dmut context: &ValidationContext,
+                             range:        &Value,
+                             rangeType:    &RangeType,
+                             reduce:       bool = true)-> (&Value, &Value, &Value, &Value)
+        throws ErrorMsg
+    {
+        let loc = range.loc;
+        let mut fst: &Value  = copy StructFieldAccessValue(loc, rangeType.start, range, RangeKeys::FST);
+        let mut scd: &Value  = copy StructFieldAccessValue(loc, rangeType.start, range, RangeKeys::SCD);
+        let mut step: &Value = copy StructFieldAccessValue(loc, rangeType.step, range, RangeKeys::STEP);
+        let mut contains: &Value = copy StructFieldAccessValue(loc, BOOL_TYPE, range, RangeKeys::CONTAINS);
+
+        if reduce {
+            let dmut interpret = alias context.cteInterpret;
+
+            fst = interpret:.reduce(fst);
+            scd = interpret:.reduce(scd);
+            step = interpret:.reduce(step);
+            contains = interpret:.reduce(contains);
+        }
+
+        return (fst, scd, step, contains);
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * =====================================          CLASS          ======================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Instantiate an object of a class type.
+     *
+     * @params:
+     *   - type must be ClassPtrType or ClassRefType.
+     *
+     * @throws:
+     *   - ErrorMsg if no matching constructor exists
+     */
+    pub fn createObjectInstance(dmut context: &ValidationContext, loc: &Word, type: &Type, params: [&Value])-> &Value
+        throws ErrorMsg
+    {
+        let (ctors, isStruct) = match type {
+            c: &ClassPtrType => {
+                (ClassStaticFieldValidation::validateCtors(alias context, loc, c.inner, name-> ""), c.sym.isStruct)
+            }
+            c: &ClassRefType => {
+                (ClassStaticFieldValidation::validateCtors(alias context, loc, c, name-> ""), c.sym.isStruct)
+            }
+            _ => panic;
+        }
+
+        return CallValidation::validate(alias context, loc, ctors, params, inCopy-> !isStruct);
+    }
+
+    /**
+     * Access a method on a class instance.
+     *
+     * @throws:
+     *   - ErrorMsg if the method does not exist or is inaccessible
+     */
+    pub fn createObjectMethodAcc(dmut context: &ValidationContext,
+                                 loc:          &Word,
+                                 cptr:         &ClassPtrType,
+                                 value:        &Value,
+                                 meth:         [c8],
+                                 allowImmut:   bool = false)-> &Value
+
+        throws ErrorMsg
+    {
+        let var = copy VarExpr(loc.locate(meth), isQuoted-> true);
+
+        {
+            return ClassVtableAccessValidation::validate(alias context, loc,
+                                                         object-> value,
+                                                         cref-> cptr.inner,
+                                                         method-> var,
+                                                         isProxy-> (value of SuperProxyValue),
+                                                         allowImmut-> allowImmut,
+                                                         inCall-> true);
+        } catch {
+            err => {
+                throw copy ErrorMsg::fatal(loc, format(ValidateErrorMessage::CLASS_NO_METHOD, value.type, meth),
+                                           notes-> copy [err]);
+            }
+        }
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * =====================================          ATOMIC          =====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Retrieve or construct the global atomic lock/unlock functions.
+     *
+     * @returns:
+     *   - (lockFn, unlockFn)
+     *
+     * @throws:
+     *   - ErrorMsg if lookup or validation fails
+     */
+    pub fn createAtomicLocksNoMonitorFuncs(dmut context: &ValidationContext, loc: &Word)-> (&Value, &Value)
+        throws ErrorMsg
+    {
+        let mut lockFn: &Value = UNIT_VALUE;
+        if let Ok(lo: &Value) = context.getCoreValue(AtomicUtils::LOCK_GLOBAL) {
+            lockFn = lo;
+        } else {
+            let lockName = VariableCreation::createSyntaxVarFromPath(loc, AtomicUtils::LOCK_GLOBAL);
+            lockFn = ValueValidation::validate(alias context, lockName);
+
+            context:.insertCoreValue(AtomicUtils::UNLOCK_GLOBAL, lockFn);
+        }
+
+        let mut unlockFn: &Value = UNIT_VALUE;
+        if let Ok(un: &Value) = context.getCoreValue(AtomicUtils::UNLOCK_GLOBAL) {
+            lockFn = un;
+        } else {
+            let unlockName = VariableCreation::createSyntaxVarFromPath(loc, AtomicUtils::UNLOCK_GLOBAL);
+            unlockFn = ValueValidation::validate(alias context, unlockName);
+
+            context:.insertCoreValue(AtomicUtils::UNLOCK_GLOBAL, unlockFn);
+        }
+
+        return (lockFn, unlockFn);
+    }
+
+    /**
+     * Same as createAtomicLocksNoMonitorFuncs(), but for monitor-based locks.
+     *
+     * @returns:
+     *   - (lockFn, unlockFn)
+     */
+    pub fn createAtomicLocksWithMonitorFuncs(dmut context: &ValidationContext, loc: &Word)-> (&Value, &Value)
+        throws ErrorMsg
+    {
+        let mut lockFn: &Value = UNIT_VALUE;
+        if let Ok(lo: &Value) = context.getCoreValue(AtomicUtils::LOCK_MONITOR) {
+            lockFn = lo;
+        } else {
+            let lockName = VariableCreation::createSyntaxVarFromPath(loc, AtomicUtils::LOCK_MONITOR);
+            lockFn = ValueValidation::validate(alias context, lockName);
+
+            context:.insertCoreValue(AtomicUtils::UNLOCK_GLOBAL, lockFn);
+        }
+
+        let mut unlockFn: &Value = UNIT_VALUE;
+        if let Ok(un: &Value) = context.getCoreValue(AtomicUtils::UNLOCK_MONITOR) {
+            lockFn = un;
+        } else {
+            let unlockName = VariableCreation::createSyntaxVarFromPath(loc, AtomicUtils::UNLOCK_MONITOR);
+            unlockFn = ValueValidation::validate(alias context, unlockName);
+
+            context:.insertCoreValue(AtomicUtils::UNLOCK_GLOBAL, unlockFn);
+        }
+
+        return (lockFn, unlockFn);
+    }
+
+    /**
+     * Construct a conditional panic used for bounds checking.
+     *
+     */
+    pub fn createOutOfArrayTest(loc: &Word, test: &Value)-> &Value {
+        let call = copy PanicValue(loc);
+        return copy ConditionalValue(loc, VOID_TYPE, test,
+                                     thenv-> call,
+                                     elsev-> UNIT_VALUE,
+                                     isComplete-> false);
+    }
+}

@@ -1,0 +1,249 @@
+/*
+ * Implements semantic validation for field access on option values in Ymir.
+ *
+ * Supported fields:
+ *   - set        — boolean flag indicating whether the option contains a value
+ *   - hasError   — boolean flag indicating whether the option contains an error
+ *   - value      — returns the wrapped value, or throws if none is present
+ *   - error      — returns the wrapped error, or throws if none is present
+ *
+ * This module is invoked by FieldValidation when the left operand is an OptionType.
+ *
+ * <hr>
+ *
+ * @Package: ymirc
+ * @Module: ymirc::semantic::validator::value::operator::fields::option
+ * @File: ymirc/semantic/validator/value/operator/fields/option.yr
+ * @Author(s):
+ *   - Emile Cadorel <ecadorel@gmail.com>
+ *
+ * @Created(YYYY-MM-DD): 2026-04-18
+ * @Copyright(C) 2021–2026 GNU-Ymir
+ * @License
+ *   ```text
+ *   This file is part of the Ymir language project.
+ *
+ *   Ymir is free software: you can redistribute it and/or modify it
+ *   under the terms of the GNU General Public License as published by
+ *   the Free Software Foundation, either version 3 of the License, or
+ *   (at your option) any later version.
+ *
+ *   Ymir is distributed in the hope that it will be useful,
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *   GNU General Public License for more details.
+ *
+ *   You should have received a copy of the GNU General Public License
+ *   along with Ymir.  If not, see <https://www.gnu.org/licenses/>.
+ *   ```
+ */
+
+in option;
+
+use ymirc::syntax::{_, declaration::_, expression::_};
+
+use ymirc::semantic::{declarator, validator, template_, interpret, symbol};
+use ymirc::semantic::generator::{value::_, type::_};
+use ymirc::semantic::generator::_;
+
+use ymirc::global::core_;
+use ymirc::errors;
+use ymirc::utils::{format, string, bigint};
+
+use ymirc::lexing::{word, tokens, keys};
+
+use std::{io, stream, time::_};
+
+
+/**
+ * OptionFieldValidation
+ *
+ * Provides semantic validation for field access on option values.
+ *
+ * Supported field names:
+ *   - set       — true if the option contains a value
+ *   - hasError  — true if the option contains an error
+ *   - value     — returns the wrapped value or throws if absent
+ *   - error     — returns the wrapped error or throws if absent
+ *
+ * This module defines the complete semantics of option field access in Ymir.
+ */
+pub mod OptionFieldValidation {
+
+    /**
+     * Validate a field access on an option value.
+     *
+     * Supported fields:
+     *   - set       — returns whether the option contains a value
+     *   - hasError  — returns whether the option contains an error
+     *   - value     — returns the wrapped value or throws if absent
+     *   - error     — returns the wrapped error or throws if absent
+     *
+     * @params:
+     *   - context:   validation context
+     *   - loc:       operator location
+     *   - left:      validated option value
+     *   - leftType:  option type of the left operand
+     *   - right:     field expression
+     *
+     * @returns:
+     *   A &Value representing the validated field access.
+     *
+     * @throws:
+     *   ErrorMsg if the field is not a valid option field.
+     */
+    pub fn validate(dmut context: &ValidationContext,
+                     loc:          &Word,
+                     left:         &Value,
+                     leftType:     &OptionType,
+                     right:        &Expression)-> &Value
+        throws ErrorMsg
+    {
+        if let field: &VarExpr = right {
+            match field.name.str {
+                OptionKeys::SET => {
+                    return copy StructFieldAccessValue(loc, BOOL_TYPE, left, OptionKeys::SET);
+                }
+                OptionKeys::HAS_ERROR => {
+                    return OptionFieldValidation::validateHasError(loc, left);
+                }
+                OptionKeys::VALUE => {
+                    return OptionFieldValidation::validateValue(alias context, loc, left, leftType);
+                }
+                OptionKeys::ERROR => {
+                    return OptionFieldValidation::validateError(alias context, loc, left, leftType);
+                }
+            }
+        }
+
+        throw copy ErrorMsg::fatal(right.loc, format(ValidateErrorMessage::TYPE_NO_FIELD, left.type, right));
+    }
+
+    /**
+     * Validate the `option.hasError` field.
+     *
+     * Semantics:
+     *   hasError = (!option.set) && (option.error != null)
+     *
+     * @params:
+     *   - loc:   operator location
+     *   - left:  validated option value
+     *
+     * @returns:
+     *   A &Value computing whether the option contains an error.
+     */
+    fn validateHasError(loc: &Word, left: &Value)-> &Value {
+        let isSet = copy StructFieldAccessValue(loc, BOOL_TYPE, left, OptionKeys::SET);
+        let notIsSet = copy UnaryOperatorValue(loc, BOOL_TYPE, UnaryOperators::NOT, isSet);
+        let hasErr = copy CmpPointerOperatorValue(loc, BinaryOperators::NOT_EQUAL,
+                                                   copy OptionFieldAccessValue(loc, PTR_VOID_TYPE, left, OptionKeys::ERROR),
+                                                   copy NullValue(loc, PTR_VOID_TYPE));
+
+        return copy LogicalBoolOperatorValue(loc, BinaryOperators::DAND, notIsSet, hasErr);
+    }
+
+    /**
+     * Validate the `option.value` field.
+     *
+     * Semantics:
+     *   - If option.set == false => throw EMPTY_VAL_OPTION
+     *   - Otherwise => return the wrapped value
+     *
+     * @params:
+     *   - context: validation context
+     *   - loc:     operator location
+     *   - left:    validated option value
+     *   - otype:   option type
+     *
+     * @returns:
+     *   A &Value representing the extracted value or a runtime check.
+     *
+     * @throws:
+     *   ErrorMsg if compile-time evaluation determines the option has no value.
+     */
+    fn validateValue(dmut context: &ValidationContext,
+                      loc:          &Word,
+                      left:         &Value,
+                      otype:        &OptionType)-> &Value
+        throws ErrorMsg
+    {
+        let dmut interpret = alias context.cteInterpret;
+        let isSet = interpret:.reduce(copy UnaryOperatorValue(loc,
+                                                                BOOL_TYPE,
+                                                                UnaryOperators::NOT,
+                                                                copy StructFieldAccessValue(loc, BOOL_TYPE, left, OptionKeys::SET)));
+
+        let value = copy OptionFieldAccessValue(loc, otype.wrapped, left, OptionKeys::VALUE);
+
+        // we know at cte if the option has a value or not
+        if let b: &BoolValue = isSet {
+            if (b.isTrue) { // !x.hasValue
+                throw copy ErrorMsg::fatal(loc, format(ValidateErrorMessage::OPTION_HAS_NO_VALUE, otype));
+            }
+
+            return value; // x.hasValue, thus return the value
+        }
+
+        let errType = TypeCreation::createExceptionFromName(alias context, loc-> loc, ExceptionUtils::EMPTY_VAL_OPTION);
+        let errInstance = ValueCreation::createObjectInstance(alias context, loc, errType, []);
+        let throwVal = copy ThrowValue(loc, errInstance);
+
+        let cond = copy ConditionalValue(loc, VOID_TYPE, isSet, throwVal, elsev-> UNIT_VALUE, isComplete-> false);
+
+        return copy BlockValue(loc, otype.wrapped, copy [cond, value], isSet-> true);
+    }
+
+    /**
+     * Validate the `option.error` field.
+     *
+     * Semantics:
+     *   - If option.set == true => throw EMPTY_ERR_OPTION
+     *   - If option.error == null => throw EMPTY_ERR_OPTION
+     *   - Otherwise => return the wrapped error
+     *
+     * @params:
+     *   - context: validation context
+     *   - loc:     operator location
+     *   - left:    validated option value
+     *   - otype:   option type
+     *
+     * @returns:
+     *   A &Value representing the extracted error or a runtime check.
+     *
+     * @throws:
+     *   ErrorMsg if compile-time evaluation determines the option has no error.
+     */
+    fn validateError(dmut context: &ValidationContext,
+                      loc:          &Word,
+                      left:         &Value,
+                      otype:        &OptionType)-> &Value
+        throws ErrorMsg
+    {
+        let isSet = copy StructFieldAccessValue(loc, BOOL_TYPE, left, OptionKeys::SET);
+        let notHasErr = copy CmpPointerOperatorValue(loc, BinaryOperators::DEQUAL,
+                                                      copy OptionFieldAccessValue(loc, PTR_VOID_TYPE, left, OptionKeys::ERROR),
+                                                      copy NullValue(loc, PTR_VOID_TYPE));
+
+        let setOrNotHasError = context.cteInterpret:.reduce(copy LogicalBoolOperatorValue(loc, BinaryOperators::DPIPE, isSet, notHasErr));
+        let innerType = TypeCreation::createExceptionType(alias context, loc-> loc);
+
+        let value = copy OptionFieldAccessValue(loc, innerType, left, OptionKeys::ERROR);
+        if let b: &BoolValue = setOrNotHasError {
+            if (b.isTrue) {
+                throw copy ErrorMsg::fatal(loc, format(ValidateErrorMessage::OPTION_HAS_NO_ERROR, otype));
+            }
+
+            return value;
+        }
+
+        let errType = TypeCreation::createExceptionFromName(alias context, loc-> loc, ExceptionUtils::EMPTY_ERR_OPTION);
+        let errInstance = ValueCreation::createObjectInstance(alias context, loc, errType, []);
+        let throwVal = copy ThrowValue(loc, errInstance);
+
+        let cond = copy ConditionalValue(loc,
+                                          VOID_TYPE,
+                                          setOrNotHasError, throwVal, elsev-> UNIT_VALUE, isComplete-> false);
+
+        return copy BlockValue(loc, errType, copy [cond, value], isSet-> true);
+    }
+}

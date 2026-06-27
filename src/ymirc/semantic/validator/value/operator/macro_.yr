@@ -1,0 +1,213 @@
+/*
+ * Implements semantic validation for macro call expressions.
+ *
+ * A macro call(`MacroCallExpr`) consists of:
+ *
+ *   - a left-hand side(the macro reference),
+ *   - a content string to match and rewrite.
+ *
+ * MacroValidation is the final stage of the macro system: it bridges the
+ * macro-solving engine with the semantic validator.
+ *
+ * <hr>
+ *
+ * @Package: ymirc
+ * @Module: ymirc::semantic::validator::value::operator::macro_
+ * @File: ymirc/semantic/validator/value/operator/macro_.yr
+ * @Author(s):
+ *   - Emile Cadorel <ecadorel@gmail.com>
+ *
+ * @Created(YYYY-MM-DD): 2026-05-26
+ * @Copyright(C) 2021–2026 GNU-Ymir
+ * @License
+ *   ```text
+ *   This file is part of the Ymir language project.
+ *
+ *   Ymir is free software: you can redistribute it and/or modify it
+ *   under the terms of the GNU General Public License as published by
+ *   the Free Software Foundation, either version 3 of the License, or
+ *   (at your option) any later version.
+ *
+ *   Ymir is distributed in the hope that it will be useful,
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *   GNU General Public License for more details.
+ *
+ *   You should have received a copy of the GNU General Public License
+ *   along with Ymir.  If not, see <https://www.gnu.org/licenses/>.
+ *   ```
+ */
+
+in macro_;
+
+use ymirc::lexing::{word, tokens};
+use ymirc::syntax::{visitor, expression::operator};
+use ymirc::semantic::validator;
+use ymirc::semantic::generator::value::_;
+
+use ymirc::errors;
+use ymirc::utils::format;
+
+use ymirc::semantic::validator::value::operator::macro_::_;
+
+
+/*!
+ * ====================================================================================================
+ * ====================================================================================================
+ * ====================================          SUBMODS          =====================================
+ * ====================================================================================================
+ * ====================================================================================================
+ */
+
+mod ::solve;
+mod ::rewrite;
+mod ::mapper;
+
+/*!
+ * ====================================================================================================
+ * ====================================================================================================
+ * ======================================          ROOT          ======================================
+ * ====================================================================================================
+ * ====================================================================================================
+ */
+
+/**
+ * MacroValidation module
+ *
+ * Provides semantic validation for macro call expressions.
+ *
+ */
+pub mod MacroValidation {
+
+    /**
+     * Validate a macro call expression.
+     *
+     * @returns:
+     *   - the validated Value produced by the macro expansion.
+     *
+     * @throws:
+     *   - ErrorMsg if the left-hand side is not a macro reference.
+     */
+    pub fn validate(dmut context: &ValidationContext, call: &MacroCallExpr)-> &Value
+        throws ErrorMsg
+    {
+        let mut left = ValueValidation::validate(alias context, call.who);
+        let value = if let ml: &MultSymValue = left {
+            ml
+        } else {
+            copy MultSymValue(left.loc, copy [left], prettyStr-> format("%", left))
+        };
+
+        return MacroValidation::validate(alias context, call.loc, value, call);
+    }
+
+    /**
+     * Attempt macro solving for each candidate in a MultSymValue.
+     *
+     * Resolution rules:
+     *   - if no candidate succeeds → throw MACRO_CALL_VALIDATION_FAILED with notes,
+     *   - if multiple candidates succeed → throw WORKS_WITH_BOTH with notes,
+     *   - if exactly one succeeds → finalize the macro expansion.
+     *
+     * @returns:
+     *   - the validated Value produced by the macro expansion.
+     *
+     * @throws:
+     *   - ErrorMsg::fatal for ambiguity or invalid macro calls,
+     *   - ErrorMsg::list for multiple candidate failures.
+     */
+    fn validate(dmut context: &ValidationContext,
+                loc:          &Word,
+                value:        &MultSymValue,
+                call:         &MacroCallExpr)-> &Value
+        throws ErrorMsg
+    {
+        let mut results: [[c8]] = []; // list of generated macro contents
+        let mut lefts: [(&MacroRefValue, &Word)] = []; // list of macros used to generate values
+        let mut errors: [&ErrorMsg] = [];
+
+        for it in value.values {
+            {
+                if let mac: &MacroRefValue = it {
+                    let (localLoc, gen) = MacroSolving::solve(alias context, loc, mac, call.content, call.trim);
+                    results ~= [gen];
+                    lefts ~= [(mac, localLoc)];
+                }
+                else {
+                    let prettyName = CallParamListCreation::formatPrettyName(it);
+                    throw copy ErrorMsg::fatal(loc, format(ValidateErrorMessage::UNDEFINED_MACRO_CALL, prettyName));
+                }
+            } catch {
+                err => { // either not a macro, or call failed
+                    errors ~= [err];
+                }
+            }
+        }
+
+        if (results.len == 0) {
+            throw copy ErrorMsg::fatal(loc, format(ValidateErrorMessage::MACRO_CALL_VALIDATION_FAILED),
+                                       notes-> errors);
+        }
+
+        if (results.len != 1) { // multiple candidates succeeded to the macro call
+            let mut candidates = copy [copy ErrorMsg::note(i._0.loc, format(ValidateErrorMessage::CANDIDATE_ARE, i._0))
+                                       for i in lefts];
+
+            throw copy ErrorMsg::fatal(loc, format(ValidateErrorMessage::WORKS_WITH_BOTH),
+                                       notes-> candidates);
+        }
+
+        return MacroValidation::finalize(alias context, loc, lefts[0]._1, lefts[0]._0, results[0]);
+    }
+
+    /**
+     * Finalize a macro expansion by parsing and validating the rewritten content.
+     *
+     * @params:
+     *   - ctorLoc: location of the macro constructor(for diagnostics),
+     *   - macVal  : the macro reference being expanded,
+     *   - content: the rewritten macro output.
+     *
+     * @returns:
+     *   - the validated Value produced by the macro expansion.
+     *
+     * @throws:
+     *   - ErrorMsg::fatal if parsing or validation fails.
+     */
+    fn finalize(dmut context: &ValidationContext,
+                loc:          &Word,
+                ctorLoc:      &Word,
+                macVal:       &MacroRefValue,
+                content:      [c8])-> &Value
+        throws ErrorMsg
+    {
+        let dmut visitor = copy SyntaxVisitor::fromStr(loc.filename, Tokens::LACC ~ content ~ Tokens::RACC);
+        let expr = {
+            ExpressionVisitor::readExpressionComplex(alias visitor, 0)
+        } catch {
+            err => {
+                let centering = utils::string::center("", utils::string::maxLineLength(content), "=");
+                throw copy ErrorMsg::fatal(loc, format(ValidateErrorMessage::IN_MACRO_FINALIZATION, centering, content, centering),
+                                           notes-> copy [copy ErrorMsg::note(ctorLoc, format(ValidateErrorMessage::DEFINED_HERE)), err]);
+            }
+        }
+
+        let dmut macroRef = alias context.referent;
+        context:.pushReferent(alias context:.getSymbolFromRef(macVal.sym),
+                              macroSym-> alias macroRef);
+
+        // We don't enter foreign, macro are inlined into the function that made the call
+        let value = {
+            ValueValidation::validate(alias context, expr)
+        } catch {
+            err => {
+                let centering = utils::string::center("", utils::string::maxLineLength(content), "=");
+                throw copy ErrorMsg::fatal(loc, format(ValidateErrorMessage::IN_MACRO_FINALIZATION, centering, content, centering),
+                                           notes-> copy [copy ErrorMsg::note(ctorLoc, format(ValidateErrorMessage::DEFINED_HERE)), err]);
+            }
+        }
+
+        context:.popReferent();
+        return value;
+    }
+}

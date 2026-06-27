@@ -1,0 +1,518 @@
+/*
+ * Implicit slice-type cast validation.
+ *
+ * CastImplicitSliceValidation performs semantic validation of implicit casts
+ * involving slice types. It is responsible for:
+ *
+ *   - validating implicit casts from strings to character slices,
+ *   - validating implicit casts from slice constructors,
+ *   - validating implicit casts from array literals and array allocations,
+ *   - validating implicit casts from CopierValue and ListComprValue,
+ *   - reconstructing slice constructors with rewritten inner values,
+ *   - rewriting list comprehensions when their inner value is implicitly castable,
+ *   - propagating detailed diagnostics when implicit casts fail.
+ *
+ * <hr>
+ *
+ * @Package: ymirc
+ * @Module: ymirc::semantic::validator::value::operator::cast_::implicit::slice
+ * @File: ymirc/semantic/validator/value/operator/cast_/implicit/slice.yr
+ * @Author(s):
+ *   - Emile Cadorel <ecadorel@gmail.com>
+ *
+ * @Created(YYYY-MM-DD): 2026-06-14
+ * @Copyright(C) 2021–2026 GNU-Ymir
+ * @License
+ *   ```text
+ *   This file is part of the Ymir language project.
+ *
+ *   Ymir is free software: you can redistribute it and/or modify it
+ *   under the terms of the GNU General Public License as published by
+ *   the Free Software Foundation, either version 3 of the License, or
+ *   (at your option) any later version.
+ *
+ *   Ymir is distributed in the hope that it will be useful,
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *   GNU General Public License for more details.
+ *
+ *   You should have received a copy of the GNU General Public License
+ *   along with Ymir.  If not, see <https://www.gnu.org/licenses/>.
+ *   ```
+ */
+
+in slice;
+
+use ymirc::semantic::validator;
+use ymirc::semantic::generator::{value::_, type::_};
+use ymirc::errors;
+
+use ymirc::lexing::word;
+
+/**
+ * CastImplicitSliceValidation module
+ *
+ * Provides the core logic for validating implicit casts involving slice types.
+ *
+ */
+pub mod CastImplicitSliceValidation {
+
+    /**
+     * Validate an implicit cast from a value to a slice type.
+     *
+     * @params:
+     *   - context: validation context used for recursive cast validation
+     *   - loc:     source location of the cast
+     *   - s:       target SliceType
+     *   - v:       value to implicitly cast
+     *   - error:   original compatibility error to throw if cast fails
+     *
+     * @returns:
+     *   - &Value: rewritten slice constructor or copier value
+     *
+     * @throws:
+     *   - error if no valid implicit slice cast exists
+     */
+    pub fn validate(dmut context: &ValidationContext,
+                    loc:          &Word,
+                    s:            &SliceType,
+                    v:            &Value,
+                    error:        &ErrorMsg)-> &Value
+        throws ErrorMsg
+    {
+        match (v, v.type) {
+            (str: &StringValue, _: &SliceType) => {
+                if let ch: &CharType = s.value {
+                    return copy StringValue(v.loc, str, size-> ch.size);
+                }
+            }
+            (c: &SliceCtorValue, sr: &SliceType) => {
+                if sr.value  of VoidType {
+                    return copy SliceCtorValue(loc, s, NULL_VALUE, NULL_VALUE,
+                                               copy IntValue(loc, USIZE_TYPE, 0),
+                                               isImplicitAlias-> true);
+                }
+
+                return CastImplicitSliceValidation::validateFromLit(alias context, loc, s, c, error,
+                                                                    isDeep-> false,
+                                                                    needCopy-> false);
+            }
+            (ArrayValue(), a: &ArrayType) => {
+                if a.value of VoidType {
+                    return copy SliceCtorValue(loc, s, NULL_VALUE, NULL_VALUE,
+                                               copy IntValue(loc, USIZE_TYPE, 0us),
+                                               isImplicitAlias-> true);
+                }
+            }
+            (c: &CopierValue, sr: &SliceType) => {
+                if (sr.value of VoidType) {
+                    return copy SliceCtorValue(loc, s, NULL_VALUE, NULL_VALUE,
+                                               copy IntValue(loc, USIZE_TYPE, 0us),
+                                               isImplicitAlias-> true);
+                }
+
+                if let ctor: &SliceCtorValue = c.value {
+                    return CastImplicitSliceValidation::validateFromLit(alias context, loc, s, ctor, error,
+                                                                        isDeep-> c.isDeep);
+                }
+
+                if let lst: &ListComprValue = c.value {
+                    return CastImplicitSliceValidation::validateFromLstCompr(alias context, loc, s.value, lst, error);
+                }
+            }
+            (a: &ArrayAllocValue, sr: &SliceType) => {
+                if (sr.value of VoidType) {
+                    return copy SliceCtorValue(loc, s, NULL_VALUE, NULL_VALUE,
+                                               copy IntValue(loc, USIZE_TYPE, 0us),
+                                               isImplicitAlias-> true);
+                }
+
+                if (a.isDynamic) {
+                    return CastImplicitSliceValidation::validateFromAllocDyn(alias context, loc, s.value, a, error);
+                }
+            }
+        }
+
+        throw error;
+    }
+
+    /**
+     * Validate an implicit cast from a SliceCtorValue literal to a slice type.
+     *
+     * @params:
+     *   - context: validation context used for recursive cast validation
+     *   - loc:     source location of the cast
+     *   - s:       target SliceType
+     *   - ctor:    SliceCtorValue literal to cast
+     *   - isDeep:  whether the cast originates from a deep copy
+     *   - needCopy: whether the resulting slice must be wrapped in a CopierValue
+     *   - error:   original compatibility error to throw if cast fails
+     *
+     * @returns:
+     *   - &Value: rewritten slice constructor or copier value
+     *
+     * @throws:
+     *   - error if cast fails
+     */
+    fn validateFromLit(dmut context: &ValidationContext,
+                       loc:          &Word,
+                       s:            &SliceType,
+                       ctor:         &SliceCtorValue,
+                       isDeep:       bool,
+                       needCopy:     bool = true,
+                       error:        &ErrorMsg)-> &Value
+        throws ErrorMsg
+    {
+        if let addr: &AddressValue = ctor.ptr {
+            if let array: &ArrayValue = addr.value {
+                return CastImplicitSliceValidation::validateFromArray(alias context, loc, s, array, error,
+                                                                      needCopy-> needCopy);
+            }
+            if let all: &ArrayAllocValue = addr.value {
+                return CastImplicitSliceValidation::validateFromAllocStat(alias context, loc, s.value, all, error,
+                                                                          isDeep-> isDeep,
+                                                                          needCopy-> needCopy);
+            }
+        }
+
+        throw error;
+    }
+
+    /**
+     * Validate an implicit cast from an ArrayValue to a slice type.
+     *
+     * @params:
+     *   - context: validation context used for recursive cast validation
+     *   - loc:     source location of the cast
+     *   - s:       target SliceType
+     *   - array:   ArrayValue literal to cast
+     *   - needCopy: whether the resulting slice must be wrapped in a CopierValue
+     *   - error:   original compatibility error to throw if cast fails
+     *
+     * @returns:
+     *   - &Value: rewritten slice constructor or copier value
+     *
+     * @throws:
+     *   - error with additional notes if element cast fails
+     */
+    fn validateFromArray(dmut context: &ValidationContext,
+                         loc:          &Word,
+                         s:            &SliceType,
+                         array:        &ArrayValue,
+                         needCopy:     bool,
+                         error:        &ErrorMsg)-> &Value
+        throws ErrorMsg
+    {
+        let mut params: [&Value] = [];
+        let mut inner: &Type = copy NoneType(loc);
+        {
+            let len = array.values.len;
+            for i in 0us .. len {
+                let innerV = CastImplicitValidation::validate(alias context, loc, array.values[i], s.value);
+                inner = SliceComposeValidation::addArrayType(alias context, innerV, inner,
+                                                             ref params);
+            }
+        } catch {
+            innerErr => {
+                throw error.withNote(copy [innerErr],
+                                     alone-> true);
+            }
+        }
+
+        if (params.len != 0us) {
+            let arrType = copy ArrayType(loc, inner, params.len,
+                                         isMutable-> true);
+
+            let arrValue = copy ArrayValue(loc, arrType, params);
+            let slcType = copy SliceType(loc, inner,
+                                         withSize-> copy IntValue(loc, USIZE_TYPE, params.len),
+                                         isMutable-> true);
+
+            let addr = copy AddressValue(loc, copy PointerType(loc, inner, isMutable-> false), arrValue);
+            let retCtor = copy SliceCtorValue(loc, slcType, addr, NULL_VALUE,
+                                              copy IntValue(loc, USIZE_TYPE, params.len),
+                                              isImplicitAlias-> true);
+
+            if needCopy {
+                return copy CopierValue(loc, slcType, retCtor, isDeep-> false);
+            }
+
+            return retCtor;
+
+        }
+
+        return copy SliceCtorValue(loc, s, NULL_VALUE, NULL_VALUE,
+                                   copy IntValue(loc, USIZE_TYPE, 0),
+                                   isImplicitAlias-> true);
+    }
+
+    /**
+     * Validate an implicit cast from a static ArrayAllocValue to a slice type.
+     *
+     * @params:
+     *   - context: validation context used for recursive cast validation
+     *   - loc:     source location of the cast
+     *   - inner:   target slice element type
+     *   - ctor:    ArrayAllocValue to cast
+     *   - isDeep:  whether the cast originates from a deep copy
+     *   - needCopy: whether the resulting slice must be wrapped in a CopierValue
+     *   - error:   original compatibility error to throw if cast fails
+     *
+     * @returns:
+     *   - &Value: rewritten slice constructor or copier value
+     *
+     * @throws:
+     *   - error with additional notes if cast fails
+     */
+    fn validateFromAllocStat(dmut context: &ValidationContext,
+                             loc:          &Word,
+                             inner:        &Type,
+                             ctor:         &ArrayAllocValue,
+                             isDeep:       bool,
+                             needCopy:     bool,
+                             error:        &ErrorMsg)-> &Value
+        throws ErrorMsg
+    {
+        {
+            // array alloc stat is a memcpy of an array on the stack
+            // let x = [old_value ; #_len];
+            // copy {.len = #_len, .ptr = &x}
+            let innerV = CastImplicitValidation::validate(alias context, loc, ctor.value, inner);
+            let innerType = TypeInference::inferImplicitMutability(innerV.type, innerV);
+
+            let len = if let arr: &ArrayType = ctor.type {
+                arr.len
+            } else panic;
+
+
+            let arrType = copy ArrayType(loc, innerType, len, isMutable-> true);
+            let slcType = copy SliceType(loc, innerType, withSize-> ctor.len, isMutable-> true);
+
+            // We rewrite the stack part
+            // let x = [new_value ; #_len]
+            let content = copy AddressValue(ctor.loc, copy PointerType(ctor.loc, innerType, isMutable-> false),
+                                            copy ArrayAllocValue::stat(loc, arrType, innerV, ctor.len));
+
+            // And the copy part
+            // copy {.len = #_len, .ptr = &x}
+            let finalCtor = copy SliceCtorValue(ctor.loc, slcType, content, NULL_VALUE,
+                                                ctor.len,
+                                                isImplicitAlias-> true);
+
+            if needCopy {
+                return copy CopierValue(ctor.loc, slcType, finalCtor, isDeep-> isDeep);
+            }
+
+            return finalCtor;
+        } catch {
+            innerErr => {
+                throw error.withNote(copy [innerErr], alone-> true);
+            }
+        }
+    }
+
+    /**
+     * Validate an implicit cast from a dynamic ArrayAllocValue to a slice type.
+     *
+     * @params:
+     *   - context: validation context used for recursive cast validation
+     *   - loc:     source location of the cast
+     *   - inner:   target slice element type
+     *   - ctor:    dynamic ArrayAllocValue to cast
+     *   - error:   original compatibility error to throw if cast fails
+     *
+     * @returns:
+     *   - &Value: rewritten dynamic ArrayAllocValue
+     *
+     * @throws:
+     *   - error with additional notes if cast fails
+     */
+    fn validateFromAllocDyn(dmut context: &ValidationContext,
+                            loc:          &Word,
+                            inner:        &Type,
+                            ctor:         &ArrayAllocValue,
+                            error:        &ErrorMsg)-> &Value
+        throws ErrorMsg
+    {
+        {
+            // An array alloc is simple,
+            // copy [old_value ; #_len]
+            let innerV = CastImplicitValidation::validate(alias context, loc, ctor.value, inner);
+            let slcType = copy SliceType(loc, innerV.type, withSize-> ctor.len, isMutable-> true);
+
+            // Create a new array alloc
+            // copy [new_value ; #_len]
+            return copy ArrayAllocValue::dyn(loc, slcType, innerV, ctor.len);
+        } catch {
+            innerErr => {
+                throw error.withNote(copy [innerErr], alone-> true);
+            }
+        }
+    }
+
+    /**
+     * Validate an implicit cast from a list comprehension to a slice type.
+     *
+     * @params:
+     *   - context: validation context used for recursive cast validation
+     *   - loc:     source location of the cast
+     *   - inner:   target slice element type
+     *   - lst:     ListComprValue to cast
+     *   - error:   original compatibility error to throw if cast fails
+     *
+     * @returns:
+     *   - &Value: rewritten list comprehension wrapped in a CopierValue
+     *
+     * @throws:
+     *   - error if the list comprehension structure is invalid
+     */
+    fn validateFromLstCompr(dmut context: &ValidationContext,
+                            loc:          &Word,
+                            inner:        &Type,
+                            lst:          &ListComprValue,
+                            error:        &ErrorMsg)-> &Value
+        throws ErrorMsg
+    {
+        if lst.type !of SliceType {
+            throw error;
+        }
+
+        // a list compr that is castable is simple, and made of three elements
+        // 1. let mut #_iter = 0;
+        // 2. let #_value: [oldType] = copy [<unit-value> ; #_len]
+        // 3. while  #_iter < #_len {
+        // 4.    let i = #_iter;
+        // 5.    #_value[i] = oldValue; <= the castable value
+        // 6.    #_iter += 1;
+        //    }
+        // 7. #_value <= return the created slice
+
+        if (lst.block.values.len < 3) throw error; // iter, loop, value_ref
+        let (aff, lpInner, oldLp) = match lst.block.values[$ - 2us] {
+            l: &LoopValue => {
+                match l.value {
+                    b: &BlockValue if b.values.len >= 2 => {
+                        if let aff: &AffectValue = b.values[$ - 2us] {
+                            (aff, b, l)
+                        } else {
+                            throw error;
+                        }
+                    }
+                    _ => throw error;
+                }
+            }
+            _ => throw error;
+        };
+
+        // we need the iterator index used in the affectation, i.e. '#_iter' from => #_value[#_iter] = oldValue;
+        let iterRef = match aff.left {
+            s: &SliceAccessValue => {
+                if let i: &VarRefValue = s.index {
+                    i
+                } else throw error;
+            }
+            _ => throw error;
+        };
+
+        // We also need the size of the slice that was created, i.e. '#_len' from => let #_value = copy [<unit-value> ; #_len]
+        let len = match lst.block.values[$ - 3us] {
+            s: &VarDeclValue => {
+                if let all: &ArrayAllocValue = s.value {
+                    all.len
+                } else throw error;
+            }
+            _ => throw error;
+        };
+
+        {
+            CastImplicitSliceValidation::rewriteListComprSlice(alias context, loc, inner, lst, aff, lpInner, oldLp, iterRef, len)
+        } catch {
+            _ => {
+                throw error;
+            }
+        }
+    }
+
+    /**
+     * Rewrite a list comprehension whose inner value is implicitly castable.
+     *
+     * @params:
+     *   - context: validation context used for recursive cast validation
+     *   - loc:     source location of the cast
+     *   - inner:   target slice element type
+     *   - lst:     original ListComprValue
+     *   - aff:     AffectValue representing the assignment inside the loop
+     *   - lpInner: BlockValue representing the loop body
+     *   - oldLp:   original LoopValue
+     *   - iterRef: VarRefValue representing the loop iterator
+     *   - len:     slice length value
+     *
+     * @returns:
+     *   - &Value: rewritten list comprehension wrapped in a CopierValue
+     *
+     * @throws:
+     *   - error if rewriting fails
+     */
+    fn rewriteListComprSlice(dmut context: &ValidationContext,
+                             loc:          &Word,
+                             inner:        &Type,
+                             lst:          &ListComprValue,
+                             aff:          &AffectValue,
+                             lpInner:      &BlockValue,
+                             oldLp:        &LoopValue,
+                             iterRef:      &VarRefValue,
+                             len:          &Value)-> &Value
+        throws ErrorMsg
+    {
+        // implicit cast the value that was used at each index of the list comprehension
+        let innerV = CastImplicitValidation::validate(alias context, loc, aff.right, inner);
+        let innerType = TypeInference::inferImplicitMutability(innerV.type, innerV);
+
+        // Because the inner value can be implicitely casted, then the list compr can be fully rewritten with new type
+        let (slcValueDecl, slcValueRef, slcIndex, sliceType) = SliceForComposeValidation::validateResultValueDecl(alias context, loc, innerType, iterRef, len,
+                                                                                                                  fromType-> VOID_TYPE,
+                                                                                                                  inCopy-> false);
+
+        let mut finalValues: [&Value] = [];
+        let mut loopValues: [&Value] = [];
+
+        // insert old initial variable declarations
+        // 1. let mut #_iter = 0;
+        for it in lst.block.values[0us .. $ - 3us] {
+            finalValues ~= [it];
+        }
+
+        // insert iterator declarations
+        // 4. let i = #_iter;
+        for it in lpInner.values[0us .. $ - 2us] {
+            loopValues ~= [it];
+        }
+
+        // rewrite the affectation part
+        // 5. #_value[i] = rewritten_value;
+        loopValues ~= [copy AffectValue(aff.loc, VOID_TYPE, slcIndex, innerV)];
+
+        // insert the iterator increment
+        // 6. #_iter += 1;
+        loopValues ~= [lpInner.values[$ - 1us]];
+
+
+        let blkContent = copy BlockValue(loc, VOID_TYPE, loopValues);
+        // new slice value
+        // 2. let #_value: [new_type] = copy [<unit-value> ; #_len];
+        finalValues ~= [slcValueDecl];
+
+        // new loop value
+        // 3. while #_iter < #_len { ... }
+        finalValues ~= [copy LoopValue(oldLp.loc, VOID_TYPE, test-> oldLp.test, blkContent)]; // new loop
+
+        // new slice reference
+        // 7. #_value
+        finalValues ~= [slcValueRef];
+
+        // it creates a slice so it is an implicit copy
+        return copy CopierValue(loc, sliceType,
+                                copy ListComprValue(loc, sliceType, copy BlockValue(loc, sliceType, finalValues)),
+                                isDone-> true);
+    }
+}

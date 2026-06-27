@@ -1,0 +1,275 @@
+/*
+ *
+ * Declares the ScopeInterpret module, responsible for reducing scope-related
+ * generator values during compile-time interpretation. This includes blocks,
+ * conditionals, list comprehensions, and variable references.
+ *
+ * Scope reduction determines which sub-expressions can be folded, how control
+ * flow propagates through blocks, and when variable references may be replaced
+ * by their compile-time.
+ *
+ * <hr>
+ *
+ * @Package: ymirc
+ * @Module: ymirc::semantic::interpret::scope
+ * @File: ymirc/semantic/interpret/scope.yr
+ * @Author(s):
+ *   - Emile Cadorel <ecadorel@gmail.com>
+ *
+ * @Created(YYYY-MM-DD): 2026-03-16
+ * @Copyright(C) 2021–2026 GNU-Ymir
+ * @License
+ *   ```text
+ *   This file is part of the Ymir language project.
+ *
+ *   Ymir is free software: you can redistribute it and/or modify it
+ *   under the terms of the GNU General Public License as published by
+ *   the Free Software Foundation, either version 3 of the License, or
+ *   (at your option) any later version.
+ *
+ *   Ymir is distributed in the hope that it will be useful,
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *   GNU General Public License for more details.
+ *
+ *   You should have received a copy of the GNU General Public License
+ *   along with Ymir.  If not, see <https://www.gnu.org/licenses/>.
+ *   ```
+ */
+
+
+in scope;
+
+use ymirc::lexing::{word, keys};
+
+use ymirc::semantic::{symbol, interpret::_};
+use ymirc::semantic::generator::{_, value::_, type::_};
+
+use ymirc::errors;
+use ymirc::utils::{format, bigint, bigfloat};
+
+use std::io;
+
+
+/**
+ * ScopeInterpret
+ *
+ * Provides compile-time reduction for scope-level generator values:
+ *   - blocks,
+ *   - conditionals,
+ *   - list comprehensions,
+ *   - variable references.
+ *
+ * Reduction is context-sensitive: operators, struct accesses, and normal
+ * evaluation each use different reduction paths. Control-flow metadata
+ * (break/return) is preserved and propagated through reduced blocks.
+ *
+ * Variable references may be replaced by their compile-time values when allowed
+ * by mutability and aliasing rules.
+ *
+ */
+pub mod ScopeInterpret {
+
+    /**
+     * Dispatches scope-related values to their corresponding reducers.
+     *
+     * Handles:
+     *   - BlockValue
+     *   - ConditionalValue
+     *   - ListComprValue
+     *   - InlineBlockValue
+     *   - LoopValue
+     *   - TryCatchValue / TryFinallyValue
+     *
+     * Returns the reduced value or the original node when no reduction applies.
+     *
+     */
+    pub fn reduce(dmut context: &CompileTimeInterpret, scope: &ScopeValue, inOperator: bool, inStruct: bool)-> &Value
+        throws ErrorMsg
+    {
+        match scope {
+            b: &BlockValue => { return ScopeInterpret::reduceBlock(alias context, b, inOperator, inStruct); }
+            c: &ConditionalValue => { return ScopeInterpret::reduceConditional(alias context, c); }
+            l: &ListComprValue => { return ScopeInterpret::reduceListCompr(alias context, l); }
+            i: &InlineBlockValue => { return i; }
+            l: &LoopValue => { return l; }
+            t: &TryCatchValue => { return t; }
+            t: &TryFinallyValue => { return t; }
+
+            _ => {
+                eprintln("internal scope interpret error: ", scope._typeinfo.name);
+                panic;
+            }
+        }
+    }
+
+    /**
+     * Reduces a conditional expression.
+     *
+     * If the test reduces to a BoolValue, selects and reduces the appropriate
+     * branch. Otherwise, rebuilds the conditional with reduced operands.
+     *
+     * Unit else-branches are normalized to UNIT_VALUE.
+     *
+     */
+    fn reduceConditional(dmut context: &CompileTimeInterpret, cd: &ConditionalValue)-> &Value
+        throws ErrorMsg
+    {
+        let test = context:.reduceInOperator(cd.test, checkCte-> false);
+        if let b: &BoolValue = test {
+            if (b.isTrue) {
+                return context:.reduce(cd.thenv);
+            } else {
+                if cd.elsev of UnitValue { return UNIT_VALUE; }
+                return context:.reduce(cd.elsev);
+            }
+        }
+
+        return copy ConditionalValue(loc-> cd.loc,
+                                      type-> cd.type,
+                                      test-> context:.reduce(cd.test),
+                                      thenv-> context:.reduce(cd.thenv),
+                                      elsev-> context:.reduce(cd.elsev),
+                                      isComplete-> cd.isComplete,
+                                      isReduced-> true);
+    }
+
+    /**
+     * Reduces a lexical block.
+     *
+     * Each contained value is reduced according to the current context
+     * (operator, struct access, or normal evaluation). Control-flow markers
+     * (break/return) are collected as values are processed.
+     *
+     * When the block collapses to a single non-unit value, that value is
+     * returned directly. Otherwise, a new BlockValue is constructed with the
+     * reduced contents and updated control-flow metadata.
+     *
+     */
+    fn reduceBlock(dmut context: &CompileTimeInterpret, block: &BlockValue, inOperator: bool, inStruct: bool)-> &Value
+        throws ErrorMsg
+    {
+        let mut values: [mut &Value] = [];
+        let mut lastVal: (&Value)? = none;
+        let mut brLoc = EOF_WORD, mut rtLoc = EOF_WORD;
+
+        for iv in block.values {
+            let v = if (inOperator) {
+                context:.reduceInOperator(iv, checkCte-> false)
+            } else if (inStruct) {
+                context:.reduceInStructAccess(iv)
+            } else {
+                context:.reduce(iv)
+            };
+
+            if (v.isReturner) { rtLoc = v.returnLoc; }
+            if (v.isBreaker) { brLoc = v.breakLoc; }
+            lastVal = (v)?;
+
+            if (!v.isFullLiteral || v.isBreaker || v.isReturner) {
+                values ~= [v];
+                lastVal = none;
+            }
+        }
+
+        if (values.len == 0us && brLoc.isEof && rtLoc.isEof) match lastVal {
+            Ok(v: &Value) => {
+                if (v !of UnitValue) return v;
+            }
+        }
+
+        match lastVal {
+            Ok(v: &Value) => {
+                values ~= [v];
+            }
+        }
+
+        if (values.len == 1us && values[0us] !of UnitValue) return values[0];
+
+        return copy BlockValue(loc-> block.loc,
+                                type-> block.type,
+                                values-> values,
+                                breakLoc-> brLoc,
+                                returnLoc-> rtLoc,
+                                isSet-> block.isSet,
+                                noValue-> block.noValue,
+                                isReduced-> true);
+    }
+
+    /**
+     * Reduces a list comprehension by reducing its internal block.
+     *
+     * If the block reduces to a BlockValue, wraps it in a new ListComprValue.
+     * Otherwise, returns the reduced inner value directly.
+     *
+     */
+    fn reduceListCompr(dmut context: &CompileTimeInterpret, l: &ListComprValue)-> &Value
+        throws ErrorMsg
+    {
+        let inner = context:.reduce(l.block);
+        if let b: &BlockValue = inner {
+            return copy ListComprValue(l.loc, l.type, b, isReduced-> true);
+        }
+
+        return inner;
+    }
+
+    /*!
+     * ================================================================================
+     * ================================================================================
+     * =========================             VARS             =========================
+     * ================================================================================
+     * ================================================================================
+     */
+
+    /**
+     * Reduces a variable reference.
+     *
+     * When allowed by mutability and aliasing rules, and when the referenced
+     * value is a compile-time constant, the reference is replaced by the
+     * reduced value. This applies differently depending on:
+     *   - struct-access reduction,
+     *   - operator-context reduction,
+     *   - normal reduction.
+     *
+     * When folding is not possible, the VarRefValue is rebuilt with a reduced
+     * underlying value and marked as non-CTE.
+     *
+     */
+    pub fn reduceVarRef(dmut context: &CompileTimeInterpret, vref: &VarRefValue, inOperator: bool, inStruct: bool)-> &Value
+        throws ErrorMsg
+    {
+        if (inStruct && !context.isForRef) {
+            let inner = context:.reduceInStructAccess(vref.value);
+            if (vref.value !of UnitValue && vref.canCte && !vref.type.isMutable) {
+                match (inner.type) {
+                    RangeType() => return inner;
+                    SliceType() => return inner;
+                    OptionType() => return inner;
+                    TupleType() => return inner;
+                }
+            }
+        }
+
+        if (inOperator && !context.isForRef) {
+            let inner = context:.reduceInOperator(vref.value, checkCte-> false);
+            if (inner.type.mutabilityFit(vref.type) || !inner.type.needsExplicitAlias) {
+                if (vref.value !of UnitValue && vref.canCte && !vref.type.isMutable) {
+                    return inner;
+                }
+            }
+        }
+
+
+        return copy VarRefValue(loc-> vref.loc,
+                                 declLoc-> vref.declLoc,
+                                 type-> vref.type,
+                                 value-> context:.reduce(vref.value), // we don't want dangling reduced var if the operation fails
+                                 refId-> vref.refId,
+                                 isSelf-> vref.isSelf,
+                                 canCte-> false,
+                                 isReduced-> true);
+    }
+
+
+}

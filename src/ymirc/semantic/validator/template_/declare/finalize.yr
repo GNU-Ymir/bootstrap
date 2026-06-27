@@ -1,0 +1,352 @@
+/*
+ * Finalization of template declaration rewriting.
+ *
+ * TemplateDeclareFinalization performs the final rewriting and validation
+ * steps required before declaring a template-instantiated symbol. After
+ * template solving produces a TemplateMapper, this module:
+ *
+ *   - merges mapper information with previously stored template mappers,
+ *   - rewrites template parameters and declaration nodes,
+ *   - resolves lambda prototypes and generates frame generators,
+ *   - verifies template guard expressions,
+ *   - ensures all template parameters are fully resolved,
+ *   - produces the final Declaration and TemplateMapper used for symbol
+ *     instantiation.
+ *
+ *
+ * <hr>
+ *
+ * @Package: ymirc
+ * @Module: ymirc::semantic::validator::template_::declare::finalize
+ * @File: ymirc/semantic/validator/template_/declare/finalize.yr
+ * @Author(s):
+ *   - Emile Cadorel <ecadorel@gmail.com>
+ *
+ * @Created(YYYY-MM-DD): 2026-06-14
+ * @Copyright(C) 2021–2026 GNU-Ymir
+ * @License
+ *   ```text
+ *   This file is part of the Ymir language project.
+ *
+ *   Ymir is free software: you can redistribute it and/or modify it
+ *   under the terms of the GNU General Public License as published by
+ *   the Free Software Foundation, either version 3 of the License, or
+ *   (at your option) any later version.
+ *
+ *   Ymir is distributed in the hope that it will be useful,
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *   GNU General Public License for more details.
+ *
+ *   You should have received a copy of the GNU General Public License
+ *   along with Ymir.  If not, see <https://www.gnu.org/licenses/>.
+ *   ```
+ */
+
+in finalize;
+
+use ymirc::syntax::{_, declaration::_, expression::_};
+use ymirc::semantic::generator::{global, value::_, type::_};
+
+use ymirc::semantic::{validator, template_, symbol};
+
+use ymirc::lexing::word;
+use ymirc::errors;
+
+use ymirc::utils::format;
+
+/**
+ * TemplateDeclareFinalization module
+ *
+ * Provides the final rewriting and validation logic required before
+ * declaring a template-instantiated symbol.
+ *
+ */
+pub mod TemplateDeclareFinalization {
+
+    /**
+     * Perform the final rewriting of a template declaration.
+     *
+     * @params:
+     *   - context: validation context used for rewriting and validation
+     *   - loc:     source location of the template instantiation
+     *   - mapper:  TemplateMapper produced by template solving
+     *   - value:   TemplateRefValue representing the template reference
+     *
+     * @returns:
+     *   - (&Declaration, TemplateMapper):
+     *        * rewritten declaration(temporary or final),
+     *        * finalized mapper
+     *
+     * @throws:
+     *   - TEMPLATE_TEST_FAILED if the guard expression evaluates to false
+     *   - TEMPLATE_SPECIALIZATION_FAILS if rewriting or validation fails
+     */
+    pub fn performTemplateRewrite(dmut context: &ValidationContext,
+                                  loc:          &Word,
+                                  mapper:       TemplateMapper,
+                                  value:        &TemplateRefValue)-> (&Declaration, TemplateMapper)
+        throws ErrorMsg
+    {
+        let mut mergedMapper = TemplateMapper();
+        mergedMapper:.merge(mapper);
+        if let Ok(map) = value.sym.templateMapper {
+            mergedMapper:.merge(map);
+        }
+
+        let mut templates = TemplateRewriting::rewriteTemplateParams(mapper, value.sym.decl.params);
+        let mut finalized = (templates.len == 0us);
+        if (templates.len != 0us) { 
+            {
+                let (auxMapper, _) = TemplateDeclareFinalization::finalizeMapper(alias context, mergedMapper, templates);
+                let rewritenTemplates = TemplateRewriting::rewriteTemplateParams(auxMapper, value.sym.decl.params);
+                if (rewritenTemplates.len == 0us) {
+                    finalized = true;
+                }
+            } catch { _ => {} }
+        }
+
+        let syntaxSymbol = value.sym.decl.decl;
+
+        if (!finalized) {
+            return (copy TemplateDecl(syntaxSymbol.loc, "",
+                                      params-> templates,
+                                      guard-> value.sym.decl.guard,
+                                      decl-> syntaxSymbol), mergedMapper);
+
+        }
+
+        let (newMapper, frames) = TemplateDeclareFinalization::finalizeMapper(alias context, mergedMapper, templates);
+        for f in frames {
+            LambdaCreation::insertGenerator(alias context, f);
+        }
+
+        let test = TemplateRewriting::rewrite(newMapper, value.sym.decl.guard);
+        TemplateDeclareFinalization::verifyTemplateTest(alias context, loc, value, test);
+
+        return (TemplateRewriting::rewrite(newMapper, syntaxSymbol), newMapper);
+    }
+
+    /**
+     * Finalize rewriting of a template prototype declaration.
+     *
+     * @params:
+     *   - context: validation context used for rewriting and validation
+     *   - loc:     source location of the template instantiation
+     *   - value:   TemplateRefValue representing the template reference
+     *   - mapper:  TemplateMapper produced by template solving
+     *   - decl:    declaration to rewrite
+     *
+     * @returns:
+     *   - (&Declaration, &Expression, TemplateMapper):
+     *        * rewritten declaration,
+     *        * rewritten guard expression,
+     *        * finalized mapper
+     *
+     * @throws:
+     *   - UNRESOLVED_TEMPLATE if parameters remain unresolved
+     *   - TEMPLATE_TEST_FAILED if the guard expression evaluates to false
+     */
+    pub fn finalizePrototypeRewrite(dmut context: &ValidationContext,
+                                    loc:          &Word,
+                                    value:        &TemplateRefValue,
+                                    mapper:       TemplateMapper,
+                                    decl:         &Declaration)-> (&Declaration, &Expression, TemplateMapper)
+        throws ErrorMsg
+    {
+        let mut mergedMapper = TemplateMapper();
+        mergedMapper:.merge(mapper);
+        if let Ok(map) = value.sym.templateMapper {
+            mergedMapper:.merge(map);
+        }
+
+        let templates = TemplateRewriting::rewriteTemplateParams(mergedMapper, value.sym.decl.params);
+        let (finalMapper, _) = TemplateDeclareFinalization::finalizeMapper(alias context, mergedMapper, templates);
+        TemplateDeclareFinalization::verifyComplete(finalMapper, value);
+
+        let test = TemplateRewriting::rewrite(finalMapper, value.sym.decl.guard);
+        TemplateDeclareFinalization::verifyTemplateTest(alias context, loc, value, test);
+
+        let finalDecl = TemplateRewriting::rewrite(finalMapper, decl);
+
+        return (finalDecl, test, finalMapper);
+    }
+
+    /**
+     * Finalize a TemplateMapper by resolving lambda prototypes and rewriting
+     * dependent template parameters.
+     *
+     * @params:
+     *   - context: validation context used for lambda validation
+     *   - mapper:  initial TemplateMapper to finalize
+     *   - rest:    remaining template parameters to rewrite
+     *
+     * @returns:
+     *   - (TemplateMapper, [&FrameGenerator]):
+     *        * finalized mapper,
+     *        * list of generated lambda frames
+     *
+     * @throws:
+     *   - TEMPLATE_SPECIALIZATION_FAILS if lambda prototype validation fails
+     */
+    fn finalizeMapper(dmut context: &ValidationContext,
+                      mapper:       TemplateMapper,
+                      rest:         [&Expression])-> (TemplateMapper, [&FrameGenerator])
+        throws ErrorMsg
+    {
+        let dmut resultMapper = TemplateMapper(score-> mapper.score);
+        let oldMapping = mapper.mapping;
+        let oldMutable = mapper.mutables;
+        let oldDMutable = mapper.deeplyMutables;
+
+        let mut syntTemplate = rest;
+        let mut frames: [mut &FrameGenerator] = [];
+
+        for n in mapper.nameOrder match oldMapping[n] {
+            Ok(lmbd: &LambdaValueWrapperExpr) => {
+                let type = TemplateTypeExprRewriting::rewriteFptr(mapper, lmbd.expr);
+                let (proto, retMapper, frame) = TemplateDeclareFinalization::finalizeLambdaProto(alias context,
+                                                                                                 type,
+                                                                                                 lmbd.value,
+                                                                                                 syntTemplate);
+
+                frames ~= [frame];
+                resultMapper:.merge(retMapper);
+                resultMapper:.insert(n, copy ValueWrapperExpr(proto.loc, proto),
+                                     mutable-> false,
+                                     deeplyMut-> false);
+
+                syntTemplate = TemplateRewriting::rewriteTemplateParams(resultMapper, syntTemplate);
+            }
+            Ok(expr: &Expression) => {
+                resultMapper:.insert(n, expr,
+                                     mutable-> n in oldMutable,
+                                     deeplyMut-> n in oldDMutable);
+            }
+            _ => panic;
+        }
+
+        return (resultMapper, frames);
+    }
+
+    /**
+     * Finalize a lambda prototype during template declaration.
+     *
+     * @params:
+     *   - context:   validation context used for lambda validation
+     *   - f:         function pointer type expression to match
+     *   - value:     lambda value or lambda wrapper
+     *   - templates: remaining template parameters
+     *
+     * @returns:
+     *   - (&Value, TemplateMapper, &FrameGenerator):
+     *        * finalized lambda prototype,
+     *        * mapper for return type solving,
+     *        * generated frame
+     *
+     * @throws:
+     *   - TEMPLATE_SPECIALIZATION_FAILS if lambda arity or return type mismatch
+     */
+    fn finalizeLambdaProto(dmut context: &ValidationContext,
+                           f:            &FunctionPtrTypeExpr,
+                           value:        &Value,
+                           templates:    [&Expression])-> (&Value, TemplateMapper, &FrameGenerator)
+        throws ErrorMsg
+    {
+        let mut paramTypes: [mut &Type] = copy [TypeValidation::validateForVarDecl(alias context, vdecl.type, vdecl,
+                                                                                   canBeRef-> true,
+                                                                                   canBeLazy-> true)
+                                                for vdecl in f.params];
+        if let lmbd: &LambdaValue = value {
+            if (lmbd.params.len != paramTypes.len) {
+                throw copy ErrorMsg::fatal(value.loc, format(ValidateErrorMessage::TEMPLATE_SPECIALIZATION_FAILS, f, value),
+                                           notes-> copy [copy ErrorMsg::fatal(f.loc, format(ValidateErrorMessage::INCOMPATIBLE_VALUES, f, value))]);
+            }
+
+            let (proto, frame) = LambdaValidation::validate(alias context, lmbd, paramTypes);
+            if let returnType: &FuncPtrType = proto.type {
+                let local = TemplateExplicitOfVarSolving::solveOfSpec(alias context,
+                                                                      f.retType.loc,
+                                                                      templates,
+                                                                      f.retType,
+                                                                      copy [returnType.retType]);
+                return (proto, local.mapper, frame);
+            }
+        }
+
+        panic;
+    }
+
+    /**
+     * Ensure that all template parameters are fully resolved.
+     *
+     * @params:
+     *   - mapper: TemplateMapper used to rewrite parameters
+     *   - value:  TemplateRefValue whose parameters must be resolved
+     *
+     * @returns:
+     *   - nothing
+     *
+     * @throws:
+     *   - UNRESOLVED_TEMPLATE if any template parameters remain
+     */
+    fn verifyComplete(mapper: TemplateMapper, value: &TemplateRefValue)
+        throws ErrorMsg
+    {
+        let templates = TemplateRewriting::rewriteTemplateParams(mapper, value.sym.decl.params);
+        if (templates.len != 0) {
+            throw copy ErrorMsg::list(copy [copy ErrorMsg::fatal(i.loc, format(ValidateErrorMessage::UNRESOLVED_TEMPLATE))
+                                            for i in templates]);
+        }
+    }
+
+    /**
+     * Evaluate and validate the template guard expression.
+     *
+     * @params:
+     *   - context: validation context used for evaluation
+     *   - loc:     source location of the template instantiation
+     *   - value:   TemplateRefValue whose guard is being evaluated
+     *   - test:    guard expression to evaluate
+     *
+     * @returns:
+     *   - nothing
+     *
+     * @throws:
+     *   - TEMPLATE_TEST_FAILED if the guard evaluates to false
+     *   - any error produced during guard evaluation
+     */
+    pub fn verifyTemplateTest(dmut context: &ValidationContext,
+                              loc:          &Word,
+                              value:        &TemplateRefValue,
+                              test:         &Expression)
+        throws ErrorMsg
+    {
+        let mut errors: [mut &ErrorMsg] = [];
+        if (test !of EmptyExpr) {
+            context:.pushReferent(alias context:.getSymbolFromRef(value.sym));
+            context:.enterForeign(isFnBody-> true);
+            context:.enterBlock();
+
+            {
+                let val = ValueValidation::validate(alias context, test);
+                if (!context.cteInterpret:.computeBool(val)) {
+                    errors ~= [copy ErrorMsg::fatal(loc, format(ValidateErrorMessage::TEMPLATE_TEST_FAILED),
+                                                    end-> test.loc)];
+                }
+            } catch {
+                err => {
+                    errors ~= [err];
+                }
+            }
+
+            context:.safeQuitBlock();
+            context:.popReferent();
+            context:.exitForeign();
+        }
+
+        if (errors.len != 0us) {
+            throw copy ErrorMsg::list(errors);
+        }
+    }
+}

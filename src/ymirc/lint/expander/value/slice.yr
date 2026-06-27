@@ -1,0 +1,261 @@
+/*
+ * SliceExpander — expands slice and array operators into YIL instructions.
+ *
+ * The SliceExpander lowers high-level slice and array operations into
+ * concrete YILValue and YILInstr nodes. It handles:
+ *
+ *   - array indexing,
+ *   - slice indexing,
+ *   - slice append,
+ *   - slice concatenation.
+ *
+ * Slice concatenation and append operations emit runtime calls and must be
+ * executed only once; unique-value registration ensures this property.
+ *
+ * <hr>
+ *
+ * @Package: ymirc
+ * @Module: ymirc::lint::expander::value::slice
+ * @File: ymirc/lint/expander/value/slice.yr
+ * @Author(s):
+ *   - Emile Cadorel <ecadorel@gmail.com>
+ *
+ * @Created(YYYY-MM-DD): 2026-06-23
+ * @Copyright(C) 2021–2026 GNU-Ymir
+ * @License
+ *   ```text
+ *   This file is part of the Ymir language project.
+ *
+ *   Ymir is free software: you can redistribute it and/or modify it
+ *   under the terms of the GNU General Public License as published by
+ *   the Free Software Foundation, either version 3 of the License, or
+ *   (at your option) any later version.
+ *
+ *   Ymir is distributed in the hope that it will be useful,
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *   GNU General Public License for more details.
+ *
+ *   You should have received a copy of the GNU General Public License
+ *   along with Ymir.  If not, see <https://www.gnu.org/licenses/>.
+ *   ```
+ */
+
+in slice;
+
+use ymirc::lint::expander;
+use ymirc::lint::node::_;
+
+use ymirc::semantic::{symbol, generator::_};
+use ymirc::semantic::generator::{type::_, value::_};
+
+use ymirc::global::{core_, state};
+use ymirc::lexing::{word, keys};
+
+use ymirc::lint::expander::value::_;
+use std::io;
+
+/**
+ * SliceExpander
+ *
+ * Expands slice and array operator semantic nodes into YILValue expressions.
+ * Handles array access, slice access, slice append, and slice concatenation.
+ *
+ * All functions append instructions to a StmtList and return the resulting
+ * YILValue representing the slice or array operation.
+ */
+pub mod SliceExpander {
+
+    /**
+     * Finalize a slice or array operator.
+     *
+     * Dispatches based on the concrete operator type:
+     *   - ArrayAccessValue,
+     *   - SliceAppendValue,
+     *   - SliceConcatValue,
+     *   - SliceAccessValue.
+     *
+     * @params:
+     *   - context: the expansion context
+     *   - sl:      the slice/array operator value
+     *   - list:    the statement list to append instructions to
+     *   - asLeft:  whether the operator is used as an l-value
+     *
+     * @returns:
+     *   - &YILValue: the finalized operator expression
+     *
+     * @throws:
+     *   - panic: for unsupported slice/array operator types
+     */
+    pub fn finalize(dmut context: &Expander, sl: &SliceOrArrayOperatorValue, ref mut list: StmtList, asLeft: bool)-> &YILValue {
+        match sl {
+            a: &ArrayAccessValue => {
+                return SliceExpander::finalizeArrayAccess(alias context, a, ref list);
+            }
+            a: &SliceAppendValue => {
+                return SliceExpander::finalizeSliceAppend(alias context, a, ref list);
+            }
+            c: &SliceConcatValue => {
+                return SliceExpander::finalizeSliceConcat(alias context, c, ref list);
+            }
+            s: &SliceAccessValue => {
+                return SliceExpander::finalizeSliceAccess(alias context, s, ref list, asLeft-> asLeft);
+            }
+        }
+
+        eprintln("internal slice operator expansion error: ", sl.__typeinfo__.name);
+        panic;
+    }
+
+    /**
+     * Finalize an array access operation.
+     *
+     * Expands the array as an l-value and the index as an r-value, then produces
+     * a YILArrayAccessValue.
+     *
+     * @params:
+     *   - context: the expansion context
+     *   - a:       the array access value
+     *   - list:    the statement list to append instructions to
+     *
+     * @returns:
+     *   - &YILValue: the array element access
+     */
+    fn finalizeArrayAccess(dmut context: &Expander, a: &ArrayAccessValue, ref mut list: StmtList)-> &YILValue {
+        let arr = ValueExpander::finalize(alias context, a.array, ref list, asLeft-> true);
+        let index = ValueExpander::finalize(alias context, a.index, ref list, asLeft-> false);
+        let type = context:.finalizeType(a.type);
+
+        return copy YILArrayAccessValue(a.loc, type, arr, index);
+    }
+
+    /**
+     * Finalize a slice concatenation operation.
+     *
+     * Behavior:
+     *   - expands left and right slices as addresses,
+     *   - computes element size,
+     *   - allocates a new slice via CONCAT_SLICE,
+     *   - registers the result as a unique value to ensure concatenation occurs once.
+     *
+     * @params:
+     *   - context: the expansion context
+     *   - s:       the slice concatenation value
+     *   - list:    the statement list to append instructions to
+     *
+     * @returns:
+     *   - &YILValue: the concatenated slice
+     */
+    fn finalizeSliceConcat(dmut context: &Expander, s: &SliceConcatValue, ref mut list: StmtList)-> &YILValue {
+        // Slice concat allocates values, thus must be performed only once
+        match context.getVariable(s.uniqId) {
+            Ok(u: &YILValue) => { // The call was already seen and validated
+                return u;
+            }
+        };
+
+        if let slc: &SliceType = s.type {
+            let leftAddr = MemoryExpander::finalizeAddressFromAny(alias context, s.left, ref list);
+            let rightAddr = MemoryExpander::finalizeAddressFromAny(alias context, s.right, ref list);
+            let type = context:.finalizeType(slc);
+            let inner = context:.finalizeType(slc.inners[0]);
+            let size = copy YILIntValue(s.loc, YIL_UINT_MAX, inner.size);
+
+            let (resultVar, addrResult) = ValueExpander::createVarForBlock(alias context, s.loc, slc, type, ref list, getAddr-> true);
+            list:.append(copy YILCall(s.loc,
+                                      copy YILNameCallValue(s.loc,
+                                                            YIL_VOID,
+                                                            YRuntimeFuncs::CONCAT_SLICE,
+                                                            copy [addrResult, leftAddr, rightAddr, size])));
+
+            return ValueExpander::registerUniqValue(alias context, s, resultVar, ref list);
+        } else panic;
+    }
+
+    /**
+     * Finalize a slice append operation.
+     *
+     * Behavior:
+     *   - expands the left slice as an address,
+     *   - expands the right value,
+     *   - computes element size,
+     *   - emits APPEND_SLICE(leftAddr, rightPtr, elemSize).
+     *
+     * @params:
+     *   - context: the expansion context
+     *   - a:       the slice append value
+     *   - list:    the statement list to append instructions to
+     *
+     * @returns:
+     *   - &YILValue: always YIL_UNIT_VALUE
+     */
+    fn finalizeSliceAppend(dmut context: &Expander, a: &SliceAppendValue, ref mut list: StmtList)-> &YILValue {
+        let leftAddr = MemoryExpander::finalizeAddressFromAny(alias context, a.left, ref list);
+        let right = ValueExpander::finalize(alias context, a.right, ref list, asLeft-> false);
+
+        if let slc: &SliceType = a.left.type {
+            let inner = context:.finalizeType(slc.inners[0]);
+            let innerSize = copy YILIntValue(a.loc, YIL_UINT_MAX, inner.size);
+
+            let (_, ptrU) = ValueExpander::createVarForBlock(alias context, a.loc, a.right.type, right.type,
+                                                             ref list,
+                                                             withValue-> right,
+                                                             getAddr-> true);
+            list:.append(copy YILCall(a.loc,
+                                      copy YILNameCallValue(a.loc,
+                                                            YIL_VOID,
+                                                            YRuntimeFuncs::APPEND_SLICE,
+                                                            copy [leftAddr, ptrU, innerSize])));
+
+            return YIL_UNIT_VALUE;
+        } else panic;
+    }
+
+    /**
+     * Finalize a slice access operation.
+     *
+     * Behavior:
+     *   - expands the slice and index,
+     *   - computes byte offset = index * elementSize,
+     *   - adds offset to the slice pointer,
+     *   - casts to the correct pointer type,
+     *   - registers the pointer as a unique value,
+     *   - dereferences the pointer to produce the final element.
+     *
+     * @params:
+     *   - context: the expansion context
+     *   - s:       the slice access value
+     *   - list:    the statement list to append instructions to
+     *   - asLeft:  whether the access is used as an l-value
+     *
+     * @returns:
+     *   - &YILValue: the accessed slice element
+     */
+    fn finalizeSliceAccess(dmut context: &Expander, s: &SliceAccessValue, ref mut list: StmtList, asLeft: bool)-> &YILValue {
+        let slc = ValueExpander::finalize(alias context, s.slice, ref list, asLeft-> asLeft);
+        let index = ValueExpander::finalize(alias context, s.index, ref list, asLeft-> false);
+
+        let resType = context:.finalizeType(s.type);
+        let size = copy YILIntValue(s.loc, YIL_UINT_MAX, resType.size);
+
+        let indexV = copy YILBinaryValue(s.loc, YIL_UINT_MAX, BinaryOperators::STAR, size, index);
+        let (indexVU, _) = ValueExpander::createVarForBlock(alias context, s.loc, NONE_TYPE, YIL_UINT_MAX,
+                                                            ref list,
+                                                            withValue-> indexV);
+        let ptrT = context.typeExpander:.finalizePointer(resType);
+
+        let dataField = copy YILBinaryValue(s.loc,
+                                            YIL_PTR_VOID,
+                                            BinaryOperators::PLUS,
+                                            copy YILFieldValue(s.loc, YIL_PTR_VOID, slc, name-> SliceKeys::PTR),
+                                            indexVU);
+
+        let (dataFieldU, _) = ValueExpander::createVarForBlock(alias context, s.loc, NONE_TYPE, YIL_UINT_MAX,
+                                                               ref list,
+                                                               withValue-> dataField);
+
+        let finalPtrV = copy YILCastValue(s.loc, ptrT, dataFieldU);
+        let uniq = ValueExpander::registerUniqValue(alias context, s, type-> ptrT, finalPtrV, ref list);
+        return copy YILUnrefValue(s.loc, resType, uniq);
+    }
+}

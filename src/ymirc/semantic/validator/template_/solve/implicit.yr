@@ -1,0 +1,228 @@
+/*
+ * Core engine for implicit template specialization in Ymir.
+ *
+ * TemplateImplicitSolving is responsible for inferring template parameter
+ * bindings when a template is instantiated without explicit template arguments.
+ * It performs structural matching between:
+ *
+ *   - the template parameter list(syntactic parameters),
+ *   - the actual argument list(runtime values or types),
+ *   - the expected types derived from the call site.
+ *
+ * <hr>
+ *
+ * @Package: ymirc
+ * @Module: ymirc::semantic::validator::template_::solve::implicit
+ * @File: ymirc/semantic/validator/template_/solve/implicit.yr
+ * @Author(s):
+ *   - Emile Cadorel <ecadorel@gmail.com>
+ *
+ * @Created(YYYY-MM-DD): 2026-06-09
+ * @Copyright(C) 2021–2026 GNU-Ymir
+ * @License
+ *   ```text
+ *   This file is part of the Ymir language project.
+ *
+ *   Ymir is free software: you can redistribute it and/or modify it
+ *   under the terms of the GNU General Public License as published by
+ *   the Free Software Foundation, either version 3 of the License, or
+ *   (at your option) any later version.
+ *
+ *   Ymir is distributed in the hope that it will be useful,
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *   GNU General Public License for more details.
+ *
+ *   You should have received a copy of the GNU General Public License
+ *   along with Ymir.  If not, see <https://www.gnu.org/licenses/>.
+ *   ```
+ */
+
+
+in implicit;
+
+use ymirc::syntax::{_, declaration::_, expression::_};
+use ymirc::semantic::generator::{value::_, type::_};
+
+use ymirc::semantic::{validator, template_, symbol};
+
+use ymirc::lexing::word;
+use ymirc::errors;
+
+use ymirc::utils::format;
+
+use ymirc::semantic::validator::template_::solve::{_, implicit::_};
+
+/*!
+ * ====================================================================================================
+ * ====================================================================================================
+ * ====================================          SUBMODS          =====================================
+ * ====================================================================================================
+ * ====================================================================================================
+ */
+
+mod ::compose;
+mod ::literal;
+mod ::operator;
+mod ::type;
+
+/*!
+ * ====================================================================================================
+ * ====================================================================================================
+ * ======================================          ROOT          ======================================
+ * ====================================================================================================
+ * ====================================================================================================
+ */
+
+/**
+ * TemplateImplicitSolving module
+ *
+ * Provides the main entry points for implicit template specialization.
+ *
+ * This module is the heart of Ymir’s implicit template inference system.
+ */
+pub mod TemplateImplicitSolving {
+
+    /**
+     * Entry point for implicit template specialization.
+     *
+     * Parameters:
+     *   - left      : TemplateRefValue referencing the template symbol,
+     *   - rights    : list of argument values,
+     *   - forMethod: whether the template belongs to a method(skip `self`).
+     *
+     * @returns:
+     *   - TemplateMapper containing inferred bindings.
+     *
+     * @throws:
+     *   - TEMPLATE_SPECIALIZATION_FAILS if inference cannot proceed.
+     */
+    pub fn solve(dmut context:   &ValidationContext,
+                 loc:       &Word,
+                 left:      &TemplateRefValue,
+                 rights:    [&Value],
+                 forMethod: bool = false)-> TemplateMapper
+        throws ErrorMsg
+    {
+        let dmut sym = alias context:.getSymbolFromRef(left.sym);
+        context:.pushReferent(alias sym);
+        context:.enterForeign(isFnBody-> false);
+
+        {
+            if let f: &FunctionDecl = left.sym.decl.decl {
+                let mut params = f.proto.params;
+                if forMethod {
+                    params = params[1 .. $];
+                }
+
+                return TemplateImplicitSolving::solve(alias context, loc, left.sym.decl.params, params, rights);
+            }
+
+            if let c: &CtorDecl = left.sym.decl.decl {
+                return TemplateImplicitSolving::solve(alias context, loc, left.sym.decl.params, c.proto.params, rights);
+            }
+
+
+            throw copy ErrorMsg::fatal(loc, format(ValidateErrorMessage::TEMPLATE_SPECIALIZATION_FAILS, left, rights));
+        } exit {
+            context:.exitForeign();
+            context:.popReferent();
+        }
+    }
+
+    /**
+     * Solve template parameters against function/constructor parameters.
+     *
+     * Error handling:
+     *   - If solving fails after some bindings were inferred, produce a
+     *     multi-error list with a diagnostic note showing partial bindings.
+     */
+    fn solve(dmut context: &ValidationContext,
+             loc:          &Word,
+             templates:    [&Expression],
+             params:       [&VarDeclExpr],
+             rights:       [&Value])-> TemplateMapper
+        throws ErrorMsg
+    {
+        let types = TemplateSolvingUtils::createTypes(rights);
+        if (params.len > types.len) {
+            throw copy ErrorMsg::fatal(loc, format(ValidateErrorMessage::TEMPLATE_SPECIALIZATION_FAILS, params, types));
+        } // the implicit can be called without enough params
+
+        let mut consumed = 0us;
+        let mut globalMapper = TemplateMapper();
+        let mut syntTemplate = templates;
+
+        for it in 0us .. params.len {
+            // Rewrite the current parameter that will be specialized to remove any template that was already validated
+            let currentParam = TemplateInstructionExprRewriting::rewriteVarDecl(globalMapper, params[it]);
+            let rest = types.len - consumed; // number of types that still can be consumed(Note that there can be more types than params in case of variadics)
+            let syntaxRest = (params.len - it) - 1us; // The number of params that where not validated yet, minus the current one
+            let consomableTypes = types[consumed .. consumed + (rest - syntaxRest)]; // The list of types that can be associated to the current parameter(can be more than 1 in case of variadics)
+
+            {
+                let local = TemplateImplicitSolving::solveParamTemplate(alias context, syntTemplate, currentParam, consomableTypes);
+                globalMapper:.merge(local.mapper);
+                consumed += local.nbConsumed;
+                syntTemplate = TemplateRewriting::rewriteTemplateParams(globalMapper, syntTemplate);
+            } catch {
+                err => {
+                    if (globalMapper.mapping.len != 0) {
+                        let note = copy ErrorMsg::note(loc, format(ValidateErrorMessage::TEMPLATE_SPE, globalMapper));
+                        throw copy ErrorMsg::list(copy [note, err]);
+                    } else throw err;
+                }
+            }
+        }
+
+        return globalMapper;
+    }
+
+    /**
+     * Solve a single template parameter.
+     *
+     * @returns:
+     *   - TemplateSolution(mapper, nbConsumed)
+     */
+    fn solveParamTemplate(dmut context: &ValidationContext,
+                          templates:    [&Expression],
+                          param:        &VarDeclExpr,
+                          types:        [&Type])-> TemplateSolution
+        throws ErrorMsg
+    {
+        if param.type of EmptyExpr {
+            return TemplateSolution(TemplateMapper(), 0);
+        }
+
+        return TemplateImplicitSolving::solveType(alias context, templates, param.type, types);
+    }
+
+    /**
+     * Dispatch implicit solving based on the expression kind.
+     *
+     * If no rule matches, returns an empty TemplateSolution.
+     */
+    pub fn solveType(dmut context: &ValidationContext,
+                     templates:    [&Expression],
+                     typeExpr:     &Expression,
+                     types:        [&Type])-> TemplateSolution
+        throws ErrorMsg
+    {
+        match typeExpr {
+            c: &ComposeExpr => {
+                return TemplateImplicitComposeSolving::solveType(alias context, templates, c, types);
+            }
+            l: &LiteralExpr => {
+                return TemplateImplicitLiteralSolving::solveType(alias context, templates, l, types);
+            }
+            o: &OperatorExpr => {
+                return TemplateImplicitOperatorSolving::solveType(alias context, templates, o, types);
+            }
+            t: &TypeExpr => {
+                return TemplateImplicitTypeSolving::solveType(alias context, templates, t, types);
+            }
+        }
+
+        return TemplateSolution(TemplateMapper(), 1);
+    }
+}

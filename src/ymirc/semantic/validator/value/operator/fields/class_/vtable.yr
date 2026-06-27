@@ -1,0 +1,394 @@
+/*
+ * Implements semantic validation for vtable-based method access on class
+ * instances in Ymir.
+ *
+ * Supported contexts:
+ *   - normal method calls
+ *   - template method calls
+ *   - field-methods and field-assign-methods
+ *   - proxy dispatch(super-calls, struct-based dispatch)
+ *   - multi-symbol resolution(overloads)
+ *
+ * This module is invoked by FieldValidation when the left operand is a class
+ * and the field name corresponds to a method rather than a data field.
+ *
+ * <hr>
+ *
+ * @Package: ymirc
+ * @Module: ymirc::semantic::validator::value::operator::fields::class_::vtable
+ * @File: ymirc/semantic/validator/value/operator/fields/class_/vtable.yr
+ * @Author(s):
+ *   - Emile Cadorel <ecadorel@gmail.com>
+ *
+ * @Created(YYYY-MM-DD): 2026-04-21
+ * @Copyright(C) 2021–2026 GNU-Ymir
+ * @License
+ *   ```text
+ *   This file is part of the Ymir language project.
+ *
+ *   Ymir is free software: you can redistribute it and/or modify it
+ *   under the terms of the GNU General Public License as published by
+ *   the Free Software Foundation, either version 3 of the License, or
+ *   (at your option) any later version.
+ *
+ *   Ymir is distributed in the hope that it will be useful,
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *   GNU General Public License for more details.
+ *
+ *   You should have received a copy of the GNU General Public License
+ *   along with Ymir.  If not, see <https://www.gnu.org/licenses/>.
+ *   ```
+ */
+
+in vtable;
+
+use ymirc::syntax::{_, declaration::_, expression::_};
+use ymirc::semantic::{validator, declarator};
+use ymirc::semantic::generator::{value::_, type::_};
+
+use ymirc::errors;
+use ymirc::lexing::word;
+use ymirc::utils::format;
+
+/**
+ * ClassVtableAccessValidation
+ *
+ * Provides semantic validation for method access on class instances using
+ * vtable lookup and template method lookup.
+ *
+ * The validator:
+ *   - determines visibility permissions(private / protected)
+ *   - resolves methods in the vtable(virtual and non-virtual)
+ *   - resolves template methods with separate protection rules
+ *   - resolves field-methods and field-assign-methods
+ *   - enforces aliasing rules for mutable methods
+ *   - detects abstract methods and forbids direct calls
+ *   - supports proxy dispatch(super-calls)
+ *   - aggregates all valid candidates into a MultSymValue
+ *   - optionally auto-calls the method when forceCall = true
+ *
+ * This module defines the complete semantics of method lookup and dispatch
+ * in Ymir.
+ */
+pub mod ClassVtableAccessValidation {
+
+    /**
+     * Validate a method access on a class instance.
+     *
+     * Dispatch strategy:
+     *   - If inCall:
+     *        - search vtable methods(validateMethod)
+     *        - search template methods(validateTemplateMethod)
+     *
+     *   - Otherwise:
+     *        - search field-methods or field-assign-methods
+     *          depending on the 'assign' flag(validateMethodField)
+     *
+     * @params:
+     *   - context:    validation context
+     *   - loc:        operator location
+     *   - object:     validated class instance
+     *   - cref:       class reference type
+     *   - method:     method expression(VarExpr)
+     *   - isProxy:    whether dispatch is forced direct(super-call)
+     *   - allowImmut: whether immutable aliasing is allowed
+     *   - assign:     whether this is a field-assign-method access
+     *   - inCall:     whether this is a method call context
+     *   - forceCall:  whether to auto-call the method when not inCall
+     *
+     * @returns:
+     *   A &Value representing the method delegate or the result of auto-calling it.
+     *
+     * @throws:
+     *   ErrorMsg if no valid method exists or visibility/aliasing rules are violated.
+     */
+    pub fn validate(dmut context: &ValidationContext,
+                    loc:          &Word,
+                    object:       &Value,
+                    cref:         &ClassRefType,
+                    method:       &Expression,
+                    isProxy:      bool,
+                    allowImmut:   bool = false,
+                    assign:       bool = false,
+                    inCall:       bool = false,
+                    forceCall:    bool = true)-> &Value
+        throws ErrorMsg
+    {
+        let (inPrv, inProt) = context.getCurrentClassReferentProtections(cref);
+
+        let mut errors: [&ErrorMsg] = [];
+        let mut values: [&Value] = [];
+
+        if inCall {
+            ClassVtableAccessValidation::validateMethod(object, cref, method, isProxy, inProt, inPrv, allowImmut, ref values, ref errors);
+            ClassVtableAccessValidation::validateTemplateMethod(object, cref, method, inProt, inPrv, allowImmut, ref values, ref errors);
+        } else {
+            ClassVtableAccessValidation::validateMethodField(alias context, loc, object, cref, method, isProxy, inProt, inPrv, assign, ref values, ref errors);
+        }
+
+        if (values.len == 0us) {
+            if (errors.len != 0us) throw copy ErrorMsg::list(errors);
+            if inCall {
+                throw copy ErrorMsg::note(method.loc, format(ValidateErrorMessage::CLASS_NO_METHOD, object.type, method), oneLine-> true);
+            } else if !assign {
+                throw copy ErrorMsg::note(method.loc, format(ValidateErrorMessage::CLASS_NO_FIELD_ACCESS_METHOD, object.type, method), oneLine-> true);
+            } else {
+                throw copy ErrorMsg::note(method.loc, format(ValidateErrorMessage::CLASS_NO_FIELD_ASSIGN_METHOD, object.type, method), oneLine-> true);
+            }
+        }
+
+        if !inCall && !assign && forceCall {
+            let dmut ret = copy MultSymValue(method.loc, values);
+            return CallValidation::validate(alias context, method.loc, ret, []);
+        }
+
+        else if (values.len == 1us) {
+            return values[0us];
+        }
+
+        return copy MultSymValue(method.loc, values, prettyStr-> format("%", method));
+    }
+
+    /**
+     * Validate normal(non-template) methods from the class vtable.
+     *
+     * Candidate selection:
+     *   - method name must match v.sym.path.file
+     *   - method must not be a field-method or field-assign-method
+     *
+     * Aliasing rules:
+     *   - mutable method requires ClassAliaserValue
+     *   - immutable method forbids ClassAliaserValue unless allowImmut = true
+     *
+     * Abstract method rules:
+     *   - if method is empty and dispatch is direct → error(abstract call)
+     *
+     * Result:
+     *   - append MethodDelegateValue to 'values'
+     *   - append errors to 'errors'
+     *
+     * @params:
+     *   - object:  class instance
+     *   - cref:    class reference type
+     *   - method:  method expression
+     *   - isProxy: force direct dispatch
+     *   - inProt:  protected visibility allowed
+     *   - inPrv:   private visibility allowed
+     *   - allowImmut: allow immutable aliasing
+     *   - values:  output list of valid delegates
+     *   - errors:  output list of errors
+     */
+    fn validateMethod(object:         &Value,
+                      cref:           &ClassRefType,
+                      method:         &Expression,
+                      isProxy:        bool,
+                      inProt:         bool,
+                      inPrv:          bool,
+                      allowImmut:     bool,
+                      ref mut values: [&Value],
+                      ref mut errors: [&ErrorMsg])
+    {
+        if let meth: &VarExpr = method for i, v in cref.vtable {
+            if v.sym.path.file == meth.name.str && !v.isFieldAssign && !v.isField {
+                if (v.sym.protection == Protection::PRIVATE && !inPrv) {
+                    errors ~= [copy ErrorMsg::fatal(method.loc, format(DeclareErrorMessage::PRIVATE_IN_THIS_CONTEXT, v, tags-> FormatTags(withParams-> true)),
+                                                    notes-> copy [copy ErrorMsg::note(v.sym.loc, ValidateErrorMessage::DECLARED_HERE)])];
+                } else if (v.sym.protection == Protection::PROTECTED && !inPrv && !inProt) {
+                    errors ~= [copy ErrorMsg::fatal(method.loc, format(DeclareErrorMessage::PRIVATE_IN_THIS_CONTEXT, v, tags-> FormatTags(withParams-> true)),
+                                                    notes-> copy [copy ErrorMsg::note(v.sym.loc, ValidateErrorMessage::DECLARED_HERE)])];
+                } else {
+                    let isDirect = if isProxy {
+                        true
+                    } else if !cref.hasAncestor {
+                        // final class with no ancestor does not need vtable
+                        (!v.isVirtual || cref.sym.isFinal || cref.sym.isStruct)
+                    } else {
+                        // method that are not over and are final are not virtual
+                        !v.isVirtual
+                    };
+
+                    if (v.isMutable && object !of ClassAliaserValue) {
+                        let mut notes = copy [copy ErrorMsg::note(object.loc, format(ValidateErrorMessage::IMPLICIT_ALIAS, object.type))];
+                        if (object of AliaserValue) notes = notes ~ copy [copy ErrorMsg::note(object.loc,
+                                                                                              end-> v.loc,
+                                                                                              format(ValidateErrorMessage::SIMPLE_ALIAS_NOT_CLASS), oneLine-> true)];
+
+                        errors ~= [copy ErrorMsg::fatal(v.loc, format(ValidateErrorMessage::MUTABLE_METHOD, v, tags-> FormatTags(withParams-> true)),
+                                                        notes-> notes)];
+                    }
+
+                    else if (!v.isMutable && (object of ClassAliaserValue || object of AliaserValue) && !allowImmut) {
+                        errors ~= [copy ErrorMsg::fatal(v.loc, format(ValidateErrorMessage::CONST_METHOD, v, tags-> FormatTags(withParams-> true)),
+                                                        notes-> copy [copy ErrorMsg::note(object.loc, format(ValidateErrorMessage::UNECESSARY_ALIAS, object.type))])];
+                    }
+
+                    else if v.isEmpty && isDirect {
+                        errors ~= [copy ErrorMsg::fatal(v.loc, format(ValidateErrorMessage::EMPTY_METHOD_CALL, v, tags-> FormatTags(withParams-> true)),
+                                                        notes-> copy [copy ErrorMsg::note(object.loc, format(ValidateErrorMessage::ABSTRACT_CLASS_CALL, object.type))])];
+                    }
+
+                    else {
+                        values ~= [copy MethodDelegateValue(v.loc, v, closure-> object, direct-> isDirect, vtableIndex-> i, isStruct-> cref.sym.isStruct)];
+                    }
+                }
+            }
+        }
+    }
+
+    /**
+     * Validate template methods declared in the class.
+     *
+     * Candidate selection:
+     *   - method name must match template method name
+     *
+     * Result:
+     *   - append MethodDelegateTemplateValue to 'values'
+     *   - append errors to 'errors'
+     *
+     * @params:
+     *   - object:  class instance
+     *   - cref:    class reference type
+     *   - method:  method expression
+     *   - inProt:  protected visibility allowed
+     *   - inPrv:   private visibility allowed
+     *   - allowImmut: allow immutable aliasing
+     *   - values:  output list of valid delegates
+     *   - errors:  output list of errors
+     */
+    fn validateTemplateMethod(object:         &Value,
+                              cref:           &ClassRefType,
+                              method:         &Expression,
+                              inProt:         bool,
+                              inPrv:          bool,
+                              allowImmut:     bool,
+                              ref mut values: [&Value],
+                              ref mut errors: [&ErrorMsg])
+    {
+        if let meth: &VarExpr = method {
+            let prots = cref.templateMethodProtections;
+            for i, v in cref.templateMethods {
+                if (v.name == meth.name) {
+                    if (prots[i] <= MethodProtection::PRV && !inPrv) {
+                        errors ~= [copy ErrorMsg::fatal(method.loc, format(DeclareErrorMessage::PRIVATE_IN_THIS_CONTEXT, v, tags-> FormatTags(withParams-> true)),
+                                                        notes-> copy [copy ErrorMsg::note(v.sym.loc, ValidateErrorMessage::DECLARED_HERE)])];
+                    } else if (prots[i] == MethodProtection::PROT && !inPrv && !inProt) {
+                        errors ~= [copy ErrorMsg::fatal(method.loc, format(DeclareErrorMessage::PRIVATE_IN_THIS_CONTEXT, v, tags-> FormatTags(withParams-> true)),
+                                                        notes-> copy [copy ErrorMsg::note(v.sym.loc, ValidateErrorMessage::DECLARED_HERE)])];
+                    } else {
+
+                        if (v.isMutable && object !of ClassAliaserValue) {
+                            let mut notes = copy [copy ErrorMsg::note(object.loc, format(ValidateErrorMessage::IMPLICIT_ALIAS, object.type))];
+                            if (object of AliaserValue) {
+                                notes = notes ~ [copy ErrorMsg::note(object.loc, end-> v.loc, format(ValidateErrorMessage::SIMPLE_ALIAS_NOT_CLASS), oneLine-> true)];
+                            }
+
+                            errors ~= [copy ErrorMsg::fatal(v.loc, format(ValidateErrorMessage::MUTABLE_METHOD, v, tags-> FormatTags(withParams-> true)),
+                                                            notes-> notes)];
+                        }
+
+                        else if (!v.isMutable && (object of ClassAliaserValue || object of AliaserValue) && !allowImmut) {
+                            errors ~= [copy ErrorMsg::fatal(v.loc, format(ValidateErrorMessage::CONST_METHOD, v, tags-> FormatTags(withParams-> true)),
+                                                            notes-> copy [copy ErrorMsg::note(object.loc, format(ValidateErrorMessage::UNECESSARY_ALIAS, object.type))])];
+                        }
+
+                        else {
+                            values ~= [copy MethodDelegateTemplateValue(v.loc, v, closure-> object, isStruct-> cref.sym.isStruct)];
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /**
+     * Validate field-methods and field-assign-methods.
+     *
+     * Candidate selection:
+     *   - v.isField      when assign = false
+     *   - v.isFieldAssign when assign = true
+     *
+     * Aliasing rules:
+     *   - field-methods require aliasing for mutable methods
+     *   - ClassAliaserValue is forbidden for field-methods
+     *
+     * Result:
+     *   - append MethodDelegateValue to 'values'
+     *   - append errors to 'errors'
+     *
+     * @params:
+     *   - context: validation context
+     *   - loc:     operator location
+     *   - object:  class instance
+     *   - cref:    class reference type
+     *   - method:  method expression
+     *   - isProxy: force direct dispatch
+     *   - inProt:  protected visibility allowed
+     *   - inPrv:   private visibility allowed
+     *   - assign:  whether this is a field-assign-method
+     *   - values:  output list of valid delegates
+     *   - errors:  output list of errors
+     */
+    fn validateMethodField(dmut context: &ValidationContext,
+                           loc: &Word,
+                           object: &Value,
+                           cref: &ClassRefType,
+                           method: &Expression,
+                           isProxy: bool,
+                           inProt: bool,
+                           inPrv: bool,
+                           assign: bool,
+                           ref mut values: [&Value],
+                           ref mut errors: [&ErrorMsg])
+    {
+        if let meth: &VarExpr = method for i, v in cref.vtable {
+            let applicable = (v.isField && !assign) || (v.isFieldAssign && assign);
+
+            if (v.sym.path.file == meth.name) && applicable {
+                if (v.sym.protection == Protection::PRIVATE && !inPrv) {
+                    errors ~= [copy ErrorMsg::fatal(method.loc, format(DeclareErrorMessage::PRIVATE_IN_THIS_CONTEXT, v, tags-> FormatTags(withParams-> true)),
+                                                    notes-> copy [copy ErrorMsg::note(v.sym.loc, ValidateErrorMessage::DECLARED_HERE)])];
+                } else if (v.sym.protection == Protection::PROTECTED && !inPrv && !inProt) {
+                    errors ~= [copy ErrorMsg::fatal(method.loc, format(DeclareErrorMessage::PRIVATE_IN_THIS_CONTEXT, v, tags-> FormatTags(withParams-> true)),
+                                                    notes-> copy [copy ErrorMsg::note(v.sym.loc, ValidateErrorMessage::DECLARED_HERE)])];
+                } else {
+                    let isDirect = if isProxy {
+                        true
+                    } else if !cref.hasAncestor  {
+                        // final class with no ancestor does not need vtable
+                        (!v.isVirtual || cref.sym.isFinal || cref.sym.isStruct)
+                    } else {
+                        // method that are not over and are final are not virtual
+                        !v.isVirtual
+                    };
+
+                    let mut caller = object;
+                    let mut success = true;
+
+                    if object of ClassAliaserValue {
+                        errors ~= [copy ErrorMsg::fatal(v.loc, format(ValidateErrorMessage::FIELD_METHOD_ALIAS, v, tags-> FormatTags(withParams-> true)),
+                                                        notes-> copy [copy ErrorMsg::note(object.loc, format(ValidateErrorMessage::UNECESSARY_ALIAS_FIELD_METHOD, object.type))])];
+                        success = false;
+                    }
+
+                    else if v.isMutable {
+                        {
+                            caller = AliasValidation::validate(alias context, loc, object, isClass-> true, isField-> false);
+                        } catch {
+                            err => {
+                                errors ~= [copy ErrorMsg::fatal(v.loc, format(ValidateErrorMessage::FIELD_METHOD_MUTABLE_ALIAS, v, tags-> FormatTags(withParams-> true)),
+                                                                notes-> copy [err])];
+                                success = false;
+                            }
+                        }
+                    }
+
+                    if success {
+                        values ~= [copy MethodDelegateValue(v.loc, v, closure-> caller, direct-> isDirect, vtableIndex-> i, isStruct-> cref.sym.isStruct)];
+                    }
+                }
+            }
+        }
+    }
+
+}

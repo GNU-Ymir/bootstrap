@@ -1,0 +1,273 @@
+/*
+ * Implements semantic validation for map list comprehensions.
+ *
+ * This module handles:
+ *   - validating key/value iterator variables for map iteration,
+ *   - enforcing copy-mode requirements for map comprehensions,
+ *   - rejecting tuple-mode comprehensions on maps,
+ *   - constructing the iterator loop using MapIteratorBegin/Next/End,
+ *   - building ListComprValue results with correct mutability and alias rules.
+ *
+ * Map list comprehensions iterate over key/value pairs using the map iterator
+ * protocol and always require copy-mode evaluation.
+
+ *
+ * <hr>
+ *
+ * @Package: ymirc
+ * @Module: ymirc::semantic::validator::value::compose::slicefor::map
+ * @File: ymirc/semantic/validator/value/compose/slicefor/map.yr
+ * @Author(s):
+ *   - Emile Cadorel <ecadorel@gmail.com>
+ *
+ * @Created(YYYY-MM-DD): 2026-05-15
+ * @Copyright(C) 2021–2026 GNU-Ymir
+ * @License
+ *   ```text
+ *   This file is part of the Ymir language project.
+ *
+ *   Ymir is free software: you can redistribute it and/or modify it
+ *   under the terms of the GNU General Public License as published by
+ *   the Free Software Foundation, either version 3 of the License, or
+ *   (at your option) any later version.
+ *
+ *   Ymir is distributed in the hope that it will be useful,
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *   GNU General Public License for more details.
+ *
+ *   You should have received a copy of the GNU General Public License
+ *   along with Ymir.  If not, see <https://www.gnu.org/licenses/>.
+ *   ```
+ */
+
+in map;
+
+use ymirc::lexing::{keys, word};
+
+use ymirc::syntax::expression::_;
+use ymirc::semantic::{validator, interpret};
+
+use ymirc::errors;
+use ymirc::semantic::generator::{value::_, type::_};
+
+use ymirc::utils::format;
+
+/**
+ * MapListComprValidation module
+ *
+ * Provides semantic validation for list comprehensions applied to maps. Map
+ * comprehensions iterate through key/value pairs using the map iterator
+ * protocol and always require copy-mode evaluation. Tuple-mode comprehensions
+ * are not supported for maps.
+ *
+ */
+pub mod MapListComprValidation {
+
+    /**
+     * Validate a list comprehension applied to a map.
+     *
+     * Determines whether the comprehension uses one or two iterator variables,
+     * dispatches to validateIteration, and reports an error if the number of
+     * variables is unsupported.
+     *
+     * @params:
+     *   - context:    validation context
+     *   - map:        the map value being iterated
+     *   - mapType:    the type of the map
+     *   - floop:      the SliceForAllocatorExpr describing the comprehension
+     *   - inCopy:     whether the comprehension is evaluated in copy-mode
+     *   - byAlias:    whether aliasing is permitted
+     *
+     * @returns:
+     *   - (value, usedAlias): the resulting comprehension value and alias usage flag
+     *
+     * @throws:
+     *   - ErrorMsg if the number of iterator variables is invalid
+     */
+    pub fn validate(dmut context: &ValidationContext,
+                    map:          &Value,
+                    mapType:      &MapType,
+                    floop:        &SliceForAllocatorExpr,
+                    inCopy:       bool,
+                    byAlias:      bool)-> (&Value, bool)
+        throws ErrorMsg
+    {
+        if floop.vars.len == 1 {
+            return MapListComprValidation::validateIteration(alias context, map, mapType, floop.vars[0], none, floop,
+                                                             inCopy-> inCopy,
+                                                             byAlias-> byAlias);
+        }
+
+        if floop.vars.len == 2 {
+            return MapListComprValidation::validateIteration(alias context, map, mapType, floop.vars[0], (floop.vars[1])?, floop,
+                                                             inCopy-> inCopy,
+                                                             byAlias-> byAlias);
+        }
+
+        throw copy ErrorMsg::fatal(floop.loc, format(ValidateErrorMessage::UNDEF_FOR_LOOP_OPERATOR, floop.vars.len, mapType));
+    }
+
+    /**
+     * Validate a single iteration of a map comprehension.
+     *
+     * Map comprehensions:
+     *   - do not support tuple-mode,
+     *   - must always run in copy-mode,
+     *   - iterate through key/value pairs using the map iterator protocol.
+     *
+     * @params:
+     *   - context:    validation context
+     *   - map:        the map value
+     *   - mapType:    the map type
+     *   - keyIter:    key iterator variable
+     *   - valueIter:  optional value iterator variable
+     *   - floop:      comprehension expression
+     *   - inCopy:     copy-mode flag
+     *   - byAlias:    aliasing flag
+     *
+     * @returns:
+     *   - (value, usedAlias)
+     *
+     * @throws:
+     *   - ErrorMsg if tuple-mode is used
+     *   - ErrorMsg if not in copy-mode
+     *   - ErrorMsg if validation fails inside the loop
+     */
+    fn validateIteration(dmut context: &ValidationContext,
+                         map:          &Value,
+                         mapType:      &MapType,
+                         keyIter:      &VarDeclExpr,
+                         valueIter:    (&VarDeclExpr)?,
+                         floop:        &SliceForAllocatorExpr,
+                         inCopy:       bool,
+                         byAlias:      bool)-> (&Value, bool)
+        throws ErrorMsg
+    {
+        if floop.isTuple {
+            throw copy ErrorMsg::fatal(floop.iter.loc, format(ValidateErrorMessage::LIST_COMPR_SIZE_CTE, mapType));
+        } else if !inCopy {
+            throw copy ErrorMsg::fatal(floop.iter.loc, format(ValidateErrorMessage::LIST_COMPR_SIZE_CTE, mapType),
+                                       notes-> copy [copy ErrorMsg::note(floop.loc, format(ValidateErrorMessage::ENCLOSE_COPY_LST))]);
+        }
+
+        let loc = floop.loc;
+        let mut errors: (&ErrorMsg)? = none;
+        let mut retValue: &Value = UNIT_VALUE;
+        let mut usedAlias: bool = false;
+
+        context:.enterBlock();
+
+        {
+            let len = context.cteInterpret:.reduce(copy MapLenAccessValue(loc, USIZE_TYPE, map));
+            let (lp, resultDecl, resultVref, resultType, usedAlias_) = MapListComprValidation::validateInnerLoop(alias context, loc, map, mapType, floop, keyIter, valueIter, len,
+                                                                                                                 byAlias-> byAlias);
+            let blk = copy BlockValue(loc, resultType, copy [resultDecl, lp, resultVref]);
+            let lst = copy ListComprValue(loc, resultType, blk);
+
+            retValue = copy CopierValue(loc, resultType, lst, isDone-> true);
+            usedAlias = usedAlias_;
+        } catch {
+            err => {
+                errors = (err)?;
+            }
+        }
+
+        {
+            context:.quitBlock(warnUnused-> (!errors.hasValue));
+        } catch {
+            err => {
+                errors = (err)?;
+            }
+        }
+
+        if let Ok(err) = errors {
+            throw err;
+        }
+
+        return (retValue, usedAlias);
+    }
+
+    /**
+     * Build the iterator loop for a map comprehension.
+     *
+     * Constructs the full loop structure using the map iterator protocol:
+     *
+     *   - MapIteratorBeginValue: create iterator
+     *   - MapIteratorNextValue:  advance iterator
+     *   - MapIteratorEndValue:   loop termination test
+     *   - MapIteratorDelValue:   cleanup in a finally block
+     *
+     * @params:
+     *   - context:    validation context
+     *   - loc:        source location
+     *   - map:        the map value
+     *   - mapType:    the map type
+     *   - floop:      comprehension expression
+     *   - keyIter:    key iterator variable
+     *   - valueIter:  optional value iterator variable
+     *   - len:        map length
+     *   - byAlias:    aliasing flag
+     *
+     * @returns:
+     *   - (loopBlock, resultDecl, resultVref, resultType, usedAlias)
+     *
+     * @throws:
+     *   - ErrorMsg if iterator validation or loop construction fails
+     */
+    fn validateInnerLoop(dmut context: &ValidationContext,
+                         loc:          &Word,
+                         map:          &Value,
+                         mapType:      &MapType,
+                         floop:        &SliceForAllocatorExpr,
+                         keyIter:      &VarDeclExpr,
+                         valueIter:    (&VarDeclExpr)?,
+                         len:          &Value,
+                         byAlias:      bool)-> (&Value, &VarDeclValue, &VarRefValue, &Type, bool)
+        throws ErrorMsg
+    {
+        let iterType = copy MapIteratorType(map.loc, mapType);
+        let beginValue = copy MapIteratorBeginValue(map.loc, iterType, map);
+
+        let indexDecl = copy VarDeclValue(loc.locate(ForLoopKeys::INDEX), USIZE_TYPE, copy IntValue(loc, USIZE_TYPE, 0), isMutable-> true);
+        let iterDecl = copy VarDeclValue(map.loc.locate(ForLoopKeys::ITER), iterType, beginValue, isMutable-> true);
+
+        let indexVref = VariableCreation::createVarFromDecl(indexDecl, canCte-> false);
+        let iterVref = VariableCreation::createVarFromDecl(iterDecl, canCte-> false);
+
+        let (keyDecl, valueDecl, _, usedAlias) = MapForLoopValidation::validateIteratorVars(alias context, iterVref, mapType, keyIter, valueIter,
+                                                                                            byMutRef-> false,
+                                                                                            byAlias-> byAlias,
+                                                                                            mapIsLvalue-> map.isLvalue);
+
+        let resInnerValue = ValueValidation::validate(alias context, floop.value);
+        let resInnerType = TypeInference::inferImplicitMutability(resInnerValue.type, resInnerValue);
+        let one = TypeInference::inferValueForType(alias context, indexVref.loc, copy IntValue(loc, USIZE_TYPE, 1), indexVref.type,
+                                                   byReference-> false);
+
+        let (resultDecl, resultVref, resultAccess, resultType) = {
+            SliceForComposeValidation::validateResultValueDecl(alias context, loc, resInnerType, indexVref, len,
+                                                               fromType-> mapType,
+                                                               inCopy-> true)
+        };
+
+        let set = copy AffectValue(loc, resultAccess.type, resultAccess, resInnerValue);
+
+        let incrementIter = copy MapIteratorNextValue(loc, iterVref);
+        let incrementIndex = copy AffectValue(loc, indexVref.type,
+                                              indexVref,
+                                              copy MathIntOperatorValue(loc, indexVref.type, BinaryOperators::PLUS, indexVref, one));
+
+        let test = copy MapIteratorEndValue(loc, iterVref);
+        let finBlk = copy BlockValue(loc, VOID_TYPE, copy [copy MapIteratorDelValue(loc, iterVref)]);
+        let blk = copy BlockValue(loc, VOID_TYPE, copy [keyDecl, valueDecl, set, incrementIndex, incrementIter]);
+
+        let tryFin = copy TryFinallyValue(loc, VOID_TYPE,
+                                          copy LoopValue(loc, VOID_TYPE, test, blk),
+                                          finBlk,
+                                          failVar-> UNIT_VALUE);
+
+        let upperBlk = copy BlockValue(loc, VOID_TYPE, copy [iterDecl, indexDecl, tryFin]);
+        return (upperBlk, resultDecl, resultVref, resultType, usedAlias);
+    }
+}

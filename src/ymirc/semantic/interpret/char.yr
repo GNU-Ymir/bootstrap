@@ -1,0 +1,297 @@
+/*
+ * Implements compile-time reduction utilities for character operators.
+ *
+ * This module provides the reduction logic for all character-related operators
+ * encountered during compile-time evaluation. It also exposes overflow-checking
+ * utilities for CharType values and helpers for converting CharValue contents
+ * into integer ranges suitable for validation.
+ *
+ * Supported operations:
+ *   - character comparisons,
+ *   - character arithmetic(when allowed by the language rules),
+ *   - overflow checking for char literals and char expressions.
+ *
+ * Character semantics:
+ *   - CharType values are always unsigned.
+ *   - The representable range is determined by the bit-width of the type.
+ *   - CharValue may internally store UTF-8 or UTF-16 code units depending
+ *     on the literal form; overflow checking normalizes these to usize.
+ *
+ * <hr>
+ *
+ * @Package: ymirc
+ * @Module: ymirc::semantic::validator::interpret::char
+ * @File: ymirc/semantic/validator/interpret/char.yr
+ * @Author(s):
+ *   - Emile Cadorel <ecadorel@gmail.com>
+ *
+ * @Created(YYYY-MM-DD): 2026-03-13
+ * @Copyright(C) 2021–2026 GNU-Ymir
+ * @License
+ *   ```text
+ *   This file is part of the Ymir language project.
+ *
+ *   Ymir is free software: you can redistribute it and/or modify it
+ *   under the terms of the GNU General Public License as published by
+ *   the Free Software Foundation, either version 3 of the License, or
+ *   (at your option) any later version.
+ *
+ *   Ymir is distributed in the hope that it will be useful,
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *   GNU General Public License for more details.
+ *
+ *   You should have received a copy of the GNU General Public License
+ *   along with Ymir.  If not, see <https://www.gnu.org/licenses/>.
+ *   ```
+ */
+
+in char;
+
+use ymirc::semantic::generator::{_, value::_, type::_};
+use ymirc::global;
+
+use ymirc::semantic::interpret::int;
+use ymirc::semantic::validator;
+use ymirc::errors;
+
+use ymirc::utils::{format, bigint};
+use ymirc::lexing::{word, keys};
+
+/**
+ * Character operator reduction subsystem.
+ *
+ * This module defines the reduction logic for character comparison and
+ * arithmetic operators. Reduction is attempted only when operands are
+ * compile-time constants; otherwise the operator is preserved.
+ *
+ * The module also provides overflow-checking utilities for CharType values.
+ * Overflow occurs when a character literal or computed character value exceeds
+ * the representable range of the target CharType.
+ *
+ * All reduction functions are invoked by the operator interpreter.
+ */
+pub mod CharInterpret {
+
+    /**
+     * Reduces a character comparison operator.
+     *
+     * Attempts full constant folding via the internal reducer. If folding
+     * fails, rebuilds the operator with reduced operands.
+     *
+     */
+    pub fn reduceCmp(dmut context: &CompileTimeInterpret, bin: &CmpCharOperatorValue)-> &Value
+        throws ErrorMsg
+    {
+        if let Ok(v) = CharInterpret::reduceCmp(alias context, bin.loc, bin.op, bin.left, bin.right) {
+            return v;
+        }
+
+        return copy CmpCharOperatorValue(bin.loc,
+                                          bin.op,
+                                          context:.reduce(bin.left),
+                                          context:.reduce(bin.right),
+                                          isReduced-> true);
+    }
+
+    /**
+     * Attempts to fold a character comparison at compile time.
+     *
+     * If both operands are CharValue literals, evaluates the comparison
+     * directly. When only one operand is literal, applies simple bound-based
+     * reasoning using the CharType range. If both operands reduce to identical
+     * literals, folds accordingly.
+     *
+     * Returns:
+     *   - Ok(BoolValue) on success,
+     *   - none when folding is not possible.
+     *
+     */
+    pub fn reduceCmp(dmut context: &CompileTimeInterpret, loc: &Word, op: BinaryOperators, bleft: &Value, bright: &Value)-> (&Value?)
+        throws ErrorMsg
+    {
+        let left = context:.reduceInOperator(bleft, checkCte-> false);
+        let right = context:.reduceInOperator(bright, checkCte-> false);
+
+        let litype = if let c: &CharType = left.type { c } else { panic; }
+        let ritype = if let c: &CharType = right.type { c } else { panic; }
+
+        match (left, right) {
+            (l: &CharValue, r: &CharValue) => {
+                let lV = l.valueAsInt;
+                let rV = r.valueAsInt;
+                match op {
+                    BinaryOperators::INF => { return (copy BoolValue(loc, rV > lV))?; }
+                    BinaryOperators::SUP => { return (copy BoolValue(loc, lV > rV))?; }
+                    BinaryOperators::INF_EQUAL => { return (copy BoolValue(loc, rV >= lV))?; }
+                    BinaryOperators::SUP_EQUAL => { return (copy BoolValue(loc, lV >= rV))?; }
+                    BinaryOperators::DEQUAL => { return (copy BoolValue(loc, lV == rV))?; }
+                    BinaryOperators::NOT_EQUAL => { return (copy BoolValue(loc, lV != rV))?; }
+                }
+            }
+            (l: &CharValue, _) => {
+                let min = IntInterpret::createIntMinValue(litype.size, false);
+                let max = IntInterpret::createIntMaxValue(litype.size, false);
+                let v = l.valueAsInt;
+                match op {
+                    BinaryOperators::INF => {
+                        if v == max { return (copy BoolValue(loc, false))?; } // max < right(i.e. right > max => false)
+                    }
+                    BinaryOperators::INF_EQUAL => {
+                        if v == min { return (copy BoolValue(loc, true))?; } // min <= right(i.e. right >= min => true)
+                    }
+                    BinaryOperators::SUP => {
+                        if v == min { return (copy BoolValue(loc, false))?; }  // min > right(i.e. right < min => false)
+                    }
+                    BinaryOperators::SUP_EQUAL => {
+                        if v == max { return (copy BoolValue(loc, true))?; } // max >= right(i.e. right <= max => true)
+                    }
+                }
+            }
+            (_, r: &CharValue) => {
+                let min = IntInterpret::createIntMinValue(ritype.size, false);
+                let max = IntInterpret::createIntMaxValue(ritype.size, false);
+                let v = r.valueAsInt;
+                match op {
+                    BinaryOperators::INF => {
+                        if v == min { return (copy BoolValue(loc, false))?; } // left < min => false
+                    }
+                    BinaryOperators::INF_EQUAL => {
+                        if v == max { return (copy BoolValue(loc, true))?; } // left <= max => true
+                    }
+                    BinaryOperators::SUP => {
+                        if v == max { return (copy BoolValue(loc, false))?; } // left > max => false
+                    }
+                    BinaryOperators::SUP_EQUAL => {
+                        if v == min { return (copy BoolValue(loc, true))?; }  // left >= min => true
+                    }
+                }
+            }
+        }
+
+        let resLeft = context:.reduce(bleft);
+        let resRight = context:.reduce(bright);
+        if (resLeft is resRight) || (resLeft.isFullLiteral && resRight.isFullLiteral && resLeft == resRight) {
+            match op {
+                BinaryOperators::DEQUAL => { return (copy BoolValue(loc, true))?; }
+                BinaryOperators::NOT_EQUAL => { return (copy BoolValue(loc, false))?; }
+                BinaryOperators::SUP => { return (copy BoolValue(loc, false))?; }
+                BinaryOperators::INF => { return (copy BoolValue(loc, false))?; }
+                BinaryOperators::INF_EQUAL => { return (copy BoolValue(loc, true))?; }
+                BinaryOperators::SUP_EQUAL => { return (copy BoolValue(loc, true))?; }
+            }
+        }
+
+        return none;
+
+    }
+
+    /**
+     * Reduces character arithmetic(+, -).
+     *
+     * When both operands are CharValue literals:
+     *   - performs the arithmetic,
+     *   - checks for overflow,
+     *   - returns a new CharValue.
+     *
+     * Otherwise, rebuilds the operator with reduced operands.
+     *
+     */
+    pub fn reduceMath(dmut context: &CompileTimeInterpret, bin: &MathCharOperatorValue)-> &Value
+        throws ErrorMsg
+    {
+        let left = context:.reduceInOperator(bin.left, checkCte-> false);
+        let right = context:.reduceInOperator(bin.right, checkCte-> false);
+
+        let t = if let t: &CharType = bin.type { t } else { panic; };
+
+        if let (l: &CharValue, r: &CharValue) = (left, right) {
+            match bin.op {
+                BinaryOperators::PLUS => {
+                    let val = l.valueAsInt + r.valueAsInt;
+                    CharInterpret::verifyOverflow(bin.loc, t, val);
+
+                    return copy CharValue(bin.loc, t, val);
+                }
+                BinaryOperators::MINUS => {
+                    let val = l.valueAsInt - r.valueAsInt;
+                    CharInterpret::verifyOverflow(bin.loc, t, val);
+
+                    return copy CharValue(bin.loc, t, val);
+                }
+            }
+        }
+
+        return copy MathCharOperatorValue(bin.loc,
+                                           bin.type,
+                                           bin.op,
+                                           context:.reduce(bin.left),
+                                           context:.reduce(bin.right),
+                                           isReduced-> true);
+    }
+
+    /**
+     * Verifies that a usize value fits within the representable range of the
+     * given CharType.
+     *
+     * Parameters:
+     *   - loc:   source location for error reporting.
+     *   - type:  the character type.
+     *   - value: the integer value to validate.
+     *
+     * Throws:
+     *   - ErrorMsg::fatal when the value exceeds the type’s capacity.
+     *
+     * Notes:
+     *   - CharType values are always unsigned.
+     *   - The maximum representable value is (2^size) - 1.
+     */
+    pub fn verifyOverflow(loc: &Word, type: &CharType, value: usize)
+        throws ErrorMsg
+    {
+        let max = {
+            copy BigInt(2us) ^^ cast!usize(type.size) - 1us
+        } catch {
+            _: &BigIntError => panic;
+        }
+
+        if (value > max) {
+            throw copy ErrorMsg::fatal(loc, format(ValidateErrorMessage::OVERFLOW_CAPACITY, type, value, max));
+        }
+    }
+
+    /**
+     * Ensures that a BigInt value fits within the representable range of a CharType.
+     *
+     */
+    pub fn verifyOverflow(loc: &Word, type: &CharType, value: &BigInt)
+        throws ErrorMsg
+    {
+        // Char are necessarily unsigned thus can be casted to usize
+        CharInterpret::verifyOverflow(loc, type, value.toT!{usize} ());
+    }
+
+    /**
+     * Ensures that a CharValue fits within the representable range of a CharType.
+     * Handles UTF-8/16/32 internal encodings.
+     *
+     */
+    pub fn verifyOverflow(loc: &Word, type: &CharType, value: &CharValue)
+        throws ErrorMsg
+    {
+        let chType = if let c: &CharType = value.type { c } else { panic; };
+
+        match chType.size {
+            8u16 => {
+                CharInterpret::verifyOverflow(loc, type, cast!{usize} (value.value.utf8));
+            }
+            16u16 => {
+                CharInterpret::verifyOverflow(loc, type, cast!{usize} (value.value.utf16));
+            }
+            _ => {
+                CharInterpret::verifyOverflow(loc, type, cast!{usize} (value.value.utf32));
+            }
+        }
+    }
+
+}

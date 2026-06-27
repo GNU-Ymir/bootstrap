@@ -1,339 +1,476 @@
+/*
+ * Declares the ClassPtrType class.
+ *
+ * A class pointer is the type of a class, record, and entity instances. It
+ * contains two level of mutability, but only one is applicable for record and
+ * entities.
+ *
+ * <hr>
+ *
+ * @Package: ymirc
+ * @Module: ymirc::semantic::generator::type::custom::classptr
+ * @File: ymirc/semantic/generator/type/custom/classptr.yr
+ * @Author(s):
+ *   - Emile Cadorel <ecadorel@gmail.com>
+ *
+ * @Created(YYYY-MM-DD): 2021-11-26
+ * @Copyright(C) 2021–2026 GNU-Ymir
+ * @License
+ *   ```text
+ *   This file is part of the Ymir language project.
+ *
+ *   Ymir is free software: you can redistribute it and/or modify it
+ *   under the terms of the GNU General Public License as published by
+ *   the Free Software Foundation, either version 3 of the License, or
+ *   (at your option) any later version.
+ *
+ *   Ymir is distributed in the hope that it will be useful,
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *   GNU General Public License for more details.
+ *
+ *   You should have received a copy of the GNU General Public License
+ *   along with Ymir.  If not, see <https://www.gnu.org/licenses/>.
+ *   ```
+ */
+
+
 in classptr;
 
-use ymirc::semantic::generator::{error,
-                                 type::temporary::classref,
-                                 value::vardecl};
+use ymirc::semantic::symbol;
 
-use ymirc::errors::message;
-use ymirc::utils::format;
-use ymirc::syntax::keys;
-use ymirc::lexing::{word, tokens};
-use ymirc::semantic::symbol::class_;
+use ymirc::semantic::generator::{type::{temporary, custom},
+                                 value::variable};
+
+use ymirc::utils::{format, comparison};
+use ymirc::lexing::{word, tokens, keys};
+
+use ymirc::errors;
 
 use std::stream;
 
 
 /**
- * A class ptr type is the type that can be used (&A), instead of just (A) (assuming A is a class)
+ * Native class-pointer type.
+ *
+ * ClassPtrType represents the type of a class, record, or entity instance.
+ * It is the type produced by expressions such as `&A` when `A` is a class-like
+ * symbol. Class pointers carry *two* layers of mutability:
+ *
+ *   - outer mutability: mutability of the pointer itself(`mut &T`)
+ *   - inner mutability: mutability of the referenced object(`&(mut T)`)
+ *
+ * For records and entities(stack-allocated types), only the outer mutability
+ * is meaningful. For heap-allocated classes, both layers participate in
+ * compatibility, mutability fitting, and aliasing rules.
+ *
+ * ClassPtrType tracks:
+ *   - the referenced class symbol,
+ *   - whether the symbol represents a record or an entity,
+ *   - whether the inner object is mutable,
+ *   - whether the pointer itself is mutable.
+ *
+ * Class pointers participate in borrowing rules:
+ *   - classes always borrow,
+ *   - records borrow only if one of their fields borrows,
+ *   - entities never borrow.
+ *
  */
 @final
 pub class ClassPtrType over CustomType {
 
-    // The content of the class ptr
-    let _sym : &ClassSymbol;
+    pub {
+        // The content of the class ptr
+        let sym: &ClassSymbol;
 
-    // True if the inner part is also mutable
-    let _innerMutable : bool;
+        // The symbol is a record (so on the stack, no inheritence, etc.)
+        let isRecord: bool;
 
-    let _isRecord : bool;
-    let _isUnion : bool;
-    let _isEntity : bool;
+        // The symbol is an entity (so on the stack, with uniq ownership and complete lifetime)
+        let isEntity: bool;
+    }
+
+    prv {
+        // True iff the inner part is also mutable
+        let _isInnerMutable: bool;
+    }
 
     /**
-     * 
+     * Construct a class-pointer type.
+     *
+     * @params:
+     *   - loc:            source location of the type expression
+     *   - sym:         the referenced class/record/entity symbol
+     *   - isMutable:      true iff the pointer itself is mutable
+     *   - isInnerMutable: true iff the referenced object is mutable
+     *
+     * Inner mutability is only meaningful for classes. For records and entities,
+     * it is forced to match the outer mutability.
      */
-    pub self (loc : &Word, type : &ClassSymbol, isMutable : bool = false, innerMutable : bool = false)
+    pub self (loc: &Word, sym: &ClassSymbol, isMutable: bool, isInnerMutable: bool)
         with super (loc, isMutable-> isMutable)
-        , _sym = type
-        , _innerMutable = ((innerMutable || type.isStruct ()) && isMutable)
-        , _isRecord = type.isRecord ()
-        , _isEntity = type.isEntity ()
-        , _isUnion = type.isUnion ()
+        , sym = sym
+        , _isInnerMutable = ((isInnerMutable || sym.isStruct) && isMutable)
+        , isRecord = sym.isRecord
+        , isEntity = sym.isEntity
     {}
 
-
-    /*!
-     * ================================================================================
-     * ================================================================================
-     * =========================           GETTERS            =========================
-     * ================================================================================
-     * ================================================================================
+    /**
+     * A class pointer is deeply mutable iff:
+     *   - the pointer itself is mutable, and
+     *   - the referenced object is mutable.
      */
-
-    pub over isDeeplyMutable (self)-> bool {
-        self._isMutable && self._innerMutable
+    @field
+    pub over isDeeplyMutable(self)-> bool {
+        self.isMutable && self._isInnerMutable
     }
 
-    pub over needExplicitAlias (self)-> bool {
-        if (self.isStruct ()) {
-            if (self._isMutable && !self._isEntity) { // records
-                for i in self.getInner ().getFields () match i {
-                    v : &VarDeclValue => {
-                        if v.getVarType ().needExplicitAlias () return true;
+    /**
+     * Determine whether the class pointer requires explicit aliasing.
+     *
+     * Rules:
+     *   - classes always borrow; a mutable pointer to a mutable class requires
+     *     aliasing,
+     *   - records require aliasing only when:
+     *       * the pointer is mutable, and
+     *       * at least one field requires aliasing,
+     *   - entities and const records never require aliasing.
+     */
+    @field
+    pub over needsExplicitAlias(self)-> bool {
+        if (!self.isStruct) {
+            // class borrow data, so if inner is mutable it needs to be aliased
+            return self.isMutable && self._isInnerMutable;
+        }
+
+        {
+            if (self.isMutable && self.isRecord) { // records
+                for i in self.inner.fields {
+                    if let v: &VarDeclValue = i && v.varType.needsExplicitAlias {
+                        return true;
                     }
                 }
-            } catch { _ => {} } // error generator in the symbol
-
-            // entities are never aliased
-            false
-        } else {
-            self._isMutable && self._innerMutable
-        }
-    }
-
-    pub over borrowDatas (self)-> bool {
-        if (self.isStruct ()) {
-            if (!self._isEntity) { // record or union
-                for i in self.getInner ().getFields () match i {
-                    v : &VarDeclValue => {
-                        if v.getVarType ().borrowDatas () return true;
-                    }
-                }
-            } catch { _ => {} } // error generator in the symbol
-
-            // entities can borrow values but we don't care, they are the only ones
-            false
-        } else {
-            true
-        }
-    }
-
-    /*!
-     * ================================================================================
-     * ================================================================================
-     * =========================          COMPARISON          =========================
-     * ================================================================================
-     * ================================================================================
-     */
-
-    pub over opEquals (self, o : &Generator)-> bool {
-        match o {
-            p : &ClassPtrType => {
-                self._sym == p._sym
             }
-            _ => { false }
+        } catch { _ => {} } // error generator in the symbol, during self.inner
+
+        // entities and const records don't need alias
+        return false;
+    }
+
+    /**
+     * Determine whether the class pointer borrows data.
+     *
+     * Rules:
+     *   - classes always borrow,
+     *   - records borrow if any field borrows,
+     *   - entities never borrow.
+     */
+    @field
+    pub over borrowsData(self)-> bool {
+        if !self.isStruct {
+            return true;
         }
+
+        {
+            if (self.isRecord) {
+                for i in self.inner.fields {
+                    if let v: &VarDeclValue = i && v.varType.borrowsData {
+                        return true;
+                    }
+                }
+            } catch { _ => {} } // error generator in the symbol
+        }
+
+        // Entities never borrow
+        return false;
     }
 
-    pub over isCompatible (self, o : &Type)-> bool {
-        self == o
+    /**
+     * Class pointers are compatible only when they are equal.
+     *
+     * Equality is structural and based on the referenced symbol.
+     */
+    pub over isCompatible(self, o: &Type)-> bool {
+        self.opEquals(o)
     }
 
-    pub over mutabilityFit (self, o : &Type, borrowed : bool = false)-> bool {
+    /**
+     * Check whether this class pointer can fit into another under mutability rules.
+     *
+     * Structs(records/entities):
+     *   - const-> const and mut-> const, is always allowed,
+     *   - const-> mut is allowed only if no borrowing occurs.
+     *
+     * Classes:
+     *   - const &T-> mut &T is forbidden when borrowed,
+     *   - &(const T)-> &(mut T) is forbidden,
+     *   - outer mutability follows standard borrowed rules.
+     *
+     * EnumType proxies are handled transparently.
+     */
+    pub over mutabilityFit(self, o: &Type, borrowed: bool = false)-> bool {
         match o {
-            p : &ClassPtrType => {
-                if (self.isStruct ()) {
-                    if (!p._isMutable) return true;
-                    if (!self._isMutable) {
-                        if (borrowed) { return false; }
-                        else {
-                            {
-                                for i in self.getInner ().getFields () match i {
-                                    v : &VarDeclValue => {
-                                        if v.getVarType ().needExplicitAlias () return false;
-                                    }
-                                }
-                            } catch { _ => {} }
-                        }
+            p: &ClassPtrType => {
+                if (self.isStruct) {
+                    if (!p.isMutable) return true; // any T-> const T, allowed
+                    if (!self.isMutable) { // const T-> mut T, only if don't borrow
+                        if (borrowed) return false; // any *(const T)-> mut(*mut T), forbidden
+                        if (self.borrowsData) return false; // const T-> mut T, forbidden if T has borrowing fields
                     }
 
-                    true
+                    return true;
                 } else {
-                    if (!p._isMutable) return true;
-                    if (borrowed && !self._isMutable) return false;
-                    if (!self._innerMutable && p._innerMutable) return false;
+                    if (!p.isMutable) return true; // any &T-> const &T, allowed
+                    if (borrowed && !self.isMutable) return false; // mut *(const &T)-> mut *(dmut &T), forbidden
+                    if (!self._isInnerMutable && p._isInnerMutable) return false; // mut(const T) => mut(mut T), forbidden
 
-                    true
+                    return true;
                 }
+            }
+            en: &EnumType => {
+                return self.mutabilityFit(en.getLastLevelProxy(), borrowed-> borrowed);
             }
             _ => panic;
         }
     }
 
-    pub over mutabilityDistance (self, o : &Type, borrowed : bool = false)-> u32 {
+    /**
+     * Compute the mutability distance between two class pointers.
+     *
+     * Structs:
+     *   - mut-> const costs 1 when borrowed or when the struct borrows data,
+     *   - otherwise distance is 0.
+     *
+     * Classes:
+     *   - losing inner mutability costs 1,
+     *   - losing outer mutability while borrowed costs 1.
+     */
+    pub over mutabilityDistance(self, o: &Type, borrowed: bool = false)-> u32 {
         match o {
-            p : &ClassPtrType => {
-                if (self.isStruct ()) {
-                    if (!self._isMutable) return 0u32;
-                    if (!p._isMutable && (borrowed || self.borrowDatas ())) return 1u32;
+            p: &ClassPtrType => {
+                if (self.isStruct) {
+                    if (!self.isMutable) return 0; // const-> const = 0 change
+                    if (!p.isMutable && (borrowed || self.borrowsData)) return 1; // mut-> const, 1 if T borrows
 
-                    0u32
+                    return 0; // mut-> mut, = 0 change
                 } else {
-                    if (!self._isMutable) return 0u32;
-                    let inner = if (self._innerMutable && !p._innerMutable) { 1u32 } else { 0u32 };
+                    if (!self.isMutable) return 0; // const-> const, = 0
+                    let inner = if (self._isInnerMutable && !p._isInnerMutable) { 1u32 } else { 0u32 }; // &(mut)-> &(const), = 1
 
-                    if (borrowed && !p._isMutable) { 1u32 + inner }
-                    else {
-                        inner
-                    }
+                    if (borrowed && !p.isMutable)
+                        return 1u32 + inner; // mut *(&T)-> const *(&T); = 1
+
+                    return inner;
                 }
+            }
+            en: &EnumType => {
+                return self.mutabilityDistance(en.getLastLevelProxy(), borrowed-> borrowed);
             }
             _ => panic;
         }
     }
 
-    pub over maxMutabilityDistance (self, borrowed : bool = false)-> u32 {
+    /**
+     * Compute the maximum mutability distance for this class pointer.
+     *
+     * Structs:
+     *   - 1 when borrowed,
+     *   - 1 when borrowing data,
+     *   - 0 otherwise if the struct does not borrow.
+     *
+     * Classes:
+     *   - 2 when borrowed(outer + inner),
+     *   - 1 otherwise(inner mutability).
+     */
+    prot over computeMaxMutabilityDistance(self, borrowed: bool)-> u32 {
         if (borrowed) {
-            if (self.isStruct ()) 1u32
-            else 2u32
-        } else {
-            if (self.isStruct () && !self.borrowDatas ()) 0u32
-            else 1u32
+            if (self.isStruct)
+                return 1u32; // (dmut *T)
+
+            return 2u32; // dmut *(&T)
         }
+
+        if (self.isStruct && !self.borrowsData) // T mutability has no impact on fitting
+            return 0;
+
+        return 1; // class inner mutability impact
     }
 
-
-    pub over sameMutability (self, o : &Type)-> bool {
+    /**
+     * Class pointers have the same mutability iff:
+     *   - their outer mutability matches, and
+     *   - for classes, their inner mutability also matches.
+     *
+     * For structs, only outer mutability matters.
+     */
+    pub over sameMutability(self, o: &Type)-> bool {
         match o {
-            p : &ClassPtrType => {
-                if (self.isStruct ()) return (self._isMutable == p._isMutable);
-                else {
-                    return self._isMutable == p._isMutable && self._innerMutable == p._innerMutable;
-                }
+            p: &ClassPtrType => {
+                if (self.isStruct)
+                    return (self.isMutable == p.isMutable);
+
+
+                return self.isMutable == p.isMutable && self._isInnerMutable == p._isInnerMutable;
+            }
+
+            en: &EnumType => {
+                return self.sameMutability(en.getLastLevelProxy());
             }
         }
 
         panic;
     }
 
-    /*!
-     * ================================================================================
-     * ================================================================================
-     * =========================           CLONING            =========================
-     * ================================================================================
-     * ================================================================================
-     */
-
-
     /**
-     * Clone the class type
+     * Clone the class pointer with a given mutability level.
+     *
      * @params:
-     *   - mutLevel: 1 = mut, 2 = dmut
+     *   - mutLevel: 0 = const, 1 = mut, 2 = deeply mutable
+     *
      */
-    pub over clone (self, mutLevel : u32)-> &Type {
-        let innerMutable = if (mutLevel > 1u32) { true } else { false };
-        copy ClassPtrType (self._loc,
-                           self._sym,
-                           isMutable-> (mutLevel != 0u32),
-                           innerMutable-> innerMutable)
+    pub over clone(self, mutLevel: u32)-> &Type {
+        let innerMutable = if (mutLevel > 1) { true } else { false };
+        let mutable = if (mutLevel != 0) { true } else { false };
+
+        if self._isInnerMutable == innerMutable && self.isMutable == mutable {
+            return self;
+        }
+
+        copy ClassPtrType(self.loc,
+                          self.sym,
+                          isMutable-> mutable,
+                          isInnerMutable-> innerMutable)
     }
 
-    pub over clone (self, pattern : &Type)-> &Type {
+    /**
+     * Clone the class pointer to match the mutability pattern of another type.
+     *
+     * If the pattern is a ClassPtrType, both outer and inner mutability are copied.
+     * Otherwise, only outer mutability is copied and inner mutability is disabled.
+     */
+    pub over clone(self, pattern: &Type)-> &Type {
         match pattern {
-            p : &ClassPtrType => {
-                return copy ClassPtrType (self._loc,
-                                          self._sym,
-                                          isMutable-> p._isMutable,
-                                          innerMutable-> p._innerMutable);
+            p: &ClassPtrType => {
+                return copy ClassPtrType(self.loc,
+                                         self.sym,
+                                         isMutable-> p.isMutable,
+                                         isInnerMutable-> p._isInnerMutable);
             }
             _ => {
-                return copy ClassPtrType (self._loc,
-                                          self._sym,
-                                          isMutable-> pattern.isMutable (),
-                                          innerMutable-> false);
+                return copy ClassPtrType(self.loc,
+                                         self.sym,
+                                         isMutable-> pattern.isMutable,
+                                         isInnerMutable-> false);
             }
         }
     }
 
-    pub over toDeeplyMutable (self)-> &Type {
-        if (self._isMutable && self._innerMutable) {
-            self
-        } else {
-            copy ClassPtrType (self._loc,
-                               self._sym,
-                               isMutable-> true,
-                               innerMutable-> true)
-        }
-    }
-
-    pub over cloneMutableTilBorrow (self)-> &Type {
-        self.clone (1u32)
-    }
-
-    /*!
-     * ================================================================================
-     * ================================================================================
-     * =========================           GETTERS            =========================
-     * ================================================================================
-     * ================================================================================
+    /**
+     * Produce a deeply mutable version of the class pointer.
+     *
+     * Equivalent to clone(2).
      */
+    pub over toDeeplyMutable(self)-> &Type {
+        return self.clone(2);
+    }
 
     /**
-     * @returns: the class type contained in the ptr
+     * Clone the class pointer, making it mutable until a borrow boundary.
+     *
+     * Equivalent to clone(1).
      */
-    pub fn getInner (self)-> &ClassRefType
+    pub over cloneMutableUntilBorrow(self)-> &Type {
+        return self.clone(1);
+    }
+
+    /**
+     * @returns the ClassRefType describing the referenced class.
+     *
+     * If the symbol represents an error generator, the associated error message
+     * is thrown.
+     */
+    @field
+    pub fn inner(self)-> &ClassRefType
         throws ErrorMsg
     {
-        if let Ok (c) = self._sym.getClassRef () {
+        if let Ok(c) = self.sym.classRef {
             return c;
         }
 
-        if let Ok (err) = self._sym.getErrorGenerator () {
-            throw err.getErrorMessage ();
+        if let Ok(err) = self.sym.errorGenerator {
+            throw err.msg;
         }
 
         panic;
     }
 
     /**
-     * @returns: the symbol referenced by the type
-     * */
-    pub fn getSymbol (self)-> &ClassSymbol {
-        self._sym
+     * @returns true iff the referenced type is a struct(record or entity).
+     */
+    @field
+    pub fn isStruct(self)-> bool {
+        self.isEntity || self.isRecord
     }
 
     /**
-     * @returns: true iif the class object is a struct
-     * */
-    pub fn isStruct (self)-> bool {
-        self._isEntity || self._isRecord || self._isUnion
+     * @returns true iff the referenced type is an entity.
+     *
+     * Entities have unique ownership and must be moved when copied.
+     */
+    @field
+    pub over isMovable(self)-> bool {
+        self.isEntity
     }
 
     /**
-     * @returns: true iif the class object is a struct
-     * */
-    pub fn isUnion (self)-> bool {
-        self._isUnion
-    }
-
-    /**
-     * @returns: true iif the class object is a struct
-     * */
-    pub fn isRecord (self)-> bool {
-        self._isRecord
-    }
-
-    /**
-     * @returns: true iif the class is a struct, and need to be moved when copied
-     * */
-    pub fn isEntity (self)-> bool {
-        self._isEntity
-    }
-
-    /**
-     * @returns: true iif the class is a struct, and need to be moved when copied
-     * */
-    pub over isMovable (self)-> bool {
-        self._isEntity
-    }
-
-    pub over isAddressable (self)-> bool {
+     * Class pointers are always addressable.
+     */
+    @field
+    pub over isAddressable(self)-> bool {
         true
     }
 
-    /*!
-     * ================================================================================
-     * ================================================================================
-     * =========================             MISC             =========================
-     * ================================================================================
-     * ================================================================================
-     */
+    impl Comparable!{&Generator} {
+
+        /**
+         * Class pointers are equal when they reference the same class symbol.
+         *
+         * Mutability does not affect equality.
+         */
+        pub over opEquals(self, o: &Generator)-> bool {
+            if let p: &ClassPtrType = o {
+                return self.sym is p.sym;
+            }
+
+            return false;
+        }
+    }
 
     impl Streamable;
     impl Formattable {
 
-        pub over format (self, dmut stream : &Formatter) {
-            if (self._isMutable) stream:.write (Decorators::MUT, ' ');
+        /**
+         * Format the class pointer using the syntax:
+         *   mut T
+         *   T
+         *   mut &(mut T)
+         *   &(T)
+         *
+         * Structs print as their symbol name.
+         * Classes print as &(T) with optional inner mutability.
+         */
+        pub over format(self, dmut stream: &Formatter) {
+            if (self.isMutable) stream:.write(Decorators::MUT, ' ');
 
-            if (self.isStruct ()) {
-                stream:.write (self._sym.getPath ().toStr ());
+            if (self.isStruct) {
+                stream:.write(self.sym.path.toStr());
             } else {
-                stream:.write (Tokens::AND, '(');
-                if (self._innerMutable) stream:.write (Decorators::MUT, ' ');
-                stream:.write (self._sym.getPath ().toStr ());
-                stream:.write (')');
+                stream:.write(Tokens::AND, '(');
+                if (self._isInnerMutable) stream:.write(Decorators::MUT, ' ');
+                stream:.write(self.sym.path.toStr());
+                stream:.write(')');
             }
-        }                
+        }
     }
 
 

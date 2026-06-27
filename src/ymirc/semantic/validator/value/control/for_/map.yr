@@ -1,0 +1,387 @@
+/*
+ * Implements semantic validation for map-based `for` loops in Ymir.
+ *
+ * Responsibilities:
+ *   - Validate iteration over maps using the map iterator protocol.
+ *   - Support both key-only and key+value iteration forms.
+ *   - Construct and manage the map iterator(begin, next, end, delete).
+ *   - Validate iterator variable declarations for keys and values.
+ *   - Apply reference and aliasing rules depending on iteration mode.
+ *   - Build the loop body, increment, and finalizer(try/finally).
+ *   - Track reference and alias usage across the loop.
+ *
+ * This module is invoked when the left operand of a `for` loop is a map.
+ *
+ * <hr>
+ *
+ * @Package: ymirc
+ * @Module: ymirc::semantic::validator::value::control::for_::map
+ * @File: ymirc/semantic/validator/value/control/for_/map.yr
+ * @Author(s):
+ *   - Emile Cadorel <ecadorel@gmail.com>
+ *
+ * @Created(YYYY-MM-DD): 2026-05-14
+ * @Copyright(C) 2021–2026 GNU-Ymir
+ * @License
+ *   ```text
+ *   This file is part of the Ymir language project.
+ *
+ *   Ymir is free software: you can redistribute it and/or modify it
+ *   under the terms of the GNU General Public License as published by
+ *   the Free Software Foundation, either version 3 of the License, or
+ *   (at your option) any later version.
+ *
+ *   Ymir is distributed in the hope that it will be useful,
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *   GNU General Public License for more details.
+ *
+ *   You should have received a copy of the GNU General Public License
+ *   along with Ymir.  If not, see <https://www.gnu.org/licenses/>.
+ *   ```
+ */
+
+in map;
+
+use ymirc::lexing::{word, keys};
+
+use ymirc::syntax::expression::_;
+use ymirc::semantic::validator;
+use ymirc::semantic::generator::{value::_, type::_};
+
+use ymirc::errors;
+
+use ymirc::utils::format;
+
+/**
+ * MapForLoopValidation
+ *
+ * Provides semantic validation for `for` loops iterating over maps.
+ *
+ * Supports:
+ *   - Single-variable iteration:
+ *         for key in map { ... }
+ *
+ *   - Dual-variable iteration(key + value):
+ *         for key, value in map { ... }
+ *
+ */
+pub mod MapForLoopValidation {
+
+    /**
+     * Validate a `for` loop iterating over a map.
+     *
+     * Supports:
+     *   - One iterator variable  → key only
+     *   - Two iterator variables → key + value
+     *
+     * @params:
+     *   - context:   validation context
+     *   - map:       map value being iterated
+     *   - mapType:   static type of the map
+     *   - floop:     for-loop expression
+     *   - byMutRef:  whether iteration is by mutable reference
+     *   - byAlias:   whether iteration is by alias
+     *
+     * @returns:
+     *   (loopValue, usedRef, usedAlias)
+     *     - loopValue: BlockValue representing the validated loop
+     *     - usedRef:   true if any iteration used a reference
+     *     - usedAlias: true if any iteration used an alias
+     *
+     * @throws:
+     *   ErrorMsg if the iterator count is unsupported.
+     */
+    pub fn validate(dmut context: &ValidationContext,
+                     map:          &Value,
+                     mapType:      &MapType,
+                     floop:        &ForLoopExpr,
+                     byMutRef:     bool,
+                     byAlias:      bool)-> (&Value, bool, bool)
+        throws ErrorMsg
+    {
+        if floop.vars.len == 1 {
+            return MapForLoopValidation::validateIteration(alias context, map, mapType, floop, floop.vars[0], none,
+                                                            byMutRef-> byMutRef,
+                                                            byAlias-> byAlias);
+        }
+
+        if floop.vars.len == 2 {
+            return MapForLoopValidation::validateIteration(alias context, map, mapType, floop, floop.vars[0], (floop.vars[1])?,
+                                                            byMutRef-> byMutRef,
+                                                            byAlias-> byAlias);
+        }
+
+        throw copy ErrorMsg::fatal(floop.loc, format(ValidateErrorMessage::UNDEF_FOR_LOOP_OPERATOR, floop.vars.len, mapType));
+    }
+
+    /**
+     * Validate the full iteration logic for a map-based `for` loop.
+     *
+     * @params:
+     *   - context:   validation context
+     *   - map:       map value
+     *   - mapType:   map type
+     *   - floop:     for-loop expression
+     *   - keyIter:   key iterator declaration
+     *   - valueIter: optional value iterator declaration
+     *   - byMutRef:  iteration by mutable reference
+     *   - byAlias:   iteration by alias
+     *
+     * @returns:
+     *   (blockValue, usedRef, usedAlias)
+     */
+    fn validateIteration(dmut context: &ValidationContext,
+                          map:          &Value,
+                          mapType:      &MapType,
+                          floop:        &ForLoopExpr,
+                          keyIter:      &VarDeclExpr,
+                          valueIter:    (&VarDeclExpr)?,
+                          byMutRef:     bool,
+                          byAlias:      bool)-> (&Value, bool, bool)
+        throws ErrorMsg
+    {
+        let loc = floop.loc;
+        let mut errors: (&ErrorMsg)? = none;
+        let mut innerValues: [&Value] = [];
+        let mut finalValues: [&Value] = [];
+        let mut values: [&Value] = [];
+        let mut test: &Value = UNIT_VALUE;
+        let mut usedRef = false, mut usedAlias = false;
+
+        context:.enterLoop();
+        context:.setCurrentLoopType(copy VoidType(loc));
+        context:.enterBlock();
+        {
+            let iterType = copy MapIteratorType(map.loc, mapType);
+            let beginValue = copy MapIteratorBeginValue(loc, iterType, map);
+
+            let iterDecl = copy VarDeclValue(map.loc.locate(ForLoopKeys::ITER), iterType, beginValue,
+                                              isMutable-> true);
+            let iterVref = copy VarRefValue(iterDecl.loc, iterDecl.loc, iterType, iterDecl.uniqId,
+                                             isSelf-> false,
+                                             canCte-> false);
+            values ~= [iterDecl];
+            let (keyDecl, valDecl, useRef, useAlias) = MapForLoopValidation::validateIteratorVars(alias context, iterVref, mapType, keyIter, valueIter,
+                                                                                                   byMutRef-> byMutRef,
+                                                                                                   byAlias-> byAlias,
+                                                                                                   mapIsLvalue-> map.isLvalue);
+
+            innerValues ~= [keyDecl];
+            innerValues ~= [valDecl];
+
+            innerValues ~= [ValueValidation::validate(alias context, floop.block)];
+            innerValues ~= [copy MapIteratorNextValue(loc, iterVref)];
+
+            finalValues ~= [copy MapIteratorDelValue(loc, iterVref)];
+            test = copy MapIteratorEndValue(loc, iterVref);
+
+            usedRef = useRef;
+            usedAlias = useAlias;
+        } catch {
+            err => {
+                errors = (err)?;
+            }
+        }
+
+        {
+            context:.quitLoop();
+            context:.quitBlock(warnUnused-> (!errors.hasValue));
+        } catch {
+            err => {
+                errors = (err)?;
+            }
+        }
+
+        if let Ok(err) = errors {
+            throw err;
+        }
+
+        let innerBlk = copy BlockValue(loc, VOID_TYPE, innerValues);
+        let lp = copy LoopValue(loc, VOID_TYPE, test, innerBlk);
+        let finBlk = copy BlockValue(loc, VOID_TYPE, finalValues);
+        let tryFin = copy TryFinallyValue(loc, VOID_TYPE, lp, finBlk, failVar-> UNIT_VALUE);
+        values ~= [tryFin];
+
+        let blk = copy BlockValue(loc, VOID_TYPE, values);
+        return (blk, usedRef, usedAlias);
+    }
+
+    /**
+     * Validate and construct iterator variables for map iteration.
+     *
+     * @params:
+     *   - context:     validation context
+     *   - iterVref:     VarRefValue referencing the map iterator
+     *   - mapType:      map type
+     *   - keyIter:      key iterator declaration
+     *   - valueIterOpt: optional value iterator declaration
+     *   - byMutRef:     iteration by mutable reference
+     *   - byAlias:      iteration by alias
+     *   - mapIsLvalue:  whether the map itself is an lvalue
+     *
+     * @returns:
+     *   (keyDecl, valueDecl, usedRef, usedAlias)
+     */
+    pub fn validateIteratorVars(dmut context: &ValidationContext,
+                                 iterVref:     &VarRefValue,
+                                 mapType:      &MapType,
+                                 keyIter:      &VarDeclExpr,
+                                 valueIterOpt: (&VarDeclExpr)?,
+                                 byMutRef:     bool,
+                                 byAlias:      bool,
+                                 mapIsLvalue:  bool)-> (&VarDeclValue, &VarDeclValue, bool, bool)
+        throws ErrorMsg
+    {
+
+        let valueIter = if let Ok(vdecl) = valueIterOpt {
+            vdecl
+        } else {
+            copy VarDeclExpr(keyIter.loc, keyIter.name.locate(Keys::UNDER), EMPTY_EXPR, EMPTY_EXPR, EOF_WORD, EOF_WORD)
+        }
+
+        let (valDecl, insertValue, usedRef, usedAlias) = MapForLoopValidation::validateValueIterator(alias context, iterVref, mapType, valueIter,
+                                                                                                      byMutRef-> byMutRef,
+                                                                                                      byAlias-> byAlias,
+                                                                                                      mapIsLvalue-> mapIsLvalue);
+
+
+        let (keyDecl, insertKey) = MapForLoopValidation::validateKeyIterator(alias context, iterVref, mapType, keyIter);
+
+        if insertValue {
+            context:.insertLocal(valDecl.loc, valDecl.name, valDecl);
+        }
+
+        if insertKey {
+            context:.insertLocal(keyDecl.loc, keyDecl.name, keyDecl);
+        }
+
+        return (keyDecl, valDecl, usedRef, usedAlias);
+    }
+
+    /**
+     * Validate the value iterator declaration for map iteration.
+     *
+     * @params:
+     *   - context:     validation context
+     *   - iterVref:     VarRefValue referencing the map iterator
+     *   - mapType:      map type
+     *   - valueIter:    value iterator declaration
+     *   - byMutRef:     iteration by mutable reference
+     *   - byAlias:      iteration by alias
+     *   - mapIsLvalue:  whether the map itself is an lvalue
+     *
+     * @returns:
+     *   (declValue, insert, usedRef, usedAlias)
+     */
+    fn validateValueIterator(dmut context: &ValidationContext,
+                              iterVref: &VarRefValue,
+                              mapType: &MapType,
+                              valueIter: &VarDeclExpr,
+                              byMutRef: bool,
+                              byAlias: bool,
+                              mapIsLvalue: bool)-> (&VarDeclValue, bool, bool, bool)
+        throws ErrorMsg
+    {
+        let mut usedRef = false;
+        let mut usedAlias = false;
+
+        let vType = if valueIter.type !of EmptyExpr {
+            let vType = TypeValidation::validateForVarDecl(alias context, valueIter.type, valueIter,
+                                                            canBeRef-> false);
+            TypeVerification::verifyCompatible(valueIter.type.loc, iterVref.loc, vType, mapType.key);
+            vType
+        } else {
+            TypeValidation::validateForVarDecl(alias context, copy TypeWrapperExpr(iterVref.loc, mapType.key), valueIter,
+                                                canBeRef-> false)
+        };
+
+        TypeVerification::verifyMutableIterator(valueIter.isMutOrDmut, vType, isRef-> valueIter.isRef);
+
+        let valAcc = copy MapIteratorValueAccessValue(valueIter.loc, vType, iterVref);
+        let iterVal = TypeInference::inferValueForType(alias context, valueIter.loc, valAcc, vType,
+                                                        byReference-> valueIter.isRef);
+        let mut access = iterVal;
+        if byMutRef && valueIter.isRef && mapType.value.isMutable && mapIsLvalue {
+            usedRef = true;
+            access = copy ReferencerValue(access.loc, access.type, access, isMutable-> true);
+        } else if !valueIter.isRef && byAlias && mapType.value.isMutable && vType.needsExplicitAlias {
+            usedAlias = true;
+            access = copy AliaserValue(access.loc, access.type, access);
+        } else if valueIter.isRef && !byMutRef && mapIsLvalue {
+            access = copy ReferencerValue(access.loc, access.type, access, isMutable-> false);
+        }
+
+        MemoryVerification::verifyMemoryOwner(valueIter.loc, vType, access,
+                                               construct-> true,
+                                               byReference-> valueIter.isRef);
+
+        let (nameValueLoc, insert) = if (valueIter.loc == Keys::UNDER) {
+            (valueIter.name.locate(ForLoopKeys::VALUE), false)
+        } else {
+            (valueIter.name, true)
+        };
+
+        let valDecl = copy VarDeclValue(nameValueLoc, vType, access,
+                                         isMutable-> (valueIter.isMutable || valueIter.isDeeplyMutable),
+                                         isIterator-> true,
+                                         isReference-> valueIter.isRef,
+                                         isCte-> false);
+
+        return (valDecl, insert, usedRef, usedAlias);
+    }
+
+    /**
+     * Validate the key iterator declaration for map iteration.
+     *
+     * @params:
+     *   - context: validation context
+     *   - iterVref: VarRefValue referencing the map iterator
+     *   - mapType:  map type
+     *   - keyIter:  key iterator declaration
+     *
+     * @returns:
+     *   (declValue, insert)
+     */
+    fn validateKeyIterator(dmut context: &ValidationContext,
+                            iterVref: &VarRefValue,
+                            mapType: &MapType,
+                            keyIter: &VarDeclExpr)-> (&VarDeclValue, bool)
+        throws ErrorMsg
+    {
+        if !keyIter.isMutOrDmut.isEof {
+            throw copy ErrorMsg::fatal(keyIter.isMutOrDmut, format(ValidateErrorMessage::FORBID_DECO_FOR_LOOP, mapType));
+        }
+
+        if !keyIter.isLazyOrRef.isEof {
+            throw copy ErrorMsg::fatal(keyIter.isLazyOrRef, format(ValidateErrorMessage::FORBID_DECO_FOR_LOOP, mapType));
+        }
+
+        let kType = if keyIter.type !of EmptyExpr {
+            let vType = TypeValidation::validateForVarDecl(alias context, keyIter.type, keyIter,
+                                                            canBeRef-> false);
+            TypeVerification::verifyCompatible(keyIter.type.loc, iterVref.loc, vType, mapType.key);
+            vType
+        } else {
+            TypeValidation::validateForVarDecl(alias context, copy TypeWrapperExpr(iterVref.loc, mapType.key), keyIter,
+                                                canBeRef-> false)
+        };
+
+        let keyValue = copy MapIteratorKeyAccessValue(keyIter.loc, kType, iterVref);
+        let (nameKeyLoc, insert) = if (keyIter.loc == Keys::UNDER) {
+            (keyIter.name.locate(ForLoopKeys::INDEX), false)
+        } else {
+            (keyIter.name, true)
+        };
+
+
+        let keyDecl = copy VarDeclValue(nameKeyLoc, kType,
+                                         copy ReferencerValue(keyValue.loc, keyValue.type, keyValue, isMutable-> false),
+                                         isMutable-> false,
+                                         isReference-> true,
+                                         isCte-> false,
+                                         isIterator-> true);
+
+        return (keyDecl, insert);
+    }
+}

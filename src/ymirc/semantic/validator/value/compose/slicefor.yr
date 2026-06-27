@@ -1,0 +1,284 @@
+/*
+ * Root dispatcher for list-comprehension validation.
+ *
+ * This module handles:
+ *   - detecting the underlying iterable type(array, slice, map, tuple, range, class),
+ *   - enforcing aliasing and reference rules,
+ *   - enforcing copy-mode when required by the iterable type,
+ *   - delegating validation to the appropriate submodule,
+ *   - constructing result allocation declarations for list comprehensions,
+ *   - computing compile-time lengths for static allocations.
+ *
+ * <hr>
+ *
+ * @Package: ymirc
+ * @Module: ymirc::semantic::validator::value::compose::slicefor
+ * @File: ymirc/semantic/validator/value/compose/slicefor.yr
+ * @Author(s):
+ *   - Emile Cadorel <ecadorel@gmail.com>
+ *
+ * @Created(YYYY-MM-DD): 2026-05-13
+ * @Copyright(C) 2021–2026 GNU-Ymir
+ * @License
+ *   ```text
+ *   This file is part of the Ymir language project.
+ *
+ *   Ymir is free software: you can redistribute it and/or modify it
+ *   under the terms of the GNU General Public License as published by
+ *   the Free Software Foundation, either version 3 of the License, or
+ *   (at your option) any later version.
+ *
+ *   Ymir is distributed in the hope that it will be useful,
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *   GNU General Public License for more details.
+ *
+ *   You should have received a copy of the GNU General Public License
+ *   along with Ymir.  If not, see <https://www.gnu.org/licenses/>.
+ *   ```
+ */
+
+in slicefor;
+
+use ymirc::lexing::{keys, word};
+
+use ymirc::syntax::expression::_;
+use ymirc::semantic::generator::{value::_, type::_};
+use ymirc::semantic::interpret;
+
+use ymirc::errors;
+use ymirc::global;
+use ymirc::utils::{format, bigint};
+
+use ymirc::semantic::validator::value::compose::slicefor::_;
+
+/*!
+ * ====================================================================================================
+ * ====================================================================================================
+ * ====================================          SUBMODS          =====================================
+ * ====================================================================================================
+ * ====================================================================================================
+ */
+
+mod ::array;
+mod ::slice;
+mod ::map;
+mod ::tuple;
+mod ::range;
+mod ::class_;
+
+/*!
+ * ====================================================================================================
+ * ====================================================================================================
+ * ======================================          ROOT          ======================================
+ * ====================================================================================================
+ * ====================================================================================================
+ */
+
+/**
+ * SliceForComposeValidation module
+ *
+ * Central dispatcher for list-comprehension validation. This module:
+ *
+ *   - unwraps alias/reference wrappers around the iterable,
+ *   - determines the underlying iterable type,
+ *   - enforces semantic rules(no by-reference iteration, alias usage),
+ *   - forwards validation to the appropriate submodule:
+ *       * ArrayListComprValidation
+ *       * SliceListComprValidation
+ *       * MapListComprValidation
+ *       * TupleListComprValidation
+ *       * RangeListComprValidation
+ *       * ClassListComprValidation
+ *   - provides helper functions for allocating result containers,
+ *   - computes compile-time lengths for static array allocation.
+ *
+ * It is the root entry point for all list-comprehension semantics.
+ */
+pub mod SliceForComposeValidation {
+
+    /**
+     * Validate a list comprehension by dispatching to the correct submodule.
+     *
+     * @params:
+     *   - context: validation context
+     *   - floop:   the SliceForAllocatorExpr describing the comprehension
+     *
+     * @returns:
+     *   - the resulting comprehension value
+     *
+     * @throws:
+     *   - ErrorMsg if by-reference iteration is attempted
+     *   - ErrorMsg if the iterable type is unsupported
+     *   - ErrorMsg if aliasing is unnecessary
+     */
+    pub fn validate(dmut context: &ValidationContext, floop: &SliceForAllocatorExpr)-> &Value
+        throws ErrorMsg
+    {
+        let inCopy = context.isInCopy(floop);
+        let mValue = ValueCreation::createEnumUnwrap(ValueValidation::validate(alias context, floop.iter));
+        let (byMutRef, byAlias, fVal) = match mValue {
+            r: &ReferencerValue => { (r.isMutable, false, r.value) }
+            a: &AliaserValue => { (false, true, a.value) }
+            _ => { (false, false, mValue) }
+        };
+
+        // list comprehension cannot iteratate by reference, it has no meaning,
+        // since we don't want to change values within the computation of new
+        // value
+        //
+        if (byMutRef) {
+            throw copy ErrorMsg::fatal(mValue.loc, format(ValidateErrorMessage::UNECESSARY_REFERENCE));
+        }
+
+        let (res, usedAlias) = match fVal.type {
+            a: &ArrayType => {
+                ArrayListComprValidation::validate(alias context, fVal, a, floop, inCopy-> inCopy, byAlias-> byAlias)
+            }
+            s: &SliceType => {
+                SliceListComprValidation::validate(alias context, fVal, s, floop, inCopy-> inCopy, byAlias-> byAlias)
+            }
+            m: &MapType => {
+                MapListComprValidation::validate(alias context, fVal, m, floop, inCopy-> inCopy, byAlias-> byAlias)
+            }
+            t: &TupleType => {
+                TupleListComprValidation::validate(alias context, fVal, t, floop, byAlias-> byAlias)
+            }
+            c: &ClassPtrType => {
+                (ClassListComprValidation::validate(alias context, fVal, c, floop,
+                                                    byAlias-> byAlias,
+                                                    inCopy-> inCopy,
+                                                    aliasLoc-> mValue.loc),
+                 true)
+            }
+            _ => {
+                throw copy ErrorMsg::fatal(floop.loc, format(ValidateErrorMessage::UNDEF_FOR_LOOP_OPERATOR, floop.vars.len, mValue.type));
+            }
+        }
+
+        if byAlias && !usedAlias {
+            throw copy ErrorMsg::fatal(mValue.loc, format(ValidateErrorMessage::UNECESSARY_ALIAS, mValue.type));
+        }
+
+        res
+    }
+
+    /**
+     * Create the result variable declaration and access expression for a list
+     * comprehension with a known length.
+     *
+     * If in copy-mode:
+     *   - allocate a dynamic slice using ArrayAllocValue::dyn.
+     *
+     * If not in copy-mode:
+     *   - compute the compile-time length using computeCteLen,
+     *   - allocate a static array on the stack,
+     *   - ensure the array does not exceed the maximum stack size.
+     *
+     * @params:
+     *   - context:    validation context
+     *   - loc:        source location
+     *   - innerType:  type of each element in the result
+     *   - indexVref:  reference to the loop index variable
+     *   - len:        number of iterations
+     *   - fromType:   type of the iterable being iterated
+     *   - inCopy:     whether the comprehension is in copy-mode
+     *
+     * @returns:
+     *   - (resultDecl, resultVref, resultIndexAccess, resultType)
+     *
+     * @throws:
+     *   - ErrorMsg if static allocation exceeds stack limits
+     *   - ErrorMsg if compile-time length cannot be computed
+     */
+    pub fn validateResultValueDecl(dmut context: &ValidationContext,
+                                   loc:          &Word,
+                                   innerType:    &Type,
+                                   indexVref:    &VarRefValue,
+                                   len:          &Value,
+                                   fromType:     &Type,
+                                   inCopy:       bool)-> (&VarDeclValue, &VarRefValue, &Value, &Type)
+        throws ErrorMsg
+    {
+        let (resultType, initValue) = if inCopy {
+            let type = copy SliceType(loc, innerType, isMutable-> true);
+            let init = copy ArrayAllocValue::dyn(loc, type, UNIT_VALUE, len);
+            (type, init)
+        } else {
+            let tabSize = SliceForComposeValidation::computeCteLen(alias context, loc, len, fromType, forTuple-> false);
+            if (tabSize > state::arrayMaxStackSize()) {
+                throw copy ErrorMsg::fatal(loc,
+                                           format(ValidateErrorMessage::OVERFLOW_CAPACITY_ARRAY,
+                                                  tabSize,
+                                                  state::arrayMaxStackSize()));
+            }
+
+            let type = copy ArrayType(loc, innerType, tabSize.toT!{usize}(), isMutable-> true);
+            (type, UNIT_VALUE)
+        };
+
+        let name = loc.locate(ForLoopKeys::VALUE);
+        let resultDecl = copy VarDeclValue(name, resultType, initValue, isMutable-> true);
+        let resultVref = VariableCreation::createVarFromDecl(resultDecl, canCte-> false);
+
+        let resultIndex = if inCopy {
+            copy SliceAccessValue(loc, innerType, resultVref, indexVref)
+        } else {
+            copy ArrayAccessValue(loc, innerType, resultVref, indexVref)
+        };
+
+        return (resultDecl, resultVref, resultIndex, resultType);
+    }
+
+    pub fn validateResultValueDeclNoLen(loc:          &Word,
+                                        innerType:    &Type)-> (&VarDeclValue, &VarRefValue, &SliceType)
+        throws ErrorMsg
+    {
+
+        let resultType = copy SliceType(loc, innerType, isMutable-> true);
+        let resultInit = copy ArrayAllocValue::dyn(loc, resultType, UNIT_VALUE, copy IntValue(loc, USIZE_TYPE, 0));
+
+        let name = loc.locate(ForLoopKeys::VALUE);
+        let resultDecl = copy VarDeclValue(name, resultType, resultInit, isMutable-> true);
+        let resultVref = VariableCreation::createVarFromDecl(resultDecl, canCte-> false);
+
+        return (resultDecl, resultVref, resultType);
+    }
+
+    /**
+     * Create the result variable declaration for list comprehensions whose
+     * length is not known in advance(e.g., class iterators).
+     *
+     * Allocates a dynamic slice with initial length 0 and returns:
+     *   - the declaration,
+     *   - the VarRefValue referencing it,
+     *   - the resulting SliceType.
+     *
+     * @params:
+     *   - loc:        source location
+     *   - innerType:  type of each element in the result
+     *
+     * @returns:
+     *   - (resultDecl, resultVref, resultSliceType)
+     */
+    pub fn computeCteLen(dmut context: &ValidationContext, loc: &Word, len: &Value, fromType: &Type, forTuple: bool)-> &BigInt
+        throws ErrorMsg
+    {
+        let size = {
+            context.cteInterpret:.computeInt(len)
+        } catch {
+            _: &ErrorMsg => {
+                let mut notes: [&ErrorMsg] = [];
+                if !forTuple {
+                    notes = copy[copy ErrorMsg::note(loc, format(ValidateErrorMessage::ENCLOSE_COPY_LST))];
+                }
+
+                throw copy ErrorMsg::fatal(loc, format(ValidateErrorMessage::LIST_COMPR_SIZE_CTE, fromType),
+                                           notes-> notes);
+            }
+        }
+
+        IntInterpret::verifyOverflow(len.loc, USIZE_TYPE, size);
+        return size;
+    }
+}

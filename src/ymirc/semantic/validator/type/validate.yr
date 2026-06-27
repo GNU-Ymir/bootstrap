@@ -1,0 +1,1246 @@
+/*
+ * This file defines the logic used to transform syntactic type expressions into
+ * fully-resolved semantic types.
+ *
+ * <hr>
+ *
+ * @Package: ymirc
+ * @Module: ymirc::semantic::validator::type::validate
+ * @File: ymirc/semantic/validator/type/validate.yr
+ * @Author(s):
+ *   - Emile Cadorel <ecadorel@gmail.com>
+ *
+ * @Created(YYYY-MM-DD): 2021-12-06
+ * @Copyright(C) 2021–2026 GNU-Ymir
+ * @License
+ *   ```text
+ *   This file is part of the Ymir language project.
+ *
+ *   Ymir is free software: you can redistribute it and/or modify it
+ *   under the terms of the GNU General Public License as published by
+ *   the Free Software Foundation, either version 3 of the License, or
+ *   (at your option) any later version.
+ *
+ *   Ymir is distributed in the hope that it will be useful,
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *   GNU General Public License for more details.
+ *
+ *   You should have received a copy of the GNU General Public License
+ *   along with Ymir.  If not, see <https://www.gnu.org/licenses/>.
+ *   ```
+ */
+
+in validate;
+
+use ymirc::semantic::{symbol, validator, template_};
+use ymirc::syntax::{_, declaration::_, expression::_};
+use ymirc::semantic::generator::{value::_, type::_};
+
+use ymirc::lexing::{word, tokens, keys};
+
+use ymirc::errors;
+use ymirc::utils::format;
+use ymirc::global::state;
+
+use std::{io, stream};
+
+/**
+ * TypeValidation module is responsible for interpreting every construct that
+ * can appear in a type position, including:
+ *
+ *   - native types(i32, bool, f64, etc.),
+ *   - decorated types(mut, dmut),
+ *   - class and struct references,
+ *   - arrays, slices, maps, tuples, futures, options,
+ *   - function and delegate types,
+ *   - typeof expressions,
+ *   - template instantiations used as types,
+ *   - and path-based type references(module access, nested symbols).
+ *
+ * The validator enforces the rules of the Ymir type system:
+ *
+ *   - propagation of mutability and deep mutability,
+ *   - restrictions on mutable keys in maps,
+ *   - completeness checks for inner types,
+ *   - correct handling of classref vs classptr,
+ *   - validation of decorators in nested types,
+ *   - and correct interpretation of compound type expressions.
+ *
+ */
+pub mod TypeValidation {
+
+    /**
+     * Validate a type expression at the top level.
+     *
+     * This is the entry point for type validation. It resolves the expression
+     * into a semantic Type and applies mutability rules from the root.
+     *
+     * @params:
+     *   - context:       validation context
+     *   - type:          syntactic type expression
+     *   - parentMutable: true if the parent context is mutable
+     *
+     * @returns: the resolved semantic type
+     * @throws:
+     *     - ErrorMsg on invalid type expression
+     */
+    pub fn validate(dmut context:    &ValidationContext,
+                     type:            &Expression,
+                     parentMutable:   bool = true)-> &Type
+        throws ErrorMsg
+    {
+        return TypeValidation::validate(alias context,
+                                         type,
+                                         parentMutable-> parentMutable,
+                                         isMutable-> false,
+                                         isDeeplyMutable-> false,
+                                         isRoot-> true);
+    }
+
+    /**
+     * Validate a type expression used in a variable declaration.
+     *
+     * Enforces decorator rules(`ref`, `lazy`, `mut`, `dmut`) and ensures that
+     * the declared type is valid for variable creation.
+     *
+     * @params:
+     *   - context:   validation context
+     *   - type:      type expression
+     *   - v:         variable declaration node
+     *   - canBeRef:  allow `ref`
+     *   - canBeLazy: allow `lazy`
+     *
+     * @returns: the resolved semantic type
+     * @throws:
+     *    - ErrorMsg on invalid decorator or type
+     */
+    pub fn validateForVarDecl(dmut context: &ValidationContext,
+                               type:         &Expression,
+                               v:            &VarDeclExpr,
+                               canBeRef:     bool = false,
+                               canBeLazy:    bool = false)-> &Type
+        throws ErrorMsg
+    {
+        if (v.isRef && !canBeRef) {
+            throw copy ErrorMsg::fatal(v.refLoc, format(ValidateErrorMessage::UNDEF_DECORATOR_HERE, Keys::REF));
+        }
+
+        if (v.isLazy && !canBeLazy) {
+            throw copy ErrorMsg::fatal(v.lazyLoc, format(ValidateErrorMessage::UNDEF_DECORATOR_HERE, Keys::LAZY));
+        }
+
+        let (isMutable, isDeeplyMutable) = (v.isMutable, v.isDeeplyMutable);
+        return TypeValidation::validate(alias context,
+                                         type,
+                                         isMutable-> (isMutable || isDeeplyMutable),
+                                         parentMutable-> (isMutable || isDeeplyMutable),
+                                         isDeeplyMutable-> isDeeplyMutable,
+                                         isRoot-> true);
+
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * =================================          IMPLEMENTATION          =================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Internal dispatcher for type validation.
+     *
+     * Matches the syntactic expression and forwards it to the appropriate
+     * validator(slice, tuple, map, decorated type, typeof, template call,
+     * etc.).
+     *
+     * @params:
+     *   - context:         validation context
+     *   - type:            syntactic type expression
+     *   - parentMutable:   mutability inherited from parent
+     *   - isMutable:       mutability applied at this level
+     *   - isDeeplyMutable: deep mutability applied at this level
+     *   - isRoot:          true if this is the top-level call
+     *
+     * @returns: the resolved semantic type
+     * @throws:
+     *    - ErrorMsg if the expression cannot be used as a type
+     */
+    fn validate(dmut context:    &ValidationContext,
+                 type:            &Expression,
+                 parentMutable:   bool,
+                 isMutable:       bool,
+                 isDeeplyMutable: bool,
+                 isRoot:          bool)-> &Type
+
+        throws ErrorMsg
+    {
+        match type {
+            EmptyExpr() => {
+                return copy NoneType(loc-> type.loc);
+            }
+            a: &SliceAllocatorExpr => {
+                return TypeValidation::validateSliceAllocator(alias context, a, parentMutable, isMutable, isDeeplyMutable)
+            }
+            c: &TemplateCallExpr => {
+                return TypeValidation::validateTemplateCall(alias context, c, parentMutable, isMutable, isDeeplyMutable)
+            }
+            v: &VarExpr => {
+                return TypeValidation::validateVar(alias context, v, parentMutable, isMutable, isDeeplyMutable)
+            }
+            p: &PathExpr => {
+                return TypeValidation::validatePath(alias context, p, parentMutable, isMutable, isDeeplyMutable)
+            }
+            b: &BinaryExpr => {
+                return TypeValidation::validateBinary(alias context, b, parentMutable, isMutable, isDeeplyMutable)
+            }
+            u: &UnaryExpr => {
+                return TypeValidation::validateUnary(alias context, u, parentMutable, isMutable, isDeeplyMutable)
+            }
+            r: &RangeTypeExpr => {
+                return TypeValidation::validateRangeType(alias context, r, parentMutable, isMutable, isDeeplyMutable)
+            }
+            dec: &DecoratedTypeExpr => {
+                return TypeValidation::validateDeco(alias context, dec, parentMutable, isDeeplyMutable, isRoot)
+            }
+            lst: &ListExpr => {
+                if (lst.isArray) {
+                    return TypeValidation::validateSliceList(alias context, lst, parentMutable, isMutable, isDeeplyMutable)
+                } else {
+                    return TypeValidation::validateTupleList(alias context, lst, parentMutable, isMutable, isDeeplyMutable)
+                }
+            }
+            lst: &ListMapExpr => {
+                return TypeValidation::validateMapList(alias context, lst, parentMutable, isMutable, isDeeplyMutable)
+            }
+            f: &FutureTypeExpr => {
+                return TypeValidation::validateFuture(alias context, f, parentMutable, isMutable, isDeeplyMutable)
+            }
+            wrapped: &TypeWrapperExpr => {
+                return TypeValidation::validateWrappedType(wrapped, parentMutable, isMutable, isDeeplyMutable)
+            }
+            list: &TypeListWrapperExpr => {
+                return TypeValidation::validateListWrapperType(alias context, list, parentMutable, isMutable, isDeeplyMutable)
+            }
+            ty: &TypeOfExpr => {
+                return TypeValidation::validateTypeOf(alias context, ty, parentMutable, isMutable, isDeeplyMutable)
+            }
+            f: &FunctionPtrTypeExpr => {
+                return TypeValidation::validateFuncPtrType(alias context, f, parentMutable, isMutable, isDeeplyMutable)
+            }
+            t: &TryExpr => {
+                return TypeValidation::validateTryType(alias context, t, parentMutable, isMutable, isDeeplyMutable)
+            }
+            p: &PragmaExpr => {
+                return TypeValidation::validatePragma(alias context, p, parentMutable, isMutable, isDeeplyMutable)
+            }
+        }
+
+        throw copy ErrorMsg::fatal(type.loc, ValidateErrorMessage::USE_AS_TYPE);
+    }
+
+    /**
+     * Validate a decorated type(`mut`, `dmut`).
+     *
+     * Enforces mutability propagation rules:
+     *   - `mut` requires the parent to be mutable,
+     *   - `dmut` requires the parent to be deeply mutable,
+     *   - nested decorators are validated recursively.
+     *
+     * @throws:
+     *    - ErrorMsg on invalid decorator placement
+     */
+    fn validateDeco(dmut context: &ValidationContext, type: &DecoratedTypeExpr, parentMutable: bool, isDeeplyMutable: bool, _: bool)-> &Type
+        throws ErrorMsg
+    {
+        let (isMutable_, isDeeplyMutable_) = (type.kind == Decorators::MUT, type.kind == Decorators::DMUT);
+        if ((isMutable_ || isDeeplyMutable_) && (!parentMutable || isDeeplyMutable)) {
+            if (!parentMutable) {
+                throw copy ErrorMsg::fatal(type.loc, ValidateErrorMessage::IMMUTABLE_PARENT)
+            } else {
+                throw copy ErrorMsg::fatal(type.loc, ValidateErrorMessage::DEEPLY_INNER_TYPE)
+            }
+        }
+
+        return TypeValidation::validate(alias context,
+                                         type.content,
+                                         isMutable-> (isMutable_ || isDeeplyMutable_ || isDeeplyMutable),
+                                         isDeeplyMutable-> (isDeeplyMutable_ || isDeeplyMutable),
+                                         parentMutable-> (isMutable_ || isDeeplyMutable_ || isDeeplyMutable),
+                                         isRoot-> false);
+
+    }
+
+    /**
+     * Validate an array allocation type: `[T ; N]`.
+     *
+     * Ensures:
+     *   - inner type is complete,
+     *   - size is a valid compile-time integer,
+     *   - size does not exceed the allowed limit.
+     *
+     * Example:
+     *     [i32 ; 12]
+     *
+     * @returns: ArrayType
+     * @throws:
+     *    - ErrorMsg on invalid size or inner type
+     */
+    fn validateSliceAllocator(dmut context: &ValidationContext, type: &SliceAllocatorExpr, parentMutable: bool, isMutable: bool, isDeeplyMutable: bool)-> &Type
+        throws ErrorMsg
+    {
+        // if (type.isDynamic()) throw copy ErrorMsg::fatal(type.loc, ValidateErrorMessage::USE_AS_TYPE);
+
+        let innerType = TypeValidation::validate(alias context,
+                                                  type.value,
+                                                  isMutable-> isDeeplyMutable,
+                                                  parentMutable-> (isMutable || isDeeplyMutable),
+                                                  isDeeplyMutable-> isDeeplyMutable,
+                                                  isRoot-> false);
+
+        TypeVerification::verifyComplete(type.value.loc, innerType, false);
+
+        if (innerType of NoneType) {
+            throw copy ErrorMsg::fatal(type.value.loc, format(ValidateErrorMessage::EMPTY_ARRAY_INNER, innerType));
+        }
+
+        let size = context.cteInterpret:.computeInt(ValueValidation::validate(alias context, type.size), isSigned-> false);
+        let tabSize = {
+            size.to!usize()
+        } catch {
+            _ => throw copy ErrorMsg::fatal(type.size.loc,
+                                             format(ValidateErrorMessage::OVERFLOW_CAPACITY,
+                                                     USIZE_TYPE,
+                                                     size, u64::max));
+        };
+
+        if (tabSize > state::arrayMaxStackSize()) { // 1MB
+            throw copy ErrorMsg::fatal(type.size.loc, format(ValidateErrorMessage::OVERFLOW_CAPACITY_ARRAY, tabSize, state::arrayMaxStackSize()));
+        }
+
+        return copy ArrayType(type.loc, innerType, tabSize, isMutable-> (parentMutable && isMutable));
+    }
+
+    /**
+     * Validate a slice type: `[T]`.
+     *
+     * Ensures the inner type is complete.
+     *
+     * @returns: SliceType
+     * @throws:
+     *    - ErrorMsg on invalid inner type
+     */
+    fn validateSliceList(dmut context: &ValidationContext, type: &ListExpr, parentMutable: bool, isMutable: bool, isDeeplyMutable: bool)-> &Type
+        throws ErrorMsg
+    {
+        if (type.params.len != 1us) {
+            throw copy ErrorMsg::fatal(type.loc, ValidateErrorMessage::USE_AS_TYPE);
+        }
+
+        let innerType = TypeValidation::validate(alias context,
+                                                  type.params[0],
+                                                  isMutable-> isDeeplyMutable,
+                                                  parentMutable-> (isMutable || isDeeplyMutable),
+                                                  isDeeplyMutable-> isDeeplyMutable,
+                                                  isRoot-> false);
+
+        TypeVerification::verifyComplete(type.loc, innerType, false);
+
+        return copy SliceType(type.loc, innerType, isMutable-> (parentMutable && isMutable));
+    }
+
+    /**
+     * Validate a map type: `[K => V]`.
+     *
+     * Ensures:
+     *   - key and value types are complete,
+     *   - key type is not mutable,
+     *   - map type info is generated for runtime hashing/comparison.
+     *
+     * Example: `[i32 => mut[c8]]`
+     *
+     * @returns: MapType
+     * @throws:
+     *    - ErrorMsg on invalid key/value types
+     */
+    fn validateMapList(dmut context: &ValidationContext, type: &ListMapExpr, parentMutable: bool, isMutable: bool, isDeeplyMutable: bool)-> &Type
+        throws ErrorMsg
+    {
+        if (type.keys.len != 1us)  {
+            throw copy ErrorMsg::fatal(type.loc, ValidateErrorMessage::USE_AS_TYPE);
+        }
+
+        let keyType = TypeValidation::validate(alias context,
+                                                type.keys[0],
+                                                isMutable-> false,
+                                                parentMutable-> false,
+                                                isDeeplyMutable-> false,
+                                                isRoot-> false);
+
+        let valueType = TypeValidation::validate(alias context,
+                                                  type.values[0],
+                                                  isMutable-> isDeeplyMutable,
+                                                  parentMutable-> (isMutable || isDeeplyMutable),
+                                                  isDeeplyMutable-> isDeeplyMutable,
+                                                  isRoot-> false);
+
+
+        TypeVerification::verifyComplete(type.loc, keyType, false);
+        TypeVerification::verifyComplete(type.loc, valueType, false);
+
+        if (keyType.isMutable) { // [dmut[i32] => i32], no
+            throw copy ErrorMsg::fatal(keyType.loc, format(ValidateErrorMessage::MAP_KEY_MUTABLE, keyType));
+        }
+
+        // [i32 => i32], or[mut i32 => mut i32], [mut i32 => i32], ok
+        let result = copy MapType(type.loc,
+                                   keyType,
+                                   valueType,
+                                   isMutable-> (parentMutable && isMutable));
+
+        // Insert the type info into the produced IR
+        // A special kind of vtable is necessary for keys of a map to be compared at runtime
+        //
+        TypeCreation::createMapTypeInfo(alias context, type.loc, result);
+        return result;
+    }
+
+    /**
+     * Validate a future type: `future-> T`.
+     *
+     * Ensures the inner type is complete.
+     *
+     * @returns: FutureType
+     * @throws:
+     *    - ErrorMsg on invalid inner type
+     */
+    fn validateFuture(dmut context: &ValidationContext, f: &FutureTypeExpr, parentMutable: bool, isMutable: bool, isDeeplyMutable: bool)-> &Type
+        throws ErrorMsg
+    {
+        let inner = TypeValidation::validate(alias context,
+                                              f.retType,
+                                              isMutable-> isDeeplyMutable,
+                                              parentMutable-> (isMutable || isDeeplyMutable),
+                                              isDeeplyMutable-> isDeeplyMutable, isRoot-> false);
+
+        TypeVerification::verifyComplete(f.loc, inner, false);
+
+        return copy FutureType(f.loc, inner, isMutable-> (parentMutable && isMutable));
+    }
+
+    /**
+     * Validate a tuple type: `(T1, T2, ...)`.
+     *
+     * Ensures all inner types are complete.
+     *
+     * @returns: TupleType
+     * @throws:
+     *    - ErrorMsg on invalid inner type
+     */
+    fn validateTupleList(dmut context: &ValidationContext, type: &ListExpr, parentMutable: bool, isMutable: bool, isDeeplyMutable: bool)-> &Type
+        throws ErrorMsg
+    {
+        let mut innerTypes: [mut &Type] = copy [{
+            let inner = TypeValidation::validate(alias context,
+                                                  i,
+                                                  isMutable-> isDeeplyMutable,
+                                                  parentMutable-> (isMutable || isDeeplyMutable),
+                                                  isDeeplyMutable-> isDeeplyMutable,
+                                                  isRoot-> false);
+
+            TypeVerification::verifyComplete(type.loc, inner, false);
+            inner
+        } for i in type.params];
+
+        return copy TupleType(type.loc, innerTypes, isMutable-> (parentMutable && isMutable));
+    }
+
+    /**
+     * Validate a tuple type produced by a type-list wrapper. Used post template
+     * specialization rewrite.
+     *
+     * Used for constructs like `fn {T...} (a: T)` where each element of T is a type. (e.g. variadic templates)
+     *
+     * @returns: TupleType
+     * @throws:
+     *    - ErrorMsg on invalid inner type
+     */
+    fn validateListWrapperType(dmut context: &ValidationContext, type: &TypeListWrapperExpr, parentMutable: bool, isMutable: bool, isDeeplyMutable: bool)-> &Type
+        throws ErrorMsg
+    {
+        let mut innerTypes = copy [{
+            let inner = TypeValidation::validate(alias context,
+                                                  copy TypeWrapperExpr(i.loc, i),
+                                                  isMutable-> isDeeplyMutable,
+                                                  parentMutable-> (isMutable || isDeeplyMutable),
+                                                  isDeeplyMutable-> isDeeplyMutable,
+                                                  isRoot-> false);
+
+            TypeVerification::verifyComplete(type.loc, inner, false);
+            inner
+        } for i in type.types];
+
+        return copy TupleType(type.loc, innerTypes, isMutable-> (parentMutable && isMutable));
+    }
+
+    /**
+     * Validate a wrapped type(used for `asIs` and mutability cloning). Used
+     * post template specialization rewrite.
+     *
+     * For construct like `fn {T} (a: T)` where T is a type.
+     *
+     * Applies mutability cloning rules depending on parent and local decorators.
+     *
+     * @returns: the cloned or deeply-mutable type
+     */
+    fn validateWrappedType(type: &TypeWrapperExpr, parentMutable: bool, isMutable: bool, isDeeplyMutable: bool)-> &Type {
+        if (isDeeplyMutable) { type.type.toDeeplyMutable() }
+        else {
+            let level = if (parentMutable && isMutable) { 1u32 } else { 0u32 };
+            if (type.asIs && type.type.isMutable) {
+                type.type
+            } else {
+                type.type.clone(level)
+            }
+        }
+    }
+
+    /**
+     * Validate a `typeof(expr)` type.
+     *
+     * Resolves the value, extracts its type, and applies mutability rules.
+     *
+     * @returns: the resolved type of the expression
+     * @throws:
+     *    - ErrorMsg on invalid inner type, or invalid value
+     */
+    fn validateTypeOf(dmut context: &ValidationContext, tyof: &TypeOfExpr, parentMutable: bool, isMutable: bool, isDeeplyMutable: bool)-> &Type
+        throws ErrorMsg
+    {
+        let content = ValueValidation::validate(alias context, tyof.value);
+        let type = content.type;
+        if (isDeeplyMutable) { type.toDeeplyMutable() }
+        else {
+            let level = if (parentMutable && isMutable) { 1u32 } else { 0u32 };
+            type.clone(level)
+        }
+    }
+
+    /**
+     * Validate a pragma-generated type.
+     *
+     * Delegates to PragmaValidation and applies mutability cloning rules.
+     *
+     * @returns: the resolved type
+     * @throws:
+     *    - ErrorMsg on invalid pragma
+     */
+    fn validatePragma(dmut context: &ValidationContext, p: &PragmaExpr, parentMutable: bool, isMutable: bool, isDeeplyMutable: bool)-> &Type
+        throws ErrorMsg
+    {
+        let type = PragmaValidation::validateType(alias context, p);
+        if (isDeeplyMutable) type.toDeeplyMutable()
+        else {
+            let level = if (parentMutable && isMutable) { 1u32 } else { 0u32 };
+            type.clone(level)
+        }
+    }
+
+    /**
+     * Validate a try-expression used as a type: `T?`.
+     *
+     * Produces an OptionType wrapping the validated inner type.
+     *
+     * @returns: OptionType
+     * @throws:
+     *    - ErrorMsg if the inner type is incomplete
+     */
+    fn validateTryType(dmut context: &ValidationContext, tr: &TryExpr, parentMutable: bool, isMutable: bool, isDeeplyMutable: bool)-> &Type
+        throws ErrorMsg
+    {
+        let inner = TypeValidation::validate(alias context,
+                                              tr.value,
+                                              isMutable-> isDeeplyMutable,
+                                              parentMutable-> (isMutable || isDeeplyMutable),
+                                              isDeeplyMutable-> isDeeplyMutable,
+                                              isRoot-> false);
+
+        TypeVerification::verifyComplete(tr.loc, inner, false);
+
+        return copy OptionType(tr.loc, inner, isMutable-> (parentMutable && isMutable));
+    }
+
+    /**
+     * Validate a function pointer or delegate type.
+     *
+     * Validates each parameter declaration(including `ref` and `lazy`),
+     * validates the return type, and constructs either:
+     *   - FuncPtrType, or
+     *   - DelegateType(if `isDelegate` is true).
+     *
+     * @returns: the resolved function or delegate type
+     * @throws:
+     *    - ErrorMsg if the inner types are invalid
+     */
+    fn validateFuncPtrType(dmut context: &ValidationContext, func: &FunctionPtrTypeExpr, parentMutable: bool, isMutable: bool, _: bool)-> &Type
+        throws ErrorMsg
+    {
+        let mut types: [mut &Type] = [];
+        let mut refs: [mut bool] = [];
+        let mut lazys: [mut bool] = [];
+
+        for vdecl in func.params {
+            let (isRef, isLazy, t) = {
+                let t = TypeValidation::validateForVarDecl(alias context, vdecl.type, vdecl, canBeRef-> true, canBeLazy-> true);
+                (vdecl.isRef, vdecl.isLazy, t)
+            };
+
+            types ~= [t];
+            refs ~= [isRef];
+            lazys ~= [isLazy];
+        }
+
+        let retType = TypeValidation::validate(alias context, func.retType);
+        if (!func.isDelegate) {
+            return copy FuncPtrType(func.loc, refs, lazys, types, retType, isMutable-> (parentMutable && isMutable));
+        }
+
+        return copy DelegateType(func.loc, refs, lazys, types, retType, isMutable-> (parentMutable && isMutable));
+    }
+
+    /**
+     * Validate a variable-style type identifier.
+     *
+     * This function resolves:
+     *   - unquoted identifiers => native types(i32, u64, bool, ...) or global symbols,
+     *   - back-quoted identifiers => always treated as user symbols, never native types.
+     *
+     * Example:
+     *     i32      → IntType(size=32, signed=true)
+     *     `i32`    → lookup of the user symbol named "i32"
+     *     `MyType` → lookup of a user-defined type
+     *
+     * If the identifier is unquoted and matches a native type name, the
+     * corresponding built-in Type is constructed with the correct size,
+     * signedness, and mutability propagation. Otherwise, the identifier is
+     * resolved through global symbol lookup.
+     *
+     * @params:
+     *   - context:         validation context
+     *   - type:            VarExpr representing the identifier
+     *   - parentMutable:   mutability inherited from parent
+     *   - isMutable:       mutability applied at this level
+     *   - isDeeplyMutable: deep mutability applied at this level
+     *
+     * @returns: the resolved native type or a type resolved from global symbols
+     * @throws:
+     *    - ErrorMsg if the identifier cannot be resolved as a type
+     */
+    fn validateVar(dmut context: &ValidationContext, type: &VarExpr, parentMutable: bool, isMutable: bool, isDeeplyMutable: bool)-> &Type
+        throws ErrorMsg
+    {
+        if !type.isQuoted {
+            match type.loc.str {
+                NativeTypes::VOID => return copy VoidType(type.loc, isMutable-> (isMutable && parentMutable));
+                NativeTypes::BOOL => return copy BoolType(type.loc, isMutable-> (parentMutable && isMutable));
+
+                NativeTypes::C8 => return copy CharType(type.loc, size-> 8u16, isMutable-> (parentMutable && isMutable));
+                NativeTypes::C16 => return copy CharType(type.loc, size-> 16u16, isMutable-> (parentMutable && isMutable));
+                NativeTypes::C32 => return copy CharType(type.loc, size-> 32u16, isMutable-> (parentMutable && isMutable));
+
+                NativeTypes::F32 => return copy FloatType(type.loc, size-> 32u16, isMutable-> (parentMutable && isMutable));
+                NativeTypes::F64 => return copy FloatType(type.loc, size-> 64u16, isMutable-> (parentMutable && isMutable));
+                NativeTypes::F80 => return copy FloatType(type.loc, size-> 80u16, isMutable-> (parentMutable && isMutable));
+                NativeTypes::REAL => return copy FloatType(type.loc, size-> 0u16, isMutable-> (parentMutable && isMutable));
+
+                NativeTypes::U8 => return copy IntType(type.loc, size-> 8u16, isSigned-> false, isMutable-> (parentMutable && isMutable));
+                NativeTypes::U16 => return copy IntType(type.loc, size-> 16u16, isSigned-> false, isMutable-> (parentMutable && isMutable));
+                NativeTypes::U32 => return copy IntType(type.loc, size-> 32u16, isSigned-> false, isMutable-> (parentMutable && isMutable));
+                NativeTypes::U64 => return copy IntType(type.loc, size-> 64u16, isSigned-> false, isMutable-> (parentMutable && isMutable));
+                NativeTypes::USIZE => return copy IntType(type.loc, size-> 0u16, isSigned-> false, isMutable-> (parentMutable && isMutable));
+
+                NativeTypes::I8 => return copy IntType(type.loc, size-> 8u16, isSigned-> true, isMutable-> (parentMutable && isMutable));
+                NativeTypes::I16 => return copy IntType(type.loc, size-> 16u16, isSigned-> true, isMutable-> (parentMutable && isMutable));
+                NativeTypes::I32 => return copy IntType(type.loc, size-> 32u16, isSigned-> true, isMutable-> (parentMutable && isMutable));
+                NativeTypes::I64 => return copy IntType(type.loc, size-> 64u16, isSigned-> true, isMutable-> (parentMutable && isMutable));
+                NativeTypes::ISIZE => return copy IntType(type.loc, size-> 0u16, isSigned-> true, isMutable-> (parentMutable && isMutable));
+            }
+        }
+
+        return TypeValidation::validateGlobalVar(alias context, type, parentMutable, isMutable, isDeeplyMutable);
+    }
+
+    /**
+     * Validate a global variable used as a type.
+     *
+     * Resolves the symbol, ensures it refers to a type, and handles
+     * multi-symbol cases.
+     *
+     * @returns: the resolved type
+     * @throws:
+     *    - ErrorMsg if the symbol is not found or not a type
+     */
+    fn validateGlobalVar(dmut context: &ValidationContext, v: &VarExpr, parentMutable: bool, isMutable: bool, isDeeplyMutable: bool)-> &Type
+        throws ErrorMsg
+    {
+        // This function is close to LiteralValidator::validateGlobalVar, but returns a type instead of a value
+        let dmut syms = context:.getGlobal(v.loc.str);
+        if (syms.len == 0us) { // The variable was not found in the symbol table
+            throw VariableCreation::createGlobalVarError(context, v.loc, v.loc.str); // We throw the according error
+        }
+
+        return TypeValidation::validateMultSymbols(alias context,
+                                                    v.loc,
+                                                    alias syms,
+                                                    parentMutable,
+                                                    isMutable,
+                                                    isDeeplyMutable);
+    }
+
+    /**
+     * Validate a path expression used as a type: `left::right`.
+     *
+     * Resolves the left value, then resolves the right symbol inside it.
+     *
+     * @returns: the resolved type
+     * @throws:
+     *     - ErrorMsg on invalid path or unresolved symbol
+     */
+    fn validatePath(dmut context: &ValidationContext, p: &PathExpr, parentMutable: bool, isMutable: bool, isDeeplyMutable: bool)-> &Type
+        throws ErrorMsg
+    {
+        let left = ValueValidation::validate(alias context, p.left);
+        return TypeValidation::validatePath(alias context,
+                                             p.loc,
+                                             left,
+                                             p.right,
+                                             parentMutable,
+                                             isMutable,
+                                             isDeeplyMutable);
+    }
+
+    /**
+     * Validate a binary expression used as a type.
+     *
+     * Only the `::` operator is allowed in type position.
+     *
+     * @throws:
+     *    - ErrorMsg on any other operator
+     */
+    fn validateBinary(dmut context: &ValidationContext, bin: &BinaryExpr, parentMutable: bool, isMutable: bool, isDeeplyMutable: bool)-> &Type
+        throws ErrorMsg
+    {
+        let left = ValueValidation::validate(alias context, bin.left);
+        if bin.op != BinaryOperators::DCOLON {
+            throw copy ErrorMsg::fatal(bin.loc, format(ValidateErrorMessage::UNDEFINED_BIN_OP, bin.loc.str, left, bin.right));
+        }
+
+        return TypeValidation::validatePath(alias context,
+                                             bin.loc,
+                                             left,
+                                             bin.right,
+                                             parentMutable,
+                                             isMutable,
+                                             isDeeplyMutable);
+    }
+
+    /**
+     * Validate a path access on a resolved value.
+     *
+     * Handles:
+     *   - module access,
+     *   - multi-symbol resolution,
+     *   - nested module chains.
+     *
+     * @returns: the resolved type
+     * @throws:
+     *    - ErrorMsg on unresolved symbol or invalid access
+     */
+    fn validatePath(dmut context: &ValidationContext, loc: &Word, left: &Value, right: &Expression, parentMutable: bool, isMutable: bool, isDeeplyMutable: bool)-> &Type
+        throws ErrorMsg
+    {
+        let v = if let v: &VarExpr = right { v } else {
+            throw copy ErrorMsg::fatal(loc, format(ValidateErrorMessage::UNDEFINED_BIN_OP, loc.str, left, right));
+        };
+
+        if let md: &ModuleRefValue = left { // If this is a module that is simple
+            let dmut res = context:.getLocalFromMod(md, v.loc.str);
+            if (res.len != 0us) {
+                return TypeValidation::validateMultSymbols(alias context, v.loc, alias res, parentMutable, isMutable, isDeeplyMutable);
+            }
+
+            throw copy ErrorMsg::fatal(loc, format(ValidateErrorMessage::UNDEFINED_BIN_OP, loc.str, left, right),
+                                        notes-> VariableCreation::createLocalVarError(context, v.loc, md, v.loc.str));
+        }
+
+        if let ms: &MultSymValue = left { // The left operand returned multiple symbols
+            let mut all: [dmut &Symbol] = [];
+            let mut errors: [&ErrorMsg] = [];
+            for c in ms.values {
+                if let md: &ModuleRefValue = c { // Some of them are modules, so we can sub access them using var 'v'
+                    let dmut r = context:.getLocalFromMod(md, v.loc.str);
+                    if (r.len == 0us) {
+                        errors ~= VariableCreation::createLocalVarError(context, v.loc, md, v.loc.str);
+                    }
+                    all ~= alias r;
+                }
+            }
+
+            if (all.len != 0us) { // There are symbols whose name are 'v.loc.str'
+                return TypeValidation::validateMultSymbols(alias context, v.loc, alias all, parentMutable, isMutable, isDeeplyMutable);
+            }
+
+            throw copy ErrorMsg::fatal(loc, format(ValidateErrorMessage::UNDEFINED_BIN_OP, loc.str, left, right),
+                                        notes-> errors);
+
+        }
+
+        throw copy ErrorMsg::fatal(loc, format(ValidateErrorMessage::UNDEFINED_BIN_OP, loc.str, left, right));
+    }
+
+    /**
+     * Validate a unary operator used in a type expression.
+     *
+     * Supported:
+     *   - `*T` => PointerType(inner type must be complete)
+     *   - `&T` => ClassPtrType(only for class references)
+     *
+     * Unsupported operators(e.g. `!`, `-`) are values, not types.
+     *
+     * Examples:
+     *     `*i32`
+     *     `&MyClass`
+     *
+     * @throws:
+     *    - ErrorMsg on invalid operator or invalid operand type
+     */
+    fn validateUnary(dmut context: &ValidationContext, un: &UnaryExpr, parentMutable: bool, isMutable: bool, isDeeplyMutable: bool)-> &Type
+        throws ErrorMsg
+    {
+        let inner = TypeValidation::validate(alias context,
+                                              un.value,
+                                              isMutable-> isDeeplyMutable,
+                                              parentMutable-> (isMutable || isDeeplyMutable),
+                                              isDeeplyMutable-> isDeeplyMutable,
+                                              isRoot-> false);
+
+
+        // '*' operator creates a pointer type for any type as long as it is a complete type
+        if un.op == UnaryOperators::STAR {
+            // pointer is the only type that can store a movable type
+            TypeVerification::verifyComplete(un.loc, inner, construct-> false);
+
+            return copy PointerType(un.loc, inner, isMutable-> ((parentMutable && isMutable) || isDeeplyMutable));
+        }
+
+        // '&' operator on classref create a classptr
+        if un.op == UnaryOperators::AND {
+            // & operator is only valid for class references
+            if let clRef: &ClassRefType = inner && !clRef.sym.isStruct { // If it is a class then it create a ClassPtrType
+                return clRef.createInstance(loc-> un.loc,
+                                             isMutable-> ((parentMutable && isMutable) || isDeeplyMutable),
+                                             isInnerMutable-> (isDeeplyMutable || inner.isMutable));
+            }
+
+            // Special error messages for structs
+            // & on structure are not allowed
+            if let clRef: &ClassRefType = inner && clRef.sym.isStruct {
+                let msg = if (clRef.isMovable) {
+                    ValidateErrorMessage::IS_AN_ENTITY
+                } else { ValidateErrorMessage::IS_A_RECORD };
+
+                throw copy ErrorMsg::fatal(un.loc, format(ValidateErrorMessage::UNDEFINED_UN_OP, un.loc.str, inner),
+                                            notes-> copy [copy ErrorMsg::note(clRef.loc, format(msg, clRef))]);
+            }
+
+            if let cptr: &ClassPtrType = inner && cptr.isStruct {
+                let msg = if (cptr.isMovable) {
+                    ValidateErrorMessage::IS_AN_ENTITY
+                } else { ValidateErrorMessage::IS_A_RECORD };
+
+                throw copy ErrorMsg::fatal(un.loc, format(ValidateErrorMessage::UNDEFINED_UN_OP, un.loc.str, inner),
+                                            notes-> copy [copy ErrorMsg::note(cptr.loc, format(msg, cptr))]);
+            }
+        }
+
+        // Other unary operators(i.e. '!', '-') are necessarily values, not types
+        // Also fallback for '&' on other things than a classref
+        throw copy ErrorMsg::fatal(un.loc, format(ValidateErrorMessage::UNDEFINED_UN_OP, un.loc.str, inner));
+    }
+
+    /**
+     * Validate a range type: `..T`.
+     *
+     * Range types are only valid for integer types.
+     *
+     * Example:
+     *     `..i32`
+     * @returns: RangeType
+     * @throws:
+     *    - ErrorMsg if the inner type is not an integer
+     */
+    fn validateRangeType(dmut context: &ValidationContext, r: &RangeTypeExpr, parentMutable: bool, isMutable: bool, isDeeplyMutable: bool)-> &Type
+        throws ErrorMsg
+    {
+        let inner = TypeValidation::validate(alias context, r.type,
+                                              isMutable-> isDeeplyMutable,
+                                              parentMutable-> (isMutable || isDeeplyMutable),
+                                              isDeeplyMutable-> isDeeplyMutable,
+                                              isRoot-> false);
+
+        if let i: &IntType = inner {
+            return copy RangeType(r.loc,
+                                   inner-> i,
+                                   isMutable-> (parentMutable && isMutable) || isDeeplyMutable);
+        }
+
+        // range only works on int
+        throw copy ErrorMsg::fatal(r.loc, format(ValidateErrorMessage::UNDEFINED_BIN_OP, r.loc.str, inner, inner));
+    }
+
+    /*!
+     * ================================================================================
+     * ================================================================================
+     * =========================          MULT SYMS           =========================
+     * ================================================================================
+     * ================================================================================
+     */
+
+    /**
+     * Transform a list of symbols into a single type.
+     *
+     * Handles:
+     *   - classes,
+     *   - traits,
+     *   - enums,
+     *   - templates,
+     *   - def symbols,
+     *   - and reports errors for values used as types.
+     *
+     * Also resolves multi-symbol ambiguity and reports candidates.
+     *
+     * @returns: a single &Type
+     * @throws:
+     *   - &ErrorMsg on invalid symbol combinations, or if multiple non-template types remain
+     *
+     */
+    pub fn validateMultSymbols(dmut context: &ValidationContext, loc: &Word, dmut syms: [&Symbol], parentMutable: bool, isMutable: bool, isDeeplyMutable: bool)-> &Type
+        throws ErrorMsg
+    {
+        let mut res: [&Type] = [];
+        let mut nonTemplate: [&Type] = [];
+        let mut errors: [&ErrorMsg] = [];
+        let mut valErrors: [&ErrorMsg] = [];
+
+        for i in 0us .. syms.len {
+            {
+                context:.pushReferent(alias syms[i]);
+
+                match alias syms[i] {
+                    dmut f: &FunctionSymbol => {
+                        {
+                            if (!f.isMethod) {
+                                let val = FunctionValidation::validateProto(alias context, alias f);
+                                valErrors ~= [copy ErrorMsg::fatal(loc, format(ValidateErrorMessage::USE_AS_TYPE_VAL, val))];
+                            }
+                        } catch { err: &ErrorMsg => { valErrors ~= [err]; } }
+                    }
+                    dmut a: &DefSymbol => { // Def are sometimes types, there is a special function to handle that
+                        TypeValidation::validateDefSymbolMultSym(loc,
+                                                                  alias context,
+                                                                  alias a,
+                                                                  ref res,
+                                                                  ref nonTemplate,
+                                                                  ref valErrors,
+                                                                  parentMutable,
+                                                                  isMutable,
+                                                                  isDeeplyMutable);
+                    }
+                    dmut t: &TemplateSymbol => { // At this point, there is no way to determine if this is a type or a value
+                        res ~= [copy TemplateRefType(loc, t)];
+                    }
+                    dmut c: &ClassSymbol => { // class are types
+                        let type = ClassValidation::validate(alias context, alias c, inModule-> false);
+                        let result = if (c.isStruct) {
+                            let resMutable = (parentMutable && isMutable) || isDeeplyMutable;
+                            type.createInstance(loc-> loc, isMutable-> resMutable, isInnerMutable-> resMutable)
+                        } else {
+                            let level = if (parentMutable && isMutable) { 1u32 } else { 0u32 };
+                            type.clone(level)
+                        };
+
+                        res ~= [result];
+                        nonTemplate ~= [result];
+                    }
+                    dmut tr: &TraitSymbol => { // Traits are also types
+                        let type = TraitValidation::validate(alias context, alias tr);
+                        res ~= [type]; // no need to clone, the type is necessarily immutable
+                        nonTemplate ~= [type];
+                    }
+                    dmut en: &EnumSymbol => {
+                        let type = EnumValidation::validate(alias context, alias en);
+                        let level = if (parentMutable && isMutable) { 1u32 } else { 0u32 }
+                        let result = type.clone(level);
+                        res ~= [result];
+                        nonTemplate ~= [result];
+                    }
+                    z: _ => {
+                        valErrors ~= [copy ErrorMsg::fatal(loc, end-> z.loc, format(ValidateErrorMessage::USE_AS_TYPE_VAL, z.path))];
+                    }
+                }
+            } catch {
+                err: &ErrorMsg => {
+                    errors ~= [err];
+                }
+            }
+
+            context:.popReferent();
+        }
+
+        // There are errors in type validation
+        if (errors.len != 0us) {
+            let dmut form = copy StringStream();
+            for i, j in syms {
+                if (i != 0us) form:.write(", ");
+                form:.write(j.path.toStr());
+            }
+
+            throw copy ErrorMsg::fatal(loc, format(ValidateErrorMessage::INVALID_SYMBOLS, form[]), notes-> errors);
+        }
+
+        res = TypeValidation::reduceMultSyms(res);
+        if (res.len == 1us) {
+            res[0]
+        } else {
+            if (res.len == 0us) { // There are no values
+                if (valErrors.len != 0us) throw copy ErrorMsg::list(valErrors); // It has to be because of value errors
+                else panic;
+            }
+
+            if (nonTemplate.len == 1) return nonTemplate[0];
+            let mut notes: [&ErrorMsg] = [];
+            for i in res {
+                notes ~= [copy ErrorMsg::note(i.loc, format(ValidateErrorMessage::CANDIDATE_ARE, i), oneLine-> true, withLoc-> true)];
+            }
+
+            throw copy ErrorMsg::fatal(loc, format(ValidateErrorMessage::MULTIPLE_SYMBOL_TYPES), notes-> notes);
+        }
+    }
+
+    /**
+     * Remove duplicate types from a mult-symbol result.
+     *
+     * @returns: a deduplicated list of types
+     */
+    fn reduceMultSyms(res: [&Type])-> [&Type] {
+        let mut final: [&Type] = [];
+        for v in res {
+            let mut found = false;
+            for v2 in final {
+                if v2 == v {
+                    found = true;
+                    break;
+                }
+            }
+
+            if !found {
+                final ~= [v];
+            }
+        }
+
+        final
+    }
+
+    /**
+     * Validate a DefSymbol inside a mult-symbol context.
+     *
+     * A DefSymbol may resolve to:
+     *   - a class reference,
+     *   - a type,
+     *   - a value(invalid in type position),
+     *   - or an ErrorGenerator.
+     *
+     * @params:
+     *   - loc:           location of the reference(for diagnostics)
+     *   - context:       validation context
+     *   - sym:           the DefSymbol to resolve
+     *   - res:           output list of all candidate types
+     *   - nonTemplate:   output list of non-template types(used for disambiguation)
+     *   - valErrors:     output list of “value used as type” errors
+     *   - parentMutable / isMutable / isDeeplyMutable:
+     *                     mutability propagation flags
+     *
+     * @throws:
+     *   - &ErrorMsg only when the DefSymbol itself is malformed
+     *     (ErrorGenerator). This must abort immediately.
+     *
+     * Notes:
+     *   - If the symbol resolves to a value, the error is pushed into valErrors
+     *     instead of thrown, so validateMultSymbols can aggregate all candidates
+     *     before deciding the final error.
+     */
+    fn validateDefSymbolMultSym(loc: &Word, dmut context: &ValidationContext, dmut sym: &DefSymbol, ref mut res: [&Type], ref mut nonTemplate: [&Type], ref mut valErrors: [&ErrorMsg], parentMutable: bool, isMutable: bool, isDeeplyMutable: bool)
+        throws ErrorMsg
+    {
+        DefValidation::validate(alias context, alias sym);
+        match sym.generator {
+            c: &ClassRefType => {
+                let result = if (c.sym.isStruct) {
+                    let resMutable = (parentMutable && isMutable) || isDeeplyMutable;
+                    c.createInstance(loc-> loc, isMutable-> resMutable, isInnerMutable-> resMutable)
+                } else {
+                    let level = if (parentMutable && isMutable) { 1u32 } else { 0u32 };
+                    c.clone(level)
+                };
+
+                res ~= [result];
+                nonTemplate ~= [result];
+            }
+            type: &Type => {
+                if (isDeeplyMutable) res ~= [type.toDeeplyMutable()];
+                else {
+                    let level = if (parentMutable && isMutable) { 1u32 } else { 0u32 };
+                    let result = type.clone(level);
+                    res ~= [result];
+                    nonTemplate ~= [result];
+                }
+            }
+            val: &Value => {
+                valErrors ~= [copy ErrorMsg::fatal(loc, format(ValidateErrorMessage::USE_AS_TYPE_VAL, val))];
+            }
+            e: &ErrorGenerator => throw e.msg;
+            _ => panic;
+        };
+    }
+
+    /*!
+     * ================================================================================
+     * ================================================================================
+     * =========================          TEMPLATES           =========================
+     * ================================================================================
+     * ================================================================================
+     */
+
+    /**
+     * Validate a template call expression.
+     *
+     * Validates:
+     *   - the argument list,
+     *   - the left operand(converted to a mult-symbol if needed),
+     *   - and forwards to validateTemplateCallMultSym.
+     *
+     * @returns: the resolved type(a singled out candidate)
+     * @throws:
+     *    - ErrorMsg if the argument list is invalid, are template specialization failed
+     */
+    fn validateTemplateCall(dmut context: &ValidationContext, t: &TemplateCallExpr, parentMutable: bool, isMutable: bool, isDeeplyMutable: bool)-> &Type
+        throws ErrorMsg
+    {
+        let list = TemplateValidation::validateArgumentList(alias context, t.rights); // validate the list of argument of the template call
+        let type: &MultSymValue = match ValueValidation::validate(alias context, t.left) {  // Validate the left operand of the call
+            m: &MultSymValue => { m }
+            tmp: _ => { copy MultSymValue(t.left.loc, copy [tmp], prettyStr-> format("%", tmp)) } // we nned a multsym to be generic in the next validation
+        };
+
+        // Finally validate the call
+        return TypeValidation::validateTemplateCallMultSym(alias context, t.loc, type, list, parentMutable, isMutable, isDeeplyMutable);
+    }
+
+    /**
+     * Validate a template call where the left operand is a mult-symbol.
+     *
+     * Computes template scores for each candidate, collects the highest-scoring
+     * rewrites, and forwards them to finalizeTemplateCallMultSym.
+     *
+     * @returns: the resolved type
+     * @throws:
+     *   - ErrorMsg if no candidate matches
+     */
+    fn validateTemplateCallMultSym(dmut context: &ValidationContext, loc: &Word, left: &MultSymValue, rights: [&Generator], parentMutable: bool, isMutable: bool, isDeeplyMutable: bool)-> &Type
+        throws ErrorMsg
+    {
+        // We store the results inside a vector, where to each valid values is associated the correct mapper
+        let mut results: [(TemplateMapper, &Value)] = [];
+        let mut highestScore = 0u32;
+        let mut errors: [&ErrorMsg] = [];
+        for it in left.values {
+            {
+                let mapper = TemplateSolving::solveCall(alias context, left.loc, it, rights);
+                if (mapper.score > highestScore) { // works and has the highest score
+                    highestScore = mapper.score;
+                    results = [];
+                    results ~= [(mapper, it)];
+                } else if (mapper.score == highestScore) { // works and has the same score as previous candidates
+                    results ~= [(mapper, it)];
+                }
+            } catch {
+                err: &ErrorMsg => { // does not work
+                    errors ~= [err];
+                }
+            }
+        }
+
+        if (results.len == 0us && errors.len != 0us) { // No value succeded, and there was some errors
+            throw copy ErrorMsg::fatal(loc, format(ValidateErrorMessage::UNDEFINED_TEMPLATE_CALL, left, rights, tags-> FormatTags(withParams-> true)), notes-> errors);
+        }
+
+        {
+            return TypeValidation::finalizeTemplateCallMultSym(alias context,
+                                                                left.loc,
+                                                                results,
+                                                                parentMutable,
+                                                                isMutable,
+                                                                isDeeplyMutable);
+        } catch {
+            err: &ErrorMsg => {
+                throw copy ErrorMsg::fatal(loc, format(ValidateErrorMessage::UNDEFINED_TEMPLATE_CALL, left, rights, tags-> FormatTags(withParams-> true)), notes-> copy [err]);
+            }
+        }
+    }
+
+    /**
+     * Finalize template specialization after rewrite.
+     *
+     * Declares each rewritten template, collects the resulting symbols, and
+     * resolves them into a single type via validateMultSymbols.
+     *
+     * @returns: the resolved type
+     * @throws:
+     *    - ErrorMsg if all specializations fail
+     */
+    fn finalizeTemplateCallMultSym(dmut context:    &ValidationContext,
+                                   loc:             &Word,
+                                   list:            [(TemplateMapper, &Value)],
+                                   parentMutable:   bool,
+                                   isMutable:       bool,
+                                   isDeeplyMutable: bool)-> &Type
+        throws ErrorMsg
+    {
+        let mut finalResults: [dmut &Symbol] = [];
+        let mut errors: [&ErrorMsg] = [];
+
+        for it in list { // for each value that can be rewritten
+            {
+                let dmut val = TemplateDeclaration::declare(alias context, loc, it._0, it._1); // rewrite the syntax template, declare it and return the declared symbol
+                finalResults ~= [alias val];
+            } catch {
+                err: &ErrorMsg => { // symbol declaration failed(rewrite cannot fail)
+                    errors ~= [err];
+                }
+            }
+        }
+
+        if (finalResults.len == 0us) { // if there is not symbol with validation
+            throw copy ErrorMsg::list(errors);
+        }
+
+        // transform the symbols into types
+        return TypeValidation::validateMultSymbols(alias context,
+                                                    loc,
+                                                    alias finalResults,
+                                                    parentMutable,
+                                                    isMutable, isDeeplyMutable);
+    }
+
+}

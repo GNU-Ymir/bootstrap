@@ -1,0 +1,279 @@
+/*
+ * Declares the MethodDelegateValue class.
+ *
+ * <hr>
+ *
+ * @Package: ymirc
+ * @Module: ymirc::semantic::generator::value::delegate::method
+ * @File: ymirc/semantic/generator/value/delegate/method.yr
+ * @Author(s):
+ *   - Emile Cadorel <ecadorel@gmail.com>
+ *
+ * @Created(YYYY-MM-DD): 2026-03-06
+ * @Copyright(C) 2021–2026 GNU-Ymir
+ * @License
+ *   ```text
+ *   This file is part of the Ymir language project.
+ *
+ *   Ymir is free software: you can redistribute it and/or modify it
+ *   under the terms of the GNU General Public License as published by
+ *   the Free Software Foundation, either version 3 of the License, or
+ *   (at your option) any later version.
+ *
+ *   Ymir is distributed in the hope that it will be useful,
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *   GNU General Public License for more details.
+ *
+ *   You should have received a copy of the GNU General Public License
+ *   along with Ymir.  If not, see <https://www.gnu.org/licenses/>.
+ *   ```
+ */
+
+in method;
+
+use ymirc::lexing::{word, keys};
+use ymirc::utils::{format, comparison};
+use std::stream;
+
+use ymirc::semantic::generator::type::native;
+use ymirc::semantic::generator::value::prototype;
+
+/**
+ * MethodDelegateValue models a delegate bound to a class or struct method.
+ *
+ * In Ymir, a method reference such as:
+ *
+ *     x.foo
+ *
+ * does not directly represent a storable value unless it is explicitly
+ * addressed using the unary `&` operator:
+ *
+ *     let dg = &x.foo;   // valid delegate
+ *     let f  = &bar;     // valid function pointer
+ *     let e  = x.foo;    // error: ambiguous without '&'
+ *
+ * MethodDelegateValue therefore represents:
+ *   - a method prototype(`proto`),
+ *   - the closure value(`closure`) on which the method will be invoked,
+ *   - whether the call is direct(`isDirect`) or virtual(via vtable),
+ *   - the vtable index(`vtableIndex`) when virtual dispatch is required,
+ *   - whether the closure is a struct(`isStruct`), requiring by-reference passing,
+ *   - the location of the `&` operator(`addressLoc`) when the delegate is
+ *     explicitly addressed.
+ *
+ * The delegate type is computed from the method prototype and depends on
+ * whether the method is addressed. Non-addressed struct methods have no
+ * delegate type and cannot be stored.
+ *
+ */
+@final
+pub class MethodDelegateValue over DelegateValue {
+
+    pub {
+        /**
+         * The prototype of the method to call.
+         */
+        let proto: &MethodPrototypeValue;
+
+        /**
+         * True if the method call can be emitted as a direct static call.
+         *
+         * This is the case for non-virtual methods. When false, the call must
+         * be dispatched through the vtable using `vtableIndex`.
+         */
+        let isDirect: bool;
+
+        /**
+         * The index of the method in the class vtable.
+         *
+         * Used only when `isDirect == false`. This index is resolved during
+         * semantic analysis and used during code generation for virtual calls.
+         */
+        let vtableIndex: usize;
+
+        /**
+         * The closure value on which the method will be invoked.
+         *
+         * For class methods, this is the class instance. For struct methods,
+         * the struct value is passed by reference.
+         */
+        let closure: &Value;
+
+        /**
+         * True iff the delegate is bound to a struct method.
+         *
+         * Struct methods always receive their closure by reference. This flag
+         * influences delegate type creation and call lowering.
+         */
+        let isStruct: bool;
+
+        /**
+         * The location of the unary '&' operator, if the method was addressed.
+         *
+         * When not EOF, this indicates that the user explicitly created a
+         * delegate value. Without '&', a method reference is invalid unless
+         * immediately followed by a call.
+         */
+        let addressLoc: &Word;
+    }
+
+    /**
+     * Construct a MethodDelegateValue.
+     *
+     * @params:
+     *   - loc:         source location of the method reference
+     *   - meth:        the method prototype
+     *   - closure:     the instance or struct value on which the method is invoked
+     *   - direct:      true iff the method is non-virtual
+     *   - isStruct:    true iff the closure is a struct
+     *   - vtableIndex: index of the method in the vtable(if virtual)
+     *   - addressLoc:  location of the '&' operator(EOF_WORD if not addressed)
+     *
+     * The delegate type is computed from the method prototype and depends on
+     * whether the method is addressed. Throwers are inherited from the closure.
+     *
+     */
+    pub self (loc:         &Word,
+              meth:        &MethodPrototypeValue,
+              closure:     &Value,
+              direct:      bool,
+              isStruct:    bool,
+              vtableIndex: usize,
+              addressLoc:  &Word = EOF_WORD)
+
+        with super (loc,
+                    delegate::method::createDelegateTypeFromPrototype(isStruct, !addressLoc.isEof, meth),
+                    isReduced-> true,
+                    throwers-> closure.throwers)
+
+        , proto       = meth
+        , closure     = closure
+        , isDirect    = direct
+        , vtableIndex = vtableIndex
+        , isStruct    = isStruct
+        , addressLoc  = addressLoc
+    {}
+
+
+    /**
+     * @returns true if the operator '&' is defined.
+     *
+     * A method reference without '&' cannot be stored or passed as a value.
+     */
+    @field
+    pub fn isAddressed(self)-> bool {
+        !self.addressLoc.isEof
+    }
+
+    /**
+     * A method delegate is a full literal only when:
+     *   - the closure is a full literal, and
+     *   - the method is direct(virtual methods cannot be evaluated at compile time).
+     */
+    @field
+    pub over isFullLiteral(self)-> bool {
+        self.closure.isFullLiteral && self.isDirect // virtual methods aren't CTE
+    }
+
+    /**
+     * Create a clone of this delegate but marked as addressed with '&'.
+     *
+     * @params:
+     *   - loc: the location of the '&' operator
+     *
+     * This is used when a method reference is implicitly converted into an
+     * addressed delegate during semantic rewriting.
+     */
+    pub fn cloneAsAddressed(self, loc: &Word)-> &MethodDelegateValue {
+        return copy MethodDelegateValue(self.loc,
+                                         self.proto,
+                                         self.closure.clone(),
+                                         self.isDirect,
+                                         self.vtableIndex,
+                                         isStruct-> self.isStruct,
+                                         addressLoc-> loc);
+    }
+
+    /**
+     * Create a deep clone of this MethodDelegateValue.
+     *
+     * The closure is recursively cloned. The prototype, vtable index, and
+     * addressing information are preserved.
+     */
+    pub over clone(self)-> &Value {
+        return copy MethodDelegateValue(self.loc,
+                                         self.proto,
+                                         self.closure.clone(),
+                                         self.isDirect,
+                                         self.vtableIndex,
+                                         isStruct-> self.isStruct,
+                                         addressLoc-> self.addressLoc);
+    }
+
+
+    impl Comparable!{&Generator};
+
+    impl Streamable;
+    impl Formattable {
+
+        /**
+         * Format the method delegate for debugging or diagnostic output.
+         *
+         * When formatting parameters(`forParams` tag), the delegate is printed
+         * as "_".
+         *
+         * When formatting with parameters(`withParams` tag), the printed form is:
+         *
+         *     closure.proto
+         *
+         * Otherwise, the printed form is:
+         *
+         *     {.func = proto, .closure = closure}
+         *
+         * If the delegate was addressed with '&', the printed form begins with
+         * the `dg` keyword.
+         *
+         * This representation is intended for semantic debugging and error
+         * reporting, not for code generation.
+         */
+        pub over format(self, dmut stream: &Formatter) {
+            if (stream.tags.forParams) {
+                stream:.write("_");
+            } else {
+                if (!self.addressLoc.isEof) stream:.write(Keys::DELEGATE, " ");
+                if (stream.tags.withParams) {
+                    stream:.write(self.closure, ".", self.proto);
+                } else {
+                    stream:.write("{.func = ", self.proto, ", .closure = ", self.closure, "}");
+                }
+            }
+        }
+
+    }
+
+}
+
+/**
+ * Compute the delegate type for a method reference.
+ *
+ * Struct methods that are not addressed cannot produce a delegate type and
+ * therefore return VoidType. Otherwise, a proper DelegateType is constructed
+ * from the method prototype’s parameter list and return type.
+ */
+fn createDelegateTypeFromPrototype(isStruct: bool, isAddressed: bool, proto: &MethodPrototypeValue)-> &Type {
+    if (isStruct && !isAddressed) return copy VoidType(proto.loc);
+    else {
+        let mut types: [mut &Type] = [];
+        let mut refs:  [mut bool] = [];
+        let mut lazys: [mut bool] = [];
+
+        for pi in proto.params {
+            types ~= [pi.type];
+            refs  ~= [pi.isReference];
+            lazys ~= [pi.isLazy];
+        }
+
+        return copy DelegateType(proto.loc, refs, lazys, types, proto.retType, isMutable-> false)
+    }
+}

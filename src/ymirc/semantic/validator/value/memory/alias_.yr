@@ -1,0 +1,270 @@
+/*
+ * Implements validation for aliasing expressions in Ymir.
+ *
+ * Aliasing appears in two syntactic forms:
+ *
+ *   1. Basic aliasing:
+ *        alias x
+ *      Produces an AliaserValue for mutable, explicitly-aliasable values.
+ *
+ *   2. Class/map aliasing:
+ *        x:.name
+ *        x:.name()
+ *        x:[index]
+ *
+ *      The operator `x:.` is the unified aliasing operator for:
+ *        - class fields
+ *        - class methods
+ *        - record/entity fields
+ *        - map fields
+ *        - map methods
+ *        - class/record/entity index aliasing(`x:[i]`)
+ *
+ *      Important distinction:
+ *        - `x:.name`  → isField = true  (identifier follows)
+ *        - `x:[i]`   → isField = false(index operator follows)
+ *
+ *      Maps support name-based aliasing(`x:.field`, `x:.remove`)
+ *      but do NOT support index aliasing(`x:[i]`).
+ *
+ * The validator enforces:
+ *   - mutability and l-value rules
+ *   - explicit alias requirements
+ *   - struct vs. class pointer aliasing rules
+ *   - map name aliasing vs. map index aliasing restrictions
+ *   - rejection of lazy or expanded values in basic aliasing
+ *
+ * <hr>
+ *
+ * @Package: ymirc
+ * @Module: ymirc::semantic::validator::value::memory::alias_
+ * @File: ymirc/semantic/validator/value/memory/alias_.yr
+ * @Author(s):
+ *   - Emile Cadorel <ecadorel@gmail.com>
+ *
+ * @Created(YYYY-MM-DD): 2026-03-30
+ * @Copyright(C) 2021–2026 GNU-Ymir
+ * @License
+ *   ```text
+ *   This file is part of the Ymir language project.
+ *
+ *   Ymir is free software: you can redistribute it and/or modify it
+ *   under the terms of the GNU General Public License as published by
+ *   the Free Software Foundation, either version 3 of the License, or
+ *   (at your option) any later version.
+ *
+ *   Ymir is distributed in the hope that it will be useful,
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *   GNU General Public License for more details.
+ *
+ *   You should have received a copy of the GNU General Public License
+ *   along with Ymir.  If not, see <https://www.gnu.org/licenses/>.
+ *   ```
+ */
+
+in alias_;
+
+use ymirc::syntax::expression::memory;
+use ymirc::semantic::validator;
+use ymirc::semantic::generator::{value, value::_, type::_};
+
+use ymirc::errors;
+use ymirc::lexing::word;
+
+use ymirc::utils::format;
+
+/**
+ * AliasValidation module
+ *
+ * Provides validation for all aliasing constructs in Ymir.
+ *
+ * Aliasing modes:
+ *
+ *   - Basic aliasing(`alias x`)
+ *       Produces an AliaserValue if the value is mutable and requires
+ *       explicit aliasing.
+ *
+ *   - Class/map aliasing(`x:.something`)
+ *
+ *       Two submodes:
+ *
+ *         1. Name-based aliasing(`x:.name`, `x:.name()`)
+ *            isField = true
+ *            Allowed on:
+ *              - class
+ *              - record
+ *              - entity
+ *              - map
+ *
+ *         2. Index aliasing(`x:[index]`)
+ *            isField = false
+ *            Allowed on:
+ *              - class
+ *              - record
+ *              - entity
+ *            NOT allowed on:
+ *              - map
+ *
+ * Parameters:
+ *   - isClass: true when the syntax is `x:.` or `x:[`
+ *   - isField: true when the next token is an identifier, false for `:[`
+ *
+ * The module enforces:
+ *   - mutability and l-value rules
+ *   - explicit alias requirements
+ *   - struct vs. class pointer aliasing rules
+ *   - map name aliasing but NOT map index aliasing
+ *   - rejection of lazy or expanded values in basic aliasing
+ */
+pub mod AliasValidation {
+
+    /**
+     * Entry point for alias expression validation.
+     *
+     * Meaning of flags:
+     *   - isClass: true when using the `x:.` or `x:[]` operator
+     *   - isField: true when the token after `x:.` is an identifier
+     *              false when the token is the index operator `:[`
+     *
+     * Lazy values are forbidden in class/map aliasing mode.
+     *
+     * Delegates to the type-specific aliasing logic.
+     */
+    pub fn validate(dmut context: &ValidationContext, mem: &AliasExpr, isClass: bool, isField: bool)-> &Value
+        throws ErrorMsg
+    {
+        let value = ValueValidation::validate(alias context, mem.content, canBeLazy-> !isClass);
+        return AliasValidation::validate(alias context, mem.loc, value, isClass-> isClass, isField-> isField);
+    }
+
+    /**
+     * Validate aliasing semantics for a fully validated value.
+     *
+     * Behavior:
+     *
+     *   - Basic aliasing(`alias x`):
+     *       → validateBasic
+     *
+     *   - Class/map aliasing(`x:.something`):
+     *
+     *       Name-based aliasing(`isField = true`):
+     *         Allowed on:
+     *           - class
+     *           - record
+     *           - entity
+     *           - map
+     *         Produces:
+     *           - ClassAliaserValue or MapAliaserValue
+     *
+     *       Index aliasing(`isField = false`):
+     *         Allowed on:
+     *           - class
+     *           - record
+     *           - entity
+     *         NOT allowed on:
+     *           - map
+     *         Produces:
+     *           - ClassAliaserValue
+     *
+     * Errors:
+     *   - using `x:.name` on a non-class/non-record/non-entity/non-map
+     *   - aliasing immutable or non-lvalue types
+     */
+    pub fn validate(dmut context: &ValidationContext, loc: &Word, value: &Value, isClass: bool, isField: bool)-> &Value
+        throws ErrorMsg
+    {
+        if !isClass {
+            return AliasValidation::validateBasic(alias context, loc, value);
+        }
+
+        if let cl: &ClassPtrType = value.type {
+            if (cl.isStruct) {
+                MemoryVerification::verifyLeftOperandMove(loc, value, allowSelf-> true);
+            } else {
+                if (!cl.isDeeplyMutable) {
+                    throw copy ErrorMsg::fatal(loc,
+                                                end-> value.loc,
+                                                format(ValidateErrorMessage::NOT_A_LVALUE_TYPE, value.type));
+                }
+            }
+
+            return copy ClassAliaserValue(loc, cl, value);
+        }
+
+        if let m: &MapType = value.type {
+            if (!isField) {
+                throw copy ErrorMsg::fatal(value.loc, format(ValidateErrorMessage::CLASS_ALIAS_INDEX_NO_CLASS, m));
+            }
+
+            if (!m.isMutable) {
+                throw copy ErrorMsg::fatal(loc,
+                                            end-> value.loc,
+                                            format(ValidateErrorMessage::NOT_A_LVALUE_TYPE, m));
+            }
+
+            return copy MapAliaserValue(loc, m, value);
+        }
+
+        if (isField) {
+            throw copy ErrorMsg::fatal(value.loc, format(ValidateErrorMessage::CLASS_ALIAS_FIELD_NO_CLASS, value));
+        }
+
+        throw copy ErrorMsg::fatal(value.loc, format(ValidateErrorMessage::CLASS_ALIAS_INDEX_NO_CLASS, value));
+    }
+
+    /**
+     * Validate basic aliasing(`alias x`).
+     *
+     * Basic aliasing is used to obtain an l-value reference to a value that
+     * explicitly supports alias semantics. This form does not use the `x:.`
+     * operator and therefore does not involve class/map aliasing rules.
+     *
+     * @params:
+     *   - context: validation context
+     *   - loc:     location of the `alias` operator
+     *   - value:   the value being aliased
+     *
+     * @returns:
+     *   - an AliaserValue referencing the underlying mutable storage
+     *
+     * @throws:
+     *   - ErrorMsg if the value cannot be aliased due to:
+     *       - being expanded
+     *       - being lazy
+     *       - being immutable
+     *       - not requiring explicit aliasing
+     */
+    fn validateBasic(dmut context: &ValidationContext, loc: &Word, value: &Value)-> &Value
+        throws ErrorMsg
+    {
+        if (value of ExpandValue) {
+            throw copy ErrorMsg::fatal(loc,
+                                        end-> value.loc,
+                                        format(ValidateErrorMessage::MISMATCH_ALIAS_EXPAND, value.type));
+        }
+
+        if (value of LazyValue) {
+            throw copy ErrorMsg::fatal(loc,
+                                        end-> value.loc,
+                                        format(ValidateErrorMessage::MISMATCH_ALIAS_LAZY, value.type));
+        }
+
+        let resValue = context.cteInterpret:.reduce(value);
+        if (!resValue.type.isMutable) {
+            throw copy ErrorMsg::fatal(loc,
+                                        end-> resValue.loc,
+                                        format(ValidateErrorMessage::NOT_A_LVALUE_TYPE, resValue.type));
+
+        }
+
+        if (!resValue.type.needsExplicitAlias) {
+            throw copy ErrorMsg::fatal(loc,
+                                        end-> resValue.loc,
+                                        format(ValidateErrorMessage::UNECESSARY_ALIAS, resValue.type));
+        }
+
+        return copy AliaserValue(loc, resValue.type, resValue);
+    }
+
+}

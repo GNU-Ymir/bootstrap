@@ -1,154 +1,292 @@
+/*
+ * message — structured compiler diagnostics and hierarchical error reporting.
+ *
+ * This module defines the ErrorMsg class, the central diagnostic container used
+ * throughout the compiler. ErrorMsg instances represent:
+ *
+ *   - fatal errors,
+ *   - warnings,
+ *   - notes,
+ *   - lists of errors,
+ *   - multi-location spans,
+ *   - nested diagnostic trees,
+ *   - one-line and multi-line messages,
+ *   - inline caret messages extracted from one-line notes.
+ *
+ * The formatter supports:
+ *
+ *   - multi-span location printing,
+ *   - inline caret messages,
+ *   - nested notes with depth suppression,
+ *   - verbose and non-verbose modes,
+ *   - stable error IDs,
+ *   - stack-trace capture for debugging.
+ *
+ * ErrorMsg is the only type thrown by the compiler frontend and middle-end.
+ * All diagnostics are normalized into this structure before printing.
+ *
+ * <hr>
+ *
+ * @Package: ymirc
+ * @Module: ymirc::errors::message
+ * @File: ymirc/errors/message.yr
+ * @Author(s):
+ *   - Emile Cadorel <ecadorel@gmail.com>
+ *
+ * @Created(YYYY-MM-DD): 2021-11-20
+ * @Copyright(C) 2021–2026 GNU-Ymir
+ * @License
+ *   ```text
+ *   This file is part of the Ymir language project.
+ *
+ *   Ymir is free software: you can redistribute it and/or modify it
+ *   under the terms of the GNU General Public License as published by
+ *   the Free Software Foundation, either version 3 of the License, or
+ *   (at your option) any later version.
+ *
+ *   Ymir is distributed in the hope that it will be useful,
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *   GNU General Public License for more details.
+ *
+ *   You should have received a copy of the GNU General Public License
+ *   along with Ymir.  If not, see <https://www.gnu.org/licenses/>.
+ *   ```
+ */
+
 in message;
 
 use std::{io, stream, fs::path, conv, env};
 use ymirc::lexing::word;
-use ymirc::errors::format;
+use ymirc::errors::{format, utils};
 use ymirc::global::state;
 use ymirc::utils::_;
 
-extern (C) fn _yrt_exc_resolve_stack_trace (trc : [*void])-> [c8];
 
-pub lazy dmut __GLOB_ERR_ID__ : [usize] = copy [0us];
+extern (C) fn _yrt_exc_resolve_stack_trace(trc: [*void])-> [c8];
 
-fn generateUniqErrorId ()-> usize {
-    __GLOB_ERR_ID__ [0] += 1us;
-    __GLOB_ERR_ID__ [0]
+pub lazy dmut __GLOB_ERR_ID__: [usize] = copy [0us];
+pub lazy EMPTY_ERROR = copy ErrorMsg::list([]);
+
+fn generateUniqErrorId()-> usize {
+    __GLOB_ERR_ID__[0] += 1us;
+    __GLOB_ERR_ID__[0]
 }
 
 /**
- * This class store a list of error message
- * This list is used to display readable message for the user
- * @example: 
- * ================
- * let loc = copy Word ("(", filename, "(test )!\\n", 1u64, 1u64, 0u64, 0u64);
- * let loc3 = copy Word (")!", filename, "(test )!\\n", 400000u64, 7u64, 0u64, 0u64);
- * let sub_note = copy ErrorMsg::note (loc, "Message3", oneLine-> false);
- * let note = copy ErrorMsg::warn (loc, end-> loc3, "Message", oneLine-> false, notes-> copy [sub_note]);
+ * ErrorMsg — hierarchical diagnostic node.
  *
- * throw copy ErrorMsg::fatal (loc, end-> loc3, "Message2", notes-> copy [note, sub_note]);
- * ================
+ * Represents a compiler diagnostic with:
+ *
+ *   - a primary message,
+ *   - an optional location span(begin/end),
+ *   - a list of sub-notes,
+ *   - severity flags(fatal, warning, note),
+ *   - one-line formatting mode,
+ *   - stable unique ID,
+ *   - captured stack trace,
+ *   - inverse depth for verbose suppression.
+ *
+ * ErrorMsg instances form a tree. The root error is printed first, then its
+ * notes, recursively. One-line notes may be extracted and displayed inline as
+ * caret messages.
+ *
+ * ErrorMsg is the only exception type thrown by the compiler.
  */
 @final
 pub class ErrorMsg over Exception {
 
     // The stack trace of the error
-    let mut _movingTrace : [*void] = [];
-    
+    let mut _movingTrace: [*void] = [];
+
     // The sub note of the error
-    let _notes : [&ErrorMsg];
+    let _notes: [&ErrorMsg];
 
     // The location of the error
-    let _begin : &Word = EOF_WORD;
+    let _begin: &Word = EOF_WORD;
 
     // The end location of the error
-    let _end : &Word = EOF_WORD;
+    let _end: &Word = EOF_WORD;
 
     // The message
-    let _msg : [c8] = "";
+    let _msg: [c8] = "";
 
     // If true, only prints an error on one line
-    let _oneLine : bool = false;
+    let _oneLine: bool = false;
 
     // If true prints the location of the error in the one line format
-    let _oneLineWithLoc : bool = false;
+    let _oneLineWithLoc: bool = false;
 
     // True iif its a note
-    let _isNote : bool = false;
+    let _isNote: bool = false;
 
     // True iif its a warning
-    let _isWarning : bool = false;
+    let _isWarning: bool = false;
 
     // True iif this is just a list of errors
-    let _isList : bool = false;
+    let _isList: bool = false;
 
     // The id of the error
-    let _id : usize;
+    let _id: usize;
 
     // True if print notes even if not verbose
-    let _forceVerbose : bool = false;
+    let _forceVerbose: bool = false;
 
     // The inverse depth of the error
-    let mut _inverseDepth : u32 = 0;
+    let mut _inverseDepth: u32 = 0;
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * =====================================          CTORS          ======================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
 
     /**
-     * A fatal error, is an error that print the message "Error : " ~ msg
+     * Construct a fatal error.
+     *
+     * Fatal errors print with the "Error:" prefix. They may include:
+     *   - a location span(loc..end),
+     *   - nested notes,
+     *   - one-line or multi-line formatting,
+     *   - forced verbose mode.
+     *
+     * @params:
+     *   - loc:         begin location,
+     *   - end:         end location(optional),
+     *   - notes:       list of sub-errors,
+     *   - oneLine:     if true, suppress source excerpt,
+     *   - msg:         error message,
+     *   - forceVerbose: force printing of all notes.
      */
-    pub self fatal (loc : &Word, end : &Word = EOF_WORD, notes : [&ErrorMsg] = [], oneLine : bool = false, msg : [c8], forceVerbose : bool = false)
+    pub self fatal(loc: &Word,
+                   end: &Word = EOF_WORD,
+                   notes: [&ErrorMsg] = [],
+                   oneLine: bool = false,
+                   msg: [c8],
+                   forceVerbose: bool = false)
+
         with _msg = msg
-        , _notes = flattening (notes, false)
-        , _begin = { if (loc.isBefore (end)) loc else end }
-        , _end = { if (loc.isBefore (end)) end else loc }
+        , _notes = flatten(notes, false)
+        , _begin = if (loc.isBefore(end)) loc else end
+        , _end = if (loc.isBefore(end)) end else loc
         , _oneLine = oneLine
-        , _id = generateUniqErrorId ()
+        , _id = generateUniqErrorId()
         , _forceVerbose = forceVerbose
     {
         self._movingTrace = self.super.trace;
-        self:.computeInverseDepth ();
+        self:.computeInverseDepth();
     }
 
     /**
-     * A note error, is an error that print the message "Note : " ~ msg
+     * Construct a note.
+     *
+     * Notes print with the "Note:" prefix. They may be:
+     *   - one-line(no source excerpt),
+     *   - multi-line(with source excerpt),
+     *   - optionally printed without location.
+     *
+     * @params:
+     *   - loc:      begin location,
+     *   - end:      end location,
+     *   - notes:    nested notes,
+     *   - oneLine:  one-line formatting,
+     *   - withLoc:  include location in one-line mode,
+     *   - msg:      note message.
      */
-    pub self note (loc : &Word, end : &Word = EOF_WORD, notes : [&ErrorMsg] = [], oneLine : bool = false, withLoc : bool = false, msg : [c8])
+    pub self note(loc: &Word,
+                  end: &Word = EOF_WORD,
+                  notes: [&ErrorMsg] = [],
+                  oneLine: bool = false,
+                  withLoc: bool = false,
+                  msg: [c8])
         with _msg = msg
-        , _begin = { if (loc.isBefore (end)) loc else end }
-        , _end = { if (loc.isBefore (end)) end else loc }
-        , _notes = flattening (notes, false)
+        , _begin = if (loc.isBefore(end)) loc else end
+        , _end = if (loc.isBefore(end)) end else loc
+        , _notes = flatten(notes, false)
         , _oneLine = oneLine
         , _oneLineWithLoc = withLoc
         , _isNote = true
-        , _id = generateUniqErrorId ()
+        , _id = generateUniqErrorId()
     {
         self._movingTrace = self.super.trace;
-        self:.computeInverseDepth ();
+        self:.computeInverseDepth();
     }
 
     /**
-     * A warn error, is an error that print the message "Warning : " ~ msg
+     * Construct a warning.
+     *
+     * Warnings print with the "Warning:" prefix. They behave like fatal errors
+     * except for severity.
+     *
+     * @params:
+     *   - loc:      begin location,
+     *   - end:      end location,
+     *   - notes:    nested notes,
+     *   - oneLine:  one-line formatting,
+     *   - msg:      warning message.
      */
-    pub self warn (loc : &Word, end : &Word = EOF_WORD, notes : [&ErrorMsg] = [], oneLine : bool = false, msg : [c8])
+    pub self warn(loc: &Word,
+                  end: &Word = EOF_WORD,
+                  notes: [&ErrorMsg] = [],
+                  oneLine: bool = false,
+                  msg: [c8])
         with _msg = msg
-        , _begin = { if (loc.isBefore (end)) loc else end }
-        , _end = { if (loc.isBefore (end)) end else loc }
-        , _notes = flattening (notes, false)
+        , _begin = if (loc.isBefore(end)) loc else end
+        , _end = if (loc.isBefore(end)) end else loc
+        , _notes = flatten(notes, false)
         , _oneLine = oneLine
         , _isWarning = true
-        , _id = generateUniqErrorId ()
+        , _id = generateUniqErrorId()
     {
         self._movingTrace = self.super.trace;
-        self:.computeInverseDepth ();
+        self:.computeInverseDepth();
+    }
+
+    /**
+     * Construct a list of errors.
+     *
+     * A list error contains only notes and no primary message. Used to group
+     * multiple diagnostics under a single node.
+     *
+     * @params:
+     *   - lst: list of ErrorMsg nodes.
+     */
+    pub self list(lst: [&ErrorMsg])
+        with _notes = flatten(lst, sort-> true)
+        , _isList = true
+        , _id = generateUniqErrorId()
+    {
+        self._movingTrace = self.super.trace;
+        self:.computeInverseDepth();
     }
 
     /**
      * Internal constructor to specifiy all fields
      */
-    prv self all (loc : &Word, end : &Word, notes : [&ErrorMsg], oneLine : bool, msg : [c8], isNote : bool, isWarning : bool, isList : bool)
+    prv self all(loc: &Word,
+                 end: &Word,
+                 notes: [&ErrorMsg],
+                 oneLine: bool,
+                 msg: [c8],
+                 isNote: bool,
+                 isWarning: bool,
+                 isList: bool)
+
         with _msg = msg
-        , _begin = { if (loc.isBefore (end)) loc else end }
-        , _end = { if (loc.isBefore (end)) end else loc }
-        , _notes = flattening (notes, isList)
+        , _begin = if (loc.isBefore(end)) loc else end
+        , _end = if (loc.isBefore(end)) end else loc
+        , _notes = flatten(notes, sort-> isList)
         , _oneLine = oneLine
         , _isNote = isNote
         , _isWarning = isWarning
         , _isList = isList
-        , _id = generateUniqErrorId ()
+        , _id = generateUniqErrorId()
     {
         self._movingTrace = self.super.trace;
-        self:.computeInverseDepth ();
+        self:.computeInverseDepth();
     }
-
-    /**
-     * An error without message, that is just a list of sub errors
-     */
-    pub self list (lst : [&ErrorMsg])
-        with _notes = flattening (lst, true)
-        , _isList = true
-        , _id = generateUniqErrorId ()
-    {
-        self._movingTrace = self.super.trace;
-        self:.computeInverseDepth ();
-    }
-
 
     /*!
      * ================================================================================
@@ -159,96 +297,107 @@ pub class ErrorMsg over Exception {
      */
 
     /**
-     * @returns: the list of sub errors 
+     * @returns: the list of sub errors
      */
-    pub fn getNotes (self) -> [&ErrorMsg] {
+    @field
+    pub fn notes(self)-> [&ErrorMsg] {
         self._notes
     }
 
     /**
      * @returns: the message of the error
      */
-    pub fn getMessage (self)-> [c8] {
-        self._msg 
+    @field
+    pub fn msg(self)-> [c8] {
+        self._msg
     }
 
     /**
      * @returns: the id of the error
      * */
-    pub fn getId (self)-> usize {
+    @field
+    pub fn id(self)-> usize {
         self._id
     }
 
     /**
      * @returns: the begin location of the error
      */
-    pub fn getLocation (self) -> &Word {
+    @field
+    pub fn loc(self)-> &Word {
         self._begin
     }
 
     /**
      * @returns: the end location of the error
      */
-    pub fn getEndLocation (self)-> &Word {
+    @field
+    pub fn endLoc(self)-> &Word {
         self._end
     }
 
     /**
      * @returns: true iif this is just a list of errors
      */
-    pub fn isList (self)-> bool {
+    @field
+    pub fn isList(self)-> bool {
         self._isList
     }
 
     /**
      * @returns: true iif the error message does not display source code location
      * */
-    pub fn isOneLine (self)-> bool {
+    @field
+    pub fn isOneLine(self)-> bool {
         self._oneLine
     }
 
     /**
      * @returns: true iif the error message is empty
      * */
-    pub fn isEmpty (self)-> bool {
+    @field
+    pub fn isEmpty(self)-> bool {
         self._oneLine && !self._oneLineWithLoc && self._msg == ""
     }
 
     /**
      * @returns: true iif the error message is a note
      * */
-    pub fn isNote (self)-> bool {
+    @field
+    pub fn isNote(self)-> bool {
         self._isNote
     }
 
     /**
      * @returns: true iif the error message is a fatal error
      * */
-    pub fn isFatal (self)-> bool {
+    @field
+    pub fn isFatal(self)-> bool {
         !self._isNote && !self._isWarning && !self._isList
     }
 
     /**
      * @returns: true iif the error message is a warning
      * */
-    pub fn isWarning (self)-> bool {
+    @field
+    pub fn isWarning(self)-> bool {
         self._isWarning
     }
 
     /**
      * @returns: all the stack traces of the errors
      */
-    pub fn getRecursiveTrace (self)-> [[c8]] {
-        let mut traces : mut [[c8]] = [];
+    pub fn getRecursiveTrace(self)-> [[c8]] {
+        let mut traces: mut[[c8]] = [];
         for i in self._notes {
-            traces ~= i.getRecursiveTrace ();
+            traces ~= i.getRecursiveTrace();
             break;
         }
 
         if (traces.len == 0us) {
-            traces ~= [_yrt_exc_resolve_stack_trace (self._movingTrace)];
+            traces ~= [_yrt_exc_resolve_stack_trace(self._movingTrace)];
         }
-        
+
         traces
     }
 
@@ -261,15 +410,20 @@ pub class ErrorMsg over Exception {
      */
 
     /**
-     * @returns: a copy of the error but as a fatal error instead of warning, note or list
-     * */
-    pub fn asFatal (self)-> &ErrorMsg {
-        copy ErrorMsg::fatal (self._begin,
-                              end-> self._end,
-                              notes-> self._notes,
-                              oneLine-> self._oneLine,
-                              msg-> self._msg,
-                              forceVerbose-> self._forceVerbose)
+     * Convert this diagnostic into a fatal error, preserving:
+     *   - locations,
+     *   - notes,
+     *   - one-line mode,
+     *   - message,
+     *   - verbose flag.
+     */
+    pub fn asFatal(self)-> &ErrorMsg {
+        copy ErrorMsg::fatal(self._begin,
+                             end-> self._end,
+                             notes-> self._notes,
+                             oneLine-> self._oneLine,
+                             msg-> self._msg,
+                             forceVerbose-> self._forceVerbose)
     }
 
     /*!
@@ -279,79 +433,54 @@ pub class ErrorMsg over Exception {
      * ================================================================================
      * ================================================================================
      */
-    
+
     /**
-     * @returns: a new error message with more notes
+     * Return a new error with additional notes appended.
+     *
+     * If alone = true, replace existing notes with the given ones.
      */
-    pub fn withNote (self, notes : [&ErrorMsg], alone : bool = false)-> &ErrorMsg {
+    pub fn withNote(self, notes: [&ErrorMsg], alone: bool = false)-> &ErrorMsg {
         if !alone {
-            let dmut ret = copy ErrorMsg::all (self._begin, self._end, self._notes ~ notes, self._oneLine, self._msg, self._isNote, self._isWarning, self._isList);
+            let dmut ret = copy ErrorMsg::all(self._begin, self._end, self._notes ~ notes, self._oneLine, self._msg, self._isNote, self._isWarning, self._isList);
             ret._movingTrace = self._movingTrace;
-            ret
-        } else {
-            let dmut ret = copy ErrorMsg::all (self._begin, self._end, notes, self._oneLine, self._msg, self._isNote, self._isWarning, self._isList);
-            ret._movingTrace = self._movingTrace;
-            ret
+            return ret;
         }
-    }
 
-    /**
-     * Add a sub note, that will contain the note of self
-     * @example: 
-     * =========
-     * let loc = ...
-     * let errB = copy ErrorMsg::fatal (loc, "B");
-     * let errX = copy ErrorMsg::fatal (loc, "C");
-     * let errA = copy ErrorMsg::fatal (loc, "A", notes-> copy [errB]);
-     * // We have an error A-> [B, C]
-     * // We add an intermidiate error D, as a note of A, containing the notes [B, C]
-     * let errD = errA.subbingNote (ErrorMsg::fatal (loc, "D"));
-     *
-     * // Errors are now D = A-> [D-> [B, C]]
-     * assert (errD.getMessage () == "A");
-     * assert (errD.getNotes ()[0].getMessage () == "D");
-     * assert (errD.getNotes ()[0].getNotes ()[0].getMessage () == "B");
-     * assert (errD.getNotes ()[0].getNotes ()[1].getMessage () == "C");
-     * =========
-     */
-    pub fn subbingNote (self, note : &ErrorMsg)-> &ErrorMsg {
-        let dmut ret = copy ErrorMsg::all (self._begin, self._end, copy [note.withNote (self._notes, alone-> true)], self._oneLine, self._msg, self._isNote, self._isWarning, self._isList);
+        let dmut ret = copy ErrorMsg::all(self._begin, self._end, notes, self._oneLine, self._msg, self._isNote, self._isWarning, self._isList);
         ret._movingTrace = self._movingTrace;
-        ret
+        return ret;
     }
 
     /**
-     * Append a note at the end of the list of notes (always at first index)
-     * @example: 
-     * ============
-     * let loc = ...
-     * let errB = copy ErrorMsg::fatal (loc, "B");
-     * let errX = copy ErrorMsg::fatal (loc, "C");
-     * let errA = copy ErrorMsg::fatal (loc, "A", notes-> copy [errB]);
-     * // We have an error A-> [B, C]
-     * // We add an intermidiate error D, as a note of A, containing the notes [B, C]
-     * let errD = errA.appendNotes (copy [copy ErrorMsg::fatal (loc, "D")]);
+     * Insert an intermediate note above existing notes.
      *
-     * // Errors are now D = A-> [B-> [D], C]
-     * assert (errD.getMessage () == "A");
-     * assert (errD.getNotes ()[0].getMessage () == "B");
-     * assert (errD.getNotes ()[1].getMessage () == "C");
-     * assert (errD.getNotes ()[0].getNotes ()[0].getMessage () == "D");
-     * =========
+     * Example:
+     *   A-> [B, C]
+     *   A.subbingNote(D) => A-> [D-> [B, C]]
      */
-    pub fn appendNotes (self, notes : [&ErrorMsg])-> &ErrorMsg {
-        if (self._notes.len == 0u64) {
-            let dmut ret = copy ErrorMsg::all (self._begin, self._end, notes, self._oneLine, self._msg, self._isNote, self._isWarning, self._isList);
-            ret._movingTrace = self._movingTrace;
-            ret
-        } else {            
-            let aux = self._notes [0].appendNotes (notes);
-            let dmut ret =  copy ErrorMsg::all (self._begin, self._end, copy [aux] ~ self._notes [1us .. $], self._oneLine, self._msg, self._isNote, self._isWarning, self._isList);
-            ret._movingTrace = self._movingTrace;
-            ret            
-        }           
+    pub fn subbingNote(self, note: &ErrorMsg)-> &ErrorMsg {
+        let dmut ret = copy ErrorMsg::all(self._begin, self._end, copy [note.withNote(self._notes, alone-> true)], self._oneLine, self._msg, self._isNote, self._isWarning, self._isList);
+        ret._movingTrace = self._movingTrace;
+        return ret;
     }
 
+    /**
+     * Append notes to the first note in the list, recursively.
+     *
+     * Used to maintain stable left-biased note trees.
+     */
+    pub fn appendNotes(self, notes: [&ErrorMsg])-> &ErrorMsg {
+        if (self._notes.len == 0u64) {
+            let dmut ret = copy ErrorMsg::all(self._begin, self._end, notes, self._oneLine, self._msg, self._isNote, self._isWarning, self._isList);
+            ret._movingTrace = self._movingTrace;
+            return ret;
+        }
+
+        let aux = self._notes[0].appendNotes(notes);
+        let dmut ret =  copy ErrorMsg::all(self._begin, self._end, copy [aux] ~ self._notes[1us .. $], self._oneLine, self._msg, self._isNote, self._isWarning, self._isList);
+        ret._movingTrace = self._movingTrace;
+        return ret;
+    }
 
     /*!
      * ====================================================================================================
@@ -361,7 +490,12 @@ pub class ErrorMsg over Exception {
      * ====================================================================================================
      */
 
-    fn computeInverseDepth (mut self) {
+    /**
+     * Compute the inverse depth of the diagnostic tree.
+     *
+     * Used to suppress deep notes in non-verbose mode.
+     */
+    fn computeInverseDepth(mut self) {
         self._inverseDepth = 0;
 
         let add = if self._isList { 0u32 } else { 1u32 };
@@ -372,31 +506,63 @@ pub class ErrorMsg over Exception {
         }
     }
 
+    /**
+     * Extract the first one-line note as an inline caret message.
+     *
+     * If the first note is one-line:
+     *   - return (note.msg, note.subNotes ~ remainingNotes)
+     *   - otherwise return ("", notes)
+     *
+     * Ensures no diagnostic information is lost.
+     */
+    fn getNoteListForFormat(self)-> ([c8], [&ErrorMsg]) {
+        if (self._oneLine || self._notes.len == 0) return ("", self._notes);
+        if (self._notes[0]._oneLine) {
+            return (self._notes[0]._msg, self._notes[0]._notes ~ self._notes[1 .. $]);
+        }
+
+        return ("", self._notes);
+    }
+
     /*!
-     * ================================================================================
-     * ================================================================================
-     * =========================        MISCELLANEOUS         =========================
-     * ================================================================================
-     * ================================================================================
+     * ====================================================================================================
+     * ====================================================================================================
+     * ======================================          MISC          ======================================
+     * ====================================================================================================
+     * ====================================================================================================
      */
 
-    fn formatNotes (self, dmut stream : &Formatter, depth : u32, root : bool = false)-> (bool, u64) {
+    /**
+     * Format a list of notes into the formatter.
+     *
+     * Handles:
+     *   - verbose suppression,
+     *   - multi-line vs one-line notes,
+     *   - indentation by depth,
+     *   - stable ordering,
+     *   - multi-span location printing.
+     *
+     * @returns:
+     *   - .0: true if multi-line notes were printed,
+     *   - .1: maximum line number among printed notes.
+     */
+    fn formatNotes(self, dmut stream: &Formatter, notes: [&ErrorMsg], depth: u32, root: bool = false)-> (bool, u64) {
         let mut notOneLine = true;
         let mut max_padd = 0u64;
         let innerRoot = if (self._isList) { root } else { false };
 
         let mut j = 0us;
-        let verbose = if (self._notes.len > 4us) { root || global::state::instance ().isVerboseActive () || stream.tags.verbose || self._forceVerbose } else { true };
-        for  i in self._notes {
+        let verbose = if (notes.len > 4us) { root || global::state::isVerboseActive() || stream.tags.verbose || self._forceVerbose } else { true };
+        for  i in notes {
             if (!verbose && j == 3us) {
-                stream:.write ('\n'c8);
-                stream:.writef ("%(b) : other errors in list, user -v or --verbose to show them", "Note");
-                stream:.write ('\n'c8, ' 'c8);
+                stream:.write('\n'c8);
+                stream:.writef("%(b) : other errors in list, user -v or --verbose to show them", "Note");
+                stream:.write('\n'c8, ' 'c8);
                 break {}
             }
 
-            let dmut innerStream = copy Formatter::from (alias stream);
-            i.format (alias innerStream, root-> innerRoot, depth-> depth + 1);
+            let dmut innerStream = copy Formatter::from(alias stream);
+            i.format(alias innerStream, root-> innerRoot, depth-> depth + 1);
             notOneLine = !i._oneLine || i._notes.len != 0u64;
 
             max_padd = i._begin.line;
@@ -404,169 +570,147 @@ pub class ErrorMsg over Exception {
                 max_padd = i._end.line;
             }
 
-            if (innerStream.hasWrittenSomeErrors () && innerStream [].len != 0) {
-                if (j != 0us) stream:.write ('\n'c8);
-                stream:.write (innerStream[]);
-                stream:.wroteErrors (true);
+            if (innerStream.hasWrittenSomeErrors() && innerStream[].len != 0) {
+                if (j != 0us) stream:.write('\n'c8);
+                stream:.write(innerStream[]);
+                stream:.wroteErrors(true);
             }
 
             if (innerStream[].len != 0us) j += 1us;
         }
 
-        (notOneLine, max_padd)
+        return (notOneLine, max_padd);
     }
 
-
-    fn formatText (self, dmut stream : &Formatter, root : bool) {
-        root;
-
+    /**
+     * Format the primary diagnostic line.
+     *
+     * Prints:
+     *   - severity prefix,
+     *   - message,
+     *   - location excerpt,
+     *   - inline caret message(if extracted from a one-line note).
+     */
+    fn formatText(self, dmut stream: &Formatter, caretMessage: [c8]) {
         if (stream.tags.withErrorIds) {
-            if (self._isNote) stream:.writef ("%(b) (#%(B))", "Note", self._id.to!{[c8], 36us} ());
-            else if (self._isWarning) stream:.writef ("%(y) (#%(B))", "Warning", self._id.to!{[c8], 36us} ());
-            else if (self._msg != "") stream:.writef ("%(r) (#%(B))", "Error", self._id.to!{[c8], 36us} ());
+            if (self._isNote) stream:.writef("%(b) (#%(B))", "Note", self._id.to!{[c8], 36us} ());
+            else if (self._isWarning) stream:.writef("%(y) (#%(B))", "Warning", self._id.to!{[c8], 36us} ());
+            else if (self._msg != "") stream:.writef("%(r) (#%(B))", "Error", self._id.to!{[c8], 36us} ());
         } else {
-            if (self._isNote) stream:.writef ("%(b)", "Note");
-            else if (self._isWarning) stream:.writef ("%(y)", "Warning");
-            else if (self._msg != "") stream:.writef ("%(r)", "Error");
+            if (self._isNote) stream:.writef("%(b)", "Note");
+            else if (self._isWarning) stream:.writef("%(y)", "Warning");
+            else if (self._msg != "") stream:.writef("%(r)", "Error");
         }
 
         if (!self._oneLine) {
-            stream:.writef (" : %", self._msg);
-            if (self._end.isEof ()) {
-                formatLocation (alias stream, self._begin);
+            stream:.writef(" : %", self._msg);
+            if (self._end.isEof) {
+                formatLocation(alias stream, self._begin, message-> caretMessage);
             } else {
-                formatLocation (alias stream, self._begin, self._end);
+                formatLocation(alias stream, self._begin, self._end, message-> caretMessage);
             }
         } else {
-            stream:.writef (" : %", self._msg);
+            stream:.writef(" : %", self._msg);
             if (self._oneLineWithLoc) {
-                formatLocationNoLineReturn (alias stream, self._begin);
+                formatLocationNoLineReturn(alias stream, self._begin);
             }
         }
     }
 
-    impl Streamable;    
+    impl Streamable;
     impl ErrorFormattable {
 
         /**
-         * Pretty print of the error, that can directly written into stderr for averting the user of an error
+         * Pretty-print the entire diagnostic tree.
+         *
+         * Responsibilities:
+         *   - deduplicate repeated errors via ID tracking,
+         *   - handle verbose suppression,
+         *   - extract inline caret messages,
+         *   - print primary diagnostic,
+         *   - print notes recursively,
+         *   - draw closing tree connectors.
+         *
+         * This is the main entry point for diagnostic rendering.
          */
-        pub over format (self, dmut stream : &Formatter, root : bool, depth : u32 = 0) {
-            if (stream.hasWrittenError (self._id)) {
+        pub over format(self, dmut stream: &Formatter, root: bool, depth: u32 = 0) {
+            if (stream.hasWrittenError(self._id)) {
                 if (!root) {
                     if (stream.tags.withErrorIds) {
-                        stream:.writef ("%(b) : previous error (#%(B))", "Note", self._id.to!{[c8], 36us} ());
+                        stream:.writef("%(b) : previous error(#%(B))", "Note", self._id.to!{[c8], 36us} ());
                     } else {
-                        stream:.writef ("%(b) : previous error", "Note");
+                        stream:.writef("%(b) : previous error", "Note");
                     }
                 }
                 return {}
             }
 
-            let verbose = (global::state::instance ().isVerboseActive () || stream.tags.verbose || self._forceVerbose);
+            let verbose = (global::state::isVerboseActive() || stream.tags.verbose || self._forceVerbose);
 
             if (self._isList) {
-                self.formatNotes (alias stream, root-> root, depth-> depth);
+                self.formatNotes(alias stream, self._notes, root-> root, depth-> depth);
                 return {}
             }
 
             else if (!verbose && (self._inverseDepth >= 4 && depth > 3) && !root) {
-                let dmut innerStream = copy Formatter::from (alias stream);
-                self.formatNotes (alias innerStream, root-> false, depth);
+                let dmut innerStream = copy Formatter::from(alias stream);
+                self.formatNotes(alias innerStream, self._notes, root-> false, depth);
 
-                if innerStream.hasWrittenSomeErrors () {
+                if innerStream.hasWrittenSomeErrors() {
                     if self._inverseDepth == 4 {
-                        stream:.writef ("%(b) : deep errors, user -v or --verbose to show them", "Note");
-                        stream:.write ('\n'c8, ' 'c8);
+                        stream:.writef("%(b) : deep errors, user -v or --verbose to show them", "Note");
+                        stream:.write('\n'c8, ' 'c8);
                     }
 
-                    stream:.write (innerStream[]);
-                    stream:.wroteErrors (true);
+                    stream:.write(innerStream[]);
+                    stream:.wroteErrors(true);
                 }
 
                 return {}
             }
 
-            stream:.registerError (self._id);
-            stream:.wroteErrors (true);
+            stream:.registerError(self._id);
+            stream:.wroteErrors(true);
 
-            self.formatText (alias stream, root);
 
-            let max_line = if (self._end.isEof ()) { self._begin.line } else { self._end.line };
-            let leftLine = center (format ("%", max_line), 3u64);
-            let padd = center ("", leftLine.len);
-            let l = format ("%% ┃ %", Colors::BOLD, padd, Colors::RESET);
+            let (caretMessage, remainingNotes) = self.getNoteListForFormat();
+            self.formatText(alias stream, caretMessage);
 
-            stream:.entabing (txt-> l);
-            let (notOneLine, max_padd) = if (self._notes.len != 0us) {
-                let dmut innerStream = copy Formatter::from (alias stream);
-                let res = self.formatNotes (alias innerStream, root-> false, depth);
+            let max_line = if (self._end.isEof) { self._begin.line } else { self._end.line };
+            let leftLine = center(format("%", max_line), 3u64);
+            let padd = center("", leftLine.len);
+            let l = format("%% ┃ %", Colors::BOLD, padd, Colors::RESET);
 
-                if (root || innerStream.hasWrittenSomeErrors ()) && innerStream [].len != 0 {
-                    stream:.write ("\n");
-                    stream:.write (innerStream[]);
+            stream:.entabing(txt-> l);
+            let (notOneLine, max_padd) = if (remainingNotes.len != 0us) {
+                let dmut innerStream = copy Formatter::from(alias stream);
+                let res = self.formatNotes(alias innerStream, remainingNotes, root-> false, depth);
+
+                if (root || innerStream.hasWrittenSomeErrors()) && innerStream[].len != 0 {
+                    stream:.write("\n");
+                    stream:.write(innerStream[]);
                 } else if root {
-                    stream:.writef ("\n%(b) : previous errors", "Note");
+                    stream:.writef("\n%(b) : previous errors", "Note");
                 }
 
                 res
             } else {
                 (false, 0u64)
             };
-            stream:.detabing ();
-            
-            if (self._notes.len != 0u64) {
-                let leftLine2 = center (format ("%", max_padd), 3u64);
-                let padd2 = center ("", leftLine2.len, "━");
-                
+            stream:.detabing();
+
+            if (remainingNotes.len != 0u64) {
+                let leftLine2 = center(format("%", max_padd), 3u64);
+                let padd2 = center("", leftLine2.len, "━");
+
                 if (notOneLine) {
-                    stream:.writef ("\n%% ┗━%━┻━ %", Colors::BOLD, padd, padd2, Colors::RESET);
+                    stream:.writef("\n%% ┗━%━┻━ %", Colors::BOLD, padd, padd2, Colors::RESET);
                 } else {
-                    stream:.writef ("\n%% ┗━%━━ %", Colors::BOLD, padd, padd2, Colors::RESET);
+                    stream:.writef("\n%% ┗━%━━ %", Colors::BOLD, padd, padd2, Colors::RESET);
                 }
-            } else if (!self._oneLine && (!self._begin.isEof () || !self._end.isEof ())) {
-                stream:.writef ("\n%% ┗━━━━━━━ %", Colors::BOLD, padd, padd, Colors::RESET);
+            } else if (!self._oneLine && (!self._begin.isEof || !self._end.isEof)) {
+                stream:.writef("\n%% ┗━━━━━━━ %", Colors::BOLD, padd, padd, Colors::RESET);
             }
         }
-        
     }
-
-
-    
-}
-
-fn flattening (notes : [&ErrorMsg], isList : bool)-> [&ErrorMsg] {
-    let mut res : [mut &ErrorMsg] = [];
-    let mut already : [usize => mut ()] = copy [];
-    for i in notes {
-        if (i.isList ()) {
-            let d = flattening (i.getNotes (), true);
-            for j in d {
-                if j.getId () !in already {
-                    res ~= [j];
-                    already [j.getId ()] = ();
-                }
-            }
-        } else {
-            if !i.isEmpty () {
-                if i.getId () !in already {
-                    res ~= [i];
-                    already [i.getId ()] = ();
-                }
-            }
-        }            
-    }
-
-    if isList {
-        return std::algorithm::sorting::sort (alias res, |x, y| => {
-            if (x.getLocation ().line < y.getLocation ().line) return true;
-            if (x.getLocation ().line == y.getLocation ().line) {
-                if x.getEndLocation ().isEof () { return false; }
-                if y.getEndLocation ().isEof () { return true; }
-                return x.getEndLocation ().line < y.getEndLocation ().line;
-            }
-
-            return false;
-        });
-    } else { return res; }
 }

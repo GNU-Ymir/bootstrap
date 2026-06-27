@@ -1,0 +1,440 @@
+/*
+ * Callexpander - expands all call-like expressions into YIL values and
+ * instructions.
+ *
+ * The CallExpander lowers high-level semantic call nodes into concrete YIL
+ * constructs. It ensures:
+ *
+ *   - calls are evaluated exactly once,
+ *   - side-effects are preserved,
+ *   - temporary variables are created when required,
+ *   - destructors are inserted for movable values,
+ *   - constructor, method, function-pointer and prototype calls are expanded
+ *     into their canonical YIL form.
+ *
+ * <hr>
+ *
+ * @Package: ymirc
+ * @Module: ymirc::lint::expander::value::call
+ * @File: ymirc/lint/expander/value/call.yr
+ * @Author(s):
+ *   - Emile Cadorel <ecadorel@gmail.com>
+ *
+ * @Created(YYYY-MM-DD): 2026-06-22
+ * @Copyright(C) 2021–2026 GNU-Ymir
+ * @License
+ *   ```text
+ *   This file is part of the Ymir language project.
+ *
+ *   Ymir is free software: you can redistribute it and/or modify it
+ *   under the terms of the GNU General Public License as published by
+ *   the Free Software Foundation, either version 3 of the License, or
+ *   (at your option) any later version.
+ *
+ *   Ymir is distributed in the hope that it will be useful,
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *   GNU General Public License for more details.
+ *
+ *   You should have received a copy of the GNU General Public License
+ *   along with Ymir.  If not, see <https://www.gnu.org/licenses/>.
+ *   ```
+ */
+
+in call;
+
+use ymirc::lint::expander;
+use ymirc::lint::node::_;
+
+use ymirc::semantic::{symbol, generator::_};
+use ymirc::semantic::generator::{type::_, value::_};
+
+use ymirc::global::{core_, state};
+use ymirc::lexing::{word, keys};
+
+use ymirc::lint::expander::value::_;
+use std::io;
+
+/**
+ * CallExpander
+ *
+ * Module responsible for expanding all call-related semantic nodes into
+ * YILValue and YILInstr nodes. It handles:
+ *
+ *   - prototype calls,
+ *   - constructor calls,
+ *   - function-pointer calls,
+ *   - method calls,
+ *   - vtable dispatch,
+ *   - creation of temporary variables,
+ *   - destructor scheduling for movable values.
+ *
+ * All functions in this module append instructions to a StmtList and return
+ * the resulting YILValue representing the call result.
+ */
+pub mod CallExpander {
+
+    /**
+     * Finalize a call expression.
+     *
+     * Registers the resulting value as a unique value and emits a YILCall
+     * instruction if the result is YILUnit. Schedules destructor calls for
+     * movable results.
+     *
+     * @params:
+     *   - context: the expansion context
+     *   - c:       the call expression to expand
+     *   - list:    the statement list to append instructions to
+     *
+     * @returns:
+     *   - &YILValue: the finalized call result
+     *
+     */
+    pub fn finalize(dmut context: &Expander,
+                    c: &CallOperatorValue,
+                    ref mut list: StmtList)-> &YILValue
+    {
+
+        // Call of function performs heavy computation with possible side effects
+        // Function call must appear only once in the finalized code
+        match context.getVariable(c.uniqId) {
+            Ok(u: &YILValue) => { // The call was already seen and validated
+                return u;
+            }
+        };
+
+        let call = match c {
+            ca: &PrototypeCallValue => { CallExpander::finalizeSimpleCall(alias context, ca, ref list) }
+            ctor: &CtorCallValue => { CallExpander::finalizeCtorCall(alias context, ctor, ref list) }
+            fptr: &FuncPtrCallValue => { CallExpander::finalizeFuncPtrCall(alias context, fptr, ref list) }
+            meth: &MethodCallValue => { CallExpander::finalizeMethodCall(alias context, meth, ref list) }
+            _ => {
+                eprintln("internal call expansion error: ", c.__typeinfo__.name);
+                panic;
+            }
+        };
+
+        let result = ValueExpander::registerUniqValue(alias context, c, call, ref list);
+        if (result of YILUnit) {
+            list:.append(copy YILCall(c.loc, call));
+        } else if (c.type.isMovable) {
+            if let v: &YILVar = result {
+                ValueExpander::registerDestroy(alias context, v, c.type, ref list, implicit-> true);
+            } else panic;
+        }
+
+        result
+    }
+
+    /**
+     * Finalize a simple prototype call.
+     *
+     * Expands all parameters, removes pending destructor scheduling for them,
+     * mangles the prototype name, registers symbol usage, and produces a
+     * YILNameCallValue.
+     *
+     * @params:
+     *   - context: the expansion context
+     *   - c:       the prototype call value
+     *   - list:    the statement list to append instructions to
+     *
+     * @returns:
+     *   - &YILValue: the YILNameCallValue representing the call
+     */
+    pub fn finalizeSimpleCall(dmut context: &Expander, c: &PrototypeCallValue, ref mut list: StmtList)-> &YILValue {
+        let retType = context:.finalizeType(c.type);
+
+        let mut params: [&YILValue] = [];
+        for i in c.params {
+            let p = ValueExpander::finalize(alias context, i, ref list, asLeft-> false);
+            ValueExpander::removeDestroy(p, ref list);
+            params ~= [p];
+        }
+
+        for i in c.addParams {
+            let p = ValueExpander::finalize(alias context, i, ref list, asLeft-> false);
+            ValueExpander::removeDestroy(p, ref list);
+            params ~= [p];
+        }
+
+        let name = Mangler::mangle(c.proto);
+        context:.registerTouchSym(name, c.proto.implLoc);
+
+        return copy YILNameCallValue(c.loc, retType, name, params);
+    }
+
+    /**
+     * Finalize a constructor call.
+     *
+     * Creates or reuses the instance being constructed, expands parameters,
+     * handles implicit delegate parameters for class constructors, registers
+     * symbol usage, and emits the constructor call as a YILCall instruction.
+     *
+     * @params:
+     *   - context: the expansion context
+     *   - c:       the constructor call value
+     *   - list:    the statement list to append instructions to
+     *
+     * @returns:
+     *   - &YILValue: the constructed instance
+     */
+    pub fn finalizeCtorCall(dmut context: &Expander, c: &CtorCallValue, ref mut list: StmtList)-> &YILValue {
+        let retType = context:.finalizeType(c.type);
+        let (inst, value) = CallExpander::finalizeCtorSelf(alias context, c.loc, retType, c.type, c.delegate.instance, ref list);
+
+        let mut params: [&YILValue] = [];
+        params ~= [inst];
+        for pi in c.params {
+            let p = ValueExpander::finalize(alias context, pi, ref list, asLeft-> false);
+            ValueExpander::removeDestroy(p, ref list);
+            params ~= [p];
+        }
+        for pi in c.addParams {
+            let p = ValueExpander::finalize(alias context, pi, ref list, asLeft-> false);
+            ValueExpander::removeDestroy(p, ref list);
+            params ~= [p];
+        }
+
+        // Class takes a last parameter in ctor calls
+        if !c.delegate.proto.classRef.sym.isStruct {
+            let delegate = c.delegate;
+            if delegate.nextCtor !of UnitValue {
+                let p = ValueExpander::finalize(alias context, delegate.nextCtor, ref list, asLeft-> false);
+                params ~= [p];
+            } else {
+                let dgYType = context.typeExpander:.finalizeDelegate();
+                let emptyDG = copy YILTupleValue(c.loc, dgYType,
+                                                 copy [YIL_NULL_VALUE, YIL_NULL_VALUE],
+                                                 fieldNames-> copy [DelegateKeys::CLOSURE, DelegateKeys::FUNC]);
+
+                params ~= [emptyDG];
+            }
+        }
+
+        let name = Mangler::mangle(c.delegate.proto);
+        context:.registerTouchSym(name, c.delegate.proto.loc);
+        list:.append(copy YILCall(c.loc, copy YILNameCallValue(c.loc, YIL_VOID, name, params)));
+        return value;
+    }
+
+    /**
+     * Finalize the "self" value for a constructor call.
+     *
+     * Handles:
+     *   - explicit instance passed to the constructor,
+     *   - redirection calls inside struct constructors,
+     *   - creation of a new temporary variable for the instance,
+     *   - initialization of struct entity flags,
+     *   - allocation of class instances via runtime allocator.
+     *
+     * @params:
+     *   - context: the expansion context
+     *   - loc:     source location of the constructor call
+     *   - retType: the YIL type of the constructed value
+     *   - clType:  the semantic class type being constructed
+     *   - inst:    the provided instance expression(or UnitValue)
+     *   - list:    the statement list to append instructions to
+     *
+     * @returns:
+     *   - (&YILValue, &YILValue): (instance-as-parameter, instance-as-value)
+     */
+    pub fn finalizeCtorSelf(dmut context: &Expander, loc: &Word, retType: &YILType, clType: &Type, inst: &Value, ref mut list: StmtList)-> (&YILValue, &YILValue) {
+        // We gave a value to the ctor
+        if (inst !of UnitValue)  {
+            let inner = ValueExpander::finalize(alias context, inst, ref list, asLeft-> true);
+            if let cptr: &ClassPtrType = clType && cptr.isStruct {
+                match (inner, inst) {
+                    // redirection call from previous generated instance in a ctor of structure
+                    (un: &YILUnrefValue, v: &VarRefValue) if (v.isReference && v.isSelf) => {
+                        return (un.value, un.value);
+                    }
+                }
+            }
+
+            return (inner, inner);
+        }
+
+        let (varref, _) = ValueExpander::createVarForBlock(alias context, loc, NONE_TYPE, retType, ref list, name-> "__self_%"s8);
+        if let cptr: &ClassPtrType = clType {
+            if (cptr.isStruct) {
+                if (cptr.sym.isEntity) {
+                    let field = copy YILFieldValue(loc, YIL_UINT_8, varref, name-> ClassKeys::SET);
+                    list:.append(copy YILAffect(loc, field, copy YILIntValue(loc, YIL_UINT_8, 1us)));
+                }
+
+                return (copy YILAddrValue(varref.loc, context.typeExpander:.finalizePointer(retType), varref), varref);
+            } else {
+                let clRef = {
+                    cptr.inner
+                } catch {
+                    _ => panic; // invalid class
+                };
+
+                let vtableName = Mangler::mangleVtable(clRef);
+                context:.registerTouchSym(vtableName, clRef.loc);
+
+                let vtableAddr = copy YILAddrValue(loc, YIL_PTR_2_VOID,
+                                                   copy YILVar(loc, vtableName, YIL_PTR_2_VOID, 0us));
+
+                let callVal = copy YILNameCallValue(loc, retType, YRuntimeFuncs::ALLOC_CLASS, copy [vtableAddr]);
+                list:.append(copy YILAffect(loc, varref, callVal));
+
+                return (varref, varref);
+            }
+        } else panic;
+    }
+
+    /**
+     * Finalize a function-pointer call.
+     *
+     * Expands parameters, removes destructor scheduling, and dispatches to:
+     *   - direct prototype call(if fptr is ProtoFuncPtrValue),
+     *   - indirect pointer call(YILPtrCallValue) otherwise.
+     *
+     * @params:
+     *   - context: the expansion context
+     *   - f:       the function-pointer call value
+     *   - list:    the statement list to append instructions to
+     *
+     * @returns:
+     *   - &YILValue: the call result
+     */
+    pub fn finalizeFuncPtrCall(dmut context: &Expander, f: &FuncPtrCallValue, ref mut list: StmtList)-> &YILValue {
+        let retType = context:.finalizeType(f.type);
+
+        let mut params: [&YILValue] = [];
+        for pi in f.params {
+            let p = ValueExpander::finalize(alias context, pi, ref list, asLeft-> false);
+            ValueExpander::removeDestroy(p, ref list);
+            params ~= [p];
+        }
+
+        if let n: &ProtoFuncPtrValue = f.fptr {
+            let proto = Mangler::mangle(n.proto);
+            context:.registerTouchSym(proto, n.proto.implLoc);
+
+            return copy YILNameCallValue(f.loc, retType, proto, params);
+        }
+
+        let fptr = ValueExpander::finalize(alias context, f.fptr, ref list, asLeft-> false);
+        return copy YILPtrCallValue(f.loc, retType, fptr, params);
+    }
+
+    /**
+     * Finalize a method call.
+     *
+     * Handles:
+     *   - direct calls on struct instances,
+     *   - virtual dispatch via vtable for class instances,
+     *   - expansion of closure instance,
+     *   - parameter expansion and destructor removal,
+     *   - symbol registration for direct calls.
+     *
+     * Produces either:
+     *   - YILNameCallValue(direct call),
+     *   - YILPtrCallValue(vtable dispatch).
+     *
+     * @params:
+     *   - context: the expansion context
+     *   - f:       the method call value
+     *   - list:    the statement list to append instructions to
+     *
+     * @returns:
+     *   - &YILValue: the call result
+     */
+    pub fn finalizeMethodCall(dmut context: &Expander,  f: &MethodCallValue, ref mut list: StmtList)-> &YILValue {
+        let methProto = f.delegate;
+        context:.registerTouchClass(methProto.closure.type);
+
+        let retType = context:.finalizeType(f.type);
+
+        let mut params: [&YILValue] = [];
+        let mut inst = ValueExpander::finalize(alias context, methProto.closure, ref list, asLeft-> false);
+
+        let isDirect = {
+            if let c: &ClassPtrType = methProto.closure.type && c.isStruct {
+                inst = MemoryExpander::createAddress(alias context, inst, context.typeExpander:.finalizePointer(inst.type), ref list);
+                true
+            } else {
+                methProto.isDirect
+            }
+        };
+
+        params ~= [inst];
+        ValueExpander::removeDestroy(inst, ref list);
+        for pi in f.params {
+            let p = ValueExpander::finalize(alias context, pi, ref list, asLeft-> false);
+            ValueExpander::removeDestroy(p, ref list);
+            params ~= [p];
+        }
+
+        for pi in f.addParams {
+            let p = ValueExpander::finalize(alias context, pi, ref list, asLeft-> false);
+            ValueExpander::removeDestroy(p, ref list);
+            params ~= [p];
+        }
+
+        if (isDirect) {
+            let name = Mangler::mangle(methProto.proto);
+            context:.registerTouchSym(name, methProto.proto.implLoc);
+
+            return copy YILNameCallValue(f.loc, retType, name, params);
+        }
+
+        let fptr = CallExpander::createVtableAccess(alias context, f.loc, inst, methProto.vtableIndex, ref list);
+        return copy YILPtrCallValue(f.loc, retType, fptr, params);
+    }
+
+    /**
+     * Create a YILValue representing access to a method entry in a vtable.
+     *
+     * Steps:
+     *   - cast instance to generic class pointer type,
+     *   - dereference to obtain class header,
+     *   - extract vtable pointer,
+     *   - compute address of the method entry using pointer arithmetic,
+     *   - dereference the entry to obtain the function pointer,
+     *   - store intermediate results in temporary variables.
+     *
+     * @params:
+     *   - context: the expansion context
+     *   - loc:     source location of the access
+     *   - inst:    the instance whose vtable is accessed
+     *   - index:   index of the method in the vtable
+     *   - list:    the statement list to append instructions to
+     *
+     * @returns:
+     *   - &YILValue: the function pointer extracted from the vtable
+     */
+    pub fn createVtableAccess(dmut context: &Expander, loc: &Word, inst: &YILValue, index: usize, ref mut list: StmtList)-> &YILValue {
+        let ptrSize = global::state::pointerArchSize() / 8us;
+
+        let generic = context.typeExpander:.finalizeGenericClassPtr(alias context);
+        let castedInst = copy YILCastValue(loc, generic, inst);
+
+        let derefInst = if let p: &YILPointer = generic {
+            copy YILUnrefValue(loc, p.inner, castedInst)
+        } else panic;
+
+        let vtableAddr = copy YILCastValue(loc, YIL_PTR_VOID, // cast to a ptr of void, because we will do some pointer arithmethics on it
+                                           // and '*(*void) + x' is not the same as '*(void) + x'
+                                           copy YILFieldValue(loc, YIL_PTR_2_VOID, derefInst, name-> ClassKeys::VTABLE));
+
+        let (vtableAddrU, _) = ValueExpander::createVarForBlock(alias context, loc, NONE_TYPE, YIL_PTR_VOID, ref list, withValue-> vtableAddr);
+
+        // +1us because 0 is the dtor
+        let funcInVtableAddr = copy YILCastValue(loc, YIL_PTR_2_VOID,
+                                                 copy YILBinaryValue(loc,
+                                                                     YIL_PTR_VOID,
+                                                                     BinaryOperators::PLUS,
+                                                                     vtableAddrU,
+                                                                     copy YILIntValue(loc, YIL_UINT_MAX, (index + 2us) * cast!{usize} (ptrSize))));
+        // [TYPEINFO, DTOR, funcs*]
+
+        let (funcInVtableAddrU, _) = ValueExpander::createVarForBlock(alias context, loc, NONE_TYPE, YIL_PTR_2_VOID, ref list, withValue-> funcInVtableAddr);
+        let unref = copy YILUnrefValue(loc, YIL_PTR_2_VOID.inner, funcInVtableAddrU); // recast the vtable to the correct array
+        let (funcVU, _) = ValueExpander::createVarForBlock(alias context, loc, NONE_TYPE, YIL_PTR_VOID, ref list, withValue-> unref);
+
+        return funcVU;
+    }
+}

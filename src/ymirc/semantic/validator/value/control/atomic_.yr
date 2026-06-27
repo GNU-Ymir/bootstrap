@@ -1,0 +1,170 @@
+/*
+ * Implements validation for `atomic` expressions in Ymir.
+ *
+ * An `atomic` expression enforces mutual exclusion around a block of code. It
+ * has two forms:
+ *
+ *   - atomic { ... }
+ *       Uses global atomic locks.
+ *
+ *   - atomic monitor { ... }
+ *       Uses monitor-specific locks, requiring `monitor` to be a class
+ *       instance(non-struct).
+ *
+ * This module validates both forms, resolves the appropriate lock/unlock
+ * functions, validates the protected block, and wraps the result in a
+ * TryFinallyValue to ensure the unlock operation always executes.
+ *
+ * <hr>
+ *
+ * @Package: ymirc
+ * @Module: ymirc::semantic::validator::value::control::atomic_
+ * @File: ymirc/semantic/validator/value/control/atomic_.yr
+ * @Author(s):
+ *   - Emile Cadorel <ecadorel@gmail.com>
+ *
+ * @Created(YYYY-MM-DD): 2026-03-27
+ * @Copyright(C) 2021–2026 GNU-Ymir
+ * @License
+ *   ```text
+ *   This file is part of the Ymir language project.
+ *
+ *   Ymir is free software: you can redistribute it and/or modify it
+ *   under the terms of the GNU General Public License as published by
+ *   the Free Software Foundation, either version 3 of the License, or
+ *   (at your option) any later version.
+ *
+ *   Ymir is distributed in the hope that it will be useful,
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *   GNU General Public License for more details.
+ *
+ *   You should have received a copy of the GNU General Public License
+ *   along with Ymir.  If not, see <https://www.gnu.org/licenses/>.
+ *   ```
+ */
+
+in atomic_;
+
+use ymirc::syntax::expression::{empty, control};
+use ymirc::semantic::validator;
+use ymirc::semantic::generator::{value::_, type::_};
+
+use ymirc::errors;
+use ymirc::utils::format;
+
+/**
+ * AtomicValidation module
+ *
+ * Provides validation for `atomic` expressions.
+ *
+ * Semantics:
+ *
+ *   - `atomic { x }`
+ *       - Uses global atomic lock/unlock functions.
+ *       - No monitor is required.
+ *
+ *   - `atomic monitor { x }`
+ *       - Uses monitor-aware lock/unlock functions.
+ *       - `monitor` must be a class pointer to a non-struct class.
+ *
+ * Locking protocol:
+ *   - The lock function is invoked before evaluating the atomic block.
+ *   - The unlock function is invoked in a `finally` block to guarantee
+ *     release even in the presence of breaks, returns, or exceptions.
+ *
+ * The module enforces:
+ *   - correct monitor type
+ *   - correct resolution of lock/unlock functions
+ *   - correct validation of the protected block
+ *   - correct construction of TryFinallyValue
+ */
+pub mod AtomicValidation {
+
+    /**
+     * Validate an `atomic` expression.
+     *
+     * Dispatches based on whether a monitor expression is present:
+     *   - Empty monitor => validateNoMonitor
+     *   - Non-empty monitor => validateWithMonitor
+     *
+     * @returns:
+     *   - a TryFinallyValue representing the atomic region
+     */
+    pub fn validate(dmut context: &ValidationContext, a: &AtomicExpr)-> &Value
+        throws ErrorMsg
+    {
+        if a.monitor of EmptyExpr {
+            return AtomicValidation::validateNoMonitor(alias context, a);
+        }
+
+        return AtomicValidation::validateWithMonitor(alias context, a);
+    }
+
+    /**
+     * Validate a monitor-based atomic expression(`atomic (monitor) { ... }`).
+     *
+     * @returns:
+     *   - a TryFinallyValue representing the atomic region
+     */
+    fn validateWithMonitor(dmut context: &ValidationContext, a: &AtomicExpr)-> &Value
+        throws ErrorMsg
+    {
+        let monitor = ValueValidation::validate(alias context, a.monitor);
+        let isClass = match monitor.type {
+            c: &ClassPtrType => { !c.isStruct }
+            _ => { false }
+        };
+
+        if (!isClass) {
+            let note = copy ErrorMsg::note(a.loc, format(ValidateErrorMessage::ATOMIC_NEEDS_MONITOR));
+            throw copy ErrorMsg::fatal(a.monitor.loc, format(ValidateErrorMessage::NOT_A_CLASS, monitor.type),
+                                        notes-> copy [note]);
+        }
+
+        let (lock, unlock) = ValueCreation::createAtomicLocksWithMonitorFuncs(alias context, loc-> a.loc);
+        let inner = ValueValidation::validate(alias context, a.value);
+
+        let before = CallValidation::validate(alias context, a.loc, lock, copy [monitor]);
+        let post = CallValidation::validate(alias context, a.loc, unlock, copy [monitor]);
+
+        let innerType = TypeInference::inferImplicitMutability(inner.type, inner);
+        let blk = copy BlockValue(a.loc,
+                                   innerType,
+                                   copy [before, inner],
+                                   breakLoc-> inner.breakLoc,
+                                   returnLoc-> inner.returnLoc);
+
+        let postBlock = copy BlockValue(a.loc, VOID_TYPE, copy [post]);
+
+        return copy TryFinallyValue(a.loc, innerType, blk, postBlock, failVar-> UNIT_VALUE);
+    }
+
+    /**
+     * Validate a global atomic expression(`atomic { ... }`).
+     *
+     * @returns:
+     *   - a TryFinallyValue representing the atomic region
+     */
+    fn validateNoMonitor(dmut context: &ValidationContext, a: &AtomicExpr)-> &Value
+        throws ErrorMsg
+    {
+        let (lock, unlock) = ValueCreation::createAtomicLocksNoMonitorFuncs(alias context, loc-> a.loc);
+        let inner = ValueValidation::validate(alias context, a.value);
+
+        let before = CallValidation::validate(alias context, a.loc, lock, []);
+        let post = CallValidation::validate(alias context, a.loc, unlock, []);
+
+        let innerType = TypeInference::inferImplicitMutability(inner.type, inner);
+        let blk = copy BlockValue(a.loc,
+                                   innerType,
+                                   copy [before, inner],
+                                   breakLoc-> inner.breakLoc,
+                                   returnLoc-> inner.returnLoc);
+
+        let postBlock = copy BlockValue(a.loc, VOID_TYPE, copy [post]);
+
+        return copy TryFinallyValue(a.loc, innerType, blk, postBlock, failVar-> UNIT_VALUE);
+    }
+
+}

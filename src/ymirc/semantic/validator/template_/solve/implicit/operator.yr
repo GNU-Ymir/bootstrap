@@ -1,0 +1,263 @@
+/*
+ * Implicit template solving for operator-based expressions(OperatorExpr).
+ *
+ * TemplateImplicitOperatorSolving handles implicit template inference for
+ * expressions whose syntactic form involves operators.
+ *
+ * <hr>
+ *
+ * @Package: ymirc
+ * @Module: ymirc::semantic::validator::template_::solve::implicit::operator
+ * @File: ymirc/semantic/validator/template_/solve/implicit/operator.yr
+ * @Author(s):
+ *   - Emile Cadorel <ecadorel@gmail.com>
+ *
+ * @Created(YYYY-MM-DD): 2026-06-09
+ * @Copyright(C) 2021–2026 GNU-Ymir
+ * @License
+ *   ```text
+ *   This file is part of the Ymir language project.
+ *
+ *   Ymir is free software: you can redistribute it and/or modify it
+ *   under the terms of the GNU General Public License as published by
+ *   the Free Software Foundation, either version 3 of the License, or
+ *   (at your option) any later version.
+ *
+ *   Ymir is distributed in the hope that it will be useful,
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *   GNU General Public License for more details.
+ *
+ *   You should have received a copy of the GNU General Public License
+ *   along with Ymir.  If not, see <https://www.gnu.org/licenses/>.
+ *   ```
+ */
+
+in operator;
+
+use ymirc::syntax::{_, declaration::_, expression::_};
+use ymirc::semantic::generator::{value::_, type::_};
+
+use ymirc::semantic::{validator, template_, symbol};
+
+use ymirc::lexing::{word, keys};
+use ymirc::errors;
+
+use ymirc::utils::format;
+
+use ymirc::semantic::validator::template_::solve::{_, implicit::_};
+
+/**
+ * TemplateImplicitOperatorSolving module
+ *
+ * Provides implicit template solving for operator-based expressions.
+ *
+ */
+pub mod TemplateImplicitOperatorSolving {
+
+    /**
+     * Dispatch implicit solving based on the concrete OperatorExpr variant.
+     *
+     * If no rule matches, returns an empty TemplateSolution.
+     *
+     * @returns:
+     *   - TemplateSolution(mapper, nbConsumed)
+     */
+    pub fn solveType(dmut context: &ValidationContext,
+                     templates:    [&Expression],
+                     typeExpr:     &OperatorExpr,
+                     types:        [&Type])-> TemplateSolution
+        throws ErrorMsg
+    {
+        match typeExpr {
+            c: &TemplateCallExpr => {
+                return TemplateImplicitOperatorSolving::solveTypeFromTemplateCall(alias context, templates, c, types);
+            }
+            p: &PathExpr => {
+                return TemplateImplicitOperatorSolving::solveTypeFromPath(alias context, templates, p, types);
+            }
+            b: &BinaryExpr => {
+                return TemplateImplicitOperatorSolving::solveTypeFromBinary(alias context, templates, b, types);
+            }
+            u: &UnaryExpr => {
+                return TemplateImplicitOperatorSolving::solveTypeFromUnary(alias context, templates, u, types);
+            }
+        }
+
+        return TemplateSolution(TemplateMapper(), 1);
+    }
+
+    /**
+     * Solve implicit template bindings for a template call:
+     *     T!arg or T!{args...}
+     *
+     * @returns:
+     *   - TemplateSolution with merged mapper.
+     */
+    fn solveTypeFromTemplateCall(dmut context: &ValidationContext,
+                                 templates:    [&Expression],
+                                 typeExpr:     &TemplateCallExpr,
+                                 types:        [&Type])-> TemplateSolution
+        throws ErrorMsg
+    {
+        if (types.len == 0us) {
+            return TemplateSolution(TemplateMapper(), 1);
+        }
+
+        let type = TypeCreation::createEnumUnwrap(types[0]);
+        let (hasTmps, clTemplates) = TemplateSolvingUtils::getTemplateListOfType(type);
+        if (!hasTmps || typeExpr.rights.len > clTemplates.len) {
+            return TemplateSolution(TemplateMapper(), 1);
+        }
+
+        let mut retMapper = TemplateMapper();
+        let mut consumed = 0us;
+        let mut syntTemplate = templates;
+
+        for i in 0us .. typeExpr.rights.len {
+            let currentParam = TemplateRewriting::rewrite(retMapper, typeExpr.rights[i]);
+            let rest = clTemplates.len - consumed;
+            let syntaxRest = (typeExpr.rights.len - i) - 1us;
+
+            let consomableTypes = clTemplates[consumed .. consumed + (rest - syntaxRest)];
+            let mut local = TemplateSolution(TemplateMapper(), 0);
+
+            if (consomableTypes.len > 0 && consomableTypes[0] of Value) {
+                let mut mp = TemplateMapper();
+                let mut done = false;
+                if let v: &VarExpr = currentParam {
+                    if let Ok(expr) = TemplateSolvingUtils::findExpression(v.name.str, syntTemplate) {
+                        let mp__ = TemplateExplicitSolving::solveParamTemplate(alias context,
+                                                                               syntTemplate,
+                                                                               expr,
+                                                                               consomableTypes[0 .. 1]);
+                        mp:.merge(mp__.mapper);
+                        done = true;
+                    }
+                }
+
+                if (!done) {
+                    let mp__ = TemplateExplicitSolving::solveParamTemplate(alias context,
+                                                                           syntTemplate,
+                                                                           currentParam,
+                                                                           consomableTypes[0 .. 1]);
+                    mp:.merge(mp__.mapper);
+                }
+
+                local = TemplateSolution(mp, 1);
+            } else {
+                let mut lst: [mut &Type] = [];
+                for ti in consomableTypes {
+                    if let t: &Type = ti {
+                        lst ~= [t];
+                    }
+                    else break;
+                }
+
+                let sol = TemplateImplicitSolving::solveType(alias context, syntTemplate, currentParam, lst);
+                local = TemplateSolution(sol.mapper, sol.nbConsumed);
+            }
+
+            retMapper:.merge(local.mapper);
+            consumed += cast!usize(local.nbConsumed);
+            syntTemplate = TemplateRewriting::rewriteTemplateParams(retMapper, syntTemplate);
+        }
+
+        return TemplateSolution(retMapper, 1);
+    }
+
+    /**
+     * Solve implicit template bindings for a path expression:
+     *     a::b
+     *
+     * Behavior:
+     *   - only the right-hand side contributes to type inference.
+     */
+    fn solveTypeFromPath(dmut context: &ValidationContext,
+                         templates:    [&Expression],
+                         path:         &PathExpr,
+                         types:        [&Type])-> TemplateSolution
+        throws ErrorMsg
+    {
+        if (types.len >= 1us) {
+            let solution = TemplateImplicitSolving::solveType(alias context,
+                                                              templates,
+                                                              path.right,
+                                                              types[0 .. 1]);
+            return TemplateSolution(solution.mapper, 1);
+        }
+
+        return TemplateSolution(TemplateMapper(), 1);
+    }
+
+    /**
+     * Solve implicit template bindings for a binary expression.
+     *
+     * Special case:
+     *   - If the operator is `::`, treat it like a PathExpr and solve only the
+     *     right-hand side.
+     *
+     * Otherwise:
+     *   - binary expressions do not contribute to implicit inference.
+     */
+    fn solveTypeFromBinary(dmut context: &ValidationContext,
+                           templates:    [&Expression],
+                           bin:          &BinaryExpr,
+                           types:        [&Type])-> TemplateSolution
+        throws ErrorMsg
+    {
+        if (types.len >= 1us && bin.op == BinaryOperators::DCOLON) {
+            let solution = TemplateImplicitSolving::solveType(alias context,
+                                                              templates,
+                                                              bin.right,
+                                                              types[0 .. 1]);
+            return TemplateSolution(solution.mapper, 1);
+        }
+
+        return TemplateSolution(TemplateMapper(), 1);
+    }
+
+    /**
+     * Solve implicit template bindings for a unary expression.
+     *
+     * Supported cases:
+     *   - Pointer dereference:
+     *        * if expected type is PointerType and operator is `*`,
+     *          solve inner type implicitly.
+     *
+     *   - Address-of:
+     *        * if expected type is ClassPtrType and operator is `&`,
+     *          solve inner type implicitly.
+     *
+     * Otherwise:
+     *   - unary expressions do not contribute to implicit inference.
+     */
+    fn solveTypeFromUnary(dmut context: &ValidationContext,
+                          templates:    [&Expression],
+                          un:           &UnaryExpr,
+                          types:        [&Type])-> TemplateSolution
+        throws ErrorMsg
+    {
+        if (types.len >= 1us) {
+            let type = TypeCreation::createEnumUnwrap(types[0]);
+
+            if let p: &PointerType = type && un.op == UnaryOperators::STAR {
+                let solution = TemplateImplicitSolving::solveType(alias context,
+                                                                  templates,
+                                                                  un.value,
+                                                                  p.inners);
+                return TemplateSolution(solution.mapper, 1);
+            }
+
+            if let c: &ClassPtrType = type && un.op == UnaryOperators::AND && !c.isStruct {
+                let solution = TemplateImplicitSolving::solveType(alias context,
+                                                                  templates,
+                                                                  un.value,
+                                                                  copy [c.inner]);
+                return TemplateSolution(solution.mapper, 1);
+            }
+        }
+
+        return TemplateSolution(TemplateMapper(), 1);
+    }
+}

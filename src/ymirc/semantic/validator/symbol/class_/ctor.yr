@@ -1,0 +1,298 @@
+/*
+ * Implements semantic validation for class constructors.
+ *
+ * This module handles:
+ *   - validation of constructor prototypes,
+ *   - detection of conflicting constructor overloads,
+ *   - integration of validated constructors into the class reference,
+ *   - validation of template constructors,
+ *   - synthesis of default constructors for movable entities,
+ *   - enforcement of initialization rules for fields,
+ *   - insertion of constructor symbols into the class's add-method list.
+ *
+ * <hr>
+ *
+ * @Package: ymirc
+ * @Module: ymirc::semantic::validator::symbol::class_::ctor
+ * @File: ymirc/semantic/validator/symbol/class_/ctor.yr
+ * @Author(s):
+ *   - Emile Cadorel <ecadorel@gmail.com>
+ *
+ * @Created(YYYY-MM-DD): 2026-05-28
+ * @Copyright(C) 2021–2026 GNU-Ymir
+ * @License
+ *   ```text
+ *   This file is part of the Ymir language project.
+ *
+ *   Ymir is free software: you can redistribute it and/or modify it
+ *   under the terms of the GNU General Public License as published by
+ *   the Free Software Foundation, either version 3 of the License, or
+ *   (at your option) any later version.
+ *
+ *   Ymir is distributed in the hope that it will be useful,
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *   GNU General Public License for more details.
+ *
+ *   You should have received a copy of the GNU General Public License
+ *   along with Ymir.  If not, see <https://www.gnu.org/licenses/>.
+ *   ```
+ */
+
+in ctor;
+
+use ymirc::syntax::{declaration::_, expression::_};
+use ymirc::semantic::{symbol, declarator, validator};
+use ymirc::semantic::generator::{value::_, type::_};
+use ymirc::errors;
+use ymirc::lexing::{word, keys};
+
+use ymirc::utils::format;
+use ymirc::semantic::validator::symbol::class_::ctor::_;
+
+
+/*!
+ * ====================================================================================================
+ * ====================================================================================================
+ * ====================================          SUBMODS          =====================================
+ * ====================================================================================================
+ * ====================================================================================================
+ */
+
+mod ::verif;
+
+/*!
+ * ====================================================================================================
+ * ====================================================================================================
+ * ======================================          ROOT          ======================================
+ * ====================================================================================================
+ * ====================================================================================================
+ */
+
+/**
+ * ClassCtorValidation module
+ *
+ * Provides the main validation pipeline for class constructors. Responsibilities:
+ *
+ *   - validate all constructor prototypes declared in the class,
+ *   - detect ambiguous or duplicate constructor overloads,
+ *   - validate template constructor prototypes,
+ *   - synthesize default constructors for movable entities,
+ *   - enforce field-initialization rules for default constructors,
+ *   - install constructor lists into the ClassRefType.
+ *
+ */
+pub mod ClassCtorValidation {
+
+    /**
+     * Validate all constructors declared in the class.
+     *
+     * @params:
+     *   - context:   validation context
+     *   - sym:       class symbol
+     *   - inModule:  whether constructors should be added to add-method list
+     *   - withValue: whether constructor bodies should be validated
+     *
+     * @throws:
+     *   - ErrorMsg::list if any constructor prototype fails validation
+     */
+    pub fn validate(dmut context: &ValidationContext,
+                    dmut sym:     &ClassSymbol,
+                    inModule:     bool,
+                    withValue:    bool)
+        throws ErrorMsg
+    {
+        let dmut cref = alias sym.classRefUnwrapped;
+
+        let mut errors   : [&ErrorMsg]           = [];
+        let mut ctors    : [&CtorPrototypeValue] = []; // list of ctor prototypes
+        let mut ctorProts: [MethodProtection]    = []; // Protection of constructors
+
+        let mut templateCtors    : [&TemplateRefCtorValue] = [];
+        let mut templateCtorProts: [MethodProtection]      = [];
+
+        for it in sym.getAllLocalSymbols(protection-> Protection::PRIVATE, sorted-> true) {
+            {
+                if let ctor: &CtorSymbol = it {
+                    let dmut mutCtor = context:.getCtorFromRef(ctor);
+                    ClassCtorValidation::validateProto(alias context, alias mutCtor, cref,
+                                                       withValue-> withValue,
+                                                       ref ctors,
+                                                       ref ctorProts);
+                    if inModule {
+                        sym:.insertAddMethod(alias mutCtor);
+                    }
+                }
+
+                else if let tmp: &TemplateSymbol = it {
+                    if tmp.decl.decl of CtorDecl {
+                        ClassCtorValidation::validateTemplateProto(tmp, cref,
+                                                                   ref templateCtors,
+                                                                   ref templateCtorProts);
+                    }
+                }
+            } catch {
+                err => {
+                    errors ~= [err];
+                }
+            }
+        }
+
+        if (errors.len != 0us) {
+            throw copy ErrorMsg::list(errors);
+        }
+
+        cref:.setCtors(ctors, ctorProts);
+        cref:.setTemplateCtors(templateCtors, templateCtorProts);
+    }
+
+    /**
+     * Ensure that movable entities have a default constructor.
+     *
+     * @params:
+     *   - context:  validation context
+     *   - sym:      class symbol
+     *   - inModule: whether to insert the synthesized constructor into add-methods
+     *
+     * @throws:
+     *   - ErrorMsg if default constructor synthesis fails
+     */
+    pub fn validateMovable(dmut context: &ValidationContext,
+                           dmut sym:     &ClassSymbol,
+                           inModule:     bool)
+        throws ErrorMsg
+    {
+        if (!sym.isEntity) {
+            return;
+        }
+
+        let dmut cref = alias sym.classRefUnwrapped;
+        let oldCtors = cref.ctors;
+        let oldCtorProts = cref.ctorProtections;
+
+        let mut hasDefault = false;
+        for ct in oldCtors if ct.name == "" && ct.params.len == 0 {
+            hasDefault = true;
+            break;
+        }
+
+        if (!hasDefault) {
+            let nCtor = ClassCtorValidation::createDefault(alias context, alias sym, cref,
+                                                           inModule-> inModule);
+            cref:.setCtors(oldCtors ~ [nCtor], oldCtorProts ~ [MethodProtection::PUB]);
+        } catch {
+            err => {
+                throw copy ErrorMsg::fatal(sym.loc, format(ValidateErrorMessage::NO_DEFAULT_CTOR_MOVE_STRUCT, sym.path),
+                                           notes-> copy [err]);
+            }
+        }
+    }
+
+    /**
+     * Validate a single constructor prototype and detect overload conflicts.
+     *
+     * @params:
+     *   - context:    validation context
+     *   - ctor:       constructor symbol
+     *   - cref:       class reference type
+     *   - withValue:  whether to validate constructor bodies
+     *   - ctorList:   accumulator for validated constructor prototypes
+     *   - ctorProts:  accumulator for constructor protections
+     *
+     * @throws:
+     *   - ErrorMsg if the constructor conflicts with an existing overload
+     */
+    fn validateProto(dmut context:      &ValidationContext,
+                     dmut ctor:         &CtorSymbol,
+                     cref:              &ClassRefType,
+                     withValue:         bool,
+                     ref mut ctorList:  [&CtorPrototypeValue],
+                     ref mut ctorProts: [MethodProtection])
+        throws ErrorMsg
+    {
+        let proto = CtorValidation::validateProto(alias context, alias ctor, cref,
+                                                  withValue-> withValue);
+        for it in ctorList {
+            if ClassCtorVerification::areSimilar(proto, it) {
+                throw copy ErrorMsg::fatal(proto.loc, format(ValidateErrorMessage::COLLIDING_METHOD_DEFINITION, proto, it),
+                                           end-> it.loc);
+            }
+        }
+
+        ctorList ~= [proto];
+        ctorProts ~= [to!{MethodProtection}(ctor.protection)];
+    }
+
+    /**
+     * Validate a template constructor prototype.
+     *
+     * @params:
+     *   - ctor:      template symbol representing a constructor
+     *   - cref:      class reference type
+     *   - ctorList:  accumulator for template constructor references
+     *   - ctorProts: accumulator for constructor protections
+     */
+    fn validateTemplateProto(ctor:              &TemplateSymbol,
+                             cref:              &ClassRefType,
+                             ref mut ctorList:  [&TemplateRefCtorValue],
+                             ref mut ctorProts: [MethodProtection])
+    {
+        ctorList ~= [copy TemplateRefCtorValue(ctor.loc, cref.sym, ctor)];
+        ctorProts ~= [to!{MethodProtection}(ctor.protection)];
+    }
+
+    /**
+     * Synthesize a default constructor for a movable entity.
+     *
+     * @params:
+     *   - context:  validation context
+     *   - sym:      class symbol
+     *   - cl:       class reference type
+     *   - inModule: whether to insert the constructor into add-methods
+     *
+     * @returns:
+     *   - the validated constructor prototype
+     *
+     * @throws:
+     *   - ErrorMsg::list if any field is uninitialized
+     *   - ErrorMsg if prototype validation fails
+     */
+    fn createDefault(dmut context: &ValidationContext,
+                     dmut sym:     &ClassSymbol,
+                     cl:           &ClassRefType,
+                     inModule:     bool)-> &CtorPrototypeValue
+        throws ErrorMsg
+    {
+        let mut errors: [&ErrorMsg] = [];
+        for fi in cl.localFields if fi.value of UnitValue {
+            errors ~= [copy ErrorMsg::fatal(fi.loc, format(ValidateErrorMessage::UNINIT_FIELD, fi.name))];
+        }
+
+        if (errors.len != 0us) {
+            throw copy ErrorMsg::list(errors);
+        }
+
+        let rename = sym.loc.locate(Keys::SELF);
+        let proto = FunctionPrototype([], EMPTY_EXPR, false);
+        let body = copy BlockExpr(rename, rename, []);
+
+        let ctor = copy CtorDecl(loc-> sym.loc,
+                                 comm-> "",
+                                 rename-> rename,
+                                 proto-> proto,
+                                 redirect-> none,
+                                 fields-> [],
+                                 body-> body,
+                                 attrs-> [],
+                                 throwers-> [],
+                                 throwerLoc-> EOF_WORD);
+        let dmut ctorSym: &CtorSymbol = context.declarator.declareCtor(ctor, alias sym,
+                                                                       protection-> Protection::PUBLIC);
+
+        if inModule {
+            sym:.insertAddMethod(alias ctorSym);
+        }
+
+        return CtorValidation::validateProto(alias context, alias ctorSym, cl);
+    }
+}

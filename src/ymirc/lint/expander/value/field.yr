@@ -1,0 +1,451 @@
+/*
+ * FieldExpander — expands all field-access expressions into YIL values.
+ *
+ * The FieldExpander lowers high-level field access constructs into concrete
+ * YILValue nodes. It handles:
+ *
+ *   - class field access,
+ *   - closure field access,
+ *   - struct field access,
+ *   - tuple field access,
+ *   - option field access,
+ *   - future field access(value, finished, threadId),
+ *   - class typeinfo access,
+ *   - map length access,
+ *   - enum field access(delegated to ValueExpander).
+ *
+ * Each field access is expanded into the appropriate YILFieldValue or
+ * YILUnrefValue depending on the underlying type and access mode.
+ *
+ * <hr>
+ *
+ * @Package: ymirc
+ * @Module: ymirc::lint::expander::value::field
+ * @File: ymirc/lint/expander/value/field.yr
+ * @Author(s):
+ *   - Emile Cadorel <ecadorel@gmail.com>
+ *
+ * @Created(YYYY-MM-DD): 2026-06-23
+ * @Copyright(C) 2021–2026 GNU-Ymir
+ * @License
+ *   ```text
+ *   This file is part of the Ymir language project.
+ *
+ *   Ymir is free software: you can redistribute it and/or modify it
+ *   under the terms of the GNU General Public License as published by
+ *   the Free Software Foundation, either version 3 of the License, or
+ *   (at your option) any later version.
+ *
+ *   Ymir is distributed in the hope that it will be useful,
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *   GNU General Public License for more details.
+ *
+ *   You should have received a copy of the GNU General Public License
+ *   along with Ymir.  If not, see <https://www.gnu.org/licenses/>.
+ *   ```
+ */
+
+
+in field;
+
+use ymirc::lint::expander;
+use ymirc::lint::node::_;
+
+use ymirc::semantic::{symbol, generator::_};
+use ymirc::semantic::generator::{type::_, value::_};
+
+use ymirc::global::{core_, state};
+use ymirc::lexing::{word, keys};
+
+use ymirc::lint::expander::value::_;
+use std::io;
+
+/**
+ * FieldExpander
+ *
+ * Expands all field-access semantic nodes into YILValue expressions.
+ * Handles class, struct, tuple, option, closure, future, and map field
+ * accesses, as well as class typeinfo extraction.
+ *
+ * All functions append instructions to a StmtList and return the resulting
+ * YILValue representing the accessed field.
+ */
+pub mod FieldExpander {
+
+    /**
+     * Finalize a field-access expression.
+     *
+     * Dispatches based on the concrete field-access type:
+     *   - ClassFieldAccessValue,
+     *   - ClosureFieldAccessValue,
+     *   - StructFieldAccessValue,
+     *   - TupleFieldAccessValue,
+     *   - OptionFieldAccessValue,
+     *   - FutureFieldAccessValue,
+     *   - ClassTypeInfoAccessValue,
+     *   - EnumFieldAccessValue,
+     *   - MapLenAccessValue.
+     *
+     * @params:
+     *   - context: the expansion context
+     *   - f:       the field-access value to expand
+     *   - list:    the statement list to append instructions to
+     *   - asLeft:  whether the field is used as an l-value
+     *
+     * @returns:
+     *   - &YILValue: the finalized field-access expression
+     *
+     * @throws:
+     *   - panic: for unsupported field-access types
+     */
+    pub fn finalize(dmut context: &Expander, f: &FieldOperatorValue, ref mut list: StmtList, asLeft: bool)-> &YILValue {
+        match f {
+            c: &ClassFieldAccessValue => {
+                return FieldExpander::finalizeClass(alias context, c, ref list);
+            }
+            c: &ClosureFieldAccessValue => {
+                return FieldExpander::finalizeClosure(alias context, c, ref list);
+            }
+            s: &StructFieldAccessValue => {
+                return FieldExpander::finalizeStruct(alias context, s, ref list,
+                                                     asLeft-> asLeft);
+            }
+            t: &TupleFieldAccessValue => {
+                return FieldExpander::finalizeTuple(alias context, t, ref list,
+                                                    asLeft-> asLeft);
+            }
+            o: &OptionFieldAccessValue => {
+                return FieldExpander::finalizeOption(alias context, o, ref list,
+                                                     asLeft-> asLeft);
+            }
+            t: &FutureFieldAccessValue => {
+                return FieldExpander::finalizeFuture(alias context, t, ref list);
+            }
+            c: &ClassTypeInfoAccessValue => {
+                return FieldExpander::finalizeClassTypeInfoAccess(alias context, c, ref list);
+            }
+            e: &EnumFieldAccessValue => {
+                return ValueExpander::finalize(alias context, e.value, ref list,
+                                               asLeft-> asLeft);
+            }
+            m: &MapLenAccessValue => {
+                return FieldExpander::finalizeMapLenAccess(alias context, m, ref list);
+            }
+        }
+
+        eprintln("internal field expansion error: ", f.__typeinfo__.name);
+        panic;
+    }
+
+    /**
+     * Finalize a class field access.
+     *
+     * Dereferences the class pointer, extracts the field by name, and returns
+     * a YILFieldValue.
+     *
+     * @params:
+     *   - context: the expansion context
+     *   - f:       the class field-access value
+     *   - list:    the statement list to append instructions to
+     *
+     * @returns:
+     *   - &YILValue: the accessed field
+     */
+    pub fn finalizeClass(dmut context: &Expander, f: &ClassFieldAccessValue, ref mut list: StmtList)-> &YILValue {
+        context:.registerTouchClass(f.object.type);
+
+        let cl = ValueExpander::finalize(alias context, f.object, ref list, asLeft-> false);
+        let clType = context.typeExpander:.finalize(alias context, f.object.type);
+        let retType = context:.finalizeType(f.type);
+
+        let clR = if let p: &YILPointer = clType {
+            copy YILUnrefValue(f.loc, p.inner, cl)
+        } else panic;
+
+        return copy YILFieldValue(f.loc, retType, clR, name-> f.name);
+    }
+
+    /**
+     * Finalize a closure field access.
+     *
+     * Dereferences the closure pointer and extracts the field by index. When
+     * the field is accessed by reference, returns an unref of the pointer field.
+     *
+     * @params:
+     *   - context: the expansion context
+     *   - f:       the closure field-access value
+     *   - list:    the statement list to append instructions to
+     *
+     * @returns:
+     *   - &YILValue: the accessed field
+     */
+    pub fn finalizeClosure(dmut context: &Expander, f: &ClosureFieldAccessValue, ref mut list: StmtList)-> &YILValue {
+        let cl = ValueExpander::finalize(alias context, f.object, ref list, asLeft-> false);
+        let retType = context:.finalizeType(f.type);
+        let clR = if let p: &YILPointer = cl.type {
+            copy YILUnrefValue(f.loc, p.inner, cl)
+        } else panic;
+
+        if f.isByRef {
+            let ptr = copy YILPointer(retType);
+            let val = copy YILFieldValue(f.loc, ptr, clR, index-> f.field);
+
+            return copy YILUnrefValue(f.loc, retType, val);
+        }
+
+        return copy YILFieldValue(f.loc, retType, clR, index-> f.field);
+    }
+
+    /**
+     * Finalize a struct field access.
+     *
+     * Expands the struct expression and extracts the field by name. Structs
+     * are not dereferenced; the field is accessed directly.
+     *
+     * @params:
+     *   - context: the expansion context
+     *   - f:       the struct field-access value
+     *   - list:    the statement list to append instructions to
+     *   - asLeft:  whether the field is used as an l-value
+     *
+     * @returns:
+     *   - &YILValue: the accessed field
+     */
+    pub fn finalizeStruct(dmut context: &Expander, f: &StructFieldAccessValue, ref mut list: StmtList, asLeft: bool)-> &YILValue {
+        context:.registerTouchClass(f.object.type);
+
+        let retType = context:.finalizeType(f.type);
+        let str = ValueExpander::finalize(alias context, f.object, ref list, asLeft-> asLeft);
+
+        return copy YILFieldValue(f.loc, retType, str, name-> f.name);
+    }
+
+    /**
+     * Finalize an option field access.
+     *
+     * Option fields are accessed through the CONTENT tuple:
+     *
+     *      a.error  => a.content.error
+     *      a.value  => a.content.value
+     *
+     * @params:
+     *   - context: the expansion context
+     *   - o:       the option field-access value
+     *   - list:    the statement list to append instructions to
+     *   - asLeft:  whether the field is used as an l-value
+     *
+     * @returns:
+     *   - &YILValue: the accessed field
+     */    
+    pub fn finalizeOption(dmut context: &Expander, o: &OptionFieldAccessValue, ref mut list: StmtList, asLeft: bool)-> &YILValue {
+        let retType = context:.finalizeType(o.type);
+        let opt = ValueExpander::finalize(alias context, o.object, ref list, asLeft-> asLeft);
+
+        let optContentType = if let t: &YILTuple = opt.type {
+            t.inners[1]
+        } else panic;
+
+        // a.error => a.content.error, a.value => a.content.value
+        let content = copy YILFieldValue(o.loc, optContentType, opt, name-> OptionKeys::CONTENT);
+        return copy YILFieldValue(o.loc, retType, content, name-> o.name);
+    }
+
+    /**
+     * Finalize a future field access.
+     *
+     * Dispatches based on the accessed field:
+     *   - VALUE     → finalizeFutureWait
+     *   - FINISHED  → finalizeFutureCheck
+     *   - THREAD_ID → finalizeFutureThreadId
+     *
+     * @params:
+     *   - context: the expansion context
+     *   - f:       the future field-access value
+     *   - list:    the statement list to append instructions to
+     *
+     * @returns:
+     *   - &YILValue: the accessed field
+     */
+    pub fn finalizeFuture(dmut context: &Expander, f: &FutureFieldAccessValue, ref mut list: StmtList)-> &YILValue {
+        match f.name {
+            FutureKeys::VALUE => {
+                return FieldExpander::finalizeFutureWait(alias context, f, ref list);
+            }
+            FutureKeys::FINISHED => {
+                return FieldExpander::finalizeFutureCheck(alias context, f, ref list);
+            }
+            FutureKeys::THREAD_ID => {
+                return FieldExpander::finalizeFutureThreadId(alias context, f, ref list);
+            }
+        }
+
+        eprintln("internal future field expansion: ", f.name);
+        panic;
+    }
+    
+    /**
+     * Finalize access to a future's threadId field.
+     *
+     * @params:
+     *   - context: the expansion context
+     *   - f:       the future field-access value
+     *   - list:    the statement list to append instructions to
+     *
+     * @returns:
+     *   - &YILValue: the threadId field
+     */
+    pub fn finalizeFutureThreadId(dmut context: &Expander, f: &FutureFieldAccessValue, ref mut list: StmtList)-> &YILValue {
+        let retType = context:.finalizeType(f.type);
+        let futureValue = ValueExpander::finalize(alias context, f.object, ref list, asLeft-> false);
+
+        return copy YILFieldValue(f.loc, retType, futureValue, name-> FutureKeys::THREAD_ID);
+    }
+
+    /**
+     * Finalize access to a future's value field.
+     *
+     * Ensures the WAIT_FUTURE runtime call is executed only once by registering
+     * the result as a unique value. Returns the dereferenced result.
+     *
+     * @params:
+     *   - context: the expansion context
+     *   - f:       the future field-access value
+     *   - list:    the statement list to append instructions to
+     *
+     * @returns:
+     *   - &YILValue: the future's resolved value
+     */
+    pub fn finalizeFutureWait(dmut context: &Expander, f: &FutureFieldAccessValue, ref mut list: StmtList)-> &YILValue {
+        let retType = context:.finalizeType(f.type);
+        match context.getVariable(f.uniqId) {
+            Ok(u: &YILValue) => { // The call was already seen and validated
+                return copy YILUnrefValue(f.loc, retType, u);
+            }
+        };
+
+
+        let futureValue = ValueExpander::finalize(alias context, f.object, ref list, asLeft-> false);
+        let call = copy YILNameCallValue(f.loc,
+                                         context.typeExpander:.finalizePointer(retType),
+                                         YRuntimeFuncs::WAIT_FUTURE,
+                                         copy [futureValue]);
+
+        let varRes = ValueExpander::registerUniqValue(alias context, f, type-> call.type, call, ref list);
+        return copy YILUnrefValue(f.loc, retType, varRes);
+    }
+
+    /**
+     * Finalize access to a future's finished field.
+     *
+     * Ensures the CHECK_FUTURE runtime call is executed only once by registering
+     * the result as a unique value.
+     *
+     * @params:
+     *   - context: the expansion context
+     *   - f:       the future field-access value
+     *   - list:    the statement list to append instructions to
+     *
+     * @returns:
+     *   - &YILValue: the boolean finished flag
+     */
+    pub fn finalizeFutureCheck(dmut context: &Expander, f: &FutureFieldAccessValue, ref mut list: StmtList)-> &YILValue {
+        let retType = context:.finalizeType(f.type);
+        match context.getVariable(f.uniqId) {
+            Ok(u: &YILValue) => { // The call was already seen and validated
+                return u;
+            }
+        };
+
+
+        let futureValue = ValueExpander::finalize(alias context, f.object, ref list, asLeft-> false);
+        let call = copy YILNameCallValue(f.loc, retType, YRuntimeFuncs::CHECK_FUTURE, copy [futureValue]);
+
+        return ValueExpander::registerUniqValue(alias context, f, type-> call.type, call, ref list);
+    }
+
+    /**
+     * Finalize a tuple field access.
+     *
+     * Extracts the field by index from the tuple expression.
+     *
+     * @params:
+     *   - context: the expansion context
+     *   - f:       the tuple field-access value
+     *   - list:    the statement list to append instructions to
+     *   - asLeft:  whether the field is used as an l-value
+     *
+     * @returns:
+     *   - &YILValue: the accessed tuple field
+     */
+    pub fn finalizeTuple(dmut context: &Expander, f: &TupleFieldAccessValue, ref mut list: StmtList, asLeft: bool)-> &YILValue {
+        let retType = context:.finalizeType(f.type);
+        let str = ValueExpander::finalize(alias context, f.object, ref list, asLeft-> asLeft);
+
+        return copy YILFieldValue(f.loc, retType, str, index-> f.index);
+    }
+
+    /**
+     * Finalize access to a class's typeinfo.
+     *
+     * Steps:
+     *   - finalize the instance,
+     *   - store it in a temporary variable,
+     *   - dereference the class header,
+     *   - extract the vtable pointer,
+     *   - cast and dereference the typeinfo entry.
+     *
+     * @params:
+     *   - context: the expansion context
+     *   - ti:      the class typeinfo access value
+     *   - list:    the statement list to append instructions to
+     *
+     * @returns:
+     *   - &YILValue: the class's typeinfo object
+     */
+    pub fn finalizeClassTypeInfoAccess(dmut context: &Expander, ti: &ClassTypeInfoAccessValue, ref mut list: StmtList)-> &YILValue {
+        context:.registerTouchClass(ti.object.type);
+
+        let loc = ti.loc;
+        let inst = ValueExpander::finalize(alias context, ti.object, ref list, asLeft-> false);
+
+        let (instU, _) = ValueExpander::createVarForBlock(alias context, loc, NONE_TYPE, inst.type, ref list, withValue-> inst);
+        let derefInst = if let p: &YILPointer = inst.type {
+            copy YILUnrefValue(loc, p.inner, instU)
+        } else panic;
+
+        let vtableAddr = copy YILFieldValue(loc, YIL_PTR_2_VOID, derefInst, name-> "#_vtable"s8);
+        let typeInfoT = context:.finalizeType(ti.type);
+        let (vtableAddrU, _) = ValueExpander::createVarForBlock(alias context, loc, NONE_TYPE, YIL_PTR_2_VOID, ref list, withValue-> vtableAddr); // vtable => [*typeinfo, *dtor, *method1, ..., *methodN]
+
+        let ctType = context.typeExpander:.finalizePointer(typeInfoT);
+        let tiPtr = copy YILCastValue(loc, ctType, copy YILUnrefValue(loc, YIL_PTR_VOID, vtableAddrU));
+        return copy YILUnrefValue(loc, typeInfoT, tiPtr);
+    }
+
+    /**
+     * Finalize access to a map's length field.
+     *
+     * Dereferences the map pointer and extracts the LEN field from the map
+     * tuple representation.
+     *
+     * @params:
+     *   - context: the expansion context
+     *   - f:       the map length-access value
+     *   - list:    the statement list to append instructions to
+     *
+     * @returns:
+     *   - &YILValue: the map length
+     */
+    pub fn finalizeMapLenAccess(dmut context: &Expander, f: &MapLenAccessValue, ref mut list: StmtList)-> &YILValue {
+        let retType = context:.finalizeType(f.type);
+        let mp = ValueExpander::finalize(alias context, f.object, ref list, asLeft-> false);
+
+        if let t: &YILPointer = mp.type {
+            let contentType = t.inner;
+            let unref = copy YILUnrefValue(f.loc, contentType, mp);
+
+            return copy YILFieldValue(f.loc, retType, unref, name-> MapKeys::LEN);
+        } else panic;
+    }
+}

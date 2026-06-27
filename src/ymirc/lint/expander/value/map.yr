@@ -1,0 +1,456 @@
+/*
+ * MapExpander — expands map operations into YIL instructions.
+ *
+ * The MapExpander lowers high-level map operations into concrete YILValue
+ * and YILInstr nodes. It handles:
+ *
+ *   - map access(MAP_FIND),
+ *   - map containment checks,
+ *   - map insertion,
+ *   - map iterator begin/end/next,
+ *   - iterator key/value extraction.
+ *
+ * Map access produces option values. Iterator operations emit runtime calls
+ * to the Ymir runtime map API.
+ *
+ *
+ * <hr>
+ *
+ * @Package: ymirc
+ * @Module: ymirc::lint::expander::value::map
+ * @File: ymirc/lint/expander/value/map.yr
+ * @Author(s):
+ *   - Emile Cadorel <ecadorel@gmail.com>
+ *
+ * @Created(YYYY-MM-DD): 2026-06-23
+ * @Copyright(C) 2021–2026 GNU-Ymir
+ * @License
+ *   ```text
+ *   This file is part of the Ymir language project.
+ *
+ *   Ymir is free software: you can redistribute it and/or modify it
+ *   under the terms of the GNU General Public License as published by
+ *   the Free Software Foundation, either version 3 of the License, or
+ *   (at your option) any later version.
+ *
+ *   Ymir is distributed in the hope that it will be useful,
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *   GNU General Public License for more details.
+ *
+ *   You should have received a copy of the GNU General Public License
+ *   along with Ymir.  If not, see <https://www.gnu.org/licenses/>.
+ *   ```
+ */
+
+
+in map;
+
+use ymirc::lint::expander;
+use ymirc::lint::node::_;
+
+use ymirc::semantic::{symbol, generator::_};
+use ymirc::semantic::generator::{type::_, value::_};
+
+use ymirc::global::{core_, state};
+use ymirc::lexing::{word, keys};
+
+use ymirc::lint::expander::value::_;
+use std::io;
+
+/**
+ * MapExpander
+ *
+ * Expands all map-related semantic nodes into YIL instructions. Handles:
+ *
+ *   - map access and option construction,
+ *   - map containment checks,
+ *   - map insertion,
+ *   - map iterator operations(begin, end, next),
+ *   - iterator key/value extraction.
+ *
+ * All functions append instructions to a StmtList and return the resulting
+ * YILValue representing the map operation.
+ */
+pub mod MapExpander {
+
+    /**
+     * Finalize a map operation.
+     *
+     * Dispatches based on the concrete map operator:
+     *   - MapAccessValue,
+     *   - MapContainsValue,
+     *   - MapInsertValue,
+     *   - MapIteratorBeginValue,
+     *   - MapIteratorEndValue,
+     *   - MapIteratorDelValue,
+     *   - MapIteratorNextValue,
+     *   - MapIteratorKeyAccessValue,
+     *   - MapIteratorValueAccessValue.
+     *
+     * @params:
+     *   - context: the expansion context
+     *   - m:       the map operator value
+     *   - list:    the statement list to append instructions to
+     *
+     * @returns:
+     *   - &YILValue: the result of the map operation
+     *
+     * @throws:
+     *   - panic: for unsupported map operator types
+     */
+    pub fn finalize(dmut context: &Expander, m: &MapOperatorValue, ref mut list: StmtList)-> &YILValue {
+        match m {
+            a: &MapAccessValue => {
+                return MapExpander::finalizeMapAccess(alias context, a, ref list);
+            }
+            c: &MapContainsValue => {
+                return MapExpander::finalizeMapContains(alias context, c, ref list);
+            }
+            i: &MapInsertValue => {
+                return MapExpander::finalizeMapInsert(alias context, i, ref list);
+            }
+            b: &MapIteratorBeginValue => {
+                return MapExpander::finalizeMapIterBegin(alias context, b, ref list);
+            }
+            e: &MapIteratorEndValue => {
+                return MapExpander::finalizeMapIterEnd(alias context, e, ref list);
+            }
+            d: &MapIteratorDelValue => {
+                return MapExpander::finalizeMapIterDel(alias context, d, ref list);
+            }
+            n: &MapIteratorNextValue => {
+                return MapExpander::finalizeMapIterNext(alias context, n, ref list);
+            }
+            k: &MapIteratorKeyAccessValue => {
+                return MapExpander::finalizeMapIterKey(alias context, k, ref list);
+            }
+            v: &MapIteratorValueAccessValue => {
+                return MapExpander::finalizeMapIterValue(alias context, v, ref list);
+            }
+        }
+
+        eprintln("internal map expansion error: ", m.__typeinfo__.name);
+        panic;
+    }
+
+    /**
+     * Finalize a map access operation.
+     *
+     * Behavior:
+     *   - calls MAP_FIND(mp, key) to obtain a pointer to the value or null,
+     *   - constructs an option value:
+     *       * none  if MAP_FIND returned null,
+     *       * some  if MAP_FIND returned a pointer,
+     *   - registers the result as a unique value.
+     *
+     * @params:
+     *   - context: the expansion context
+     *   - m:       the map access value
+     *   - list:    the statement list to append instructions to
+     *
+     * @returns:
+     *   - &YILValue: an option containing the found value or none
+     */
+    pub fn finalizeMapAccess(dmut context: &Expander, m: &MapAccessValue, ref mut list: StmtList)-> &YILValue {
+        match context.getVariable(m.uniqId) {
+            Ok(u: &YILValue) => {
+                return u;
+            }
+        }
+
+        let optType = if let o: &OptionType = m.type { o } else panic;
+        let valueType = context:.finalizeType(optType);
+        let innerType =  context:.finalizeType(optType.inners[0]);
+        let mpAddr = MemoryExpander::finalizeAddressFromAny(alias context, m.map, ref list);
+        let keyAddr = MemoryExpander::finalizeAddressFromAny(alias context, m.key, ref list);
+
+        let (value, _) = ValueExpander::createVarForBlock(alias context, m.loc,
+                                                          NONE_TYPE,
+                                                          context.typeExpander:.finalizePointer(innerType),
+                                                          ref list);
+        list:.append(copy YILAffect(m.loc,
+                                    value,
+                                    copy YILNameCallValue(m.loc,
+                                                          value.type,
+                                                          YRuntimeFuncs::MAP_FIND,
+                                                          copy [mpAddr, keyAddr])));
+
+        // let result: V?;
+        // {
+        //    let _value = _yrt_map_find(&mp, &key);
+        //    if (_value == null) result = none
+        //    else result = (*_value)?;
+        // };
+        let (result, _) = ValueExpander::createVarForBlock(alias context, m.loc, NONE_TYPE, valueType, ref list);
+        let mut elseList = StmtList();
+        let mut thenList = StmtList();
+
+        let noneValue = LiteralExpander::finalizeErrOpt(alias context,
+                                                        copy ErrOptionValue(m.loc, type-> optType),
+                                                        ref thenList);
+
+        thenList:.append(copy YILAffect(m.loc, result, noneValue));
+
+        if let t: &YILTuple = valueType {
+            // the returned value is a reference to the actual value
+            let contentType = t.inners[1];
+            let innerOptValue = copy YILUnrefValue(m.loc, innerType, value);
+            let content = copy YILTupleValue(m.loc, contentType,
+                                             fieldNames-> copy [OptionKeys::VALUE],
+                                             copy [innerOptValue]);
+
+            let optValue = copy YILTupleValue(m.loc, valueType,
+                                              fieldNames-> copy [OptionKeys::SET, OptionKeys::CONTENT],
+                                              copy [copy YILIntValue(m.loc, YIL_UINT_8, 1us), content]);
+
+            elseList:.append(copy YILAffect(m.loc, result, optValue));
+        } else panic;
+
+        ControlExpander::finalizeCond(m.loc, alias context, ref list,
+                                      copy YILBinaryValue(m.loc, YIL_UINT_8, BinaryOperators::DEQUAL, value, YIL_NULL_VALUE),
+                                      m.loc,
+                                      thenList,
+                                      m.loc,
+                                      elseList,
+                                      cover-> false);
+
+        context:.registerVariable(m.uniqId, result);
+        return result;
+    }
+
+    /**
+     * Finalize a map containment check.
+     *
+     * Behavior:
+     *   - calls MAP_FIND(mp, key),
+     *   - compares the result against null,
+     *   - returns a boolean(u8) indicating presence or absence,
+     *   - registers the result as a unique value.
+     *
+     * @params:
+     *   - context: the expansion context
+     *   - m:       the map contains value
+     *   - list:    the statement list to append instructions to
+     *
+     * @returns:
+     *   - &YILValue: a u8 boolean(1 or 0)
+     */
+    pub fn finalizeMapContains(dmut context: &Expander, m: &MapContainsValue, ref mut list: StmtList)-> &YILValue {
+        let valueType = context:.finalizeType(m.type);
+        match context.getVariable(m.uniqId) {
+            Ok(u: &YILValue) => {
+                if (m.isNot) {
+                    return copy YILBinaryValue(m.loc, YIL_UINT_8, BinaryOperators::NOT_EQUAL, u, YIL_NULL_VALUE);
+                } else {
+                    return copy YILBinaryValue(m.loc, YIL_UINT_8, BinaryOperators::DEQUAL, u, YIL_NULL_VALUE);
+                }
+            }
+        }
+
+        let mpAddr = MemoryExpander::finalizeAddressFromAny(alias context, m.map, ref list);
+        let keyAddr = MemoryExpander::finalizeAddressFromAny(alias context, m.key, ref list);
+
+        let (value, _) = ValueExpander::createVarForBlock(alias context, m.loc, NONE_TYPE,
+                                                          context.typeExpander:.finalizePointer(valueType),
+                                                          ref list);
+        list:.append(copy YILAffect(m.loc,
+                                    value,
+                                    copy YILNameCallValue(m.loc,
+                                                          value.type,
+                                                          YRuntimeFuncs::MAP_FIND,
+                                                          copy [mpAddr, keyAddr])));
+
+
+        context:.registerVariable(m.uniqId, value);
+
+        if (m.isNot) {
+            return copy YILBinaryValue(m.loc, YIL_UINT_8, BinaryOperators::DEQUAL, value, YIL_NULL_VALUE);
+        } else {
+            return copy YILBinaryValue(m.loc, YIL_UINT_8, BinaryOperators::NOT_EQUAL, value, YIL_NULL_VALUE);
+        }
+    }
+
+    /**
+     * Finalize a map insertion.
+     *
+     * Emits a call to:
+     *
+     *      MAP_INSERT(mpAddr, keyAddr, valueAddr)
+     *
+     * @params:
+     *   - context: the expansion context
+     *   - m:       the map insert value
+     *   - list:    the statement list to append instructions to
+     *
+     * @returns:
+     *   - &YILValue: always YIL_UNIT_VALUE
+     */
+    pub fn finalizeMapInsert(dmut context: &Expander, m: &MapInsertValue, ref mut list: StmtList)-> &YILValue {
+        let mpAddr = MemoryExpander::finalizeAddressFromAny(alias context, m.map, ref list);
+        let keyAddr = MemoryExpander::finalizeAddressFromAny(alias context, m.key, ref list);
+        let valueAddr = MemoryExpander::finalizeAddressFromAny(alias context, m.value, ref list);
+
+        list:.append(copy YILCall(m.loc,
+                                  copy YILNameCallValue(m.loc,
+                                                        YIL_VOID,
+                                                        YRuntimeFuncs::MAP_INSERT,
+                                                        copy [mpAddr, keyAddr, valueAddr])));
+
+        return YIL_UNIT_VALUE;
+    }
+
+    /**
+     * Finalize the beginning of a map iterator.
+     *
+     * Emits a call to:
+     *
+     *      MAP_ITER_BEGIN(mpAddr)
+     *
+     * returning an iterator value.
+     *
+     * @params:
+     *   - context: the expansion context
+     *   - b:       the map iterator begin value
+     *   - list:    the statement list to append instructions to
+     *
+     * @returns:
+     *   - &YILValue: the iterator value
+     */
+    pub fn finalizeMapIterBegin(dmut context: &Expander, b: &MapIteratorBeginValue, ref mut list: StmtList)-> &YILValue {
+        let mpAddr = MemoryExpander::finalizeAddressFromAny(alias context, b.map, ref list);
+        let iterType = context:.finalizeType(b.type);
+
+        return copy YILNameCallValue(b.loc, iterType, YRuntimeFuncs::MAP_ITER_BEGIN, copy [mpAddr]);
+    }
+
+    /**
+     * Finalize deletion of the current iterator entry.
+     *
+     * Emits:
+     *
+     *      MAP_ITER_DEL(iter)
+     *
+     * @params:
+     *   - context: the expansion context
+     *   - d:       the map iterator delete value
+     *   - list:    the statement list to append instructions to
+     *
+     * @returns:
+     *   - &YILValue: always YIL_UNIT_VALUE
+     */
+    pub fn finalizeMapIterDel(dmut context: &Expander, d: &MapIteratorDelValue, ref mut list: StmtList)-> &YILValue {
+        let iterValue = ValueExpander::finalize(alias context, d.iter, ref list, asLeft-> false);
+        list:.append(copy YILCall(d.loc,
+                                  copy YILNameCallValue(d.loc,
+                                                        YIL_VOID,
+                                                        YRuntimeFuncs::MAP_ITER_DEL,
+                                                        copy [iterValue])));
+
+        return YIL_UNIT_VALUE;
+    }
+
+    /**
+     * Finalize an iterator end check.
+     *
+     * Emits:
+     *
+     *      MAP_ITER_END(iter)
+     *
+     * returning a u8 boolean indicating whether the iterator is at the end.
+     *
+     * @params:
+     *   - context: the expansion context
+     *   - e:       the map iterator end value
+     *   - list:    the statement list to append instructions to
+     *
+     * @returns:
+     *   - &YILValue: a u8 boolean
+     */
+    pub fn finalizeMapIterEnd(dmut context: &Expander, e: &MapIteratorEndValue, ref mut list: StmtList)-> &YILValue {
+        let iterValue = ValueExpander::finalize(alias context, e.iter, ref list, asLeft-> false);
+        return copy YILNameCallValue(e.loc,
+                                     YIL_UINT_8,
+                                     YRuntimeFuncs::MAP_ITER_END,
+                                     copy [iterValue]);
+    }
+
+    /**
+     * Finalize advancing a map iterator.
+     *
+     * Emits:
+     *
+     *      MAP_ITER_NEXT(iter)
+     *
+     * @params:
+     *   - context: the expansion context
+     *   - n:       the map iterator next value
+     *   - list:    the statement list to append instructions to
+     *
+     * @returns:
+     *   - &YILValue: always YIL_UNIT_VALUE
+     */
+    pub fn finalizeMapIterNext(dmut context: &Expander, n: &MapIteratorNextValue, ref mut list: StmtList)-> &YILValue {
+        let iterValue = ValueExpander::finalize(alias context, n.iter, ref list, asLeft-> false);
+        list:.append(copy YILCall(n.loc,
+                                  copy YILNameCallValue(n.loc,
+                                                        YIL_VOID,
+                                                        YRuntimeFuncs::MAP_ITER_NEXT, copy [iterValue])));
+
+        return YIL_UNIT_VALUE;
+    }
+
+    /**
+     * Finalize access to the key of the current iterator entry.
+     *
+     * Emits:
+     *
+     *      MAP_ITER_KEY(iter)
+     *
+     * and dereferences the returned pointer.
+     *
+     * @params:
+     *   - context: the expansion context
+     *   - k:       the map iterator key access value
+     *   - list:    the statement list to append instructions to
+     *
+     * @returns:
+     *   - &YILValue: the key value
+     */
+    pub fn finalizeMapIterKey(dmut context: &Expander, k: &MapIteratorKeyAccessValue, ref mut list: StmtList)-> &YILValue {
+        let iterValue = ValueExpander::finalize(alias context, k.iter, ref list, asLeft-> false);
+        let retType = context:.finalizeType(k.type);
+        return copy YILUnrefValue(k.loc,
+                                  retType,
+                                  copy YILNameCallValue(k.loc,
+                                                        context.typeExpander:.finalizePointer(retType),
+                                                        YRuntimeFuncs::MAP_ITER_KEY, copy [iterValue]));
+    }
+
+    /**
+     * Finalize access to the value of the current iterator entry.
+     *
+     * Emits:
+     *
+     *      MAP_ITER_VAL(iter)
+     *
+     * and dereferences the returned pointer.
+     *
+     * @params:
+     *   - context: the expansion context
+     *   - v:       the map iterator value access value
+     *   - list:    the statement list to append instructions to
+     *
+     * @returns:
+     *   - &YILValue: the value
+     */
+    pub fn finalizeMapIterValue(dmut context: &Expander, v: &MapIteratorValueAccessValue, ref mut list: StmtList)-> &YILValue {
+        let iterValue = ValueExpander::finalize(alias context, v.iter, ref list, asLeft-> false);
+        let retType = context:.finalizeType(v.type);
+        return copy YILUnrefValue(v.loc,
+                                  retType,
+                                  copy YILNameCallValue(v.loc,
+                                                        context.typeExpander:.finalizePointer(retType),
+                                                        YRuntimeFuncs::MAP_ITER_VAL, copy [iterValue]));
+    }
+}

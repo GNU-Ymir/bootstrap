@@ -1,0 +1,367 @@
+/*
+ * Implements semantic validation for all indexing operations in Ymir.
+ *
+ * Responsibilities:
+ *   - Validate index expressions on arrays, slices, pointers, maps, and classes.
+ *   - Dispatch indexing to the appropriate specialized validator:
+ *       • ArrayIndexValidation
+ *       • SliceIndexValidation
+ *       • PointerIndexValidation
+ *       • MapIndexValidation
+ *       • ClassIndexValidation
+ *   - Handle aliasing rules for class indexers.
+ *   - Validate multi-index expressions and expanded indices.
+ *   - Support index assignment operations.
+ *   - Manage $-context for class aliasers.
+ *
+ * This module is the root entry point for the `[]` operator in Ymir.
+ *
+ * <hr>
+ *
+ * @Package: ymirc
+ * @Module: ymirc::semantic::validator::value::operator::index
+ * @File: ymirc/semantic/validator/value/operator/index.yr
+ * @Author(s):
+ *   - Emile Cadorel <ecadorel@gmail.com>
+ *
+ * @Created(YYYY-MM-DD): 2026-05-13
+ * @Copyright(C) 2021–2026 GNU-Ymir
+ * @License
+ *   ```text
+ *   This file is part of the Ymir language project.
+ *
+ *   Ymir is free software: you can redistribute it and/or modify it
+ *   under the terms of the GNU General Public License as published by
+ *   the Free Software Foundation, either version 3 of the License, or
+ *   (at your option) any later version.
+ *
+ *   Ymir is distributed in the hope that it will be useful,
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *   GNU General Public License for more details.
+ *
+ *   You should have received a copy of the GNU General Public License
+ *   along with Ymir.  If not, see <https://www.gnu.org/licenses/>.
+ *   ```
+ */
+
+in index;
+
+use ymirc::syntax::expression::operator;
+use ymirc::semantic::validator;
+use ymirc::semantic::generator::{value::_, type::_};
+
+use ymirc::errors;
+use ymirc::lexing::word;
+
+use ymirc::utils::format;
+
+use ymirc::semantic::validator::value::operator::index::_;
+
+/*!
+ * ====================================================================================================
+ * ====================================================================================================
+ * ====================================          SUBMODS          =====================================
+ * ====================================================================================================
+ * ====================================================================================================
+ */
+
+pub mod ::array;
+pub mod ::map;
+pub mod ::class_;
+
+mod ::slice;
+mod ::pointer;
+
+/*!
+ * ====================================================================================================
+ * ====================================================================================================
+ * ======================================          ROOT          ======================================
+ * ====================================================================================================
+ * ====================================================================================================
+ */
+
+/**
+ * IndexValidation
+ *
+ * Root validator for all indexing operations in Ymir:
+ *
+ *      object[index]
+ *      object[i, j]
+ *      object[a .. b]
+ *      object[key]
+ *      object[key] = value
+ *
+ * It is the central dispatcher for the `[]` operator.
+
+ */
+pub mod IndexValidation {
+
+
+    /**
+     * Validate a multiple-operand expression containing an index operation.
+     *
+     * @params:
+     *   - context: validation context
+     *   - mult:    the multiple-operand expression containing the index operator
+     *
+     * @returns:
+     *   A &Value representing the result of the indexing operation.
+     *
+     * @throws:
+     *   ErrorMsg if validation of the left operand or index expressions fails.
+     */
+    pub fn validate(dmut context: &ValidationContext, mult: &MultOperatorExpr)-> &Value
+        throws ErrorMsg
+    {
+        let mut left = ValueValidation::validate(alias context, mult.left);
+        if (mult.isAlias) {
+            left = AliasValidation::validate(alias context, mult.loc, left,
+                                              isClass-> true,
+                                              isField-> false);
+        } else {
+            left = ValueCreation::createEnumUnwrap(left);
+        }
+
+        return IndexValidation::validate(alias context, mult.loc, left, mult.rights,
+                                          inCopy-> context.isInCopy(mult));
+    }
+
+    /**
+     * Validate a simple indexing operation with a single index expression.
+     *
+     * This is a convenience overload for:
+     *
+     *      object[index]
+     *
+     * @params:
+     *   - context: validation context
+     *   - loc:     location of the index operator
+     *   - object:  the object being indexed
+     *   - index:   the index expression
+     *
+     * @returns:
+     *   A &Value representing the result of the indexing operation.
+     *
+     * @throws:
+     *   ErrorMsg if the index is invalid for the object type.
+     */
+    pub fn validate(dmut context: &ValidationContext,
+                     loc:          &Word,
+                     object:       &Value,
+                     index:        &Value)-> &Value
+        throws ErrorMsg
+    {
+        let (rights, rTypes) = (copy [index], copy [index.type]);
+        return IndexValidation::validate(alias context, loc, object, rights, rTypes,
+                                          byAlias-> (object of ClassAliaserValue),
+                                          inCopy-> false);
+    }
+
+    /**
+     * Validate an indexing operation with one or more index expressions.
+     *
+     * @params:
+     *   - context: validation context
+     *   - loc:     location of the index operator
+     *   - object:  the object being indexed
+     *   - indices: list of index expressions
+     *   - inCopy:  whether the operation occurs inside a copy expression
+     *
+     * @returns:
+     *   A &Value representing the result of the indexing operation.
+     *
+     * @throws:
+     *   ErrorMsg if any index is invalid or unsupported for the object type.
+     */
+    pub fn validate(dmut context: &ValidationContext,
+                     loc:          &Word,
+                     object:       &Value,
+                     indices:      [&Expression],
+                     inCopy:       bool)-> &Value
+        throws ErrorMsg
+    {
+        let byAlias = match object {
+            a: &ClassAliaserValue => {
+                context:.enterDollar(a.value);
+                true
+            }
+            v: _ => {
+                context:.enterDollar(v);
+                false
+            }
+        };
+
+        let (rights, rTypes) = {
+            IndexValidation::validateRights(alias context, indices)
+        } exit {
+            context:.exitDollar();
+        };
+
+        return IndexValidation::validate(alias context, loc, object, rights, rTypes,
+                                          byAlias-> byAlias,
+                                          inCopy-> inCopy);
+    }
+
+    /**
+     * Validate an index assignment operation:
+     *
+     *      object[indices...] = assign
+     *
+     * @params:
+     *   - context: validation context
+     *   - loc:     location of the assignment operator
+     *   - object:  the object being indexed
+     *   - indices: list of index expressions
+     *   - assign:  value to assign
+     *
+     * @returns:
+     *   A &Value representing the result of the assignment.
+     *
+     * @throws:
+     *   ErrorMsg if the object type does not support indexed assignment.
+     */
+    pub fn validateAssign(dmut context: &ValidationContext,
+                           loc:          &Word,
+                           object:       &Value,
+                           indices:      [&Expression],
+                           assign:       &Value)-> &Value
+        throws ErrorMsg
+    {
+        let byAlias = match object {
+            a: &ClassAliaserValue => {
+                context:.enterDollar(a.value);
+                true
+            }
+            v: _ => {
+                context:.enterDollar(v);
+                false
+            }
+        };
+
+        let (rights, rTypes) = {
+            IndexValidation::validateRights(alias context, indices)
+        } exit {
+            context:.exitDollar();
+        };
+
+        let (ret, useAlias) = {
+            match object.type {
+                m: &MapType => {
+                    (MapIndexValidation::validateAssign(alias context, loc, object, m, rights, rTypes, assign), false)
+                }
+                c: &ClassPtrType => {
+                    (ClassIndexValidation::validateAssign(alias context, loc, object, c, rights, assign), true)
+                }
+                _ => {
+                    throw copy ErrorMsg::fatal(loc, format(ValidateErrorMessage::UNDEFINED_INDEX_OP, object.type, rTypes));
+                }
+            }
+        }
+
+        if (byAlias && !useAlias) {
+            throw copy ErrorMsg::fatal(object.loc, format(ValidateErrorMessage::UNECESSARY_ALIAS, object.type));
+        }
+
+        return ret
+    }
+
+    /**
+     * Dispatch indexing based on the object's static type.
+     *
+     * @params:
+     *   - context:  validation context
+     *   - loc:      index operator location
+     *   - object:   object being indexed
+     *   - rights:   validated index values
+     *   - rTypes:   index types
+     *   - byAlias:  whether aliasing was requested
+     *   - inCopy:   whether inside a copy expression
+     */
+    fn validate(dmut context: &ValidationContext,
+                 loc: &Word,
+                 object: &Value,
+                 rights: [&Value],
+                 rTypes: [&Type],
+                 byAlias: bool,
+                 inCopy: bool)-> &Value
+        throws ErrorMsg
+    {
+        let (ret, useAlias) = {
+            match object.type {
+                a: &ArrayType => {
+                    (ArrayIndexValidation::validate(alias context, loc, object, a, rights, rTypes, inCopy), false)
+                }
+                s: &SliceType => {
+                    (SliceIndexValidation::validate(alias context, loc, object, s, rights, rTypes), false)
+                }
+                p: &PointerType => {
+                    (PointerIndexValidation::validate(alias context, loc, object, p, rights, rTypes), false)
+                }
+                m: &MapType => {
+                    (MapIndexValidation::validate(alias context, loc, object, m, rights, rTypes), false)
+                }
+                c: &ClassPtrType => {
+                    (ClassIndexValidation::validate(alias context, loc, object, c, rights), true)
+                }
+                _ => {
+                    throw copy ErrorMsg::fatal(loc, format(ValidateErrorMessage::UNDEFINED_INDEX_OP, object.type, rTypes));
+                }
+            }
+        }
+
+        if (byAlias && !useAlias) {
+            throw copy ErrorMsg::fatal(object.loc, format(ValidateErrorMessage::UNECESSARY_ALIAS, object.type));
+        }
+
+        return ret
+    }
+
+    /**
+     * Validate and expand index expressions.
+     *
+     * @params:
+     *   - context: validation context
+     *   - indices: list of index expressions
+     *
+     * @returns:
+     *   (rights, types)
+     *     - rights: validated index values
+     *     - types:  their corresponding types
+     */
+    fn validateRights(dmut context: &ValidationContext, indices: [&Expression])-> ([&Value], [&Type])
+        throws ErrorMsg
+    {
+        let mut errors: [&ErrorMsg] = [];
+        let mut rights: [&Value] = [];
+        let mut types: [&Type] = [];
+
+        for r in indices {
+            {
+                let v = ValueValidation::validate(alias context, r);
+                match v {
+                    e: &ExpandValue => {
+                        for i_v in e.values {
+                            rights ~= [i_v];
+                            types ~= [i_v.type];
+                        }
+                    }
+                    _ => {
+                        rights ~= [v];
+                        types ~= [v.type];
+                    }
+                }
+            } catch {
+                err => {
+                    errors ~= [err];
+                }
+            }
+        }
+
+        if (errors.len != 0us) {
+            throw copy ErrorMsg::list(errors);
+        }
+
+        return (rights, types);
+    }
+}

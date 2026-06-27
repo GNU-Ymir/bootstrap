@@ -1,0 +1,457 @@
+/*
+ * Implements semantic validation for function symbols.
+ *
+ * This module handles:
+ *   - prototype validation for declared and template-instantiated functions,
+ *   - validation of parameters, return types, attributes, and throwers,
+ *   - validation of function bodies(when requested),
+ *   - construction of PrototypeValue and FrameGenerator entries,
+ *   - enforcement of unsafe contexts and return-type rules,
+ *   - detection of function collisions and invalid main signatures.
+ *
+ * <hr>
+ *
+ * @Package: ymirc
+ * @Module: ymirc::semantic::validator::symbol::function::basic
+ * @File: ymirc/semantic/validator/symbol/function/basic.yr
+ * @Author(s):
+ *   - Emile Cadorel <ecadorel@gmail.com>
+ *
+ * @Created(YYYY-MM-DD): 2026-05-13
+ * @Copyright(C) 2021–2026 GNU-Ymir
+ * @License
+ *   ```text
+ *   This file is part of the Ymir language project.
+ *
+ *   Ymir is free software: you can redistribute it and/or modify it
+ *   under the terms of the GNU General Public License as published by
+ *   the Free Software Foundation, either version 3 of the License, or
+ *   (at your option) any later version.
+ *
+ *   Ymir is distributed in the hope that it will be useful,
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *   GNU General Public License for more details.
+ *
+ *   You should have received a copy of the GNU General Public License
+ *   along with Ymir.  If not, see <https://www.gnu.org/licenses/>.
+ *   ```
+ */
+
+in basic;
+
+use ymirc::syntax::{expression::_, declaration::_};
+use ymirc::semantic::{validator, template_};
+use ymirc::semantic::{generator::_, symbol};
+use ymirc::semantic::generator::{value::_, type::_};
+
+use ymirc::errors;
+use ymirc::utils::{format, log};
+use ymirc::lexing::{word, tokens, keys};
+
+use std::{stream, io};
+
+use ymirc::semantic::validator::symbol::function::_;
+
+
+/**
+ * FunctionValidation module
+ *
+ * Provides semantic validation for function symbols, including:
+ *
+ *   - prototype validation(with or without body),
+ *   - template-mapper integration,
+ *   - parameter and return-type validation,
+ *   - thrower validation and exception-contract checking,
+ *   - unsafe-context handling,
+ *   - memory-ownership verification for return values,
+ *   - construction of PrototypeValue and FrameGenerator entries,
+ *   - detection of function collisions.
+ *
+ * This module is invoked both for prototype-only validation(e.g., during
+ * template instantiation) and full validation including the function body.
+ */
+pub mod FunctionValidation {
+
+    /**
+     * Validate the prototype of a function symbol, without validating its body.
+     *
+     * If the function already has a cached frame prototype, it is returned
+     * immediately.
+     *
+     * @params:
+     *   - context: validation context
+     *   - sym:     function symbol to validate
+     *
+     * @returns:
+     *   - the PrototypeValue for the function
+     *
+     * @throws:
+     *   - ErrorMsg if prototype validation fails
+     */
+    pub fn validateProto(dmut context: &ValidationContext, dmut sym: &FunctionSymbol)-> &PrototypeValue
+        throws ErrorMsg
+    {
+        if let v: &PrototypeValue = sym.frameProto {
+            return v;
+        }
+
+        context:.pushReferent(alias sym);
+        context:.enterForeign(isFnBody-> false);
+        {
+            return FunctionValidation::validate(alias context, alias sym,
+                                                validateBody-> false);
+        } catch {
+            err => {
+                throw copy ErrorMsg::fatal(sym.loc, format(ValidateErrorMessage::VALIDATING_SYMBOL, sym.path.toStr()),
+                                           notes-> copy [err]);
+            }
+        } exit {
+            context:.exitForeign();
+            context:.popReferent();
+        }
+    }
+
+    /**
+     * Validate the prototype of a function declaration(non-symbol version).
+     *
+     * Used when validating a function declaration directly, such as during
+     * template instantiation. This version:
+     *
+     *   - validates throwers,
+     *   - validates attributes,
+     *   - validates parameters and return type(without default values),
+     *   - constructs a PrototypeValue with template-mapper information.
+     *
+     * Errors are aggregated and wrapped in a VALIDATING_SYMBOL diagnostic.
+     *
+     * @params:
+     *   - context:  validation context
+     *   - implLoc:  location of the function implementation
+     *   - sym:      symbol representing the function
+     *   - func:     function declaration
+     *   - mapper: template mapper for instantiated functions
+     *
+     * @returns:
+     *   - the constructed PrototypeValue
+     *
+     * @throws:
+     *   - ErrorMsg if prototype validation fails
+     */
+    pub fn validateProto(dmut context: &ValidationContext,
+                         dmut sym:     &Symbol,
+                         implLoc:      &Word,
+                         func:         &FunctionDecl,
+                         mapper:       TemplateMapper)-> &PrototypeValue
+        throws ErrorMsg
+    {
+        let mut error: (&ErrorMsg)? = none;
+        let mut retType: &Type = NONE_TYPE;
+        let mut params: [&ProtoVarDeclValue] = [];
+        let mut throwers: [Thrower] = [];
+
+        context:.pushReferent(alias sym);
+        context:.enterForeign(isFnBody-> false);
+        {
+            throwers = FunctionPrototypeValidation::validateThrowers(alias context, func.throwerLoc, func.throwers);
+            FunctionVerification::verifyUndefAttributesFunction(func.attrs);
+            context:.enterBlock();
+            {
+                let (retType_, params_) = FunctionPrototypeValidation::validateParamsAndRetType(alias context, func.loc, sym, func.proto,
+                                                                                                forMethod-> false,
+                                                                                                withValue-> false);
+                retType = retType_;
+                params = params_;
+            } exit {
+                context:.safeQuitBlock();
+            }
+        } catch {
+            err => {
+                error = (err)?;
+            }
+        } exit {
+            context:.exitForeign();
+            context:.popReferent();
+        }
+
+        if let Ok(msg) = error {
+            throw copy ErrorMsg::fatal(sym.loc, format(ValidateErrorMessage::VALIDATING_SYMBOL, sym.path.toStr()),
+                                       notes-> copy [msg]);
+        }
+
+        return copy PrototypeValue(sym.loc,
+                                   implLoc-> implLoc,
+                                   sym,
+                                   params,
+                                   retType,
+                                   throwers,
+                                   fromTemplate-> mapper?,
+                                   attrs-> func.attrs);
+    }
+
+    /**
+     * Validate a function symbol, including its body.
+     *
+     * @params:
+     *   - context: validation context
+     *   - sym:     function symbol
+     *
+     * @throws:
+     *   - ErrorMsg if validation fails
+     */
+    pub fn validate(dmut context: &ValidationContext, dmut sym: &FunctionSymbol)
+        throws ErrorMsg
+    {
+        context:.pushReferent(alias sym);
+        context:.enterForeign(isFnBody-> false);
+        {
+            FunctionValidation::validate(alias context, alias sym,
+                                         validateBody-> true);
+        } catch {
+            err => {
+                throw copy ErrorMsg::fatal(sym.loc, format(ValidateErrorMessage::VALIDATING_SYMBOL, sym.path.toStr()),
+                                           notes-> copy [err]);
+            }
+        } exit {
+            context:.exitForeign();
+            context:.popReferent();
+        }
+    }
+
+    /**
+     * Validate the body of a function.
+     *
+     * @params:
+     *   - context:     validation context
+     *   - sym:         function symbol
+     *   - func:        function declaration
+     *   - retType:     declared return type
+     *   - throwers:    declared throwers
+     *   - preThrowing: additional throwers from outer contexts
+     *
+     * @returns:
+     *   - the validated body value
+     *
+     * @throws:
+     *   - ErrorMsg if body validation fails
+     */
+    pub fn validateBody(dmut context: &ValidationContext,
+                        path:         &SymbolPath,
+                        func:         &FunctionDecl,
+                        retType:      &Type,
+                        throwers:     [Thrower],
+                        isUnsafe:     bool,
+                        preThrowing:  [Thrower] = [])-> &Value
+        throws ErrorMsg
+    {
+        logging::info("Validate function %", path);
+
+        context:.enterFunctionBody();
+        if func.body of EmptyExpr {
+            context:.clearLocalScope();
+            return UNIT_VALUE;
+        }
+
+        let mut unsafeLoc = FunctionPrototypeValidation::getAttributeLoc(func.attrs, Attributes::UNSAFE);
+        let mut forceUnsafe = false;
+        if (unsafeLoc.isEof && isUnsafe) {
+            unsafeLoc = func.loc;
+            forceUnsafe = true;
+        }
+
+        let mut bodyValue: &Value = UNIT_VALUE;
+        let mut errors: (&ErrorMsg)? = none;
+        if (!unsafeLoc.isEof) {
+            context:.enterUnsafeContext(unsafeLoc);
+        }
+
+        {
+            context:.setFunctionReturn(retType);
+            bodyValue = ValueValidation::validate(alias context, func.body);
+
+            if (!bodyValue.isReturner) {
+                let mut loc = retType.loc;
+                if loc.isEof {
+                    loc = bodyValue.loc;
+                }
+
+                bodyValue = TypeInference::inferValueForType(alias context, loc, bodyValue, retType,
+                                                             byReference-> false);
+
+                MemoryVerification::verifyMemoryOwner(loc, retType, bodyValue,
+                                                      byReference-> false);
+
+                if retType !of VoidType {
+                    bodyValue = copy ReturnValue(bodyValue.loc, bodyValue);
+                }
+            }
+
+            FunctionVerification::verifyThrowing(func.loc, path,
+                                                 thrown-> (bodyValue.throwers ~ preThrowing),
+                                                 expected-> throwers);
+        } catch {
+            err => {
+                errors = err?;
+            }
+        }
+
+        if (!unsafeLoc.isEof) {
+            context:.exitUnsafeContext(force-> forceUnsafe);
+        }
+
+        if let Ok(err) = errors {
+            throw err;
+        }
+
+        return bodyValue;
+    }
+
+    /**
+     * Core function validation routine.
+     *
+     * Performs:
+     *   - thrower validation,
+     *   - attribute validation,
+     *   - parameter and return-type validation,
+     *   - optional body validation,
+     *   - block-scope management,
+     *   - finalization via finalizeFunction.
+     *
+     * Errors are captured and re-thrown after block cleanup.
+     *
+     * @params:
+     *   - context:      validation context
+     *   - sym:          function symbol
+     *   - validateBody: whether to validate the function body
+     *
+     * @returns:
+     *   - the PrototypeValue for the function
+     *
+     * @throws:
+     *   - ErrorMsg if validation fails
+     */
+    fn validate(dmut context: &ValidationContext, dmut sym: &FunctionSymbol, validateBody: bool = true)-> &PrototypeValue
+        throws ErrorMsg
+    {
+        let func = sym.decl;
+        let mut errors: (&ErrorMsg)? = none;
+        let mut retType: &Type = NONE_TYPE;
+        let mut params: [&ProtoVarDeclValue] = [];
+        let mut body: &Value = UNIT_VALUE;
+
+        let throwers = FunctionPrototypeValidation::validateThrowers(alias context, func.throwerLoc, func.throwers);
+        FunctionVerification::verifyUndefAttributesFunction(func.attrs);
+
+        context:.enterBlock();
+        {
+            let (retType_, params_) = FunctionPrototypeValidation::validateParamsAndRetType(alias context, func.loc, sym, func.proto,
+                                                                                            forMethod-> false,
+                                                                                            withValue-> true);
+            retType = retType_;
+            params = params_;
+
+            if validateBody {
+                body = FunctionValidation::validateBody(alias context, sym.path, func, retType, throwers,
+                                                        isUnsafe-> sym.isUnsafe);
+            }
+        } catch {
+            err => {
+                errors = (err)?;
+            }
+        }
+
+        {
+            context:.quitBlock(warnUnused-> (errors.hasValue && validateBody));
+        } catch {
+            err => {
+                errors = (err)?;
+            }
+        }
+
+        if let Ok(err) = errors {
+            throw err;
+        }
+
+        return finalizeFunction(alias context, alias sym, func.loc, func, params, retType, throwers, body, validateBody);
+    }
+
+    /**
+     * Finalize a validated function by constructing its prototype and frame.
+     *
+     * Steps:
+     *   1. If validating the body, generate a FrameGenerator and register it.
+     *   2. Build a PrototypeValue with:
+     *        - parameters,
+     *        - return type,
+     *        - throwers,
+     *        - template-mapper info,
+     *        - attributes.
+     *   3. Reject inline `main` functions.
+     *   4. If validating the body:
+     *        - check for function collisions,
+     *        - attach the frame prototype to the symbol.
+     *
+     * @params:
+     *   - context:      validation context
+     *   - sym:          function symbol
+     *   - implLoc:      implementation location
+     *   - func:         function declaration
+     *   - params:       validated parameters
+     *   - retType:      validated return type
+     *   - throwers:     validated throwers
+     *   - body:         validated body
+     *   - validateBody: whether the body was validated
+     *
+     * @returns:
+     *   - the constructed PrototypeValue
+     *
+     * @throws:
+     *   - ErrorMsg if finalization fails
+     */
+    fn finalizeFunction(dmut context: &ValidationContext,
+                        dmut sym:     &FunctionSymbol,
+                        implLoc:      &Word,
+                        func:         &FunctionDecl,
+                        params:       [&ProtoVarDeclValue],
+                        retType:      &Type,
+                        throwers:     [Thrower],
+                        body:         &Value,
+                        validateBody: bool)-> &PrototypeValue
+        throws ErrorMsg
+    {
+        if (validateBody && func.body !of EmptyExpr) {
+            let frame = copy FrameGenerator(func.loc,
+                                            implLoc-> func.loc,
+                                            sym.path,
+                                            params,
+                                            retType,
+                                            body,
+                                            FrameKind::FUNC,
+                                            externLang-> sym.externLang,
+                                            isWeak-> sym.isWeak,
+                                            templateMapper-> sym.templateMapper);
+
+            context:.insertGenerator(alias sym, frame);
+        }
+        
+        let gen = copy PrototypeValue(sym.loc,
+                                      implLoc-> implLoc,
+                                      sym,
+                                      params,
+                                      retType,
+                                      throwers,
+                                      fromTemplate-> sym.templateMapper,
+                                      attrs-> func.attrs);
+
+        if func.name == Keys::MAIN && gen.isInline {
+            throw copy ErrorMsg::fatal(gen.inlineLoc, format(ValidateErrorMessage::MAIN_INLINE));
+        }
+
+        if validateBody {
+            FunctionVerification::verifyFunctionCollision(sym, func.name.str, gen);
+            sym:.setFrameProto(gen, body);
+        }
+
+        return gen;
+    }
+}

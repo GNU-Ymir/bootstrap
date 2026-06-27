@@ -1,0 +1,437 @@
+/*
+ * Declares the CompileTimeInterpret class.
+ *
+ * The CompileTimeInterpret performs compile-time reduction of generator
+ * values. It evaluates literals, operators, scopes, and memory constructs when
+ * possible, and preserves reduction results to avoid repeated work.
+ *
+ * The interpreter also provides utilities for computing compile-time constants
+ * (strings, ints, floats, bools) and for determining whether a value is fully
+ * known at compile time.
+ *
+ * <hr>
+ *
+ * @Package: ymirc
+ * @Module: ymirc::semantic::interpret::visitor
+ * @File: ymirc/semantic/interpret/visitor.yr
+ * @Author(s):
+ *   - Emile Cadorel <ecadorel@gmail.com>
+ *
+ * @Created(YYYY-MM-DD): 2026-03-14
+ * @Copyright(C) 2021–2026 GNU-Ymir
+ * @License
+ *   ```text
+ *   This file is part of the Ymir language project.
+ *
+ *   Ymir is free software: you can redistribute it and/or modify it
+ *   under the terms of the GNU General Public License as published by
+ *   the Free Software Foundation, either version 3 of the License, or
+ *   (at your option) any later version.
+ *
+ *   Ymir is distributed in the hope that it will be useful,
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *   GNU General Public License for more details.
+ *
+ *   You should have received a copy of the GNU General Public License
+ *   along with Ymir.  If not, see <https://www.gnu.org/licenses/>.
+ *   ```
+ */
+
+in visitor;
+
+
+use ymirc::semantic::generator::{value::_, type::_};
+use ymirc::global::{core_, state};
+use ymirc::lexing::{word, keys};
+use ymirc::semantic::{symbol, interpret::_, validator};
+use ymirc::errors;
+
+use ymirc::utils::{bigint, bigfloat, format};
+
+
+/**
+ * Compile-time interpreter for generator values.
+ *
+ * This class reduces generator IR nodes into simpler or literal forms when
+ * possible. It caches reduced values, tracks inlined functions, and exposes
+ * utilities for computing compile-time constants.
+ *
+ * Reduction is context-sensitive:
+ *   - normal evaluation,
+ *   - operator evaluation,
+ *   - struct-field access evaluation.
+ *
+ * The interpreter also determines whether a value is fully known at compile
+ * time and provides helpers for extracting typed literals(string, bool, int,
+ * float).
+ *
+ */
+@final
+pub class CompileTimeInterpret {
+
+    pub {
+        /**
+         * True when this interpreter is not allowed to reduce variable
+         * references by inspecting their inner values. Other interpreters may
+         * dereference variables during reduction.
+         */
+        let isForRef: bool;
+    }
+
+    prv {
+        /**
+         * Cache of already-reduced values, keyed by uniqId.
+         * Prevents repeated reductions and unnecessary allocations.
+         */
+        let mut _reduced: [usize => mut &Value] = copy [];
+
+        /**
+         * Set of functions currently being inlined.
+         * Prevents recursive inlining and tracks inline contexts.
+         */
+        let mut _inlineSet: [&FunctionSymbol => mut()] = copy [];
+
+    }
+
+    /**
+     * Constructs a compile-time interpreter.
+     *
+     * @params:
+     *   - forRef:  whether variable references is forbidden
+     *   - reduced: initial map of already-reduced values
+     *
+     */
+    pub self (forRef: bool = false, mut reduced: [usize => mut &Value])
+        with isForRef = forRef
+        , _reduced = alias reduced
+    {}
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * =====================================          UTILS          ======================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * @returns the internal map of reduced values.
+     */
+    @field
+    pub fn reduced(mut self)-> mut[usize => mut &Value] {
+        return alias self._reduced;
+    }
+
+    /**
+     * @returns true iff the given function is currently being inlined.
+     */
+    pub fn isInlining(self, func: &FunctionSymbol)-> bool {
+        func in self._inlineSet
+    }
+
+    /**
+     * Marks a function as being inlined.
+     */
+    pub fn insertInlining(mut self, func: &FunctionSymbol) {
+        self._inlineSet[func] = ();
+    }
+
+    /**
+     * Removes a function from the inlining set.
+     */
+    pub fn removeInlining(mut self, func: &FunctionSymbol) {
+        self._inlineSet:.remove(func);
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ===================================          REDUCTION          ====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Reduces a value in normal evaluation context.
+     *
+     * Uses cached reductions when available. Dispatches to the appropriate
+     * subsystem(literal, operator, scope, memory). Stores the result in the
+     * reduction cache.
+     *
+     */
+    pub fn reduce(mut self, value: &Value)-> &Value
+        throws ErrorMsg
+    {
+        // If the value is already reduce no need to retry reducing it
+        // It will only be a lose of time and allocation space
+        if (value.isReduced) return value;
+        if let Ok(v) = self._reduced[value.uniqId] {
+            return v;
+        }
+
+        let rdc = match value {
+            l: &LiteralValue => { return LiteralInterpret::reduce(alias self, l, inOperator-> false); }
+            o: &OperatorValue => { return OperatorInterpret::reduce(alias self, o, inOperator-> false); }
+            s: &ScopeValue => { return ScopeInterpret::reduce(alias self, s, inOperator-> false, inStruct-> false); }
+            m: &MemoryValue => { return MemoryInterpret::reduce(alias self, m); }
+
+            //
+            _ => {
+                value
+            }
+        };
+
+        self._reduced[value.uniqId] = rdc;
+        rdc
+    }
+
+    /**
+     * Reduces a value in operator context.
+     *
+     * Certain constructs(literals, fields, scopes, variable references) use
+     * operator-specific reduction paths. If `checkCte` is true and the result
+     * is not compile-time known, falls back to normal reduction.
+     *
+     */
+    pub fn reduceInOperator(mut self, value: &Value, checkCte: bool)-> &Value
+        throws ErrorMsg
+    {
+        let res = match value {
+            l: &LiteralValue => { LiteralInterpret::reduce(alias self, l, inOperator-> true) }
+            f: &FieldOperatorValue => { FieldInterpret::reduce(alias self, f, inOperator-> true) }
+            s: &ScopeValue => { ScopeInterpret::reduce(alias self, s, inOperator-> true, inStruct-> false) }
+            v: &VarRefValue => { ScopeInterpret::reduceVarRef(alias self, v, inOperator-> true, inStruct-> false) }
+
+            _ => {
+                return self:.reduce(value);
+            }
+        };
+
+        if (checkCte && !self.isCte(res)) {
+            return self:.reduce(value);
+        }
+
+        return res;
+    }
+
+    /**
+     * Reduces a value in struct-field-access context.
+     *
+     * Similar to operator reduction but tailored for field access. Does not
+     * extract the field; only reduces the containing value.
+     *
+     */
+    pub fn reduceInStructAccess(mut self, value: &Value)-> &Value
+        throws ErrorMsg
+    {
+        match value {
+            l: &LiteralValue => { return LiteralInterpret::reduce(alias self, l, inOperator-> true); }
+            s: &ScopeValue => { return ScopeInterpret::reduce(alias self, s, inOperator-> true, inStruct-> true); }
+            v: &VarRefValue => { return ScopeInterpret::reduceVarRef(alias self, v, inOperator-> true, inStruct-> true); }
+            e: &EnumFieldAccessValue => { return self:.reduce(e.value); }
+
+            _ => {
+                return self:.reduce(value);
+            }
+        }
+    }
+
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ======================================          CTES          ======================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Determines whether a reduced value is fully known at compile time.
+     *
+     * Composite values(ranges, arrays, tuples, options, named values,
+     * aliasers) are CTE only when all their components are CTE.
+     *
+     */
+    pub fn isCte(self, value: &Value)-> bool {
+        match value {
+            r: &RangeValue => {
+                if (!self.isCte(r.left)) return false;
+                if (!self.isCte(r.right)) return false;
+                if (!self.isCte(r.step)) return false;
+                if (!self.isCte(r.isFull)) return false;
+
+                true
+            }
+            a: &ArrayValue => {
+                for it in a.values {
+                    if (!self.isCte(it)) return false;
+                }
+
+                true
+            }
+            t: &TupleValue => {
+                for it in t.values {
+                    if (!self.isCte(it)) return false;
+                }
+
+                true
+            }
+            o: &OptionValue => { // cte iif inner is cte
+                self.isCte(o.value)
+            }
+            e: &ErrOptionValue => { // cte iif none
+                e.err of NullValue
+            }
+            c: &NameDelegateValue => {
+                c.closure of NullValue
+            }
+            l: &LambdaValue => {
+                !l.isClosure
+            }
+            n: &NamedValue => {
+                self.isCte(n.value)
+            }
+            a: &AliaserValue => {
+                self.isCte(a.value)
+            }
+            e: &EnumFieldAccessValue => {
+                self.isCte(e.value)
+            }
+            ProtoFuncPtrValue() => { true }
+            LiteralValue() => { true }
+            MapValue() => { false }
+            _ => { false }
+        }
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ==================================          CTE COMPUTE          ===================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Computes a compile-time string literal.
+     *
+     * @returns(encodingSize, encodedContent)
+     * @throws when the value is not a compile-time string.
+     */
+    pub fn computeString(mut self, value: &Value)-> (u16, StringValueContent)
+        throws ErrorMsg
+    {
+        let inner = self:.reduceInOperator(value, checkCte-> false);
+        match inner {
+            s: &StringValue => {
+                return (s.encodingSize, s.value);
+            }
+            _ => {
+                if (self.isCte(inner)) {
+                    let ch      = copy CharType(value.loc, size-> 8u16, isMutable-> false);
+                    let slcType = copy SliceType(value.loc, ch, isMutable-> false);
+                    throw copy ErrorMsg::fatal(inner.loc,
+                                                format(ValidateErrorMessage::INCOMPATIBLE_TYPE, inner.type, slcType));
+                } else {
+                    throw copy ErrorMsg::fatal(value.loc, format(ValidateErrorMessage::UNKNOWN_AT_COMPILE_TIME, value.type));
+                }
+            }
+        };
+    }
+
+    /**
+     * Computes and decodes a compile-time string literal into UTF-8.
+     *
+     * @throws when the value is not a compile-time string.
+     */
+    pub fn decodeString(mut self, value: &Value)-> [c8]
+        throws ErrorMsg
+    {
+        match self:.computeString(value) {
+            (8u16, val: _) => {
+                Utf::decode(val.utf8)
+            }
+            (16u16, val: _) => {
+                Utf::decode(val.utf16)
+            }
+            (_, val: _) => {
+                Utf::decode(val.utf32)
+            }
+        }
+    }
+
+    /**
+     * Computes a compile-time boolean literal.
+     *
+     * @throws when the value is not a compile-time bool.
+     */
+    pub fn computeBool(mut self, value: &Value)-> bool
+        throws ErrorMsg
+    {
+        let inner = self:.reduceInOperator(value, checkCte-> false);
+        if let b: &BoolValue = inner {
+            return b.isTrue;
+        }
+
+        if (self.isCte(inner)) {
+            let bType = copy BoolType(value.loc, isMutable-> false);
+            throw copy ErrorMsg::fatal(inner.loc,
+                                        format(ValidateErrorMessage::INCOMPATIBLE_TYPE, inner.type, bType));
+        } else {
+            throw copy ErrorMsg::fatal(value.loc, format(ValidateErrorMessage::UNKNOWN_AT_COMPILE_TIME, value.type));
+        }
+    }
+
+    /**
+     * Computes a compile-time integer literal.
+     *
+     * @params:
+     *   - size, signed: used only for error reporting
+     *
+     * @throws when the value is not a compile-time int.
+     *
+     */
+    pub fn computeInt(mut self, value: &Value, size: u16 = 0u16, isSigned: bool = true)-> &BigInt
+        throws ErrorMsg
+    {
+        let inner = self:.reduceInOperator(value, checkCte-> false);
+        if let i: &IntValue = inner {
+            return i.value;
+        }
+
+        if (self.isCte(inner)) {
+            let iType = copy IntType(value.loc, size-> size, isSigned-> isSigned, isMutable-> false);
+            throw copy ErrorMsg::fatal(inner.loc,
+                                        format(ValidateErrorMessage::INCOMPATIBLE_TYPE, inner.type, iType));
+        } else {
+            throw copy ErrorMsg::fatal(value.loc, format(ValidateErrorMessage::UNKNOWN_AT_COMPILE_TIME, value.type));
+        }
+    }
+
+    /**
+     * Computes a compile-time float literal.
+     *
+     * @params:
+     *   - size: used only for error reporting
+     *
+     * @throws when the value is not a compile-time float.
+     */
+    pub fn computeFloat(mut self, value: &Value, size: u16 = 0u16)-> &BigFloat
+        throws ErrorMsg
+    {
+        let inner = self:.reduceInOperator(value, checkCte-> false);
+        if let f: &FloatValue = inner {
+            return f.value;
+        }
+
+        if (self.isCte(inner)) {
+            let fType = copy FloatType(value.loc, size-> size, isMutable-> false);
+            throw copy ErrorMsg::fatal(inner.loc,
+                                        format(ValidateErrorMessage::INCOMPATIBLE_TYPE, inner.type, fType));
+        } else {
+            throw copy ErrorMsg::fatal(value.loc, format(ValidateErrorMessage::UNKNOWN_AT_COMPILE_TIME, value.type));
+        }
+    }
+
+}

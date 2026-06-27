@@ -1,0 +1,196 @@
+/*
+ * Implements semantic validation for class destructors.
+ *
+ * This module handles:
+ *   - validation of destructor prototypes,
+ *   - inheritance of ancestor destructors,
+ *   - detection of movable-field requirements for implicit destructors,
+ *   - synthesis of default destructors when required,
+ *   - integration of destructor values into the ClassRefType,
+ *   - insertion of destructor symbols into the class's add-method list.
+ *
+ * <hr>
+ *
+ * @Package: ymirc
+ * @Module: ymirc::semantic::validator::symbol::class_::dtor
+ * @File: ymirc/semantic/validator/symbol/class_/dtor.yr
+ * @Author(s):
+ *   - Emile Cadorel <ecadorel@gmail.com>
+ *
+ * @Created(YYYY-MM-DD): 2026-05-28
+ * @Copyright(C) 2021–2026 GNU-Ymir
+ * @License
+ *   ```text
+ *   This file is part of the Ymir language project.
+ *
+ *   Ymir is free software: you can redistribute it and/or modify it
+ *   under the terms of the GNU General Public License as published by
+ *   the Free Software Foundation, either version 3 of the License, or
+ *   (at your option) any later version.
+ *
+ *   Ymir is distributed in the hope that it will be useful,
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *   GNU General Public License for more details.
+ *
+ *   You should have received a copy of the GNU General Public License
+ *   along with Ymir.  If not, see <https://www.gnu.org/licenses/>.
+ *   ```
+ */
+
+in dtor;
+
+
+use ymirc::syntax::{declaration::_, expression::_};
+use ymirc::semantic::{symbol, declarator, validator};
+use ymirc::semantic::generator::{value::_, type::_};
+use ymirc::errors;
+use ymirc::lexing::{word, keys};
+
+use ymirc::utils::format;
+
+/**
+ * ClassDtorValidation module
+ *
+ * Provides the main validation pipeline for class destructors. Responsibilities:
+ *
+ *   - validate explicit destructor definitions,
+ *   - inherit ancestor destructors when appropriate,
+ *   - detect when movable fields require a destructor,
+ *   - synthesize default destructors when needed,
+ *   - validate synthesized destructors,
+ *   - install the final destructor value into the ClassRefType.
+ *
+ */
+pub mod ClassDtorValidation {
+
+    /**
+     * Validate the destructor of a class and install it into the ClassRefType.
+     *
+     * Responsibilities:
+     *   - validate or inherit the destructor via validateVtable(),
+     *   - store the resulting destructor value into cref.setDtor().
+     *
+     * @params:
+     *   - context:  validation context
+     *   - sym:      class symbol
+     *   - ancestor: optional ancestor ClassRefType
+     *   - inModule: whether to insert destructor into add-method list
+     *
+     * @throws:
+     *   - ErrorMsg if destructor validation fails
+     */
+    pub fn validate(dmut context: &ValidationContext,
+                    dmut sym:     &ClassSymbol,
+                    ancestor:     (&ClassRefType)?,
+                    inModule:     bool)
+        throws ErrorMsg
+    {
+        let dmut cref = alias sym.classRefUnwrapped;
+        let dtor = ClassDtorValidation::validateVtable(alias context, alias sym, cref, ancestor,
+                                                       inModule-> inModule);
+        cref:.setDtor(dtor);
+    }
+
+    /**
+     * Validate the destructor in the context of inheritance and movable fields.
+     *
+     * @params:
+     *   - context:  validation context
+     *   - sym:      class symbol
+     *   - cref:     class reference type
+     *   - ancestor: optional ancestor ClassRefType
+     *   - inModule: whether to insert destructor into add-methods
+     *
+     * @returns:
+     *   - the validated destructor value
+     *
+     * @throws:
+     *   - ErrorMsg if validation or synthesis fails
+     */
+    fn validateVtable(dmut context: &ValidationContext,
+                      dmut sym:     &ClassSymbol,
+                      cref:         &ClassRefType,
+                      ancestor:     (&ClassRefType)?,
+                      inModule:     bool)-> &Value
+        throws ErrorMsg
+    {
+        let mut ancDtor: &Value = UNIT_VALUE;
+        if let Ok(ancRef) = ancestor { // maybe the ancestor has a destructor
+            ancDtor = ancRef.dtor;
+        }
+
+        let mut forceMovable = false;
+        if (sym.isEntity) {
+            for v in cref.localFields if v.varType.isMovable {
+                if let c: &ClassPtrType = v.varType {
+                    if (c.inner.dtor of DtorPrototypeValue) {
+                        forceMovable = true;
+                        break;
+                    }
+                }
+            }
+        }
+
+        let dmut dtor = alias sym.dtor;
+        if let dmut func: &DtorSymbol = alias dtor { // a destructor is defined, we return its prototype
+            if inModule {
+                sym:.insertAddMethod(alias func);
+            }
+
+            if (forceMovable || !func.isEmpty) {
+                return DtorValidation::validateProto(alias context, alias func, cref,
+                                                     ancDtor-> ancDtor);
+            }
+
+            return UNIT_VALUE;
+        }
+
+        if (forceMovable) {
+            return ClassDtorValidation::createDefault(alias context, alias sym, cref,
+                                                      inModule-> inModule);
+        }
+
+        return ancDtor;
+    }
+
+    /**
+     * Synthesize a default destructor for an entity that requires one.
+     *
+     * @params:
+     *   - context:  validation context
+     *   - sym:      class symbol
+     *   - cref:     class reference type
+     *   - inModule: whether to insert destructor into add-methods
+     *
+     * @returns:
+     *   - the validated destructor value
+     *
+     * @throws:
+     *   - ErrorMsg if prototype validation fails
+     */
+    fn createDefault(dmut context: &ValidationContext,
+                     dmut sym:     &ClassSymbol,
+                     cref:         &ClassRefType,
+                     inModule:     bool)-> &Value
+        throws ErrorMsg
+    {
+        let selfLoc = sym.loc.locate(Keys::SELF);
+        let var = copy VarDeclExpr(selfLoc,
+                                   selfLoc,
+                                   isMutOrDmut-> sym.loc.locate(Keys::MUTABLE),
+                                   isLazyOrRef-> EOF_WORD,
+                                   value-> EMPTY_EXPR,
+                                   type-> EMPTY_EXPR);
+
+        let body = copy BlockExpr(sym.loc, sym.loc, []);
+        let dtor = copy DtorDecl(sym.loc.locate(Keys::DTOR), [], var, body);
+        let dmut dtorSym = context.declarator.declareDtor(dtor, alias sym);
+        if inModule {
+            sym:.insertAddMethod(alias dtorSym);
+        }
+
+        return DtorValidation::validateProto(alias context, alias dtorSym, cref,
+                                             ancDtor-> UNIT_VALUE);
+    }
+}

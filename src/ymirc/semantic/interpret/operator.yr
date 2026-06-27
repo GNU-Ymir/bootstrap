@@ -1,0 +1,854 @@
+/*
+ * Implements compile-time reduction of operator expressions.
+ *
+ * This module is part of the semantic interpreter and is responsible for
+ * evaluating operator values during compile-time execution(CTE) and
+ * operator-context reduction. It walks operator trees, reduces operands,
+ * and applies the appropriate operator-specific reduction logic.
+ *
+ * The interpreter supports:
+ *   - arithmetic, comparison, logical, and bitwise operators,
+ *   - pointer, float, char, bool, and range operators,
+ *   - array and slice operators(including special array operators),
+ *   - field access, casts, and map operations,
+ *   - function, method, constructor, and prototype calls,
+ *   - inlining of inline-marked functions and methods,
+ *   - compile-time execution of pure functions(cteFunction).
+ *
+ * Reduction is lazy and safe: only expressions that can be evaluated at
+ * compile time are reduced; all others are preserved. Errors are raised
+ * only for true compile-time faults(overflow, division by zero, etc.).
+ *
+ * Recursion prevention:
+ *   Inline expansion and CTE execution use a shared inlining stack stored
+ *   in the CompileTimeInterpret. This prevents recursive inlining and
+ *   recursive CTE execution, including mutual recursion and re-entry during
+ *   reduction.
+
+ *
+ * <hr>
+ *
+ * @Package: ymirc
+ * @Module: ymirc::semantic::interpret::operator
+ * @File: ymirc/semantic/interpret/operator.yr
+ * @Author(s):
+ *   - Emile Cadorel <ecadorel@gmail.com>
+ *
+ * @Created(YYYY-MM-DD): 2026-03-14
+ * @Copyright(C) 2021–2026 GNU-Ymir
+ * @License
+ *   ```text
+ *   This file is part of the Ymir language project.
+ *
+ *   Ymir is free software: you can redistribute it and/or modify it
+ *   under the terms of the GNU General Public License as published by
+ *   the Free Software Foundation, either version 3 of the License, or
+ *   (at your option) any later version.
+ *
+ *   Ymir is distributed in the hope that it will be useful,
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *   GNU General Public License for more details.
+ *
+ *   You should have received a copy of the GNU General Public License
+ *   along with Ymir.  If not, see <https://www.gnu.org/licenses/>.
+ *   ```
+ */
+
+in operator;
+
+use ymirc::lexing::{word, keys};
+
+use ymirc::semantic::{symbol, interpret::_};
+use ymirc::semantic::generator::{_, value::_, type::_};
+
+use ymirc::errors;
+use ymirc::utils::{format, bigint, bigfloat};
+
+use std::io;
+
+/**
+ * Public entry point for operator reduction.
+ *
+ * The `reduce` function dispatches to the internal interpreter and performs
+ * compile-time reduction of any OperatorValue. The `inOperator` flag indicates
+ * whether the reduction occurs inside an operator evaluation, which affects
+ * how literal reduction is performed(e.g., relaxed CTE checks).
+ *
+ * All operator kinds are handled explicitly. Unknown operator classes trigger
+ * an internal panic, as the interpreter must be exhaustive.
+ */
+pub mod OperatorInterpret {
+
+    /**
+     * Dispatches operator reduction based on the concrete operator class.
+     *
+     * Parameters:
+     *   - context:     the compile-time interpreter instance.
+     *   - op:          the operator to reduce.
+     *   - inOperator:  whether the reduction occurs inside an operator evaluation.
+     *
+     * Returns:
+     *   A reduced Value corresponding to the operator.
+     *
+     * Notes:
+     *   - Each operator class has a dedicated reduction function.
+     *   - Primitive or non-reducible operators return themselves.
+     *   - Unknown operator types cause an internal panic.
+     */
+    pub fn reduce(dmut context: &CompileTimeInterpret, op: &OperatorValue, inOperator: bool)-> &Value
+        throws ErrorMsg
+    {
+        return inner::reduce(alias context, op, inOperator);
+    }
+
+    pub fn reduceCompare(dmut context: &CompileTimeInterpret, left: &Value, right: &Value)-> (&Value?)
+        throws ErrorMsg
+    {
+        match (left.type, right.type) {
+            (IntType(), IntType()) => return IntInterpret::reduceCmp(alias context, EOF_WORD, BinaryOperators::EQUAL, left, right);
+            (FloatType(), FloatType()) => return FloatInterpret::reduceCmp(alias context, EOF_WORD, BinaryOperators::EQUAL, left, right);
+            (CharType(), CharType()) => return CharInterpret::reduceCmp(alias context, EOF_WORD, BinaryOperators::EQUAL, left, right);
+            (BoolType(), BoolType()) => return BoolInterpret::reduceCmp(alias context, EOF_WORD, BinaryOperators::EQUAL, left, right);
+            (SliceType(), SliceType()) => return SliceOrArrayInterpret::reduceCmp(alias context, EOF_WORD, BinaryOperators::EQUAL, left, right);
+            _ => {
+                return none;
+            }
+        }
+    }
+
+}
+
+
+mod inner {
+
+    /**
+     * Dispatches operator reduction based on the concrete operator class.
+     *
+     * Parameters:
+     *   - context:     the compile-time interpreter instance.
+     *   - op:          the operator to reduce.
+     *   - inOperator:  whether the reduction occurs inside an operator evaluation.
+     *
+     * Returns:
+     *   A reduced Value corresponding to the operator.
+     *
+     * Notes:
+     *   - Each operator class has a dedicated reduction function.
+     *   - Primitive or non-reducible operators return themselves.
+     *   - Unknown operator types cause an internal panic.
+     */
+    pub fn reduce(dmut context: &CompileTimeInterpret, op: &OperatorValue, inOperator: bool)-> &Value
+        throws ErrorMsg
+    {
+        match op {
+            a: &AffectValue => { return inner::reduceAffect(alias context, a); }
+            b: &BinaryOperatorValue => { return inner::reduceBinary(alias context, b); }
+            c: &CallOperatorValue => { return inner::reduceCall(alias context, c); }
+            c: &CastValue => { return inner::reduceCast(alias context, c); }
+            f: &FieldOperatorValue => { return FieldInterpret::reduce(alias context, f, inOperator); }
+            m: &MapOperatorValue => { return MapInterpret::reduce(alias context, m, inOperator); }
+            s: &SliceOrArrayOperatorValue => { return SliceOrArrayInterpret::reduceSliceOrArray(alias context, s, inOperator); }
+            u: &UnaryOperatorValue => { return inner::reduceUnary(alias context, u); }
+
+            _ => {
+                eprintln("internal operator interpret error: ", op._typeinfo.name);
+                panic;
+            }
+        }
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * =====================================          AFFECT          =====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Reduces an assignment operator.
+     *
+     * Both left and right operands are reduced normally. The assignment
+     * operator itself is reconstructed with the reduced operands and marked as
+     * reduced.
+     *
+     */
+    fn reduceAffect(dmut context: &CompileTimeInterpret, aff: &AffectValue)-> &Value
+        throws ErrorMsg
+    {
+        let left = context:.reduce(aff.left);
+        let right = context:.reduce(aff.right);
+
+        return copy AffectValue(aff.loc, aff.type, left, right, isReduced-> true);
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          BINARIES          ====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Reduces a binary operator.
+     *
+     * Dispatches to the appropriate subsystem based on the operator’s concrete
+     * class (int, float, char, bool, pointer, range, array, etc.). Each
+     * subsystem implements its own reduction logic.
+     *
+     * Operators that cannot be reduced at compile time return themselves.
+     *
+     */
+    fn reduceBinary(dmut context: &CompileTimeInterpret, op: &BinaryOperatorValue)-> &Value
+        throws ErrorMsg
+    {
+        match op {
+            // Int
+            b: &BitwiseIntOperatorValue => { return IntInterpret::reduceBit(alias context, b); }
+            c: &CmpIntOperatorValue => { return IntInterpret::reduceCmp(alias context, c); }
+            m: &MathIntOperatorValue => { return IntInterpret::reduceMath(alias context, m); }
+            s: &SpecialMathIntOperatorValue => { return IntInterpret::reduceSpe(alias context, s); }
+
+            // Char
+            c: &CmpCharOperatorValue => { return CharInterpret::reduceCmp(alias context, c); }
+            m: &MathCharOperatorValue => { return CharInterpret::reduceMath(alias context, m); }
+
+            // Bool
+            c: &CmpBoolOperatorValue => { return BoolInterpret::reduceCmp(alias context, c); }
+            l: &LogicalBoolOperatorValue => { return BoolInterpret::reduceLogic(alias context, l); }
+
+            // Float
+            c: &CmpFloatOperatorValue => { return FloatInterpret::reduceCmp(alias context, c); }
+            m: &MathFloatOperatorValue => { return FloatInterpret::reduceMath(alias context, m); }
+            s: &SpecialMathFloatOperatorValue => { return FloatInterpret::reduceSpe(alias context, s); }
+
+            // Range
+            r: &RangeContainsValue => { return RangeInterpret::reduceContains(alias context, r); }
+
+            // Array
+            s: &SpecialArrayOperatorValue => { return SliceOrArrayInterpret::reduceSpe(alias context, s); }
+
+            // Class
+            c: &CmpClassTypeOperatorValue => { return c; }
+
+            // Ptr
+            c: &CmpPointerOperatorValue => { return c; }
+            m: &MathPointerOperatorValue => { return m; }
+
+            _ => {
+                eprintln("internal operator interpret error: ", op._typeinfo.name);
+                panic;
+            }
+        }
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * =====================================          CALLS          ======================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Reduces a call operator.
+     *
+     * Dispatches to:
+     *   - constructor calls,
+     *   - function-pointer calls,
+     *   - method calls,
+     *   - prototype calls.
+     *
+     * Each call kind has its own reduction rules, including inlining and CTE
+     * execution when applicable.
+     *
+     */
+    fn reduceCall(dmut context: &CompileTimeInterpret, op: &CallOperatorValue)-> &Value
+        throws ErrorMsg
+    {
+        match op {
+            c: &CtorCallValue => { return inner::reduceCtorCall(alias context, c); }
+            f: &FuncPtrCallValue => { return inner::reduceFptrCall(alias context, f); }
+            m: &MethodCallValue => { return inner::reduceMethodCall(alias context, m); }
+            p: &PrototypeCallValue => { return inner::reduceProtoCall(alias context, p); }
+            _ => {
+                eprintln("internal operator interpret error: ", op._typeinfo.name);
+                panic;
+            }
+        }
+    }
+
+    /**
+     * Reduces a constructor call.
+     *
+     * All parameters and additional parameters are reduced with relaxed CTE
+     * rules. The constructor call is reconstructed with reduced arguments.
+     *
+     */
+    fn reduceCtorCall(dmut context: &CompileTimeInterpret, ctor: &CtorCallValue)-> &Value
+        throws ErrorMsg
+    {
+        let params = copy [context:.reduce(i) for i in ctor.params];
+        let addParams = copy [context:.reduce(i) for i in ctor.addParams];
+
+        return copy CtorCallValue(ctor.loc,
+                                   ctor.type,
+                                   ctor.delegate,
+                                   params,
+                                   addParams-> addParams,
+                                   isReduced-> true);
+    }
+
+    /**
+     * Reduces a function-pointer call.
+     *
+     * Steps:
+     *   - reduce the function pointer expression,
+     *   - reduce parameters,
+     *   - if the pointer resolves to a ProtoFuncPtrValue, convert the call into a
+     *     PrototypeCallValue and reduce it,
+     *   - otherwise reconstruct the function-pointer call.
+     *
+     */
+    fn reduceFptrCall(dmut context: &CompileTimeInterpret, func: &FuncPtrCallValue)-> &Value
+        throws ErrorMsg
+    {
+        let params = copy [context:.reduce(i) for i in func.params];
+        let fptr = context:.reduce(func.fptr);
+        match fptr {
+            p: &ProtoFuncPtrValue => {
+                let call = copy PrototypeCallValue(func.loc,
+                                                    func.type,
+                                                    p.proto,
+                                                    params,
+                                                    addParams-> [],
+                                                    isReduced-> false);
+
+                return inner::reduceProtoCall(alias context, call);
+            }
+        }
+
+        return copy FuncPtrCallValue(func.loc,
+                                      func.type,
+                                      fptr,
+                                      params,
+                                      isReduced-> true);
+    }
+
+    /**
+     * Reduces a method call.
+     *
+     * Parameters and additional parameters are reduced with relaxed CTE rules.
+     *
+     * If the method resolves to a direct inlineable function symbol, the method
+     * is inlined using `inlineMethod`. If inlining succeeds, the inlined block
+     * is returned; otherwise the call is reconstructed normally.
+     *
+     */
+    fn reduceMethodCall(dmut context: &CompileTimeInterpret, meth: &MethodCallValue)-> &Value
+        throws ErrorMsg
+    {
+        let params = copy [context:.reduce(i) for i in meth.params];
+        let addParams = copy [context:.reduce(i) for i in meth.addParams];
+
+        if let func: &FunctionSymbol = meth.delegate.proto.sym && meth.delegate.isDirect && func.isInline {
+            let cl = inner::inlineMethod(alias context, meth, params ~ addParams);
+            if let Ok(inlined) = cl {
+                return inlined;
+            }
+        }
+
+        return copy MethodCallValue(meth.loc,
+                                     meth.type,
+                                     meth.delegate,
+                                     params,
+                                     addParams-> addParams,
+                                     isReduced-> true);
+    }
+
+    /**
+     * Reduces a prototype call.
+     *
+     * Steps:
+     *   - reduce parameters and additional parameters,
+     *   - if the prototype resolves to a function symbol:
+     *       * attempt CTE execution when no parameters are present,
+     *       * attempt normal inlining when the function is marked inline,
+     *   - if neither applies, reconstruct the call.
+     *
+     * Prototype calls are the general mechanism for calling free functions,
+     * template instantiations, and other non-method callables.
+     *
+     */
+    fn reduceProtoCall(dmut context: &CompileTimeInterpret, call: &PrototypeCallValue)-> &Value
+        throws ErrorMsg
+    {
+        let params = copy [context:.reduce(i) for i in call.params];
+        let addParams = copy [context:.reduce(i) for i in call.addParams];
+
+        if let func: &FunctionSymbol = call.proto.sym && params.len == 0 {
+            if params.len == 0 { // template params inline
+                let cl = inner::cteFunction(alias context, call);
+                if let Ok(inlined) = cl {
+                    return inlined;
+                }
+            }
+
+            if func.isInline { // normal inline, allowing runtime execution
+                let cl = inner::inlineFunction(alias context, call, params ~ addParams);
+                if let Ok(inlined) = cl {
+                    return inlined;
+                }
+            }
+        }
+
+
+        return copy PrototypeCallValue(call.loc,
+                                        call.type,
+                                        call.proto,
+                                        params,
+                                        addParams-> addParams,
+                                        isReduced-> true);
+    }
+
+    /**
+     * Attempts to inline a method call.
+     *
+     * Inlining is allowed only when:
+     *   - the delegate resolves to a FunctionSymbol,
+     *   - the function has a validated MethodPrototypeValue,
+     *   - the function has a non-empty body,
+     *   - the function is not already being inlined(recursion prevention),
+     *   - the parameter count matches(including implicit `self`),
+     *   - the function is marked inline.
+     *
+     * The inliner:
+     *   - creates a VarDeclValue for `self`,
+     *   - creates VarDeclValue bindings for all parameters,
+     *   - clones and reduces the function body,
+     *   - wraps everything in an InlineBlock.
+     *
+     * The InlineBlock lowering phase handles return rewriting and scoping.
+     *
+     */
+    fn inlineMethod(dmut context: &CompileTimeInterpret, meth: &MethodCallValue, params: [&Value])-> (&Value?)
+        throws ErrorMsg
+    {
+        // Calling something that isn't a function?
+        let func = if let func: &FunctionSymbol = meth.delegate.proto.sym {
+            func
+        } else {
+            return none;
+        }
+
+        if context.isInlining(func) return none;
+        context:.insertInlining(func);
+        {
+            // Function no validated, but called??
+            let proto = if let proto: &MethodPrototypeValue = func.frameProto {
+                proto
+            } else {
+                return none;
+            }
+
+            // no body to inline
+            let body = if let body: &Value = func.frameBody {
+                if body of UnitValue return none;
+
+                body
+            } else { return none; }
+
+
+            // +1 for self, proto.params[0] being self, but encapsulated inside the closure of the delegate
+            if (params.len + 1) != proto.params.len { return none; }
+
+            let dmut values: [&Value] = [];
+            let instType = proto.classRef.createInstance(isMutable-> proto.isMutable,
+                                                          isInnerMutable-> proto.isMutable);
+
+            let dmut selfDecl = copy VarDeclValue(proto.params[0].loc,
+                                                   instType,
+                                                   value-> meth.delegate.closure,
+                                                   isMutable-> proto.isMutable,
+                                                   isReference-> instType.isStruct,
+                                                   isLazy-> false,
+                                                   isIterator-> false,
+                                                   uniqId-> proto.params[0].uniqId);
+            values ~= [selfDecl];
+
+            // Declare the variables to hold the values inside the inline block
+            for i, v in proto.params[1 .. $] {
+                let value = params[i]; // self is not in params
+                let dmut decl = copy VarDeclValue(v.loc,
+                                                   v.type,
+                                                   value,
+                                                   isMutable-> v.isMutable,
+                                                   isReference-> v.isReference,
+                                                   isLazy-> v.isLazy,
+                                                   isIterator-> false,
+                                                   uniqId-> v.uniqId);
+
+                values ~= [decl];
+            }
+
+            let innerBody = context:.reduce(body.clone());
+            return (copy InlineBlockValue(meth.loc, meth.type, values ~ [innerBody]))?;
+        } exit {
+            context:.removeInlining(func);
+        }
+    }
+
+    /**
+     * Attempts to inline a free function call.
+     *
+     * Similar to method inlining, but without `self`. Inlining is allowed only
+     * when:
+     *   - the prototype resolves to a FunctionSymbol,
+     *   - the function has a PrototypeValue as its prototype,
+     *   - the function has a non-empty body,
+     *   - the function is not already being inlined,
+     *   - the parameter count matches,
+     *   - the function is marked inline.
+     *
+     * The inliner:
+     *   - creates VarDeclValue bindings for all parameters,
+     *   - clones and reduces the function body,
+     *   - wraps everything in an InlineBlock.
+     *
+     */
+    fn inlineFunction(dmut context: &CompileTimeInterpret, call: &PrototypeCallValue, params: [&Value])-> (&Value?)
+        throws ErrorMsg
+    {
+
+        // Calling something that isn't a function?
+        let func = if let func: &FunctionSymbol = call.proto.sym {
+            func
+        } else {
+            return none;
+        }
+
+        if context.isInlining(func) return none;
+        context:.insertInlining(func);
+        {
+            // Function no validated, but called??
+            let proto = if let proto: &PrototypeValue = func.frameProto {
+                proto
+            } else {
+                return none;
+            }
+
+            // no body to inline
+            let body = if let body: &Value = func.frameBody {
+                if body of UnitValue return none;
+
+                body
+            } else { return none; }
+
+
+            if params.len != proto.params.len { return none; }
+
+            let dmut values: [&Value] = [];
+
+            // Declare the variables to hold the values inside the inline block
+            for i, v in proto.params {
+                let value = params[i];
+                let dmut decl = copy VarDeclValue(v.loc,
+                                                   v.type,
+                                                   value,
+                                                   isMutable-> v.isMutable,
+                                                   isReference-> v.isReference,
+                                                   isLazy-> v.isLazy,
+                                                   isIterator-> false,
+                                                   uniqId-> v.uniqId);
+
+                values ~= [decl];
+            }
+
+            let innerBody = context:.reduce(body.clone());
+
+            return (copy InlineBlockValue(call.loc, call.type, values ~ [innerBody]))?;
+        } exit {
+            context:.removeInlining(func);
+        }
+    }
+
+    /**
+     * Attempts to execute a function at compile time.
+     *
+     * CTE execution is allowed only when:
+     *   - the prototype resolves to a FunctionSymbol,
+     *   - the function has a non-empty body,
+     *   - the function is not already being inlined or CTE-executed,
+     *   - the function body reduces to a CTE-compatible value.
+     *
+     * Steps:
+     *   - reduce the function body,
+     *   - unwrap single-value blocks,
+     *   - unwrap return values,
+     *   - if the result is a full CTE value, return it,
+     *   - otherwise return none.
+     *
+     * Recursion prevention ensures that recursive or mutually recursive
+     * functions do not attempt CTE execution.
+     *
+     */
+    fn cteFunction(dmut context: &CompileTimeInterpret, call: &PrototypeCallValue)-> (&Value?)
+        throws ErrorMsg
+    {
+        // Calling something that isn't a function?
+        let func = if let func: &FunctionSymbol = call.proto.sym {
+            func
+        } else {
+            return none;
+        }
+
+        if context.isInlining(func) return none;
+        context:.insertInlining(func);
+
+        {
+            // no body to cte execute
+            let body = if let body: &Value = func.frameBody {
+                if body of UnitValue return none;
+
+                body
+            } else { return none; }
+
+            let mut inner = context:.reduce(body);
+            if let bl: &BlockValue = inner {
+                if (bl.isSet && bl.values.len == 1us) {
+                    inner = bl.values[$ - 1us];
+                }
+            }
+
+            if let r: &ReturnValue = inner {
+                inner = context:.reduce(r.value);
+            }
+
+            if (context.isCte(inner)) {
+                return inner?;
+            }
+
+            return none;
+        } exit {
+            context:.removeInlining(func);
+        }
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          CASTING          =====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Reduces a cast operator.
+     *
+     * The cast reduction proceeds in two phases:
+     *
+     *   1. `reduceInOperator` is applied to the casted value to perform
+     *      context-aware reduction without forcing full CTE evaluation.
+     *
+     *   2. A fallback(`or`) is computed by fully reducing the value and
+     *      reconstructing the cast only when the reduced value’s type differs
+     *      from the target type. This ensures that redundant casts are removed.
+     *
+     * If the target type is an IntType, CharType, or FloatType, the reduction
+     * is delegated to the corresponding specialized cast reducer. Otherwise,
+     * the fallback value is returned.
+     *
+     * Notes:
+     *   - Cast reduction is opportunistic: it only performs CTE evaluation when
+     *     the operand is a literal or reducible to one.
+     *   - Overflow checks are performed for integer and character casts.
+     *
+     */
+    fn reduceCast(dmut context: &CompileTimeInterpret, c: &CastValue)-> &Value
+        throws ErrorMsg
+    {
+        let mut inner = context:.reduceInOperator(c.value, checkCte-> false);
+        let or = {
+            let innerOr = context:.reduce(c.value);
+            if (innerOr.type == c.type) {
+                innerOr
+            } else {
+                copy CastValue(c.loc, c.type, innerOr, isLvalue-> c.isLvalue, isReduced-> true)
+            }
+        };
+
+        match c.type {
+            iT: &IntType => { return reduceCastToInt(c.loc, inner, iT, or); }
+            cT: &CharType => { return reduceCastToChar(c.loc, inner, cT, or); }
+            fT: &FloatType => { return reduceCastToFloat(c.loc, inner, fT, or); }
+            _ => {
+                return or;
+            }
+        }
+    }
+
+    /**
+     * Reduces a cast to an integer type.
+     *
+     * Supported source types:
+     *   - IntValue   : overflow-checked reinterpretation
+     *   - CharValue  : code-unit converted to integer, overflow-checked
+     *   - BoolValue  : true-> 1, false-> 0
+     *   - FloatValue: truncated BigFloat-> BigInt, overflow-checked
+     *
+     * If the source value is not a literal of one of the supported types,
+     * the fallback value(`or`) is returned.
+     *
+     * Overflow:
+     *   - All integer casts are validated using `IntInterpret::verifyOverflowInt`.
+     *
+     * Returns:
+     *   A reduced IntValue when possible, or the fallback value.
+     */
+    fn reduceCastToInt(loc: &Word, value: &Value, iT: &IntType, or: &Value)-> &Value
+        throws ErrorMsg
+    {
+        match (value) {
+            i: &IntValue => {
+                IntInterpret::verifyOverflow(loc, iT, i.value);
+                return copy IntValue(loc, iT, i.value);
+            }
+            ch: &CharValue => {
+                let ival = ch.valueAsInt;
+                IntInterpret::verifyOverflow(loc, iT, ival);
+
+                return copy IntValue(loc, iT, ival);
+            }
+            b: &BoolValue => {
+                if (b.isTrue) {
+                    return copy IntValue(loc, iT, copy BigInt(1));
+                } else {
+                    return copy IntValue(loc, iT, copy BigInt(0));
+                }
+            }
+            f: &FloatValue => {
+                let ival = copy BigInt(f.value);
+                IntInterpret::verifyOverflow(loc, iT, ival);
+
+                return copy IntValue(loc, iT, ival);
+            }
+            _ => {
+                return or;
+            }
+        };
+    }
+
+    /**
+     * Reduces a cast to a float type.
+     *
+     * Supported source types:
+     *   - IntValue   : converted to BigFloat
+     *   - FloatValue: retyped to the target FloatType
+     *
+     * If the source value is not a literal of one of the supported types,
+     * the fallback value(`or`) is returned.
+     *
+     * Notes:
+     *   - No overflow checking is required for float casts.
+     *   - FloatValue is reconstructed to ensure the correct target type.
+     *
+     */
+    fn reduceCastToFloat(loc: &Word, value: &Value, fT: &FloatType, or: &Value)-> &Value {
+        match value {
+            i: &IntValue => {
+                return copy FloatValue(loc, fT, copy BigFloat(i.value));
+            }
+            f: &FloatValue => {
+                return copy FloatValue(loc, fT, f.value);
+            }
+            _ => {
+                return or;
+            }
+        }
+    }
+
+    /**
+     * Reduces a cast to a character type.
+     *
+     * Supported source types:
+     *   - IntValue   : integer converted to character, overflow-checked
+     *   - CharValue  : retyped to the target CharType, overflow-checked
+     *
+     * Character semantics:
+     *   - CharType is always unsigned.
+     *   - Overflow is validated using `CharInterpret::verifyOverflowChar`.
+     *   - CharValue may internally store UTF-8 or UTF-16 code units; the
+     *     reduction normalizes these to integer form before validation.
+     *
+     * If the source value is not a literal of one of the supported types,
+     * the fallback value(`or`) is returned.
+     */
+    fn reduceCastToChar(loc: &Word, value: &Value, ct: &CharType, or: &Value)-> &Value
+        throws ErrorMsg
+    {
+        match value {
+            i: &IntValue => {
+                CharInterpret::verifyOverflow(loc, ct, i.value);
+                return copy CharValue(loc, ct, i.value);
+            }
+            c: &CharValue => {
+                CharInterpret::verifyOverflow(loc, ct, c.valueAsInt);
+                return copy CharValue(loc, ct, c.valueAsInt);
+            }
+            _ => {
+                return or;
+            }
+        }
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * =====================================          UNARY          ======================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Dispatches unary-operator reduction based on the operand’s static type.
+     *
+     * This is the top-level entry point for unary operator interpretation. It
+     * selects the appropriate reduction subsystem according to the type of the
+     * operand:
+     *
+     *   • BoolType   → BoolInterpret::reduceUnary
+     *   • IntType    → IntInterpret::reduceUnary
+     *   • FloatType  → FloatInterpret::reduceUnary
+     *
+     * If the operand’s type does not correspond to a supported unary operator
+     * family, the unary operator is reconstructed with a fully reduced operand
+     * and marked as reduced.
+     *
+     * Parameters:
+     *   - context: the compile-time interpreter instance.
+     *   - un:      the unary operator to reduce.
+     *
+     * Returns:
+     *   A reduced Value corresponding to the unary operation.
+     *
+     */
+    fn reduceUnary(dmut context: &CompileTimeInterpret, un: &UnaryOperatorValue)-> &Value
+        throws ErrorMsg
+    {
+        match un.value.type {
+            BoolType() => return BoolInterpret::reduceUnary(alias context, un);
+            IntType() => return IntInterpret::reduceUnary(alias context, un);
+            FloatType() => return FloatInterpret::reduceUnary(alias context, un);
+        }
+
+        return copy UnaryOperatorValue(loc-> un.loc,
+                                        type-> un.type,
+                                        op-> un.op,
+                                        value-> context:.reduce(un.value),
+                                        isReduced-> true);
+    }
+
+
+}

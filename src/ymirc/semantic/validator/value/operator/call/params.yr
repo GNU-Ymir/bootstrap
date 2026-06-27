@@ -1,0 +1,567 @@
+/*
+ * Implements semantic validation and construction of parameter lists for
+ * function calls in Ymir.
+ *
+ * Responsibilities:
+ *   - Infer and validate argument types against function parameter types.
+ *   - Perform memory-ownership verification for arguments.
+ *   - Compute overload-resolution scoring contributions.
+ *   - Reorder arguments according to named parameters.
+ *   - Construct tuple arguments for parameters that consume multiple values.
+ *   - Detect invalid named parameters and mismatched argument counts.
+ *
+ * <hr>
+ *
+ * @Package: ymirc
+ * @Module: ymirc::semantic::validator::value::operator::call::params
+ * @File: ymirc/semantic/validator/value/operator/call/params.yr
+ * @Author(s):
+ *   - Emile Cadorel <ecadorel@gmail.com>
+ *
+ * @Created(YYYY-MM-DD): 2026-04-25
+ * @Copyright(C) 2021–2026 GNU-Ymir
+ * @License
+ *   ```text
+ *   This file is part of the Ymir language project.
+ *
+ *   Ymir is free software: you can redistribute it and/or modify it
+ *   under the terms of the GNU General Public License as published by
+ *   the Free Software Foundation, either version 3 of the License, or
+ *   (at your option) any later version.
+ *
+ *   Ymir is distributed in the hope that it will be useful,
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *   GNU General Public License for more details.
+ *
+ *   You should have received a copy of the GNU General Public License
+ *   along with Ymir.  If not, see <https://www.gnu.org/licenses/>.
+ *   ```
+ */
+
+in params;
+
+use ymirc::syntax::declaration::function;
+use ymirc::semantic::validator;
+use ymirc::semantic::generator::{value::_, type::_};
+
+use ymirc::errors;
+use ymirc::utils::format;
+
+use ymirc::lexing::{word, tokens, keys};
+use std::stream;
+
+/**
+ * CallParamListCreation
+ *
+ * Provides utilities for validating and constructing argument lists for
+ * function calls. This includes:
+ *
+ *   - Type inference for arguments
+ *   - Memory-ownership verification
+ *   - Overload scoring contributions
+ *   - Named-parameter resolution
+ *   - Variadic and tuple-parameter construction
+ *
+ * These routines are invoked by the call operator validator to ensure
+ * that arguments match the expected parameter list of a callable entity.
+ */
+pub mod CallParamListCreation {
+
+
+    /**
+     * Validate a list of arguments against a list of expected parameter types.
+     *
+     * Performs:
+     *   - Type inference for each argument
+     *   - Memory-ownership verification
+     *   - Overload scoring based on type changes, mutability distance,
+     *     and reference semantics
+     *
+     * @params:
+     *   - context: validation context
+     *   - refs:    list of booleans indicating whether each parameter is passed by reference
+     *   - lazys:   list of booleans indicating whether each parameter is lazy
+     *   - args:    list of expected parameter types
+     *   - params:  list of argument values provided by the caller
+     *
+     * @returns:
+     *   (validatedValues, score)
+     *     - validatedValues: list of inferred/converted argument values
+     *     - score: overload-resolution score contribution
+     *
+     * @throws:
+     *   ErrorMsg if any argument fails type inference or memory verification.
+     */
+    pub fn validateTypeParamList(dmut context: &ValidationContext,
+                                  refs:         [bool],
+                                  lazys:        [bool],
+                                  args:         [&Type],
+                                  params:       [&Value])-> ([&Value], u32)
+        throws ErrorMsg
+    {
+        let mut errors: [&ErrorMsg] = [];
+        let mut score = 0u32;
+        let mut values: [&Value] = [];
+
+        for i in 0us .. args.len {
+            {
+                let ch = TypeInference::inferValueForType(alias context, params[i].loc, params[i],
+                                                           type-> args[i],
+                                                           byReference-> refs[i]);
+
+                MemoryVerification::verifyMemoryOwner(params[i].loc, args[i], ch,
+                                                       construct-> true,
+                                                       byReference-> refs[i],
+                                                       byLazy-> lazys[i]);
+                values ~= [ch];
+
+                if (ch is params[i] || ch of ReferencerValue) {
+                    score += Scores::TYPE_NO_CHANGE;
+                } else score += Scores::TYPE;
+
+                if (refs[i]) {
+                    score += Scores::MUT;
+                }
+
+                score += ch.type.maxMutabilityDistance - ch.type.mutabilityDistance(args[i]);
+            } catch {
+                err: &ErrorMsg => {
+                    errors ~= [err];
+                }
+            }
+        }
+
+        if (errors.len != 0us) {
+            throw copy ErrorMsg::list(errors);
+        }
+
+        return (values, score);
+    }
+
+    /**
+     * Validate a list of arguments against a list of ProtoVarDeclValue parameters.
+     *
+     * Supports:
+     *   - Optional type verification(verifType)
+     *   - Optional memory verification(verifMemory)
+     *   - Lambda-parameter inference when parameter type is NoneType
+     *
+     * Computes overload-resolution scoring based on:
+     *   - Type changes
+     *   - Mutability distance
+     *   - Reference semantics
+     *
+     * @params:
+     *   - context:    validation context
+     *   - loc:        location of the call expression
+     *   - args:       list of parameter declarations
+     *   - params:     list of argument values
+     *   - verifType:  whether to perform type inference
+     *   - verifMemory:whether to perform memory-ownership verification
+     *   - isLambda:   whether the call is a lambda invocation
+     *
+     * @returns:
+     *   (types, values, score)
+     *     - types:  inferred parameter types(for lambdas)
+     *     - values: validated argument values
+     *     - score:  overload-resolution score contribution
+     *
+     * @throws:
+     *   ErrorMsg if any argument fails validation.
+     */
+    pub fn validateTypeParamList(dmut context: &ValidationContext,
+                                  loc:          &Word,
+                                  args:         [&ProtoVarDeclValue],
+                                  params:       [&Value],
+                                  verifType:    bool = true,
+                                  verifMemory:  bool = true,
+                                  isLambda:     bool = false)-> ([&Type], [&Value], u32)
+        throws ErrorMsg
+    {
+        let mut types: [&Type] = [];
+        let mut values: [&Value] = [];
+        let mut errors: [&ErrorMsg] = [];
+        let mut score = 0u32;
+
+        for i in 0us .. args.len {
+            let argType = args[i].type;
+
+            if (isLambda && argType of NoneType) {
+                types ~= [params[i].type.clone(0u32)];
+            } else {
+                {
+                    let ch = if (verifType) {
+                        TypeInference::inferValueForType(alias context, params[i].loc, params[i],
+                                                          type-> argType,
+                                                          byReference-> args[i].isReference)
+                    } else {
+                        params[i]
+                    };
+
+                    if (verifMemory) {
+                        MemoryVerification::verifyMemoryOwner(params[i].loc, argType, ch,
+                                                               construct-> true,
+                                                               byReference-> args[i].isReference,
+                                                               byLazy-> args[i].isLazy);
+                    }
+
+                    values ~= [ch];
+
+                    if (ch is params[i] || ch of ReferencerValue) {
+                        score += Scores::TYPE_NO_CHANGE;
+                    } else score += Scores::TYPE;
+
+                    if (args[i].isReference) {
+                        score += Scores::MUT;
+                    }
+
+                    score += ch.type.maxMutabilityDistance - ch.type.mutabilityDistance(argType);
+                } catch {
+                    err: &ErrorMsg => {
+                        errors ~= [err.withNote(copy [copy ErrorMsg::note(loc, format(ValidateErrorMessage::PARAMETER_NAME, args[i]), oneLine-> true)])];
+                    }
+                }
+            }
+        }
+
+        if (errors.len != 0us) {
+            throw copy ErrorMsg::list(errors);
+        }
+
+        return (types, values, score);
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ================================          PARAMETER ORDER          =================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Reorder arguments according to named parameters and positional rules.
+     *
+     * Handles:
+     *   - Named argument placement
+     *   - Tuple construction for parameters consuming multiple values
+     *   - Variadic parameter rules
+     *
+     * @params:
+     *   - loc:        location of the call
+     *   - args:       list of parameter declarations
+     *   - params:     list of argument values
+     *   - nbNamed:    number of named arguments at the start of `params`
+     *   - isVariadic: whether the function is variadic
+     *
+     * @returns:
+     *   (orderedParams, remainingParams)
+     *
+     * @throws:
+     *   ErrorMsg if named parameters are duplicated or argument counts mismatch.
+     */
+    pub fn validateParamListSort(loc:        &Word,
+                                  args:       [&ProtoVarDeclValue],
+                                  params:     [&Value],
+                                  nbNamed:    usize,
+                                  isVariadic: bool = false)-> ([&Value], [&Value])
+        throws ErrorMsg
+    {
+        let mut result: [mut &Value] = copy [UNIT_VALUE ; args.len];
+        let mut errors: [&ErrorMsg] = [];
+        for i in 0us .. nbNamed {
+            if let n: &NamedValue = params[i] {
+                let index = CallParamListCreation::findNamedParam(args, n);
+                match result[index] {
+                    UnitValue() => { result[index] = n.value; }
+                    ot: _ => {
+                        errors ~= [copy ErrorMsg::fatal(params[i].loc,
+                                                         end-> ot.loc,
+                                                         format(ValidateErrorMessage::MULTIPLE_NAMED_PARAM, n.name))];
+                    }
+                }
+            } else panic;
+        }
+
+        if (errors.len != 0us) throw copy ErrorMsg::list(errors);
+        let indexes = CallParamListCreation::constructRestArgs(args, alias result);
+
+        // Count the number of values that will be consumed by the args that are unset
+        let mut needing = 0us;
+        for i in indexes {
+            needing += cast!usize(args[i].nbConsume);
+        }
+
+        // Needing must be exactly params.len if this is not variadic
+        // Otherwise it(needing) can be lower than params.len
+        if (needing > (params.len - nbNamed)) || (!isVariadic && needing < (params.len - nbNamed)) {
+            needing += (args.len - indexes.len);
+            throw copy ErrorMsg::fatal(loc, CallParamListCreation::formatTooFew(params.len, needing));
+        }
+
+        let mut paramIndex = nbNamed;
+        for i in indexes {
+            if args[i].nbConsume == 1us {
+                result[i] = params[paramIndex];
+                paramIndex += 1us;
+            } else {
+                let mut tuValues: [mut &Value] = copy [UNIT_VALUE ; args[i].nbConsume];
+                let mut tuTypes: [mut &Type] = copy [NONE_TYPE ; args[i].nbConsume];
+
+                for j in 0us .. tuValues.len {
+                    tuValues[j] = params[paramIndex + j];
+                    tuTypes[j] = params[paramIndex + j].type;
+                }
+
+                let tu = copy TupleValue(params[paramIndex].loc, tuValues,
+                                          type-> copy TupleType(params[paramIndex].loc, tuTypes,
+                                                                 isMutable-> false));
+                result[i] = tu;
+                paramIndex += tuValues.len;
+            }
+        }
+
+        return (result, params[paramIndex .. $]);
+    }
+
+    /**
+     * Fill unset parameters with default values when available, and return
+     * the list of parameter indices that still require positional arguments.
+     *
+     * @params:
+     *   - args: list of parameter declarations
+     *   - sets: mutable list of assigned argument slots
+     *
+     * @returns:
+     *   List of indices of parameters still needing arguments.
+     */
+    fn constructRestArgs(args: [&ProtoVarDeclValue], mut sets: [mut &Value])-> [usize] {
+        let mut unsetLocs: [usize] = [];
+        for i, v in sets match v {
+            UnitValue() => {
+                if (args[i].value !of UnitValue) {
+                    sets[i] = args[i].value;
+                } else {
+                    unsetLocs ~= [i];
+                }
+            }
+        }
+
+        unsetLocs
+    }
+
+    /**
+     * Locate the index of a parameter matching a named argument.
+     *
+     * @params:
+     *   - args:  list of parameter declarations
+     *   - value: the NamedValue containing the parameter name
+     *
+     * @returns:
+     *   Index of the matching parameter.
+     *
+     * @throws:
+     *   ErrorMsg if no parameter with the given name exists.
+     */
+    fn findNamedParam(args: [&ProtoVarDeclValue], value: &NamedValue)-> usize
+        throws ErrorMsg
+    {
+        for i, v in args {
+            if v.name == value.name {
+                return i;
+            }
+        }
+
+        throw copy ErrorMsg::fatal(value.loc, format(ValidateErrorMessage::NO_PARAMETER_NAMED, value.name));
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ===================================          CHECKINGS          ====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Detect error-typed arguments and abort the call early.
+     *
+     * Prevents cascading diagnostics by rejecting calls that contain
+     * invalid arguments before overload resolution.
+     *
+     * @params:
+     *   - loc:    location of the call
+     *   - left:   call target
+     *   - rights: list of argument values
+     *
+     * @throws:
+     *   ErrorMsg if any argument has type ErrorType.
+     */
+    pub fn checkNoErrorParams(loc: &Word, left: &Value, rights: [&Value])
+        throws ErrorMsg
+    {
+        let mut notes: [&ErrorMsg] = [];
+        for v in rights {
+            if (v.type of ErrorType) {
+                notes ~= [copy ErrorMsg::note(v.loc, format(ValidateErrorMessage::ERROR_PARAM, v, v.type))];
+            }
+        }
+
+        if (notes.len != 0us) {
+            let prettyName = CallParamListCreation::formatPrettyName(left);
+            throw copy ErrorMsg::fatal(loc, format(ValidateErrorMessage::UNDEFINED_CALL_OP, prettyName, CallParamListCreation::formatParamsWithTypes(rights)),
+                                        notes-> notes);
+        }
+    }
+
+    /**
+     * Throw an aggregated error for all unknown named parameters.
+     *
+     * @params:
+     *   - params: list of NamedValue arguments that do not match any parameter
+     *
+     * @throws:
+     *   ErrorMsg listing all unknown named parameters.
+     */
+    pub fn throwUnknwonNamed(params: [&Value])
+        throws ErrorMsg
+    {
+        let mut res: [&ErrorMsg] = [];
+        for it in params match it {
+            n: &NamedValue => {
+                res ~= [copy ErrorMsg::fatal(it.loc, format(ValidateErrorMessage::NO_PARAMETER_NAMED, n.name))];
+            }
+            _ => panic;
+        }
+
+        throw copy ErrorMsg::list(res);
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          FORMATS          =====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Produce a human-readable name for a call target.
+     *
+     * Handles:
+     *   - MultSymValue
+     *   - Lambda values
+     *   - Delegates
+     *   - Template refs
+     *   - Method delegates
+     *   - Module references
+     *   - Call operator values
+     *
+     * Used exclusively for error messages.
+     *
+     * @params:
+     *   - v: the value to pretty-print
+     *
+     * @returns:
+     *   A formatted string representing the call target.
+     */
+    pub fn formatPrettyName(v: &Value)-> [c8] {
+        match v {
+            m: &MultSymValue if m.values.len == 1 => {
+                return CallParamListCreation::formatPrettyName(m.values[0]);
+            }
+            vdecl: &VarDeclValue if vdecl.varType of LambdaType => {
+                return format("%", vdecl.value, tags-> FormatTags(withParams-> true));
+            }
+            vref: &VarRefValue => {
+                if vref.type of LambdaType {
+                    return CallParamListCreation::formatPrettyName(vref.value);
+                }
+
+                return format("%: %", v, v.type);
+            }
+            p: &NameDelegateValue => {
+                return format("%", p, tags-> FormatTags(withParams-> true));
+            }
+            f: &FakeMethodDelegateValue => {
+                return format("%", f, tags-> FormatTags(withParams-> true));
+            }
+            p: &ProtoFuncPtrValue => {
+                return format("%", p.type, tags-> FormatTags(withParams-> true))
+            }
+            t: &TemplateRefValue => {
+                if let f: &FunctionDecl = t.sym.decl.decl {
+                    return format("% %%",
+                                   t.sym.path.toStr(),
+                                   t.sym.decl.params,
+                                   f.proto);
+                }
+            }
+            t: &MethodDelegateTemplateValue => {
+                return format("%", t.proto, tags-> FormatTags(withParams-> true));
+            }
+            c: &CallOperatorValue => {
+                return format("%", c.type, tags-> FormatTags(withParams-> true));
+            }
+            c: &MethodCallValue => {
+                return format("%", c.type, tags-> FormatTags(withParams-> true));
+            }
+            m: &ModuleRefValue => {
+                return format("mod %", m, tags-> FormatTags(withParams-> true));
+            }
+            lmbd: &LambdaValue => {
+                let dmut str = copy StringStream();
+                for i, j in lmbd.params {
+                    if (i != 0us) str:.write(", ");
+                    str:.write(format("%", j));
+                }
+                return format("lambda |%|", str[]);
+            }
+        }
+
+        return format("%", v, tags-> FormatTags(withParams-> true));
+    }
+
+    /**
+     * Format a list of args as:
+     *
+     *      { arg1: Type1, arg2: Type2, ... }
+     *
+     * Used in call-error diagnostics.
+     *
+     * @params:
+     *   - values: list of argument values
+     *
+     * @returns:
+     *   A formatted string describing the args and their types.
+     */
+    pub fn formatParamsWithTypes(v: [&Value])-> [c8] {
+        let dmut stream = copy Formatter();
+        stream:.write('{');
+        for i, j in v {
+            if (i != 0us) stream:.write(", ");
+            stream:.write(format("%(y): %(y)", j, j.type, tags-> FormatTags(forParams-> true)));
+        }
+        stream:.write('}');
+
+        return stream[];
+    }
+
+    /**
+     * Format the “too few params” error message with correct pluralization.
+     *
+     * @params:
+     *   - provided: number of args actually provided
+     *   - expected: number of args expected
+     *
+     * @returns:
+     *   A formatted error message.
+     */
+    pub fn formatTooFew(provided: usize, expected: usize)-> [c8] {
+        let isOrP = if (provided == 1us) { "is" } else { "are" };
+        let isOrE = if (expected == 1us) { "is" } else { "are" };
+
+        return format(ValidateErrorMessage::TOO_FEW_PARAMETERS, expected, isOrE, provided, isOrP);
+    }
+}
