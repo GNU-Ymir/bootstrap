@@ -57,6 +57,7 @@ use ymirc::lexing::{word, tokens, keys};
 use ymirc::utils::format;
 
 use ymirc::errors;
+use std::io;
 
 /**
  * SpawnValidation module
@@ -98,43 +99,139 @@ pub mod SpawnValidation {
         throws ErrorMsg
     {
         let retValue = ValueValidation::validate(alias context, la.value);
-        let (byAlias, innerType) = if (MemoryVerification::needsExplicitAlias(retValue)) {
+        let (byAlias, innerType) = if (!MemoryVerification::needsExplicitAlias(retValue) && retValue.type.needsExplicitAlias) {
+            (true, retValue.type)
+        } else {
             (false, retValue.type.cloneMutableUntilBorrow())
-        } else {
-            (retValue.type.needsExplicitAlias, retValue.type)
         };
 
-        let lmbd = if (innerType of VoidType) {
-            let proto = FunctionPrototype([], retType-> EMPTY_EXPR, isVariadic-> false);
-            copy LambdaExpr(la.loc, proto, la.value)
+        let (lmbdValue, paramTypes) = if (innerType of VoidType) {
+            SpawnValidation::validateVoid(alias context, la.loc, retValue, innerType)
         } else {
-            let name = la.loc.locate("#_REF");
-            let retVdecl = copy VarDeclExpr(loc-> la.loc,
-                                            name-> name,
-                                            type-> copy TypeWrapperExpr(la.loc, innerType, asIs-> true),
-                                            value-> EMPTY_EXPR,
-                                            isMutOrDmut-> la.loc.locate(Keys::MUTABLE),
-                                            isLazyOrRef-> la.loc.locate(Keys::REF));
+            SpawnValidation::validateReturn(alias context, la.loc, retValue, innerType)
+        }
 
-            let vexpr = copy VarExpr(name, isQuoted-> true);
+        let (retProto, frame) = LambdaValidation::validate(alias context, lmbdValue, paramTypes,
+                                                           forLazy-> true,
+                                                           castClosure-> false);
 
-            let proto = FunctionPrototype(copy [retVdecl], retType-> EMPTY_EXPR, isVariadic-> false);
-            let blk = copy BinaryExpr(la.loc.locate(Tokens::EQUAL), vexpr, la.value);
-            copy LambdaExpr(la.loc, proto, blk)
-        };
-
-        let retFunc = LambdaValidation::validate(alias context, lmbd,
-                                                 isClosure-> true,
-                                                 forLazy-> true,
-                                                 copyLoc-> la.loc);
+        LambdaCreation::insertGenerator(alias context, frame);
         let type = copy FutureType(la.loc, innerType, isMutable-> true);
 
         return copy FutureValue(la.loc,
                                 type,
                                 retValue,
-                                lambda-> retFunc,
+                                lambda-> retProto,
                                 isByAlias-> byAlias);
 
     }
 
+    /**
+     * Validate the lambda for a spawn expression(`spawn x`) that returns a void value.
+     *
+     * @params:
+     *   - context:  validation context
+     *   - loc:      the location of the spawn expression
+     *   - retValue: the value returned by the spawn
+     *   - retType:  the return type of the spawn expression
+     *
+     * @returns:
+     *   - .0: the lambda value called when a thread is spawned
+     *   - .1: the list of parameter types of the lambda value
+     *
+     */
+    fn validateVoid(dmut context: &ValidationContext, loc: &Word, retValue: &Value, retType: &Type)-> (&LambdaValue, [&Type])
+        throws ErrorMsg
+    {
+        let proto = FunctionPrototype([],
+                                      retType-> EMPTY_EXPR,
+                                      isVariadic-> false);
+
+        let (paramVars, paramTypes, _, incomplete) = LambdaPrototypeValidation::validate(alias context, proto);
+        if incomplete {
+            eprintln("internal lazy value validation");
+            panic;
+        }
+
+        let blk = copy BlockExpr(loc, loc, copy [copy ValueWrapperExpr(retValue.loc, retValue), EMPTY_EXPR]);
+        let frameName = context.referent.path.push(format("_%_%", loc.line, loc.col));
+        let index = context.getCurrentClosingIndex();
+
+        let lmbdValue = copy LambdaValue(loc,
+                                         copy LambdaType(loc, paramTypes, retType),
+                                         frameName,
+                                         paramVars,
+                                         VOID_TYPE,
+                                         blk,
+                                         isClosure-> true,
+                                         index,
+                                         copyLoc-> loc);
+        return (lmbdValue, paramTypes);
+    }
+
+    /**
+     * Validate the lambda for a spawn expression(`spawn x`) that returns a value.
+     *
+     * @params:
+     *   - context:  validation context
+     *   - loc:      the location of the spawn expression
+     *   - retValue: the value returned by the spawn
+     *   - retType:  the return type of the spawn expression
+     *
+     * @returns:
+     *   - .0: the lambda value called when a thread is spawned
+     *   - .1: the list of parameter types of the lambda value
+     *
+     */
+    fn validateReturn(dmut context: &ValidationContext, loc: &Word, retValue: &Value, retType: &Type)-> (&LambdaValue, [&Type])
+        throws ErrorMsg
+    {
+        let name = loc.locate("#_REF");
+        context:.enterBlock();
+        {
+            let retVdecl = copy VarDeclExpr(loc-> name,
+                                            name-> name,
+                                            type-> copy TypeWrapperExpr(loc, retType, asIs-> true),
+                                            value-> EMPTY_EXPR,
+                                            isMutOrDmut-> loc.locate(Keys::MUTABLE),
+                                            isLazyOrRef-> loc.locate(Keys::REF));
+
+
+            let proto = FunctionPrototype(copy [retVdecl],
+                                          retType-> EMPTY_EXPR,
+                                          isVariadic-> false);
+
+            let (paramVars, paramTypes, _, incomplete) = LambdaPrototypeValidation::validate(alias context, proto);
+            if incomplete {
+                eprintln("internal lazy value validation");
+                panic;
+            }
+
+            let vref = copy VarRefValue(name, loc, retType, paramVars[0].uniqId,
+                                        isReference-> true,
+                                        canCte-> false);
+            let vexpr = copy ValueWrapperExpr(loc, vref);
+            let resultExpr = copy ValueWrapperExpr(retValue.loc, retValue);
+
+            let affect = copy BinaryExpr(loc.locate(Tokens::EQUAL), vexpr, resultExpr);
+            let blk = copy BlockExpr(loc, loc, copy [affect, EMPTY_EXPR]);
+
+            let frameName = context.referent.path.push(format("_%_%", loc.line, loc.col));
+            let index = context.getCurrentClosingIndex();
+
+            let lmbdValue = copy LambdaValue(loc,
+                                             copy LambdaType(loc, paramTypes, retType),
+                                             frameName,
+                                             paramVars,
+                                             VOID_TYPE,
+                                             blk,
+                                             isClosure-> true,
+                                             index,
+                                             copyLoc-> loc);
+
+            return (lmbdValue, paramTypes);
+        } exit {
+            context:.safeQuitBlock();
+        }
+    }
 }
