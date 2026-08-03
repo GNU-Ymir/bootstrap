@@ -1,0 +1,526 @@
+/*
+ * This file implements the creation of semantic helper types and core
+ * type-information structures used by the Ymir compiler. It provides the logic
+ * required to:
+ *
+ *   - build map type-info(hash and comparison functions),
+ *   - lazily load and cache core exception types,
+ *   - instantiate class references and class pointers,
+ *   - construct TypeInfo, TypeID, and FieldInfo types,
+ *   - and load core traits such as Iterable and Hashable.
+ *
+ * <hr>
+ *
+ * @Package: ymirc
+ * @Module: ymirc::semantic::validator::type::create
+ * @File: ymirc/semantic/validator/type/create.yr
+ * @Author(s):
+ *   - Emile Cadorel <ecadorel@gmail.com>
+ *
+ * @Created(YYYY-MM-DD): 2026-03-21
+ * @Copyright(C) 2021–2026 GNU-Ymir
+ * @License
+ *   ```text
+ *   This file is part of the Ymir language project.
+ *
+ *   Ymir is free software: you can redistribute it and/or modify it
+ *   under the terms of the GNU General Public License as published by
+ *   the Free Software Foundation, either version 3 of the License, or
+ *   (at your option) any later version.
+ *
+ *   Ymir is distributed in the hope that it will be useful,
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *   GNU General Public License for more details.
+ *
+ *   You should have received a copy of the GNU General Public License
+ *   along with Ymir.  If not, see <https://www.gnu.org/licenses/>.
+ *   ```
+ */
+
+in create;
+
+
+use ymirc::lexing::{word, tokens};
+use ymirc::semantic::{symbol, validator, generator::{global, value::_, type::_}};
+use ymirc::errors;
+use ymirc::syntax::expression::operator;
+
+use ymirc::utils::format;
+use ymirc::global::core_;
+
+use std::fs::path;
+
+/**
+ * TypeCreation module
+ *
+ * This module provides constructors for semantic types and core runtime
+ * metadata required by the Ymir compiler. It centralizes:
+ *
+ *   - creation of map type-info(hash and comparison vtables),
+ *   - instantiation of class and exception types,
+ *   - loading and caching of core types(TypeInfo, TypeID, FieldInfo),
+ *   - and loading of core traits(Iterable, Hashable).
+ *
+ * */
+pub mod TypeCreation {
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ======================================          MAP          =======================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Create and register the type-info(vtable) for a map type.
+     *
+     * Ensures that the key type:
+     *   - is hashable(via HASH_KEY_FUNC),
+     *   - is comparable(via CMP_KEY_FUNC),
+     *   - and implements the Hashable trait when needed.
+     *
+     * If the map type-info already exists, the function returns immediately.
+     *
+     * @params:
+     *   - context: validation context
+     *   - loc:     location of the map type
+     *   - type:    the MapType to validate
+     *
+     * @throws:
+     *    - ErrorMsg if the key type is not hashable or comparable
+     */
+    pub fn createMapTypeInfo(dmut context: &ValidationContext, loc: &Word, type: &MapType)
+        throws ErrorMsg
+    {
+        // Insert the map information(vtable) in the list of generators
+        let cstResult = if (type.isMutable) { type.clone(0u32) } else { type };
+        let name = format("#_map_info:%", cstResult);
+
+        // Map type info was already validated
+        if (context.hasCustomGenerator(name)) return;
+
+        let keyType = type.key;
+
+        // Key must be hashable
+        let keyHashFunc = {
+            match keyType {
+                c: &ClassPtrType => { // We verify the trait to have a better error display
+                    let hashTrait = TypeCreation::createHashableTrait(alias context, loc);
+                    TypeVerification::verifyImplement(keyType.loc, c, hashTrait);
+                }
+            }
+
+            // Find the hash function
+            TypeCreation::createKeyHashFunction(alias context, loc, keyType)
+        } catch {
+            err: &ErrorMsg => {
+                throw copy ErrorMsg::fatal(loc, end-> keyType.loc, format(ValidateErrorMessage::MAP_KEY_NOT_HASHABLE),
+                                            notes-> copy [err]);
+            }
+        };
+
+        // And comparable
+        let keyCmpFunc = {
+            // We check for the operator to have a better error display
+            let _ = PragmaOperatorValidation::validateBinary(alias context, loc, Tokens::DEQUAL, keyType, keyType);
+
+            // The comparison function used to compare two keys
+            TypeCreation::createKeyCmpFunction(alias context, loc, keyType)
+        } catch {
+            err: &ErrorMsg => {
+                throw copy ErrorMsg::fatal(loc, end-> keyType.loc, format(ValidateErrorMessage::MAP_KEY_NOT_COMPARABLE),
+                                            notes-> copy [err]);
+            }
+        };
+
+        // Insert the generator for the type to be properly transformed in YIL
+        if let m: &MapType = cstResult {
+            context:.insertCustomGenerator(name,
+                                            copy MapInfoGenerator(type.loc, m, keyCmpFunc, keyHashFunc));
+        } else panic;
+    }
+
+    /**
+     * Retrieve or instantiate the hash function for a map key type.
+     *
+     * The function:
+     *   - loads HASH_KEY_FUNC from core values if available,
+     *   - otherwise resolves it from syntax and caches it,
+     *   - then performs a template call with the key type.
+     *
+     * @returns: the instantiated hash function prototype
+     * @throws:
+     *    - ErrorMsg if hashing cannot be resolved for the key type
+     */
+    fn createKeyHashFunction(dmut context: &ValidationContext, loc: &Word, type: &Type)-> &PrototypeValue
+        throws ErrorMsg
+    {
+        {
+            let mut sym: &Value = UNIT_VALUE;
+            if let Ok(v) = context.getCoreValue(MapUtils::HASH_KEY_FUNC) {
+                sym = v;
+            } else {
+                let var = VariableCreation::createSyntaxVarFromPath(EOF_WORD, MapUtils::HASH_KEY_FUNC);
+                sym = ValueValidation::validate(alias context, var);
+                context:.insertCoreValue(MapUtils::HASH_KEY_FUNC, sym);
+            }
+
+            let func = TemplateValidation::validateCall(alias context, loc, sym, copy [type]);
+            match func {
+                p: &PrototypeValue => return p;
+            }
+
+            panic;
+        } catch {
+            err: &ErrorMsg => {
+                throw copy ErrorMsg::fatal(loc, format(ValidateErrorMessage::MAP_KEY_NOT_HASHABLE, type),
+                                            notes-> copy [err]);
+            }
+        }
+    }
+
+    /**
+     * Retrieve or instantiate the comparison function for a map key type.
+     *
+     * The function:
+     *   - loads CMP_KEY_FUNC from core values or resolves it,
+     *   - then performs a template call with the key type.
+     *
+     * @returns: the instantiated comparison function prototype
+     * @throws:  &ErrorMsg if comparison cannot be resolved for the key type
+     */
+    fn createKeyCmpFunction(dmut context: &ValidationContext, loc: &Word, type: &Type)-> &PrototypeValue
+        throws ErrorMsg
+    {
+        {
+            let mut sym: &Value = UNIT_VALUE;
+            if let Ok(func) = context.getCoreValue(MapUtils::CMP_KEY_FUNC) {
+                sym = func;
+            } else {
+                let var = VariableCreation::createSyntaxVarFromPath(EOF_WORD, MapUtils::CMP_KEY_FUNC);
+                sym = ValueValidation::validate(alias context, var);
+                context:.insertCoreValue(MapUtils::CMP_KEY_FUNC, sym);
+            }
+
+            let func = TemplateValidation::validateCall(alias context, loc, sym, copy [type]);
+            match func {
+                p: &PrototypeValue => return p;
+            }
+
+            throw copy ErrorMsg::fatal(loc, ValidateErrorMessage::MALFORMED_CORE);
+        } catch {
+            err: &ErrorMsg => {
+                throw copy ErrorMsg::fatal(loc, format(ValidateErrorMessage::MAP_KEY_NOT_COMPARABLE, type),
+                                            notes-> copy [err]);
+            }
+        }
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ===================================          EXCEPTIONS          ===================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Retrieve or instantiate the core Exception type.
+     *
+     * If already cached, returns a mutable ClassPtrType instance.
+     * Otherwise resolves the symbol, validates it, and caches the result.
+     *
+     * @returns: ClassPtrType for the core exception type
+     * @throws:
+     *    - ErrorMsg if the core exception type is malformed
+     */
+    pub fn createExceptionType(dmut context: &ValidationContext, loc: &Word = EOF_WORD)-> &ClassPtrType
+        throws ErrorMsg
+    {
+        if let Ok(ty: &ClassPtrType) = context.getCoreType(ExceptionUtils::EXCEPTION) {
+            return copy ClassPtrType(loc, ty.sym, isMutable-> true, isInnerMutable-> true);
+        }
+
+        let var = VariableCreation::createSyntaxVarFromPath(loc, ExceptionUtils::EXCEPTION);
+        let type = TypeValidation::validate(alias context, var);
+
+        if let c: &ClassRefType = type {
+            let t = c.createInstance(true, true);
+            context:.insertCoreType(ExceptionUtils::EXCEPTION, t);
+
+            return t;
+        }
+
+        throw copy ErrorMsg::fatal(loc, ValidateErrorMessage::MALFORMED_CORE);
+    }
+
+    /**
+     * Retrieve or instantiate the core Exception type.
+     *
+     * If already cached, returns a mutable ClassPtrType instance.
+     * Otherwise resolves the symbol, validates it, and caches the result.
+     *
+     * @returns: ClassPtrType for the core exception type
+     * @throws:
+     *    - ErrorMsg if the core exception type is malformed
+     */
+    pub fn createExceptionFromName(dmut context: &ValidationContext, loc: &Word = EOF_WORD, name: Path)-> &ClassPtrType
+        throws ErrorMsg
+    {
+        if let Ok(ty: &ClassPtrType) = context.getCoreType(name) {
+            return copy ClassPtrType(loc, ty.sym, isMutable-> true, isInnerMutable-> true);
+        }
+
+        let var = VariableCreation::createSyntaxVarFromPath(loc, name);
+        let type = TypeValidation::validate(alias context, var);
+
+        if let c: &ClassRefType = type {
+            let t = c.createInstance(true, true);
+            context:.insertCoreType(name, t);
+
+            return t;
+        }
+
+        throw copy ErrorMsg::fatal(loc, ValidateErrorMessage::MALFORMED_CORE);
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * =====================================          CLASS          ======================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Create a class instance(ClassPtrType) from a class reference or pointer.
+     *
+     * @params:
+     *   - type:         ClassRefType or ClassPtrType
+     *   - mutable:      outer mutability
+     *   - innerMutable: inner mutability
+     *
+     * @returns: the instantiated class pointer type
+     * @panic: if the input is not a class type
+     */
+    pub fn createClassInstance(type: &Type, mutable: bool = false, innerMutable: bool = false)-> &Type
+        throws ErrorMsg
+    {
+        match type {
+            c: &ClassRefType => { c.createInstance(mutable, innerMutable) }
+            c: &ClassPtrType => { c.inner.createInstance(mutable, innerMutable) }
+            _ => panic;
+        }
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          TYPEINFO          ====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Retrieve or instantiate the core TypeInfo type.
+     *
+     * If cached, returns a mutable instance.
+     * Otherwise resolves the symbol, validates it, and caches it.
+     *
+     * @returns: ClassPtrType for TypeInfo
+     * @throws:
+     *   - ErrorMsg if the core TypeInfo type is malformed
+     */
+    pub fn createTypeInfo(dmut context: &ValidationContext, loc: &Word)-> &ClassPtrType
+        throws ErrorMsg
+    {
+        if let Ok(ty: &ClassPtrType) = context.getCoreType(TypeUtils::TYPEINFO_TYPE) {
+            return copy ClassPtrType(loc, ty.sym, isMutable-> true, isInnerMutable-> true);
+        }
+
+        let name = VariableCreation::createSyntaxVarFromPath(loc, TypeUtils::TYPEINFO_TYPE);
+        {
+            match TypeValidation::validate(alias context, name) {
+                s: &ClassPtrType => {
+                    context:.insertCoreType(TypeUtils::TYPEINFO_TYPE, s);
+                    return s;
+                }
+                _ => throw copy ErrorMsg::fatal(loc, ValidateErrorMessage::MALFORMED_CORE);
+            }
+        } catch {
+            err: &ErrorMsg => {
+                throw err.appendNotes(copy [copy ErrorMsg::note(loc, ValidateErrorMessage::HERE)]);
+            }
+        }
+    }
+
+    /**
+     * Retrieve or instantiate the TypeID enum and extract a field from it.
+     *
+     * Ensures the TypeID enum is loaded into core types, then validates
+     * the requested field.
+     *
+     * @params:
+     *   - loc:   location of the request
+     *   - field: name of the enum field
+     *
+     * @returns: the enum constant value
+     * @throws:
+     *    - ErrorMsg if TypeID is malformed or the field is invalid
+     */
+    pub fn createTypeID(dmut context: &ValidationContext, loc: &Word, field: [c8])-> &Value
+        throws ErrorMsg
+    {
+        let mut type: &Type = NONE_TYPE;
+        if let Ok(ty: &EnumType) = context.getCoreType(TypeUtils::TYPEIDS_TYPE) {
+            type = ty;
+        } else {
+            let name = VariableCreation::createSyntaxVarFromPath(loc, TypeUtils::TYPEIDS_TYPE);
+            type = TypeValidation::validate(alias context, name);
+            context:.insertCoreType(TypeUtils::TYPEIDS_TYPE, type);
+        }
+
+        {            
+            if let en: &EnumType = type {
+                if let Ok(v: &Value) = EnumStaticFieldValidation::validate(loc, en, field) {
+                    return v;
+                } 
+            }
+            
+            throw copy ErrorMsg::fatal(loc, ValidateErrorMessage::MALFORMED_CORE);            
+        } catch {
+            err: &ErrorMsg => {
+                throw err.appendNotes(copy [copy ErrorMsg::note(loc, ValidateErrorMessage::HERE)]);
+            }
+        }
+    }
+
+    /**
+     * Retrieve or instantiate the core FieldInfo type.
+     *
+     * If cached, returns a mutable instance.
+     * Otherwise resolves the symbol, validates it, and caches it.
+     *
+     * @returns: ClassPtrType for FieldInfo
+     * @throws:
+     *    - ErrorMsg if the core FieldInfo type is malformed
+     */
+    pub fn createFieldInfo(dmut context: &ValidationContext, loc: &Word)-> &ClassPtrType
+        throws ErrorMsg
+    {
+        if let Ok(ty: &ClassPtrType) = context.getCoreType(TypeUtils::FIELDINFO_TYPE) {
+            return copy ClassPtrType(loc, ty.sym, isMutable-> true, isInnerMutable-> true);
+        }
+
+        let name = VariableCreation::createSyntaxVarFromPath(loc, TypeUtils::FIELDINFO_TYPE);
+        {
+            match TypeValidation::validate(alias context, name) {
+                s: &ClassPtrType => {
+                    context:.insertCoreType(TypeUtils::FIELDINFO_TYPE, s);
+                    return s;
+                }
+                _ => throw copy ErrorMsg::fatal(loc, ValidateErrorMessage::MALFORMED_CORE);
+            }
+        } catch {
+            err: &ErrorMsg => {
+                throw err.appendNotes(copy [copy ErrorMsg::note(loc, ValidateErrorMessage::MALFORMED_CORE)]);
+            }
+        }
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * =====================================          TRAITS          =====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Retrieve or instantiate the core Iterable trait.
+     *
+     * If cached, returns a TraitRefType.
+     * Otherwise resolves the symbol, validates it, and caches it.
+     *
+     * @returns: TraitRefType for Iterable
+     * @throws:
+     *    - ErrorMsg if the core trait is malformed
+     */
+    pub fn createIteratorTrait(dmut context: &ValidationContext, loc: &Word)-> &TraitRefType
+        throws ErrorMsg
+    {
+        if let Ok(ty: &TraitRefType) = context.getCoreType(GlobalTraitUtils::ITERABLE_TRAIT) {
+            return copy TraitRefType(loc, ty.sym);
+        }
+
+        let name = VariableCreation::createSyntaxVarFromPath(loc, GlobalTraitUtils::ITERABLE_TRAIT);
+        {
+            match TypeValidation::validate(alias context, name) {
+                t: &TraitRefType => {
+                    context:.insertCoreType(GlobalTraitUtils::ITERABLE_TRAIT, t);
+                    return t;
+                }
+                _ => throw copy ErrorMsg::fatal(loc, ValidateErrorMessage::MALFORMED_CORE);
+            }
+        } catch {
+            err: &ErrorMsg => {
+                throw err.appendNotes(copy [copy ErrorMsg::note(loc, ValidateErrorMessage::MALFORMED_CORE)]);
+            }
+        }
+    }
+
+    /**
+     * Retrieve or instantiate the core Hashable trait.
+     *
+     * If cached, returns a TraitRefType.
+     * Otherwise resolves the symbol, validates it, and caches it.
+     *
+     * @returns: TraitRefType for Hashable
+     * @throws:
+     *    - ErrorMsg if the core trait is malformed
+     */
+    pub fn createHashableTrait(dmut context: &ValidationContext, loc: &Word)-> &TraitRefType
+        throws ErrorMsg
+    {
+        if let Ok(ty: &TraitRefType) = context.getCoreType(GlobalTraitUtils::HASHABLE_TRAIT) {
+            return copy TraitRefType(loc, ty.sym);
+        }
+
+        let name = VariableCreation::createSyntaxVarFromPath(loc, GlobalTraitUtils::HASHABLE_TRAIT);
+        {
+            match TypeValidation::validate(alias context, name) {
+                t: &TraitRefType => {
+                    context:.insertCoreType(GlobalTraitUtils::HASHABLE_TRAIT, t);
+                    return t;
+                }
+                _ => throw copy ErrorMsg::fatal(loc, ValidateErrorMessage::MALFORMED_CORE);
+            }
+        } catch {
+            err: &ErrorMsg => {
+                throw err.appendNotes(copy [copy ErrorMsg::note(loc, ValidateErrorMessage::MALFORMED_CORE)]);
+            }
+        }
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ======================================          ENUM          ======================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Unwrap an enum type to its underlying representation
+     *
+     */
+    pub fn createEnumUnwrap(type: &Type)-> &Type {
+        if let en: &EnumType = type {
+            return en.getLastLevelProxy();
+        }
+
+        return type;
+    }
+}

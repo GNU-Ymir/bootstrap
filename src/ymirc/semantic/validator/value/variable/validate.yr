@@ -1,0 +1,548 @@
+/*
+ * Implements validation of variable references in expressions.
+ *
+ * This module handles:
+ *   - resolution of local variables, parameters, and proto-variables,
+ *   - resolution of global variables, functions, modules, templates, macros,
+ *   - handling of overloaded symbols and multi-symbol resolution,
+ *   - construction of VarRefValue, GlobalVarRefValue, ModuleRefValue, etc.,
+ *   - and error reporting for undefined or invalid variable usages.
+ *
+ * Variable resolution is context-sensitive: the current referent stack,
+ * protection rules, and symbol categories all influence the result.
+ *
+ * <hr>
+ *
+ * @Package: ymirc
+ * @Module: ymirc::semantic::validator::value::variable::validate
+ * @File: ymirc/semantic/validator/value/variable/validate.yr
+ * @Author(s):
+ *   - Emile Cadorel <ecadorel@gmail.com>
+ *
+ * @Created(YYYY-MM-DD): 2026-03-26
+ * @Copyright(C) 2021–2026 GNU-Ymir
+ * @License
+ *   ```text
+ *   This file is part of the Ymir language project.
+ *
+ *   Ymir is free software: you can redistribute it and/or modify it
+ *   under the terms of the GNU General Public License as published by
+ *   the Free Software Foundation, either version 3 of the License, or
+ *   (at your option) any later version.
+ *
+ *   Ymir is distributed in the hope that it will be useful,
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *   GNU General Public License for more details.
+ *
+ *   You should have received a copy of the GNU General Public License
+ *   along with Ymir.  If not, see <https://www.gnu.org/licenses/>.
+ *   ```
+ */
+
+in validate;
+
+use ymirc::syntax::{_, declaration::_, expression::_};
+use ymirc::semantic::{declarator, validator, template_, symbol};
+use ymirc::semantic::generator::{value::_, type::_, global};
+
+use ymirc::errors;
+use ymirc::utils::format;
+
+use ymirc::lexing::word;
+
+use std::stream;
+
+/**
+ * VariableValidation module
+ *
+ * Provides resolution and validation of variable references. Supports local
+ * variables, parameters, proto-variables, global variables, functions, modules,
+ * templates, macros, class constructors, and more. When multiple symbols share
+ * the same name, this module performs multi-symbol resolution and returns
+ * either a single value or a MultSymValue.
+ *
+ * All functions assume syntactic correctness and operate during semantic
+ * validation.
+ */
+pub mod VariableValidation {
+
+    /**
+     * Validate a variable reference and resolve it to a semantic value.
+     *
+     * Resolution order:
+     *   1. Local variables and parameters(including proto-variables).
+     *   2. Local variable declarations(VarDeclValue).
+     *   3. Any other locally-bound value.
+     *   4. Global symbols(via validateGlobal).
+     *
+     * Special cases:
+     *   - Lambda variables return their associated lambda value.
+     *   - Immutable variables may expose their underlying value directly.
+     *
+     * @params:
+     *   - context: validation context
+     *   - v:       the VarExpr representing the variable reference
+     *
+     * @returns:
+     *   - a VarRefValue, lambda value, global reference, or other semantic value
+     *
+     * @throws:
+     *   - ErrorMsg if the variable cannot be resolved
+     */
+    pub fn validate(dmut context: &ValidationContext, v: &VarExpr)-> &Value
+        throws ErrorMsg
+    {
+        let value = context:.getLocal(v.loc, v.name.str);
+        if let Ok(protoV: &ProtoVarDeclValue) = value {
+            return copy VarRefValue(v.loc,
+                                     protoV.loc,
+                                     protoV.type,
+                                     protoV.uniqId,
+                                     isSelf-> protoV.isSelf,
+                                     isParam-> true,
+                                     isReference-> protoV.isReference,
+                                     isLazy-> protoV.isLazy);
+
+        }
+
+
+        if let Ok(vdecl: &VarDeclValue) = value {
+            if vdecl.varType of LambdaType {
+                // return the lambda value associated to the var decl
+                return vdecl.value;
+            }
+
+            let mut refValue: &Value = UNIT_VALUE;
+            if (!vdecl.isMutable) {
+                refValue = vdecl.value;
+            }
+
+            return copy VarRefValue(v.loc,
+                                     vdecl.loc,
+                                     vdecl.varType,
+                                     vdecl.uniqId,
+                                     isSelf-> false,
+                                     canCte-> vdecl.isCte,
+                                     isIterator-> vdecl.isIterator,
+                                     isReference-> vdecl.isReference,
+                                     isLazy-> vdecl.isLazy,
+                                     value-> refValue);
+        }
+
+        if let Ok(any) = value {
+            return any;
+        }
+
+        return VariableValidation::validateGlobal(alias context, v);
+    }
+
+    /**
+     * Resolve a variable reference against global symbols.
+     *
+     * Retrieves all global symbols matching the name and dispatches to
+     * validateMultSymbols. If no symbols exist, produces a global-variable
+     * undefined-reference error.
+     *
+     * @params:
+     *   - context: validation context
+     *   - v:       the VarExpr representing the reference
+     *
+     * @returns:
+     *   - a semantic value representing the resolved global symbol(s)
+     *
+     * @throws:
+     *   - &ErrorMsg if the symbol is undefined or resolution fails
+     */
+    fn validateGlobal(dmut context: &ValidationContext, v: &VarExpr)-> &Value
+        throws ErrorMsg
+    {
+        let dmut syms = context:.getGlobal(v.name.str);
+        if (syms.len == 0us) {
+            throw VariableCreation::createGlobalVarError(context, v.loc, v.name.str);
+        }
+
+        {
+            return VariableValidation::validateMultSymbols(alias context, v.loc, alias syms);
+        } catch {
+            err: &ErrorMsg => {
+                throw copy ErrorMsg::fatal(v.loc,
+                                            format(ValidateErrorMessage::UNDEF_VAR, v.name.str),
+                                            notes-> copy [err]);
+            }
+        }
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ================================          MULTIPLE SYMBOLS          ================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Resolve a list of symbols that share the same name.
+     *
+     * For each symbol:
+     *   - Push it as the current referent.
+     *   - Attempt to validate it as a value.
+     *   - Collect value results, type-errors, or validation errors.
+     *   - Pop the referent.
+     *
+     * After processing:
+     *   - If any validation errors occurred => aggregate and throw.
+     *   - Deduplicate values.
+     *   - If exactly one value remains => return it.
+     *   - If none remain but type errors exist => throw type errors.
+     *   - Otherwise => return a MultSymValue containing all values.
+     *
+     * @params:
+     *   - context: validation context
+     *   - loc:     location of the reference
+     *   - syms:    list of symbols with the same name
+     *   - base:    optional initial list of values(used for chaining)
+     *
+     * @returns:
+     *   - a single value or a MultSymValue
+     *
+     * @throws:
+     *   - &ErrorMsg if symbol resolution fails or all candidates are invalid
+     */
+    pub fn validateMultSymbols(dmut context: &ValidationContext, loc: &Word, dmut syms: [&Symbol], base: [&Value] = [])-> &Value
+        throws ErrorMsg
+    {
+        let mut res: [&Value] = base;
+        let mut errors: [mut &ErrorMsg] = [];
+        let mut typeErrors: [mut &ErrorMsg] = [];
+
+        for i in 0us .. syms.len {
+            context:.pushReferent(alias syms[i]);
+            {
+                match alias syms[i] {
+                    // Functions
+                    dmut f: &FunctionSymbol if !f.isMethod => {
+                        res ~= [FunctionValidation::validateProto(alias context, alias f)];
+                    }
+                    dmut f: &FunctionSymbol if f.isMethod => {
+                        typeErrors ~= [copy ErrorMsg::fatal(f.loc, format(ValidateErrorMessage::IS_A_METHOD, f.path))];
+                    }
+
+                    // Modules
+                    m: &ModuleSymbol => {
+                        res ~= [copy ModuleRefValue(loc, m)];
+                    }
+                    l: &LazyModuleSymbol => {
+                        res ~= [copy ModuleRefValue(loc, context:.getModuleFromLazy(l))];
+                    }
+
+                    // Globals
+                    dmut gv: &GlobalVarSymbol => {
+                        VariableValidation::validateGlobalVarSymbol(alias context, loc, alias gv, ref res);
+                    }
+                    dmut a: &DefSymbol => {
+                        VariableValidation::validateDefSymbol(alias context, loc, alias a, ref res, ref typeErrors);
+                    }
+
+                    // Templates
+                    dmut t: &TemplateSymbol => { // At this point there is no way to determine if it is a type or a value
+                        if t.isMethod {
+                            typeErrors ~= [copy ErrorMsg::fatal(t.loc, format(ValidateErrorMessage::IS_A_METHOD, t.path))];
+                        } else {
+                            res ~= [copy TemplateRefValue(t.loc, t)];
+                        }
+                    }
+                    dmut m: &MacroSymbol => {
+                        res ~= [copy MacroRefValue(loc, m)];
+                    }
+
+                    // Custom types
+                    dmut c: &ClassSymbol => {
+                        VariableValidation::validateClassSymbolCtors(alias context, loc, alias c, ref res, ref typeErrors);
+                    }
+                    dmut tr: &TraitSymbol => {
+                        VariableValidation::validateTraitSymbol(alias context, loc, alias tr, ref typeErrors);
+                    }
+                    dmut en: &EnumSymbol => { // Enum are also types
+                        VariableValidation::validateEnumSymbol(alias context, loc, alias en, ref typeErrors);
+                    }
+                    type: _ => {
+                        typeErrors ~= [copy ErrorMsg::fatal(loc, end-> type.loc, format(ValidateErrorMessage::USE_AS_VALUE_TYPE, type.path))];
+                    }
+                }
+            } catch {
+                err: &ErrorMsg => {
+                    errors ~= [err];
+                }
+            }
+
+            context:.popReferent();
+        }
+
+        // There are errors in value validation
+        if (errors.len != 0us) {
+            let dmut form = copy StringStream();
+            for i, j in syms {
+                if (i != 0us) form:.write(", ");
+                form:.write(j.path.toStr());
+            }
+
+            throw copy ErrorMsg::fatal(loc, format(ValidateErrorMessage::INVALID_SYMBOLS, form[]), notes-> errors);
+        }
+
+        res = VariableValidation::reduceMultSyms(res);
+        if (res.len == 1us) {
+            return res[0];
+        }
+
+        if (res.len == 0us) {
+            if (typeErrors.len != 0us) { // There are no values
+                throw copy ErrorMsg::list(typeErrors); // It has to be because of type error
+            } else panic;
+        }
+
+        let prettyStr = VariableValidation::createPrettyStringMultSym(res);
+        return copy MultSymValue(loc, res, prettyStr-> prettyStr);
+    }
+
+    /**
+     * Validate a definition symbol used as a value.
+     *
+     * Cases:
+     *   - If the definition generates a value => append it.
+     *   - If it generates a class type => return its constructors.
+     *   - If it generates a type => record a type-error(cannot use type as value).
+     *
+     * @params:
+     *   - context:    validation context
+     *   - loc:        location of the reference
+     *   - sym:        the DefSymbol being validated
+     *   - res:        accumulator for value results
+     *   - typeErrors: accumulator for type-errors
+     *
+     * @returns:
+     *   - nothing; modifies `res` or `typeErrors` in place
+     *
+     * @throws:
+     *   - ErrorMsg if DefValidation fails internally
+     */
+    fn validateDefSymbol(dmut context: &ValidationContext, loc: &Word, dmut sym: &DefSymbol, ref mut res: [&Value], ref mut typeErrors: [&ErrorMsg])
+        throws ErrorMsg
+    {
+        DefValidation::validate(alias context, alias sym);
+
+        if let value: &Value = sym.generator { // simple value
+            res ~= [value.clone()];
+        }
+
+        else if let c: &ClassRefType = sym.generator { // e.g. for copy X(), where def X: Class
+            let ctors = ClassStaticFieldValidation::validateCtors(alias context, loc, c, name-> ""s8);
+            if let m: &MultSymValue = ctors {
+                res ~= m.values;
+            } else {
+                res ~= [ctors];
+            }
+        }
+
+        else if let type: &Type = sym.generator { // def X: T
+            typeErrors ~= [copy ErrorMsg::fatal(loc, format(ValidateErrorMessage::USE_AS_VALUE_TYPE, type))];
+        }
+
+        else { // error generator is supposed to have been thrown in DefValidation::validate
+            panic;
+        };
+    }
+
+    /**
+     * Validate a global variable symbol.
+     *
+     * Ensures the global variable is fully validated, then produces a
+     * GlobalVarRefValue referencing its generator.
+     *
+     * @params:
+     *   - context: validation context
+     *   - loc:     location of the reference
+     *   - sym:     the GlobalVarSymbol
+     *   - res:     accumulator for value results
+     *
+     * @returns:
+     *   - nothing; appends a GlobalVarRefValue to `res`
+     *
+     * @throws:
+     *   - ErrorMsg if the global variable is invalid
+     */
+    fn validateGlobalVarSymbol(dmut context: &ValidationContext, loc: &Word, dmut sym: &GlobalVarSymbol, ref mut res: [&Value])
+        throws ErrorMsg
+    {
+        GlobalVarValidation::validate(alias context, alias sym, inModule-> false);
+
+        if let gv: &GlobalVarGenerator = sym.generator {
+            res ~= [copy GlobalVarRefValue(loc, sym, gv)];
+        }
+
+        else { // error generator is supposed to have been thrown in GlobalVarValidation::validate
+            panic;
+        }
+    }
+
+    /**
+     * Validate a class symbol used as a value.
+     *
+     * A class used as a value refers to its constructors. This function:
+     *   1. Validates the class type.
+     *   2. Retrieves all constructors via ClassStaticFieldValidation.
+     *   3. Appends them to the result list.
+     *
+     * @params:
+     *   - context: validation context
+     *   - loc:     location of the reference
+     *   - sym:     the ClassSymbol
+     *   - res:     accumulator for value results
+     *
+     * @returns:
+     *   - nothing; appends constructor values to `res`
+     *
+     * @throws:
+     *   - ErrorMsg if class validation fails
+     */
+    fn validateClassSymbolCtors(dmut context: &ValidationContext, loc: &Word, dmut sym: &ClassSymbol, ref mut res: [&Value], ref mut typeErrors: [&ErrorMsg])
+        throws ErrorMsg
+    {
+        let type = ClassValidation::validate(alias context, alias sym, inModule-> false);
+        {
+            let val = ClassStaticFieldValidation::validateCtors(alias context, loc, type,
+                                                                name-> ""s8);
+
+            match val {
+                m: &MultSymValue => {
+                    res ~= m.values;
+                }
+                _ => { res ~= [val]; }
+            }
+        } catch {
+            err => {
+                typeErrors ~= [err];
+            }
+        }
+    }
+
+    /**
+     * Validate a trait symbol used as a value.
+     *
+     * Traits are types, not values. This function validates the trait type and
+     * records a type-error indicating that it cannot be used as a value.
+     *
+     * @params:
+     *   - context:    validation context
+     *   - loc:        location of the reference
+     *   - sym:        the TraitSymbol
+     *   - typeErrors: accumulator for type-errors
+     *
+     * @returns:
+     *   - nothing; appends a type-error to `typeErrors`
+     */
+    fn validateTraitSymbol(dmut context: &ValidationContext, loc: &Word, dmut sym: &TraitSymbol, ref mut typeErrors: [&ErrorMsg])
+        throws ErrorMsg
+    {
+        let type = TraitValidation::validate(alias context, alias sym);
+        typeErrors ~= [copy ErrorMsg::fatal(loc, format(ValidateErrorMessage::USE_AS_VALUE_TYPE, type))];
+    }
+
+    /**
+     * Validate an enum symbol used as a value.
+     *
+     * Enums are types, not values. This function validates the enum type and
+     * records a type-error indicating that it cannot be used as a value.
+     *
+     * @params:
+     *   - context:    validation context
+     *   - loc:        location of the reference
+     *   - sym:        the EnumSymbol
+     *   - typeErrors: accumulator for type-errors
+     *
+     * @returns:
+     *   - nothing; appends a type-error to `typeErrors`
+     */
+    fn validateEnumSymbol(dmut context: &ValidationContext, loc: &Word, dmut sym: &EnumSymbol, ref mut typeErrors: [&ErrorMsg])
+        throws ErrorMsg
+    {
+        let type = EnumValidation::validate(alias context, alias sym);
+        typeErrors ~= [copy ErrorMsg::fatal(loc, format(ValidateErrorMessage::USE_AS_VALUE_TYPE, type))];
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * =====================================          UTILS          ======================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Produce a compact, human-readable representation of a multi-symbol value set.
+     *
+     * Deduplicates values by string representation, then prints:
+     *   - up to two values explicitly,
+     *   - followed by ", ..." if more exist,
+     *   - wrapped in braces if multiple values are present.
+     *
+     * @params:
+     *   - values: list of semantic values
+     *
+     * @returns:
+     *   - a formatted string representing the set
+     */
+    fn createPrettyStringMultSym(values: [&Value])-> [c8] {
+        let mut set: [[c8] => mut()] = copy [];
+        for i in values {
+            set[format("%", i)] = ();
+        }
+
+        let dmut stream = copy StringStream();
+        if (set.len > 1us) stream:.write("{");
+
+        let mut i = 0us;
+        for val in set {
+            if (i != set.len - 1us && i == 2us) stream:.write(", ...");
+            else if (i == set.len - 1us || i < 2us) {
+                if i != 0us { stream:.write(", "); }
+                stream:.write(val);
+            }
+
+            i += 1us;
+        }
+
+        if (set.len > 1) stream:.write("}"s8);
+        stream[]
+    }
+
+    /**
+     * Deduplicate a list of values using semantic equality.
+     *
+     * @params:
+     *   - res: list of values
+     *
+     * @returns:
+     *   - a new list containing each distinct value once
+     */
+    fn reduceMultSyms(res: [&Value])-> [&Value] {
+        let mut final: [mut &Value] = [];
+        for v in res {
+            let mut found = false;
+            for v2 in final {
+                if v2 == v {
+                    found = true;
+                    break;
+                }
+            }
+
+            if !found {
+                final ~= [v];
+            }
+        }
+
+        final
+    }
+
+
+}

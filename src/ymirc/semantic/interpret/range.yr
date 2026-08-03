@@ -1,0 +1,354 @@
+/*
+ * Declares the RangeInterpret module, used to reduce range-related operations.
+ *
+ * <hr>
+ *
+ * @Package: ymirc
+ * @Module: ymirc::semantic::interpret::range
+ * @File: ymirc/semantic/interpret/range.yr
+ * @Author(s):
+ *   - Emile Cadorel <ecadorel@gmail.com>
+ *
+ * @Created(YYYY-MM-DD): 2026-03-14
+ * @Copyright(C) 2021–2026 GNU-Ymir
+ * @License
+ *   ```text
+ *   This file is part of the Ymir language project.
+ *
+ *   Ymir is free software: you can redistribute it and/or modify it
+ *   under the terms of the GNU General Public License as published by
+ *   the Free Software Foundation, either version 3 of the License, or
+ *   (at your option) any later version.
+ *
+ *   Ymir is distributed in the hope that it will be useful,
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *   GNU General Public License for more details.
+ *
+ *   You should have received a copy of the GNU General Public License
+ *   along with Ymir.  If not, see <https://www.gnu.org/licenses/>.
+ *   ```
+ */
+
+in range;
+
+use ymirc::semantic::generator::{_, value::_, type::_};
+use ymirc::global;
+
+use ymirc::semantic::validator;
+use ymirc::errors;
+
+use ymirc::utils::{format, bigint};
+use ymirc::lexing::{word, keys};
+
+
+/**
+ * Provides reduction logic for range-membership operators. The reducer attempts
+ * full constant folding when both the tested value and the range bounds are
+ * compile-time integers. When full folding is not possible, the reducer still
+ * performs structural validation and reconstructs the operator with reduced
+ * operands.
+ *
+ * Supported operators:
+ *   - IN      (x in r)
+ *   - NOT_IN  (x !in r)
+ *
+ *
+ */
+pub mod RangeInterpret {
+
+    /**
+     * Reduces a range-membership operator.
+     *
+     * Steps:
+     *   1. Reduce both operands with `reduceInStructAccess`.
+     *   2. If the right operand is a RangeValue and the left is an IntValue,
+     *      evaluate the membership test at compile time:
+     *         - handles inclusive/exclusive bounds,
+     *         - handles reversed ranges,
+     *         - applies NOT_IN by negation.
+     *
+     *   3. If folding is not possible, rebuild the operator with reduced operands.
+     *
+     * Notes:
+     *   - Performs minimal validation even when the range is not fully literal.
+     *   - Only integer ranges are supported here - since range can only contain int values.
+     *
+     */
+    pub fn reduceContains(dmut context: &CompileTimeInterpret, rng: &RangeContainsValue)-> &Value
+        throws ErrorMsg
+    {
+        let left = context:.reduceInStructAccess(rng.left);
+        let right = context:.reduceInStructAccess(rng.right);
+
+        if let r: &RangeValue = right {
+            let fstR = r.left;
+            let scdR = r.right;
+            let containsR = r.isFull;
+
+            if let (x: &IntValue, fst: &IntValue, scd: &IntValue, contain: &BoolValue) = (left, fstR, scdR, containsR) {
+                let res = if (contain.isTrue) {
+                    if (fst.value < scd.value) {
+                        x.value >= fst.value && x.value <= scd.value
+                    } else {
+                        x.value >= scd.value && x.value <= fst.value
+                    }
+                } else {
+                    if (fst.value < scd.value) {
+                        x.value >= fst.value && x.value < scd.value
+                    } else {
+                        x.value > scd.value && x.value <= fst.value
+                    }
+                };
+
+                if (rng.op == Keys::NOT_IN) {
+                    return copy BoolValue(rng.loc, !res)
+                } else {
+                    return copy BoolValue(rng.loc, res)
+                };
+            }
+        }
+
+        return copy RangeContainsValue(rng.loc,
+                                        rng.type,
+                                        rng.op,
+                                        context:.reduce(rng.left),
+                                        context:.reduce(rng.right),
+                                        rng.call,
+                                        isReduced-> true);
+    }
+
+    /**
+     * Reduce the number of iterations of a range at compile time.
+     *
+     * Dispatch strategy:
+     *   1. If fst, scd, step, and contains are all constant:
+     * => computeNbIterations()
+     *
+     *   2. If only step and contains are constant:
+     * => almostComputeNbIterations()
+     *        (endpoints are dynamic but step is known)
+     *
+     *   3. Otherwise:
+     * => reduceNbIterations()
+     *        (fully dynamic evaluation using IR)
+     *
+     * The result is always an Value of type Int(usize).
+     *
+     * @params:
+     *   - context:   compile-time interpreter
+     *   - loc:       operator location
+     *   - fst:       start value of the range
+     *   - scd:       end value of the range
+     *   - step:      step value(may be negative)
+     *   - contains:  boolean indicating inclusiveness(..=)
+     *
+     * @returns:
+     *   A &Value representing the number of iterations(usize).
+     *
+     * @throws:
+     *   ErrorMsg if reduction fails or operands are malformed.
+     */
+    pub fn reduceLen(dmut context: &CompileTimeInterpret,
+                      loc:          &Word,
+                      fst:          &Value,
+                      scd:          &Value,
+                      step:         &Value,
+                      contains:     &Value)-> &Value
+        throws ErrorMsg
+    {
+        let max = IntInterpret::createIntMaxValue(USIZE_TYPE);
+        match (fst, scd, step, contains) {
+            (fstI: &IntValue, scdI: &IntValue, stepI: &IntValue, containsB: &BoolValue) =>
+            {
+                let len = RangeInterpret::computeNbIterations(fstI.value, scdI.value, stepI.value, max, containsB.isTrue);
+                return copy IntValue(loc, USIZE_TYPE, len);
+            }
+            (_, _, stepI: &IntValue, containsB: &BoolValue) => {
+                let len = RangeInterpret::almostComputeNbIterations(loc, fst, scd, stepI.value, max, containsB.isTrue);
+                return context:.reduce(len);
+            }
+            _ => {
+                let len = RangeInterpret::reduceNbIterations(loc, fst, scd, step, max, contains);
+                return context:.reduce(len);
+            }
+        }
+    }
+
+    /**
+     * Compute the number of iterations when all operands are constant BigInt.
+     *
+     * @params:
+     *   - fst:      start BigInt
+     *   - scd:      end BigInt
+     *   - step:     step BigInt
+     *   - max:      maximum allowed iteration count(usize::max)
+     *   - contains: whether the range is inclusive
+     *
+     * @returns:
+     *   A BigInt representing the number of iterations.
+     */
+    fn computeNbIterations(fst: &BigInt, scd: &BigInt, step: &BigInt, max: &BigInt, contains: bool)-> &BigInt {
+        let stepU = if (step < 0) { 0 - step } else { step };
+        if (stepU == 0) return copy BigInt(0);
+
+        let (fstU, scdU, subU) = if (fst > scd) {
+            (scd, fst, fst - scd)
+        } else {
+            (fst, scd, scd - fst)
+        };
+
+        let nbAll = subU / stepU;
+
+        if (nbAll == max) return nbAll;
+        if (contains) return nbAll + 1us;
+
+        // recompute, because is it not necessarily == scd since the division might trunc the value
+        let last = (nbAll * stepU) + fstU;
+        if (last != scdU) return nbAll + 1us;
+
+        nbAll
+    } catch {
+        _ => panic; // stepU == 0
+    }
+
+    /**
+     * Compute the number of iterations when:
+     *
+     *      • step is constant
+     *      • fst and/or scd are dynamic Values
+     *
+     * This produces IR that computes:
+     *
+     *      nbAll = (abs(scd - fst) / abs(step))
+     *
+     * and then applies inclusiveness rules.
+     *
+     *
+     * All operations are expressed as IR nodes(MathIntOperatorValue,
+     * CmpIntOperatorValue, ConditionalValue).
+     *
+     * @params:
+     *   - loc:       operator location
+     *   - fst:       start value(dynamic)
+     *   - scd:       end value(dynamic)
+     *   - step:      constant step BigInt
+     *   - max:       maximum allowed iteration count
+     *   - contains:  constant BoolValue
+     *
+     * @returns:
+     *   A &Value representing the IR computing the number of iterations.
+     */
+    fn almostComputeNbIterations(loc: &Word, fst: &Value, scd: &Value, step: &BigInt, max: &BigInt, contains: bool)-> &Value {
+        let stepU = if (step < 0) { 0 - step } else { step };
+        if (stepU == 0) return copy IntValue(loc, USIZE_TYPE, 0);
+
+        let rngType = if let i: &IntType = fst.type { i } else { panic; };
+        let (fstU, scdU, mut subU) = if (step < 0) {
+            (scd, fst, copy MathIntOperatorValue(loc, rngType, BinaryOperators::MINUS, fst, scd))
+        } else {
+            (fst, scd, copy MathIntOperatorValue(loc, rngType, BinaryOperators::MINUS, scd, fst))
+        };
+
+        let stepI = copy IntValue(loc, rngType, stepU);
+        let maxI = copy IntValue(loc, rngType, max);
+        let nbAll = copy MathIntOperatorValue(loc, rngType, BinaryOperators::DIV, subU, stepI);
+        let nbAllP1 = copy MathIntOperatorValue(loc, rngType, BinaryOperators::PLUS, nbAll, copy IntValue(loc, rngType, 1us));
+
+        if (contains) {
+            let cmp = copy CmpIntOperatorValue(loc, BinaryOperators::DEQUAL, nbAll, maxI);
+            return copy ConditionalValue(loc, rngType, cmp, nbAll, nbAllP1); // if contains { return if (nbAll == max) { nbAll } else { nbAll + 1 } }
+        }
+
+        let mulNbAll = copy MathIntOperatorValue(loc, rngType, BinaryOperators::STAR, nbAll, stepI);
+        let last = copy MathIntOperatorValue(loc, rngType, BinaryOperators::PLUS, mulNbAll, fstU);
+
+        let cmp = copy CmpIntOperatorValue(loc, BinaryOperators::NOT_EQUAL, last, scdU);
+        return copy ConditionalValue(loc, rngType, cmp, nbAllP1, nbAll); // return if (last == scdU) { nbAll } else { nbAll + 1 };
+    }
+
+    /**
+     * Fully dynamic range-length computation.
+     *
+     * This is used when fst, scd, and step are all dynamic Values.
+     *
+     * @params:
+     *   - loc:     operator location
+     *   - fstV:    dynamic start value
+     *   - scdV:    dynamic end value
+     *   - stepV:   dynamic step value
+     *   - max:     maximum allowed iteration count
+     *   - contains: dynamic BoolValue
+     *
+     * @returns:
+     *   A &Value representing a BlockValue computing the number of iterations.
+     */
+    fn reduceNbIterations(loc: &Word, fstV: &Value, scdV: &Value, stepV: &Value, max: &BigInt, contains: &Value)-> &Value {
+        let mut lst: [&Value] = [];
+
+        let rngTuType = {
+            copy TupleType(loc, copy [fstV.type, scdV.type, stepV.type], isMutable-> false)
+        } catch {
+            _ => panic;
+        };
+
+        let vdecl = copy VarDeclValue(loc.locate("#_range"), rngTuType, copy TupleValue(loc, rngTuType, copy [fstV, scdV, stepV]), isMutable-> false);
+        let vref = copy VarRefValue(vdecl.loc, loc, rngTuType, vdecl.uniqId, isSelf-> false, canCte-> true);
+
+        lst ~= [vdecl];
+
+        let fst = copy TupleFieldAccessValue(loc, rngTuType.inners[0], vref, 0us);
+        let scd = copy TupleFieldAccessValue(loc, rngTuType.inners[1], vref, 1us);
+        let step = copy TupleFieldAccessValue(loc, rngTuType.inners[2], vref, 2us);
+
+        let rngType = if let i: &IntType = fst.type { i } else { panic; };
+        let stepType = if let i: &IntType = step.type { i } else { panic; };
+
+        let stepCmp = copy CmpIntOperatorValue(loc, BinaryOperators::INF, step, copy IntValue(loc, stepType, 0));
+
+        let tuType = {
+            copy TupleType(loc, copy [rngType, rngType, rngType, rngType], isMutable-> false)
+        } catch {
+            _ => panic;
+        };
+
+        let valNeg = copy TupleValue(loc, tuType, copy [copy UnaryOperatorValue(loc, stepType, UnaryOperators::MINUS, step),
+                                                         scd,
+                                                         fst,
+                                                         copy MathIntOperatorValue(loc, rngType, BinaryOperators::MINUS, fst, scd)]);
+
+        let valPos = copy TupleValue(loc, tuType, copy [step, fst, scd, copy MathIntOperatorValue(loc, rngType, BinaryOperators::MINUS, scd, fst)]);
+
+        let valDecl = copy VarDeclValue(loc.locate("#_val"), tuType, copy ConditionalValue(loc, tuType, stepCmp, valNeg, valPos), isMutable-> false);
+        let val = copy VarRefValue(valDecl.loc, loc, tuType, valDecl.uniqId, isSelf-> false, canCte-> true);
+        lst ~= [valDecl];
+
+        let maxI = copy IntValue(loc, rngType, max);
+        let stepU = copy TupleFieldAccessValue(loc, rngType, val, 0us);
+        let fstU = copy TupleFieldAccessValue(loc, rngType, val, 1us);
+        let scdU = copy TupleFieldAccessValue(loc, rngType, val, 2us);
+        let subU = copy TupleFieldAccessValue(loc, rngType, val, 3us);
+
+        let nbAllDecl = copy VarDeclValue(loc.locate("#_nbAll"), rngType, copy MathIntOperatorValue(loc, rngType, BinaryOperators::DIV, subU, stepU), isMutable-> false);
+        let nbAll = copy VarRefValue(nbAllDecl.loc, loc, rngType, nbAllDecl.uniqId, isSelf-> false, canCte-> true);
+        lst ~= [nbAllDecl];
+
+        let valIfNoMax = {
+            let mulNbAll = copy MathIntOperatorValue(loc, rngType, BinaryOperators::STAR, nbAll, stepU);
+            let last = copy MathIntOperatorValue(loc, rngType, BinaryOperators::PLUS, mulNbAll, fstU);
+
+            let nbAllP1 = copy MathIntOperatorValue(loc, rngType, BinaryOperators::PLUS, nbAll, copy IntValue(loc, rngType, 1us));
+            let cmp = copy LogicalBoolOperatorValue(loc, BinaryOperators::DPIPE, copy CmpIntOperatorValue(loc, BinaryOperators::NOT_EQUAL, last, scdU), contains);
+            copy ConditionalValue(loc, rngType, cmp, nbAllP1, nbAll)
+        };
+
+        // if (nbAll == max) { nbAll } else { let last = (nbAll * stepU) + fstU; if (last != scdU || contains) { nbAll + 1 } else { nbAll } };
+        let cmp = copy CmpIntOperatorValue(loc, BinaryOperators::DEQUAL, nbAll, maxI);
+        let cnd = copy ConditionalValue(loc, rngType, cmp, nbAll, valIfNoMax);
+        lst ~= [cnd];
+
+        return copy BlockValue(loc, rngType, lst);
+    }
+
+
+}

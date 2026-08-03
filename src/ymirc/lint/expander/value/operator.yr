@@ -1,0 +1,419 @@
+/*
+ * OperatorExpander — expands operator expressions into YIL values.
+ *
+ * The OperatorExpander lowers all operator constructs into concrete YILValue
+ * and YILInstr nodes. It handles:
+ *
+ *   - affectations(=),
+ *   - casts,
+ *   - unary operators,
+ *   - binary operators(including logical && and ||),
+ *   - class-type comparisons(is / !is),
+ *   - field access,
+ *   - slice/array access,
+ *   - map operators,
+ *   - call operators.
+ *
+ * It ensures correct evaluation order, short-circuit semantics, unique-value
+ * registration, and correct l-value/r-value handling.
+ *
+ * <hr>
+ *
+ * @Package: ymirc
+ * @Module: ymirc::lint::expander::value::operator
+ * @File: ymirc/lint/expander/value/operator.yr
+ * @Author(s):
+ *   - Emile Cadorel <ecadorel@gmail.com>
+ *
+ * @Created(YYYY-MM-DD): 2026-06-23
+ * @Copyright(C) 2021–2026 GNU-Ymir
+ * @License
+ *   ```text
+ *   This file is part of the Ymir language project.
+ *
+ *   Ymir is free software: you can redistribute it and/or modify it
+ *   under the terms of the GNU General Public License as published by
+ *   the Free Software Foundation, either version 3 of the License, or
+ *   (at your option) any later version.
+ *
+ *   Ymir is distributed in the hope that it will be useful,
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *   GNU General Public License for more details.
+ *
+ *   You should have received a copy of the GNU General Public License
+ *   along with Ymir.  If not, see <https://www.gnu.org/licenses/>.
+ *   ```
+ */
+
+in operator;
+
+use ymirc::lint::expander;
+use ymirc::lint::node::_;
+
+use ymirc::semantic::{symbol, generator::_};
+use ymirc::semantic::generator::{type::_, value::_};
+
+use ymirc::global::{core_, state};
+use ymirc::lexing::{word, keys};
+
+use ymirc::lint::expander::value::_;
+use std::io;
+
+/**
+ * OperatorExpander
+ *
+ * Expands all operator-level semantic nodes into YILValue expressions.
+ * Handles affectations, casts, unary and binary operators, logical boolean
+ * operators, class-type comparisons, field access, slice/array access,
+ * map operators, and call operators.
+ *
+ * All functions append instructions to a StmtList and return the resulting
+ * YILValue representing the operator expression.
+ */
+pub mod OperatorExpander {
+
+    /**
+     * Finalize an operator expression.
+     *
+     * Dispatches based on the concrete operator type:
+     *   - AffectValue,
+     *   - CastValue,
+     *   - BinaryOperatorValue,
+     *   - FieldOperatorValue,
+     *   - SliceOrArrayOperatorValue,
+     *   - MapOperatorValue,
+     *   - UnaryOperatorValue,
+     *   - CallOperatorValue.
+     *
+     * @params:
+     *   - context: the expansion context
+     *   - op:      the operator value to expand
+     *   - list:    the statement list to append instructions to
+     *   - asLeft:  whether the operator is used as an l-value
+     *
+     * @returns:
+     *   - &YILValue: the finalized operator expression
+     *
+     * @throws:
+     *   - panic: for unsupported operator types
+     */
+    pub fn finalizeOperator(dmut context: &Expander,
+                            op:           &OperatorValue,
+                            ref mut list: StmtList,
+                            asLeft:       bool)-> &YILValue
+    {
+        match op {
+            a: &AffectValue => {
+                return OperatorExpander::finalizeAffect(alias context, a, ref list);
+            }
+            c: &CastValue => {
+                return OperatorExpander::finalizeCast(alias context, c,
+                                                      asLeft-> asLeft,
+                                                      ref list);
+            }
+            b: &BinaryOperatorValue => {
+                return OperatorExpander::finalizeBinary(alias context, b,
+                                                        asLeft-> asLeft,
+                                                        ref list);
+            }
+            f: &FieldOperatorValue => {
+                return FieldExpander::finalize(alias context, f,
+                                               asLeft-> asLeft,
+                                               ref list);
+            }
+            s: &SliceOrArrayOperatorValue => {
+                return SliceExpander::finalize(alias context, s,
+                                               asLeft-> asLeft,
+                                               ref list);
+            }
+            m: &MapOperatorValue => {
+                return MapExpander::finalize(alias context, m, ref list);
+            }
+            u: &UnaryOperatorValue => {
+                return OperatorExpander::finalizeUnary(alias context, u,
+                                                       asLeft-> asLeft,
+                                                       ref list);
+            }
+            c: &CallOperatorValue => {
+                return CallExpander::finalize(alias context, c, ref list);
+            }
+        }
+
+        eprintln("internal operator expansion error: ", op.__typeinfo__.name);
+        panic;
+    }
+
+    /**
+     * Finalize a cast operation.
+     *
+     * Behavior:
+     *   - expands the inner value,
+     *   - performs constant folding for integer→integer casts,
+     *   - otherwise produces a YILCastValue.
+     *
+     * @params:
+     *   - context: the expansion context
+     *   - ct:      the cast value
+     *   - asLeft:  whether the cast is used as an l-value
+     *   - list:    the statement list to append instructions to
+     *
+     * @returns:
+     *   - &YILValue: the casted value
+     */
+    pub fn finalizeCast(dmut context: &Expander, ct: &CastValue,
+                        asLeft: bool,
+                        ref mut list: StmtList)-> &YILValue
+    {
+        let value = ValueExpander::finalize(alias context, ct.value,
+                                            ref list,
+                                            asLeft-> asLeft);
+
+        let type = context:.finalizeType(ct.type);
+        match (type, value) {
+            (ti: &YILInt, vi: &YILIntValue) => {
+                return copy YILIntValue(ct.loc, ti, vi.value);
+            }
+        }
+
+        let ret = copy YILCastValue(ct.loc, type, value);
+        if (!asLeft && context.isInAFrame()) {
+            return ValueExpander::registerUniqValue(alias context, ct, ret, ref list);
+        }
+
+        return ret;
+    }
+
+    /**
+     * Finalize an affectation(assignment).
+     *
+     * Expands the left operand as an l-value and the right operand as an r-value,
+     * then emits a YILAffect instruction.
+     *
+     * @params:
+     *   - context: the expansion context
+     *   - a:       the affectation value
+     *   - list:    the statement list to append instructions to
+     *
+     * @returns:
+     *   - &YILValue: the left operand
+     */
+    pub fn finalizeAffect(dmut context: &Expander, a: &AffectValue, ref mut list: StmtList)-> &YILValue {
+        let left = ValueExpander::finalize(alias context, a.left, ref list, asLeft-> true);
+        let right = ValueExpander::finalize(alias context, a.right, ref list, asLeft-> false);
+
+        OperatorExpander::finalizeAffect(a.loc, left, right, ref list);
+        return left;
+    }
+
+    /**
+     * Finalize a low-level affectation.
+     *
+     * Removes pending destructor scheduling on the right value and emits:
+     *
+     *      left = right
+     *
+     * when both operands are non-unit.
+     *
+     * @params:
+     *   - loc:   source location
+     *   - left:  the left-hand YILValue
+     *   - right: the right-hand YILValue
+     *   - list:  the statement list to append instructions to
+     *
+     * @returns:
+     *   - void
+     */
+    pub fn finalizeAffect(loc: &Word, left: &YILValue, right: &YILValue, ref mut list: StmtList) {
+        if (left !of YILUnit && right !of YILUnit) {
+            ValueExpander::removeDestroy(right, ref list);
+            list:.append(copy YILAffect(loc, left, right));
+        }
+    }
+
+    /**
+     * Finalize a binary operator.
+     *
+     * Behavior:
+     *   - dispatches special operators(logical, range contains, math, array),
+     *   - registers unique values for non-l-value binary expressions,
+     *   - otherwise produces a YILBinaryValue.
+     *
+     * @params:
+     *   - context: the expansion context
+     *   - b:       the binary operator value
+     *   - list:    the statement list to append instructions to
+     *   - asLeft:  whether the operator is used as an l-value
+     *
+     * @returns:
+     *   - &YILValue: the binary operator result
+     */
+    pub fn finalizeBinary(dmut context: &Expander,
+                          b:            &BinaryOperatorValue,
+                          ref mut list: StmtList,
+                          asLeft:       bool)-> &YILValue
+    {
+        match b {
+            bl: &LogicalBoolOperatorValue => { return OperatorExpander::finalizeLogicalBool(alias context, bl, ref list); }
+            r: &RangeContainsValue => { return ValueExpander::finalize(alias context, r.call, ref list, asLeft-> asLeft); }
+            s: &SpecialMathIntOperatorValue => { return ValueExpander::finalize(alias context, s.call, ref list, asLeft-> asLeft); }
+            f: &SpecialMathFloatOperatorValue => { return ValueExpander::finalize(alias context, f.call, ref list, asLeft-> asLeft); }
+            a: &SpecialArrayOperatorValue => { return ValueExpander::finalize(alias context, a.call, ref list, asLeft-> asLeft); }
+            c: &CmpClassTypeOperatorValue => { return OperatorExpander::finalizeClassTypeCmp(alias context, c, ref list); }
+        }
+
+        match context.getVariable(b.uniqId) {
+            Ok(u: &YILValue) => { // The call was already seen and validated
+                return u;
+            }
+        };
+
+        let left = ValueExpander::finalize(alias context, b.left, ref list, asLeft-> asLeft);
+        let right = ValueExpander::finalize(alias context, b.right, ref list, asLeft-> false);
+
+        let type = context:.finalizeType(b.type);
+        let ret = copy YILBinaryValue(b.loc, type, b.op, left, right);
+
+        if (!asLeft && context.isInAFrame()) {
+            return ValueExpander::registerUniqValue(alias context, b, ret, ref list);
+        }
+
+        return ret;
+    }
+
+    /**
+     * Finalize a logical boolean operator(&& or ||).
+     *
+     * Implements short-circuit semantics:
+     *
+     *   - left is evaluated first,
+     *   - right is evaluated only when required,
+     *   - result is stored in a temporary variable,
+     *   - control flow is implemented via finalizeCond().
+     *
+     * @params:
+     *   - context: the expansion context
+     *   - b:       the logical boolean operator value
+     *   - list:    the statement list to append instructions to
+     *
+     * @returns:
+     *   - &YILValue: the boolean result
+     */
+    pub fn finalizeLogicalBool(dmut context: &Expander,
+                               b:            &LogicalBoolOperatorValue,
+                               ref mut list: StmtList)-> &YILValue
+    {
+        let mut rightList = StmtList();
+        let left = ValueExpander::finalize(alias context, b.left, ref list, asLeft-> false);
+        let right = ValueExpander::finalize(alias context, b.right, ref rightList, asLeft-> false);
+
+        let leftVar = if (left !of YILVar && left !of YILIntValue) {
+            let (leftVar, _) = ValueExpander::createVarForBlock(alias context,
+                                                                b.loc, NONE_TYPE, left.type, ref list, withValue-> left);
+            leftVar
+        } else {
+            left
+        };
+
+        let type = context:.finalizeType(b.type);
+        let (var, _) = ValueExpander::createVarForBlock(alias context, b.loc, b.type, type, ref list);
+        let mut ifL = StmtList(), mut ifNL = StmtList();
+
+        if (b.op == BinaryOperators::DAND) { // let leftVar = left; if (leftVar) { right } else { leftVar }
+            ifL:.append(rightList);
+            ifL:.append(copy YILAffect(b.loc, var, right));
+            ifNL:.append(copy YILAffect(b.loc, var, leftVar));
+        } else { // operator == ||, let leftVar = left; if (leftVar) { leftVar } else { right }
+            ifL:.append(copy YILAffect(b.loc, var, leftVar));
+
+            ifNL:.append(rightList);
+            ifNL:.append(copy YILAffect(b.loc, var, right));
+        };
+
+        ControlExpander::finalizeCond(b.loc, alias context, ref list, leftVar, b.loc, ifL, b.loc, ifNL, cover-> false);
+        return var;
+    }
+
+    /**
+     * Finalize a class-type comparison(is / !is).
+     *
+     * Behavior:
+     *   - expands the left operand(dereferencing references),
+     *   - loads the right-hand typeinfo symbol,
+     *   - extracts the vtable pointer from the instance,
+     *   - emits CMP_CLASS_OF_TYPE,
+     *   - negates the result for NOT_OF.
+     *
+     * @params:
+     *   - context: the expansion context
+     *   - c:       the class-type comparison value
+     *   - list:    the statement list to append instructions to
+     *
+     * @returns:
+     *   - &YILValue: a u8 boolean result
+     */
+    pub fn finalizeClassTypeCmp(dmut context: &Expander,
+                                c:            &CmpClassTypeOperatorValue,
+                                ref mut list: StmtList)-> &YILValue
+    {
+        let left = if let r: &ReferencerValue = c.left { // can be a reference value if this test is inside a pattern matching
+            // i don't really know if it should be tested there(binary operator validator) or here
+            ValueExpander::finalize(alias context, r.value, ref list, asLeft-> false)
+        } else {
+            ValueExpander::finalize(alias context, c.left, ref list, asLeft-> false)
+        };
+
+        let derefInst = if let p: &YILPointer = left.type {
+            copy YILUnrefValue(c.loc, p.inner, left)
+        } else panic;
+
+        let rightTypeInfoName = Mangler::mangleTypeInfo(c.classRef);
+        context:.registerTouchSym(rightTypeInfoName, c.classRef.loc);
+
+        let rTypeInfo = copy YILAddrValue(c.loc, YIL_PTR_2_VOID,
+                                          copy YILVar(c.loc, rightTypeInfoName, YIL_PTR_2_VOID, 0us));
+
+        let lvtable = copy YILFieldValue(c.loc, YIL_PTR_2_VOID, derefInst, name-> "#_vtable"s8);
+        let (vtableAddrU, _) = ValueExpander::createVarForBlock(alias context,
+                                                                c.loc,
+                                                                NONE_TYPE,
+                                                                YIL_PTR_2_VOID, ref list, withValue-> lvtable);
+
+        let call = copy YILNameCallValue(c.loc,
+                                         YIL_UINT_8,
+                                         YRuntimeFuncs::CMP_CLASS_OF_TYPE,
+                                         copy [rTypeInfo, vtableAddrU]);
+
+        if (c.op == BinaryOperators::NOT_OF) {
+            let (resCall, _) = ValueExpander::createVarForBlock(alias context, c.loc, NONE_TYPE, YIL_UINT_8, ref list, withValue-> call);
+            copy YILUnaryValue(c.loc, YIL_UINT_8, UnaryOperators::NOT, resCall)
+        } else {
+            call
+        }
+    }
+
+    /**
+     * Finalize a unary operator.
+     *
+     * Expands the operand and produces a YILUnaryValue.
+     *
+     * @params:
+     *   - context: the expansion context
+     *   - u:       the unary operator value
+     *   - list:    the statement list to append instructions to
+     *   - asLeft:  whether the operator is used as an l-value
+     *
+     * @returns:
+     *   - &YILValue: the unary operator result
+     */
+    pub fn finalizeUnary(dmut context: &Expander,
+                         u:            &UnaryOperatorValue,
+                         ref mut list: StmtList,
+                         asLeft:       bool)-> &YILValue
+    {
+        let value = ValueExpander::finalize(alias context, u.value, ref list, asLeft-> asLeft);
+        let type = context:.finalizeType(u.type);
+
+        return copy YILUnaryValue(u.loc, type, u.op, value);
+    }
+}

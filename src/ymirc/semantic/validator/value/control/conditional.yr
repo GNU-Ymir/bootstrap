@@ -1,0 +1,220 @@
+/*
+ * Implements validation for conditional expressions in Ymir.
+ *
+ * Ymir conditionals come in two forms:
+ *
+ *   - compile-time conditionals(`cte if x { ... } else { ... }`)
+ *   - runtime conditionals(`if x { ... } else { ... }`)
+ *
+ * This module validates both forms, determines whether the condition is
+ * known at compile time, performs type inference across branches, and
+ * constructs a ConditionalValue representing the result.
+ *
+ * Responsibilities:
+ *   - detect and evaluate compile-time conditions
+ *   - validate runtime conditions and detect useless conditions
+ *   - enforce boolean test expressions
+ *   - validate both branches and infer a common result type
+ *   - propagate breaker/returner semantics
+ *   - verify memory ownership for branch values
+ *
+ * <hr>
+ *
+ * @Package: ymirc
+ * @Module: ymirc::semantic::validator::value::control::conditional
+ * @File: ymirc/semantic/validator/value/control/conditional.yr
+ * @Author(s):
+ *   - Emile Cadorel <ecadorel@gmail.com>
+ *
+ * @Created(YYYY-MM-DD): 2026-03-27
+ * @Copyright(C) 2021–2026 GNU-Ymir
+ * @License
+ *   ```text
+ *   This file is part of the Ymir language project.
+ *
+ *   Ymir is free software: you can redistribute it and/or modify it
+ *   under the terms of the GNU General Public License as published by
+ *   the Free Software Foundation, either version 3 of the License, or
+ *   (at your option) any later version.
+ *
+ *   Ymir is distributed in the hope that it will be useful,
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *   GNU General Public License for more details.
+ *
+ *   You should have received a copy of the GNU General Public License
+ *   along with Ymir.  If not, see <https://www.gnu.org/licenses/>.
+ *   ```
+ */
+
+in conditional;
+
+use ymirc::lexing::word;
+
+use ymirc::syntax::expression::_;
+use ymirc::semantic::validator;
+use ymirc::semantic::generator::{value, value::_, type, type::_};
+
+use ymirc::errors;
+use ymirc::utils::format;
+
+
+/**
+ * ConditionalValidation module
+ *
+ * Provides validation for conditional expressions(`if ... else ...`).
+ *
+ * Conditional semantics:
+ *
+ *   - If the condition is marked as compile-time(`cond.isCte`), only the
+ *     selected branch is validated and evaluated.
+ *
+ *   - If the condition is runtime:
+ *       - the test expression must be boolean
+ *       - constant boolean tests produce USELESS_COND diagnostics
+ *       - both branches are validated
+ *       - a common result type is inferred
+ *
+ * Breaker/returner semantics:
+ *   - If one branch breaks/returns and the other does not, the non-breaking
+ *     branch determines the result type.
+ *   - If both branches break/return, the result type is void.
+ *
+ * The module enforces:
+ *   - boolean test expressions
+ *   - correct compile-time evaluation
+ *   - correct type inference across branches
+ *   - correct memory-ownership rules for branch values
+ */
+pub mod ConditionalValidation {
+
+    /**
+     * Validate a conditional expression.
+     *
+     * @returns:
+     *   - a ConditionalValue representing the conditional expression
+     *
+     * @throws:
+     *   - ErrorMsg if the test is invalid, the condition is useless, or
+     *     branch types cannot be reconciled
+     */
+    pub fn validate(dmut context: &ValidationContext, cond: &ConditionalExpr)-> &Value
+        throws ErrorMsg
+    {
+        if !cond.isCte.isEof {
+            return ConditionalValidation::validateCte(alias context, cond);
+        }
+
+        let mut test: &Value = UNIT_VALUE;
+        if cond.test !of EmptyExpr {
+            test = context.cteInterpret:.reduce(ValueValidation::validate(alias context, cond.test));
+            TypeVerification::verifyCompatible(test.loc, EOF_WORD, test.type, BOOL_TYPE);
+        }
+
+        if let b: &BoolValue = test {
+            if (b.isTrue) {
+                throw copy ErrorMsg::fatal(b.loc, format(ValidateErrorMessage::USELESS_COND_TRUE));
+            }
+
+            throw copy ErrorMsg::fatal(b.loc, format(ValidateErrorMessage::USELESS_COND_FALSE));
+        }
+
+        let content = ValueValidation::validate(alias context, cond.block);
+        let mut type = content.type;
+        {
+            MemoryVerification::verifyMemoryOwner(content.loc, type, content, byReference-> false);
+        } catch {
+            _: &ErrorMsg => {
+                type = type.clone(0u32);
+                MemoryVerification::verifyMemoryOwner(content.loc, type, content, byReference-> false);
+            }
+        }
+
+        return ConditionalValidation::validateConditionalElse(alias context, cond.loc, cond.else_, type, test, content);
+    }
+
+    /**
+     * Validate a compile-time conditional.
+     *
+     * Steps:
+     *   1. Validate the test expression.
+     *   2. Evaluate the test via CTE interpretation.
+     *   3. Validate only the selected branch:
+     *        - if true => validate the `then` block
+     *        - if false => validate the `else` block
+     *
+     * Runtime branches are not validated.
+     *
+     * @returns:
+     *   - the value of the selected branch
+     */
+    pub fn validateCte(dmut context: &ValidationContext, cond: &ConditionalExpr)-> &Value
+        throws ErrorMsg
+    {
+        let test = ValueValidation::validate(alias context, cond.test);
+        let value = context.cteInterpret:.computeBool(test);
+
+        if (value) {
+            return ValueValidation::validate(alias context, cond.block);
+        } else { // otherwise only the else part is validated
+            return ValueValidation::validate(alias context, cond.else_);
+        }
+    }
+
+    /**
+     * Validate the else branch of a runtime conditional and infer the result type.
+     *
+     * @throws:
+     *   - ErrorMsg if type inference fails or branch types are incompatible
+     */
+    pub fn validateConditionalElse(dmut context: &ValidationContext,
+                                    loc:          &Word,
+                                    else_:        &Expression,
+                                    type:         &Type,
+                                    test:         &Value,
+                                    content:      &Value)-> &Value
+        throws ErrorMsg
+    {
+        if else_ of EmptyExpr {
+            if (type !of VoidType) {
+                throw copy ErrorMsg::fatal(loc,
+                                            end-> content.loc,
+                                            format(ValidateErrorMessage::IF_COND_NOT_COMPLETE, type));
+            }
+
+            return copy ConditionalValue(loc,
+                                          type,
+                                          test-> test,
+                                          thenv-> content,
+                                          elsev-> UNIT_VALUE);
+        }
+
+        let elsev = ValueValidation::validate(alias context, else_);
+        let (inferedType, valueElse) = if (!elsev.isBreaker && !elsev.isReturner) {
+            {
+                if (content.isBreaker || content.isReturner) {
+                    (elsev.type, elsev)
+                } else { // neither are breakers/returners
+                    TypeInference::inferValueForBranch(alias context, content.loc, oldType-> type, val-> elsev)
+                }
+            } catch {
+                err: &ErrorMsg => {
+                    throw copy ErrorMsg::fatal(loc, notes-> copy [err], ValidateErrorMessage::BRANCHING_VALUE);
+                }
+            }
+        } else {
+            if (!content.isBreaker && !content.isReturner) {
+                (content.type, elsev)
+            } else { // both are breakers/returner
+                (copy VoidType(loc), elsev)
+            }
+        };
+
+        return copy ConditionalValue(loc,
+                                      type-> inferedType,
+                                      test-> test,
+                                      thenv-> content,
+                                      elsev-> valueElse);
+    }
+
+}

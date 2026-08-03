@@ -1,0 +1,398 @@
+/*
+ * Implements semantic validation for destructors.
+ *
+ * This module handles:
+ *   - prototype validation for destructors(with or without body),
+ *   - validation of destructor attributes,
+ *   - enforcement of destructor parameter rules(mutable self),
+ *   - validation of destructor bodies,
+ *   - automatic chaining to ancestor destructors,
+ *   - automatic destruction of movable fields,
+ *   - construction of DtorPrototypeValue entries,
+ *   - generation of destructor frames(FrameGenerator).
+ *
+ * Destructor semantics in Ymir:
+ *   - a destructor takes exactly one parameter: a mutable `self`,
+ *   - it returns void,
+ *   - it cannot declare throwers,
+ *   - it automatically calls ancestor destructors,
+ *   - it automatically destroys movable fields,
+ *   - it may be empty, in which case no frame is generated.
+ *
+ * <hr>
+ *
+ * @Package: ymirc
+ * @Module: ymirc::semantic::validator::symbol::function::dtor
+ * @File: ymirc/semantic/validator/symbol/function/dtor.yr
+ * @Author(s):
+ *   - Emile Cadorel <ecadorel@gmail.com>
+ *
+ * @Created(YYYY-MM-DD): 2026-05-21
+ * @Copyright(C) 2021–2026 GNU-Ymir
+ * @License
+ *   ```text
+ *   This file is part of the Ymir language project.
+ *
+ *   Ymir is free software: you can redistribute it and/or modify it
+ *   under the terms of the GNU General Public License as published by
+ *   the Free Software Foundation, either version 3 of the License, or
+ *   (at your option) any later version.
+ *
+ *   Ymir is distributed in the hope that it will be useful,
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *   GNU General Public License for more details.
+ *
+ *   You should have received a copy of the GNU General Public License
+ *   along with Ymir.  If not, see <https://www.gnu.org/licenses/>.
+ *   ```
+ */
+
+in dtor;
+
+use ymirc::syntax::{expression::_, declaration::_};
+use ymirc::semantic::{validator, template_};
+use ymirc::semantic::{generator::_, symbol};
+use ymirc::semantic::generator::{value::_, type::_};
+
+use ymirc::errors;
+use ymirc::utils::{format, log};
+use ymirc::lexing::{word, tokens, keys};
+
+use std::{stream, io};
+
+use ymirc::semantic::validator::symbol::function::_;
+
+/**
+ * DtorValidation module
+ *
+ * Provides semantic validation for class destructors. Responsibilities:
+ *
+ *   - validate destructor prototypes,
+ *   - validate destructor bodies,
+ *   - enforce destructor attribute rules,
+ *   - ensure `self` is mutable,
+ *   - chain ancestor destructors,
+ *   - destroy movable fields,
+ *   - generate destructor frames,
+ *   - construct DtorPrototypeValue entries.
+ *
+ * Destructor validation is performed in a classRef-aware foreign context
+ * to ensure correct handling of `self`, inheritance, and movable fields.
+ */
+pub mod DtorValidation {
+
+    /**
+     * Validate the prototype of a destructor symbol, without validating its body.
+     *
+     * @params:
+     *   - context: validation context
+     *   - sym:     destructor symbol
+     *   - cref:    ClassRefType of the enclosing class
+     *   - ancDtor: ancestor destructor delegate(UNIT_VALUE if none)
+     *
+     * @returns:
+     *   - the DtorPrototypeValue for the destructor
+     *
+     * @throws:
+     *   - ErrorMsg if prototype validation fails
+     */
+    pub fn validateProto(dmut context: &ValidationContext,
+                         dmut sym: &DtorSymbol,
+                         cref: &ClassRefType,
+                         ancDtor: &Value)-> &DtorPrototypeValue
+        throws ErrorMsg
+    {
+        if let v: &DtorPrototypeValue = sym.frameProto {
+            return v;
+        }
+
+        context:.pushReferent(alias sym);
+        context:.enterForeign(isFnBody-> false, classRef-> cref);
+        {
+            return DtorValidation::validate(alias context, alias sym, cref,
+                                            validateBody-> false,
+                                            ancDtor-> ancDtor);
+        } catch {
+            err => {
+                throw copy ErrorMsg::fatal(sym.loc, format(ValidateErrorMessage::VALIDATING_SYMBOL, sym.path.toStr()),
+                                           notes-> copy [err]);
+            }
+        } exit {
+            context:.exitForeign();
+            context:.popReferent();
+        }
+    }
+
+    /**
+     * Validate a destructor symbol, including its body.
+     *
+     * @params:
+     *   - context: validation context
+     *   - sym:     destructor symbol
+     *   - cref:    ClassRefType of the enclosing class
+     *
+     * @throws:
+     *   - ErrorMsg if validation fails
+     */
+    pub fn validate(dmut context: &ValidationContext,
+                    dmut sym: &DtorSymbol,
+                    cref: &ClassRefType)
+        throws ErrorMsg
+    {
+        let mut ancDtor: &Value = UNIT_VALUE;
+        if let Ok(ancRef) = cref.ancestor {
+            ancDtor = ancRef.dtor;
+        }
+
+        context:.pushReferent(alias sym);
+        context:.enterForeign(isFnBody-> false, classRef-> cref);
+        {
+            DtorValidation::validate(alias context, alias sym, cref,
+                                     validateBody-> true,
+                                     ancDtor-> ancDtor);
+        } catch {
+            err => {
+                throw copy ErrorMsg::fatal(sym.loc, format(ValidateErrorMessage::VALIDATING_SYMBOL, sym.path.toStr()),
+                                           notes-> copy [err]);
+            }
+        } exit {
+            context:.exitForeign();
+            context:.popReferent();
+        }
+    }
+
+    /**
+     * Core destructor validation routine.
+     *
+     * Performs:
+     *   - attribute validation,
+     *   - validation of the implicit `self` parameter,
+     *   - enforcement of `self` mutability,
+     *   - optional body validation,
+     *   - block-scope management,
+     *   - finalization via finalize().
+     *
+     * Notes:
+     *   - destructors always have exactly one parameter: `self`,
+     *     extracted from func.proto.params[0].
+     *   - return type is always void.
+     *
+     * Errors are captured and re-thrown after cleanup.
+     *
+     * @params:
+     *   - context:      validation context
+     *   - sym:          destructor symbol
+     *   - cref:         ClassRefType of the enclosing class
+     *   - ancDtor:      ancestor destructor delegate
+     *   - validateBody: whether to validate the destructor body
+     *
+     * @returns:
+     *   - the DtorPrototypeValue for the destructor
+     *
+     * @throws:
+     *   - ErrorMsg if validation fails
+     */
+    fn validate(dmut context: &ValidationContext,
+                dmut sym:     &DtorSymbol,
+                cref:         &ClassRefType,
+                ancDtor:      &Value,
+                validateBody: bool)-> &DtorPrototypeValue
+        throws ErrorMsg
+    {
+        let func = sym.decl;
+        FunctionVerification::verifyUndefAttributesDtor(func.attrs);
+
+        let mut errors: (&ErrorMsg)? = none;
+        let mut body: &Value = UNIT_VALUE;
+        let mut params: [&ProtoVarDeclValue] = [];
+        context:.enterBlock();
+        {
+            let selfParam = FunctionPrototypeValidation::validateSelfParamDecl(func.proto.params[0], cref);
+            if !selfParam.isMutable {
+                throw copy ErrorMsg::fatal(selfParam.loc, format(ValidateErrorMessage::DTOR_SELF_NOT_MUT));
+            }
+            context:.insertLocal(selfParam.loc, selfParam.name, selfParam);
+
+            let cptr = cref.createInstance(true, true);
+            if validateBody {
+                body = DtorValidation::validateBody(alias context, sym, func, cptr.inner, ancDtor, selfParam);
+            }
+
+            params = copy [selfParam];
+        } catch {
+            err => {
+                errors = (err)?;
+            }
+        }
+
+        {
+            context:.quitBlock(warnUnused-> (!errors.hasValue && validateBody));
+        } catch {
+            err => {
+                errors = (err)?;
+            }
+        }
+
+        if let Ok(err) = errors {
+            throw err;
+        }
+
+        return DtorValidation::finalize(alias context, alias sym, func, cref, params, body, validateBody);
+    }
+
+    /**
+     * Finalize a validated destructor by constructing its prototype and frame.
+     *
+     * @params:
+     *   - context:      validation context
+     *   - sym:          destructor symbol
+     *   - func:         destructor declaration
+     *   - cref:         ClassRefType of the class
+     *   - params:       validated parameters(always[self])
+     *   - body:         validated destructor body
+     *   - validateBody: whether the body was validated
+     *
+     * @returns:
+     *   - the constructed DtorPrototypeValue
+     */
+    fn finalize(dmut context: &ValidationContext,
+                dmut sym:     &DtorSymbol,
+                func:         &DtorDecl,
+                cref:         &ClassRefType,
+                params:       [&ProtoVarDeclValue],
+                body:         &Value,
+                validateBody: bool)-> &DtorPrototypeValue
+    {
+        let proto = copy DtorPrototypeValue(sym.loc, sym, cref);
+        if validateBody && func.body !of EmptyExpr {
+            let frame = copy FrameGenerator(func.loc,
+                                            implLoc-> cref.sym.loc,
+                                            sym.path,
+                                            params,
+                                            VOID_TYPE,
+                                            body,
+                                            FrameKind::DTOR,
+                                            externLang-> sym.externLang,
+                                            isWeak-> (sym.isWeak || cref.sym.isWeak),
+                                            templateMapper-> sym.templateMapper);
+
+            context:.insertGenerator(alias sym, frame);
+            sym:.setFrameProto(proto, body);
+        }
+
+        return proto;
+    }
+
+    /**
+     * Validate the body of a destructor.
+     *
+     * @params:
+     *   - context:   validation context
+     *   - sym:       destructor symbol
+     *   - func:      destructor declaration
+     *   - cref:      ClassRefType of the class
+     *   - ancDtor:   ancestor destructor delegate
+     *   - selfParam: validated `self` parameter
+     *
+     * @returns:
+     *   - the validated destructor body value
+     *
+     * @throws:
+     *   - ErrorMsg if validation fails
+     */
+    fn validateBody(dmut context: &ValidationContext,
+                    sym:          &DtorSymbol,
+                    func:         &DtorDecl,
+                    cref:         &ClassRefType,
+                    ancDtor:      &Value,
+                    selfParam:    &ProtoVarDeclValue)-> &Value
+        throws ErrorMsg
+    {
+        logging::info("Validate dtor %", sym.path);
+
+        let selfVref = VariableCreation::createVarFromDecl(selfParam,
+                                                           isSelf-> true,
+                                                           isReference-> true);
+
+        let mut blk: [&Value] = [];
+        blk ~= [FunctionValidation::validateBody(alias context, sym.path, func, VOID_TYPE, [],
+                                                 isUnsafe-> false)];
+        if let meth: &DtorPrototypeValue = ancDtor {
+            let methDg = copy MethodDelegateValue(func.loc, meth, closure-> selfVref,
+                                                  direct-> true,
+                                                  vtableIndex-> 0,
+                                                  isStruct-> cref.sym.isStruct);
+            let call = copy MethodCallValue(func.loc, VOID_TYPE, methDg, []);
+            blk ~= [call];
+        }
+
+        if cref.sym.isEntity {
+            let entityBl = DtorValidation::validateMovableFieldDtorCall(selfVref, cref);
+            if entityBl !of UnitValue {
+                blk ~= [entityBl];
+            }
+        }
+
+        if blk.len == 1 {
+            return blk[0];
+        }
+
+        return copy BlockValue(func.loc, VOID_TYPE, blk);
+    }
+
+    /**
+     * Validate destructor calls for movable fields.
+     *
+     * For each field in the class:
+     *   - if the field is a movable class pointer,
+     *   - and the pointed-to class has a destructor,
+     *   - generate:
+     *        * a conditional call to the field's destructor,
+     *        * a post-call assignment to mark the field as unset.
+     *
+     * This ensures that movable fields are safely destroyed and marked as
+     * invalid after destruction.
+     *
+     * @params:
+     *   - selfVref: VarRefValue for `self`
+     *   - cref:     ClassRefType of the class
+     *
+     * @returns:
+     *   - UNIT_VALUE if no movable fields exist,
+     *   - otherwise a BlockValue containing destructor calls
+     *
+     * @throws:
+     *   - ErrorMsg if validation fails
+     */
+    fn validateMovableFieldDtorCall(selfVref: &Value, cref: &ClassRefType)-> &Value
+        throws ErrorMsg
+    {
+        let loc = selfVref.loc;
+        let mut calls: [&Value] = [];
+        for v in cref.localFields if let c: &ClassPtrType = v.varType && v.varType.isMovable {
+            if let dt: &DtorPrototypeValue = c.inner.dtor {
+                let fieldAccess = copy StructFieldAccessValue(v.loc, c, selfVref, v.name);
+                let methDg = copy MethodDelegateValue(loc, dt,
+                                                      closure-> fieldAccess,
+                                                      direct-> true,
+                                                      vtableIndex-> 0,
+                                                      isStruct-> true);
+                let lSet = copy StructFieldAccessValue(loc, BOOL_TYPE, fieldAccess, ClassKeys::SET);
+                let call = copy MethodCallValue(loc, VOID_TYPE, methDg, []);
+                let postCall = copy AffectValue(loc, VOID_TYPE, lSet, copy BoolValue(loc, false));
+                let instrs = copy BlockValue(loc, VOID_TYPE, copy [call, postCall, UNIT_VALUE],
+                                             isSet-> true);
+
+                let cond = copy ConditionalValue(loc, VOID_TYPE, lSet, instrs, UNIT_VALUE);
+                calls ~= [cond];
+            }
+        }
+
+        if calls.len == 0 {
+            return UNIT_VALUE;
+        }
+
+        return copy BlockValue(loc, VOID_TYPE, calls);
+    }
+}

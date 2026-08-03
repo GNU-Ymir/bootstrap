@@ -1,0 +1,417 @@
+/*
+ * Implements semantic validation for class methods.
+ *
+ * This module handles:
+ *   - prototype validation for methods(with or without body),
+ *   - validation of method attributes,
+ *   - validation of `self` mutability rules,
+ *   - validation of parameters, return type, and throwers,
+ *   - validation of method bodies,
+ *   - integration with trait implementations,
+ *   - construction of MethodPrototypeValue entries,
+ *   - generation of method frames(FrameGenerator).
+ *
+ * Method semantics in Ymir:
+ *   - the first parameter is always `self`,
+ *   - `self` must be mutable for methods that mutate the instance,
+ *   - methods may declare throwers,
+ *   - methods may be associated with traits,
+ *   - methods may be empty(no frame generated),
+ *   - @field methods follow strict getter/setter rules.
+ *
+ * <hr>
+ *
+ * @Package: ymirc
+ * @Module: ymirc::semantic::validator::symbol::function::method
+ * @File: ymirc/semantic/validator/symbol/function/method.yr
+ * @Author(s):
+ *   - Emile Cadorel <ecadorel@gmail.com>
+ *
+ * @Created(YYYY-MM-DD): 2026-05-21
+ * @Copyright(C) 2021–2026 GNU-Ymir
+ * @License
+ *   ```text
+ *   This file is part of the Ymir language project.
+ *
+ *   Ymir is free software: you can redistribute it and/or modify it
+ *   under the terms of the GNU General Public License as published by
+ *   the Free Software Foundation, either version 3 of the License, or
+ *   (at your option) any later version.
+ *
+ *   Ymir is distributed in the hope that it will be useful,
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *   GNU General Public License for more details.
+ *
+ *   You should have received a copy of the GNU General Public License
+ *   along with Ymir.  If not, see <https://www.gnu.org/licenses/>.
+ *   ```
+ */
+
+in method;
+
+use ymirc::syntax::{declaration::_, expression::_};
+use ymirc::semantic::{validator, template_};
+use ymirc::semantic::{generator::_, symbol};
+use ymirc::semantic::generator::{value::_, type::_};
+
+use ymirc::errors;
+use ymirc::utils::{format, log};
+use ymirc::lexing::{word, tokens, keys};
+
+use ymirc::semantic::validator::symbol::function::_;
+
+/**
+ * MethodValidation module
+ *
+ * Provides semantic validation for class methods. Responsibilities:
+ *
+ *   - validate method prototypes,
+ *   - validate method bodies,
+ *   - enforce method attribute rules,
+ *   - validate `self` mutability,
+ *   - validate parameters, return type, and throwers,
+ *   - integrate trait implementation semantics,
+ *   - generate method frames,
+ *   - construct MethodPrototypeValue entries.
+ *
+ * Method validation is performed in a classRef-aware foreign context
+ * to ensure correct handling of `self`, inheritance, and trait bindings.
+ */
+pub mod MethodValidation {
+
+    /**
+     * Validate a method symbol, including its body.
+     *
+     * @params:
+     *   - context: validation context
+     *   - sym:     method symbol
+     *   - cref:    ClassRefType of the enclosing class
+     *
+     * @throws:
+     *   - ErrorMsg if validation fails
+     */
+    pub fn validate(dmut context: &ValidationContext,
+                    dmut sym:     &FunctionSymbol,
+                    cref:         &ClassRefType)
+        throws ErrorMsg
+    {
+        context:.pushReferent(alias sym);
+        context:.enterForeign(isFnBody-> false, classRef-> cref);
+        {
+            MethodValidation::validate(alias context, alias sym, cref,
+                                       traitSym-> EMPTY_SYMBOL,
+                                       validateBody-> true,
+                                       withValue-> true);
+        } catch {
+            err => {
+                throw copy ErrorMsg::fatal(sym.loc, format(ValidateErrorMessage::VALIDATING_SYMBOL, sym.path.toStr()),
+                                           notes-> copy [err]);
+            }
+        } exit {
+            context:.exitForeign();
+            context:.popReferent();
+        }
+    }
+
+    /**
+     * Validate the prototype of a method symbol, without validating its body.
+     *
+     * @params:
+     *   - context:   validation context
+     *   - sym:       method symbol
+     *   - cref:      ClassRefType of the enclosing class
+     *   - withValue: whether parameters should include default values
+     *
+     * @returns:
+     *   - the MethodPrototypeValue for the method
+     *
+     * @throws:
+     *   - ErrorMsg if prototype validation fails
+     */
+    pub fn validateProto(dmut context: &ValidationContext,
+                         dmut sym:     &FunctionSymbol,
+                         cref:         &ClassRefType,
+                         withValue:    bool = true)-> &MethodPrototypeValue
+        throws ErrorMsg
+    {
+        context:.pushReferent(alias sym);
+        context:.enterForeign(isFnBody-> false, classRef-> cref);
+        {
+            return MethodValidation::validate(alias context, alias sym, cref,
+                                              traitSym-> EMPTY_SYMBOL,
+                                              validateBody-> false,
+                                              withValue-> withValue);
+        } catch {
+            err => {
+                throw copy ErrorMsg::fatal(sym.loc, format(ValidateErrorMessage::VALIDATING_SYMBOL, sym.path.toStr()),
+                                           notes-> copy [err]);
+            }
+        } exit {
+            context:.exitForeign();
+            context:.popReferent();
+        }
+    }
+
+    /**
+     * Validate the prototype of a method symbol in the context of a trait
+     * implementation, without validating its body.
+     *
+     * @params:
+     *   - context:   validation context
+     *   - sym:       method symbol
+     *   - cref:      ClassRefType of the enclosing class
+     *   - traitRef:  trait reference providing the trait symbol
+     *   - withValue: whether parameters should include default values
+     *
+     * @returns:
+     *   - the MethodPrototypeValue for the method
+     *
+     * @throws:
+     *   - ErrorMsg if prototype validation fails
+     */
+    pub fn validateProto(dmut context: &ValidationContext,
+                         dmut sym:     &FunctionSymbol,
+                         cref:         &ClassRefType,
+                         traitRef:     &TraitRefType,
+                         withValue:    bool = true)-> &MethodPrototypeValue
+        throws ErrorMsg
+    {
+        context:.pushReferent(alias sym);
+        context:.enterForeign(isFnBody-> false, classRef-> cref);
+        {
+            return MethodValidation::validate(alias context, alias sym, cref,
+                                              traitSym-> traitRef.sym,
+                                              validateBody-> false,
+                                              withValue-> withValue);
+        } catch {
+            err => {
+                throw copy ErrorMsg::fatal(sym.loc, format(ValidateErrorMessage::VALIDATING_SYMBOL, sym.path.toStr()),
+                                           notes-> copy [err]);
+            }
+        } exit {
+            context:.exitForeign();
+            context:.popReferent();
+        }
+    }
+
+    /**
+     * Validate a method prototype declared inside a trait implementation block.
+     *
+     * @params:
+     *   - context:   validation context
+     *   - sym:       method symbol
+     *   - implLoc:   location of the `impl` keyword
+     *   - func:      method declaration
+     *   - cref:      ClassRefType of the enclosing class
+     *   - mapper:  template mapper for instantiation
+     *
+     * @returns:
+     *   - the constructed MethodPrototypeValue
+     *
+     * @throws:
+     *   - ErrorMsg if validation fails
+     */
+    pub fn validateProto(dmut context: &ValidationContext,
+                         dmut sym:     &Symbol,
+                         implLoc:      &Word,
+                         func:         &FunctionDecl,
+                         cref:         &ClassRefType,
+                         mapper:       TemplateMapper)-> &MethodPrototypeValue
+        throws ErrorMsg
+    {
+        let mut errors: (&ErrorMsg)? = none;
+        let mut params: [&ProtoVarDeclValue] = [];
+        let mut retType: &Type = NONE_TYPE;
+        let mut throwers: [Thrower] = [];
+
+        context:.pushReferent(alias sym);
+        context:.enterForeign(isFnBody-> false, classRef-> cref);
+        {
+            throwers = FunctionPrototypeValidation::validateThrowers(alias context, func.throwerLoc, func.throwers);
+            FunctionVerification::verifyUndefAttributesMethod(func.attrs);
+            context:.enterBlock();
+            {
+                let selfParam = FunctionPrototypeValidation::validateSelfParamDecl(func.proto.params[0], cref);
+                let (retType_, params_) = FunctionPrototypeValidation::validateParamsAndRetType(alias context, func.loc, sym, func.proto,
+                                                                                                forMethod-> true,
+                                                                                                withValue-> false);
+                retType = retType_;
+                params = copy [selfParam] ~ params_;
+                FunctionVerification::verifyMethodFieldAttribute(func.loc, func.attrs, params, retType);
+            } exit {
+                context:.safeQuitBlock();
+            }
+        } catch {
+            err => {
+                errors = (err)?;
+            }
+        } exit {
+            context:.exitForeign();
+            context:.popReferent();
+        }
+
+        if let Ok(err) = errors {
+            throw copy ErrorMsg::fatal(sym.loc, format(ValidateErrorMessage::VALIDATING_SYMBOL, sym.path.toStr()),
+                                       notes-> copy [err]);
+        }
+
+        let isFinal = FunctionPrototypeValidation::getAttributeLoc(func.attrs, Attributes::FINAL);
+        return copy MethodPrototypeValue(sym.loc, sym, params[1 .. $], retType, throwers,
+                                         implLoc-> implLoc,
+                                         classRef-> cref,
+                                         traitSym-> EMPTY_SYMBOL,
+                                         isMutable-> params[0].type.isMutable,
+                                         isEmpty-> func.body of EmptyExpr,
+                                         isOver-> func.isOver,
+                                         isFinal-> !isFinal.isEof,
+                                         attrs-> func.attrs,
+                                         fromTemplate-> (mapper)?);
+    }
+
+    /**
+     * Core method validation routine.
+     *
+     * @params:
+     *   - context:      validation context
+     *   - sym:          method symbol
+     *   - cref:         ClassRefType of the enclosing class
+     *   - traitSym:     trait symbol(EMPTY_SYMBOL if none)
+     *   - validateBody: whether to validate the method body
+     *   - withValue:    whether parameters include default values
+     *
+     * @returns:
+     *   - the MethodPrototypeValue for the method
+     *
+     * @throws:
+     *   - ErrorMsg if validation fails
+     */
+    fn validate(dmut context: &ValidationContext,
+                dmut sym:     &FunctionSymbol,
+                cref:         &ClassRefType,
+                traitSym:     &Symbol,
+                validateBody: bool,
+                withValue:    bool)-> &MethodPrototypeValue
+        throws ErrorMsg
+    {
+        let func = sym.decl;
+        let mut errors: (&ErrorMsg)? = none;
+        let mut params: [&ProtoVarDeclValue] = [];
+        let mut retType: &Type = NONE_TYPE;
+        let mut body: &Value = UNIT_VALUE;
+
+        let throwers = FunctionPrototypeValidation::validateThrowers(alias context, func.throwerLoc, func.throwers);
+        FunctionVerification::verifyUndefAttributesMethod(func.attrs);
+
+        context:.enterBlock();
+        {
+            let selfParam = FunctionPrototypeValidation::validateSelfParamDecl(func.proto.params[0], cref);
+            context:.insertLocal(selfParam.loc, selfParam.name, selfParam, canShadow-> true);
+
+            let (retType_, params_) = FunctionPrototypeValidation::validateParamsAndRetType(alias context, func.loc, sym, func.proto,
+                                                                                           forMethod-> true,
+                                                                                           withValue-> withValue);
+            retType = retType_;
+            params = copy [selfParam] ~ params_;
+            FunctionVerification::verifyMethodFieldAttribute(func.loc, func.attrs, params, retType);
+
+            if (validateBody) {
+                body = FunctionValidation::validateBody(alias context, sym.path, func, retType, throwers,
+                                                        isUnsafe-> false);
+            }
+        }
+
+        {
+            context:.quitBlock(warnUnused-> (!errors.hasValue && validateBody));
+        } catch {
+            err => {
+                errors = (err)?;
+            }
+        }
+
+        if let Ok(err) = errors {
+            throw err;
+        }
+
+        return MethodValidation::finalize(alias context,
+                                          alias sym,
+                                          cref,
+                                          traitSym,
+                                          func,
+                                          params,
+                                          retType,
+                                          throwers,
+                                          body,
+                                          validateBody);
+    }
+
+    /**
+     * Finalize a validated method by constructing its prototype and frame.
+     *
+     * @params:
+     *   - context:      validation context
+     *   - sym:          method symbol
+     *   - cref:         ClassRefType of the class
+     *   - traitSym:     trait symbol
+     *   - func:         method declaration
+     *   - params:       validated parameters(self + user params)
+     *   - retType:      validated return type
+     *   - throwers:     validated throwers
+     *   - body:         validated method body
+     *   - validateBody: whether the body was validated
+     *
+     * @returns:
+     *   - the constructed MethodPrototypeValue
+     *
+     * @throws:
+     *   - ErrorMsg if inline/virtual constraints are violated
+     */
+    fn finalize(dmut context: &ValidationContext,
+                dmut sym:     &FunctionSymbol,
+                cref:         &ClassRefType,
+                traitSym:     &Symbol,
+                func:         &FunctionDecl,
+                params:       [&ProtoVarDeclValue],
+                retType:      &Type,
+                throwers:     [Thrower],
+                body:         &Value,
+                validateBody: bool)-> &MethodPrototypeValue
+        throws ErrorMsg
+    {
+        if validateBody && func.body !of EmptyExpr {
+            let frame = copy FrameGenerator(func.loc,
+                                            implLoc-> cref.sym.loc,
+                                            sym.path,
+                                            params,
+                                            retType,
+                                            body,
+                                            FrameKind::METHOD,
+                                            externLang-> sym.externLang,
+                                            isWeak-> (sym.isWeak || cref.sym.isWeak),
+                                            templateMapper-> sym.templateMapper);
+
+            context:.insertGenerator(alias sym, frame);
+        }
+
+        let isFinal = FunctionPrototypeValidation::getAttributeLoc(func.attrs, Attributes::FINAL);
+        let gen = copy MethodPrototypeValue(sym.loc, sym, params[1..$], retType, throwers,
+                                            classRef-> cref,
+                                            traitSym-> traitSym,
+                                            isMutable-> params[0].type.isMutable,
+                                            isEmpty-> func.body of EmptyExpr,
+                                            isOver-> func.isOver,
+                                            isFinal-> !isFinal.isEof,
+                                            attrs-> func.attrs,
+                                            fromTemplate-> sym.templateMapper);
+
+        if gen.isInline && sym.isVirtual {
+            throw copy ErrorMsg::fatal(gen.inlineLoc, format(ValidateErrorMessage::INLINE_VIRTUAL_METHOD, gen));
+        }
+
+        else if gen.isInline && validateBody {
+            sym:.setFrameProto(gen, body);
+        }
+
+        return gen;
+    }
+}

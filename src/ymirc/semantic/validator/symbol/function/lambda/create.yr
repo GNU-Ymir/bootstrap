@@ -1,0 +1,230 @@
+/*
+ * Implements creation of lambda delegates from function-pointer values.
+ *
+ * This module handles:
+ *   - construction of delegate wrappers around function pointers,
+ *   - generation of synthetic lambda frames,
+ *   - creation of closure variables for fptr-> delegate conversion,
+ *   - generation of call expressions forwarding parameters to the fptr,
+ *   - insertion of lambda frames into the validation context,
+ *   - prevention of duplicate lambda-frame generation via mangling.
+ *
+ * The conversion from a function pointer to a delegate is implemented as a
+ * synthetic lambda whose closure is the function pointer itself. This allows
+ * function pointers to be used in any context requiring a delegate value.
+ *
+ * <hr>
+ *
+ * @Package: ymirc
+ * @Module: ymirc::semantic::validator::symbol::function::lambda::create
+ * @File: ymirc/semantic/validator/symbol/function/lambda/create.yr
+ * @Author(s):
+ *   - Emile Cadorel <ecadorel@gmail.com>
+ *
+ * @Created(YYYY-MM-DD): 2026-05-25
+ * @Copyright(C) 2021–2026 GNU-Ymir
+ * @License
+ *   ```text
+ *   This file is part of the Ymir language project.
+ *
+ *   Ymir is free software: you can redistribute it and/or modify it
+ *   under the terms of the GNU General Public License as published by
+ *   the Free Software Foundation, either version 3 of the License, or
+ *   (at your option) any later version.
+ *
+ *   Ymir is distributed in the hope that it will be useful,
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *   GNU General Public License for more details.
+ *
+ *   You should have received a copy of the GNU General Public License
+ *   along with Ymir.  If not, see <https://www.gnu.org/licenses/>.
+ *   ```
+ */
+
+in create;
+
+use ymirc::syntax::{expression::_, declaration::_};
+use ymirc::semantic::{validator, template_};
+use ymirc::semantic::{generator::_, symbol};
+use ymirc::semantic::generator::{value::_, type::_};
+
+use ymirc::errors;
+use ymirc::utils::{format, log};
+use ymirc::lexing::{word, tokens, keys};
+use ymirc::global::_;
+
+/**
+ * LambdaCreation module
+ *
+ * Provides utilities for constructing delegate values from function-pointer
+ * types. Responsibilities:
+ *
+ *   - build a synthetic lambda prototype for fptr-> delegate conversion,
+ *   - generate a closure variable referencing the function pointer,
+ *   - generate parameter variables and forwarding call expressions,
+ *   - generate a FrameGenerator for the synthetic lambda,
+ *   - insert the generated frame into the validation context,
+ *   - avoid duplicate generation via name mangling.
+ *
+ * The resulting delegate behaves as:
+ *
+ *     dg(args...) => fptr(args...)
+ *
+ * where the closure is the function pointer itself.
+ */
+pub mod LambdaCreation {
+
+    /**
+     * Insert a lambda frame into the validation context if not already present.
+     *
+     * The frame is identified by its mangled name. If the name is not already
+     * registered as a custom generator, the frame is inserted under the current
+     * referent.
+     *
+     * @params:
+     *   - context: validation context
+     *   - frame:   FrameGenerator to insert
+     */
+    pub fn insertGenerator(dmut context: &ValidationContext, frame: &FrameGenerator) {
+        let name = Mangler::mangle(frame);
+        if !context.hasCustomGenerator(name) {
+            context:.insertNamedGenerator(name, alias context.referent, frame);
+        }
+    }
+
+    /**
+     * Create a delegate value from a function-pointer value.
+     *
+     * Steps:
+     *   1. Build a synthetic symbol path for the generated lambda frame.
+     *   2. Create the implicit closure parameter(the function pointer).
+     *   3. Create a VarRefValue for the closure.
+     *   4. Delegate to createLambdaDelegateFromFptr() to:
+     *        - generate parameter variables,
+     *        - generate parameter types,
+     *        - determine return type,
+     *        - generate the forwarding call expression.
+     *   5. Construct a NamePrototypeValue for the synthetic lambda.
+     *   6. Construct a NameDelegateValue representing the resulting delegate.
+     *   7. Mangle the prototype name and generate a FrameGenerator if not already
+     *      present in the lambdaContext.
+     *   8. Insert the frame into the validation context.
+     *
+     * @params:
+     *   - context:   validation context
+     *   - loc:       location of the conversion expression
+     *   - fptrType:  function-pointer type being converted
+     *   - func:      function-pointer value used as closure
+     *
+     * @returns:
+     *   - a NameDelegateValue representing the generated delegate
+     */
+    pub fn createDelegateFromFptr(dmut context: &ValidationContext,
+                                  loc: &Word,
+                                  fptrType: &FuncPtrType,
+                                  func: &Value)-> &Value
+    {
+        let frameName = copy SymbolPath(DelegateUtils::CAST_FPTR_TO_DG.toStr(sep-> "::"));
+        let fstParam = copy ProtoVarDeclValue(loc.locate("#{CLOSURE-VARREF}"), fptrType, UNIT_VALUE,
+                                              isMutable-> false,
+                                              isReference-> false,
+                                              isLazy-> false,
+                                              isSelf-> false,
+                                              nbConsume-> 1);
+
+        let closureRef = VariableCreation::createVarFromDecl(fstParam);
+        let (paramVars, paramTypes, retType, body) = LambdaCreation::createLambdaDelegateFromFptr(alias context, loc, fptrType, closureRef);
+        let frameProto = copy NamePrototypeValue(loc, loc, frameName, copy [fstParam] ~ paramVars, retType,
+                                                 isLambda-> true);
+        let retProto = copy NameDelegateValue(loc, frameProto, fptrType.references, fptrType.lazys, paramTypes, retType,
+                                              closure-> func,
+                                              isFromFptr-> true);
+
+        let mnglName = Mangler::mangle(frameProto);
+        if mnglName !in context.lambdaContext {
+            let frame = copy FrameGenerator(loc, loc, frameName, params-> copy [fstParam] ~ paramVars, retType, body, FrameKind::LMBD,
+                                            isWeak-> true);
+            LambdaCreation::insertGenerator(alias context, frame);
+            context.lambdaContext:.insert(mnglName);
+        }
+
+        return retProto;
+    }
+
+    /**
+     * Generate the components of a synthetic lambda used to wrap a function pointer.
+     *
+     * This function constructs:
+     *   - parameter declarations for each fptr parameter,
+     *   - parameter types,
+     *   - a forwarding call expression to the function pointer,
+     *   - the return type of the lambda.
+     *
+     * @params:
+     *   - context:    validation context
+     *   - loc:        location of the synthetic lambda
+     *   - fptrType:   function-pointer type being wrapped
+     *   - closureRef: VarRefValue referencing the function pointer
+     *
+     * @returns:
+     *   - (params, paramTypes, retType, body)
+     *       params:     list of ProtoVarDeclValue for parameters
+     *       paramTypes: list of parameter types
+     *       retType:    return type of the lambda
+     *       body:       forwarding call expression
+     */
+    fn createLambdaDelegateFromFptr(dmut context: &ValidationContext,
+                                    loc:          &Word,
+                                    fptrType:     &FuncPtrType,
+                                    closureRef:   &Value)-> ([&ProtoVarDeclValue], [&Type], &Type, &Value)
+    {
+        let mut params: [&ProtoVarDeclValue] = [];
+        let mut usedCall: [&Value] = [];
+        let mut types: [&Type] = [];
+
+        context:.enterForeign(isFnBody-> false, classRef-> context.getCurrentClassReferent());
+        context:.enterBlock();
+        for i, type in fptrType.params {
+            let paramGen = copy ProtoVarDeclValue(loc.locate(format("v_%", i)), type, UNIT_VALUE,
+                                                  isMutable-> type.isMutable,
+                                                  isSelf-> false,
+                                                  isReference-> fptrType.references[i],
+                                                  isLazy-> fptrType.lazys[i],
+                                                  nbConsume-> 1);
+
+            params ~= [paramGen];
+            types ~= [type];
+            context:.insertLocal(paramGen.loc, paramGen.name, paramGen,
+                                 canShadow-> true)?;
+        }
+
+        context:.enterFunctionBody();
+        for i in 0 .. fptrType.params.len {
+            let var = VariableCreation::createVarFromDecl(params[i],
+                                                          isReference-> params[i].isReference,
+                                                          isLazy-> params[i].isLazy);
+            let mut value: &Value = var;
+            if params[i].isLazy {
+                value = copy LazyValue(var.loc, var.type, var, UNIT_VALUE,
+                                       isByAlias-> false,
+                                       isDone-> true);
+            } else if params[i].isReference {
+                value = copy ReferencerValue(var.loc, var.type, var);
+            }
+
+            usedCall ~= [value];
+        }
+
+        let retType = fptrType.retType;
+        let mut call: &Value = copy FuncPtrCallValue(loc, retType, closureRef, usedCall);
+        if retType !of VoidType && retType !of NoneType {
+            call = copy ReturnValue(loc, call);
+        }
+
+        context:.safeQuitBlock();
+        context:.exitForeign();
+
+        return (params, types, retType, call);
+    }
+}

@@ -1,0 +1,253 @@
+/*
+ * Implements semantic validation for slice indexing and slicing in Ymir.
+ *
+ * Responsibilities:
+ *   - Validate integer indexing on slices.
+ *   - Validate range indexing on slices(sub-slicing).
+ *   - Perform compile-time bounds checking when possible.
+ *   - Insert runtime bounds checks when necessary.
+ *   - Construct SliceAccessValue or SliceCtorValue depending on the
+ *     indexing mode.
+ *   - Enforce unsafe-context restrictions for pointer-based access.
+ *
+ *
+ * <hr>
+ *
+ * @Package: ymirc
+ * @Module: ymirc::semantic::validator::value::operator::index::slice
+ * @File: ymirc/semantic/validator/value/operator/index/slice.yr
+ * @Author(s):
+ *   - Emile Cadorel <ecadorel@gmail.com>
+ *
+ * @Created(YYYY-MM-DD): 2026-05-06
+ * @Copyright(C) 2021–2026 GNU-Ymir
+ * @License
+ *   ```text
+ *   This file is part of the Ymir language project.
+ *
+ *   Ymir is free software: you can redistribute it and/or modify it
+ *   under the terms of the GNU General Public License as published by
+ *   the Free Software Foundation, either version 3 of the License, or
+ *   (at your option) any later version.
+ *
+ *   Ymir is distributed in the hope that it will be useful,
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *   GNU General Public License for more details.
+ *
+ *   You should have received a copy of the GNU General Public License
+ *   along with Ymir.  If not, see <https://www.gnu.org/licenses/>.
+ *   ```
+ */
+
+in slice;
+
+use ymirc::syntax::expression::operator;
+use ymirc::semantic::{validator, interpret};
+use ymirc::semantic::generator::{value::_, type::_};
+
+use ymirc::errors;
+use ymirc::lexing::{word, tokens, keys};
+
+use ymirc::utils::{format, bigint};
+
+
+/**
+ * SliceIndexValidation
+ *
+ * Provides semantic validation for indexing operations on slices:
+ *
+ *      slice[i]
+ *      slice[a .. b]
+ *
+ *
+ */
+pub mod SliceIndexValidation {
+
+    /**
+     * Validate an indexing operation on a slice.
+     *
+     * @params:
+     *   - context:      validation context
+     *   - loc:          location of the index operator
+     *   - slice:        the slice value being indexed
+     *   - sliceType:    the static type of the slice
+     *   - indices:      list of index expressions
+     *   - indicesTypes: list of index types
+     *
+     * @returns:
+     *   A &Value representing the result of the indexing operation.
+     *
+     * @throws:
+     *   ErrorMsg if the index type is invalid or unsupported.
+     */
+    pub fn validate(dmut context: &ValidationContext,
+                     loc:          &Word,
+                     slice:        &Value,
+                     sliceType:    &SliceType,
+                     indices:      [&Value],
+                     indicesTypes: [&Type])-> &Value
+        throws ErrorMsg
+    {
+        if indicesTypes.len == 1 {
+            if let i: &IntType = indicesTypes[0] {
+                return SliceIndexValidation::validateInt(alias context, loc, slice, sliceType, indices[0], i);
+            }
+
+            if let r: &RangeType = indicesTypes[0] {
+                return SliceIndexValidation::validateRange(alias context, loc, slice, sliceType, indices[0], r);
+            }
+        }
+
+        throw copy ErrorMsg::fatal(loc, format(ValidateErrorMessage::UNDEFINED_INDEX_OP, sliceType, indicesTypes));
+    }
+
+    /**
+     * Validate integer indexing on a slice.
+     *
+     * @params:
+     *   - context:    validation context
+     *   - loc:        index operator location
+     *   - slice:      slice value
+     *   - sliceType:  slice type
+     *   - indexValue: index expression
+     *   - indexType:  integer type of the index
+     *
+     * @returns:
+     *   A &Value representing the slice access.
+     *
+     * @throws:
+     *   ErrorMsg if bounds are violated.
+     */
+    fn validateInt(dmut context: &ValidationContext,
+                    loc:          &Word,
+                    slice:        &Value,
+                    sliceType:    &SliceType,
+                    indexValue:   &Value,
+                    indexType:    &IntType)-> &Value
+        throws ErrorMsg
+    {
+        let innerType = sliceType.value;
+        let len = context.cteInterpret:.reduce(copy StructFieldAccessValue(loc, USIZE_TYPE, slice, SliceKeys::LEN));
+        let cteTest = ValueVerification::verifyIndexOverflow(alias context, loc, sliceType, indexValue, indexType,
+                                                              maxLen-> len,
+                                                              equalMax-> false);
+
+
+        let index = CastValidation::validateExplicit(alias context, indexValue.loc, indexValue, USIZE_TYPE);
+        let sliceAccess = copy SliceAccessValue(loc, innerType, slice, index);
+
+        if (!context.getUnsafeContextLoc().isEof) {
+            ValueVerification::verifyUnsafeContext(alias context, loc);
+            return sliceAccess;
+        }
+
+        if cteTest {
+            return sliceAccess;
+        }
+
+        let cmp = copy CmpIntOperatorValue(loc, BinaryOperators::INF_EQUAL, len, index);
+        let cond = ValueCreation::createOutOfArrayTest(loc, cmp);
+        return copy BlockValue(loc, innerType, copy [cond, sliceAccess], isSet-> true);
+    }
+
+    /**
+     * Validate range indexing on a slice, producing a sub-slice.
+     *
+     * @params:
+     *   - context:    validation context
+     *   - loc:        index operator location
+     *   - slice:      slice value
+     *   - sliceType:  slice type
+     *   - indexValue: range expression
+     *   - indexType:  range type
+     *
+     * @returns:
+     *   A &Value representing the resulting sub-slice.
+     *
+     * @throws:
+     *   ErrorMsg if bounds are violated or the range is invalid.
+     */
+    pub fn validateRange(dmut context: &ValidationContext,
+                          loc:          &Word,
+                          slice:        &Value,
+                          sliceType:    &SliceType,
+                          indexValue:   &Value,
+                          indexType:    &RangeType)-> &Value
+        throws ErrorMsg
+    {
+        let startType = indexType.start;
+        let innerType = sliceType.value;
+        let ptrType = copy PointerType(loc, innerType, isMutable-> innerType.isMutable); // the pointer type of the slice value[ptr ; len]
+
+        let (sliceLen, arrayAddr, blkInfo) = if let ctor: &SliceCtorValue = slice {
+            (context.cteInterpret:.reduce(ctor.len), ctor.ptr, ctor.blk)
+        } else {
+            let sliceLen = context.cteInterpret:.reduce(copy StructFieldAccessValue(loc, USIZE_TYPE, slice, SliceKeys::LEN));
+            let arrayAddr = copy StructFieldAccessValue(loc, ptrType, slice, SliceKeys::PTR);
+            let blkInfo = copy StructFieldAccessValue(loc, PTR_VOID_TYPE, slice, SliceKeys::BLK_INFO);
+            (sliceLen, arrayAddr, blkInfo)
+        };
+
+        let fstIndex = context.cteInterpret:.reduce(copy StructFieldAccessValue(loc, indexType, indexValue, RangeKeys::FST));
+        let scdIndex = context.cteInterpret:.reduce(copy StructFieldAccessValue(loc, indexType, indexValue, RangeKeys::SCD));
+
+        // Cte verification if possible, to check wether the range values are correctly bounded
+        let cteFst = ValueVerification::verifyIndexOverflow(alias context, loc, sliceType, fstIndex, startType,
+                                                             maxLen-> sliceLen,
+                                                             equalMax-> true);
+
+        let cteScd = ValueVerification::verifyIndexOverflow(alias context, loc, sliceType, scdIndex, startType,
+                                                             maxLen-> sliceLen,
+                                                             equalMax-> true);
+
+        let cteOrder = ValueVerification::verifyIncreasingRangeIndex(alias context, loc, sliceType, fstIndex, scdIndex);
+
+        let fstSizeIndex = CastValidation::validateExplicit(alias context, fstIndex.loc, fstIndex, USIZE_TYPE);
+        let scdSizeIndex = CastValidation::validateExplicit(alias context, scdIndex.loc, scdIndex, USIZE_TYPE);
+
+        let sizeValue = CastValidation::validateExplicit(alias context,
+                                                         loc,
+                                                         TypeSize::validate(alias context, loc, innerType),
+                                                         USIZE_TYPE);
+
+        let newLen = context.cteInterpret:.reduce(copy MathIntOperatorValue(loc, USIZE_TYPE, BinaryOperators::MINUS, scdSizeIndex, fstSizeIndex));
+
+
+        let fstPaddIndex = copy MathIntOperatorValue(loc, USIZE_TYPE, BinaryOperators::STAR, fstSizeIndex, sizeValue);
+        let newPtr = copy MathPointerOperatorValue(loc, ptrType, BinaryOperators::PLUS,
+                                                   arrayAddr,
+                                                   fstPaddIndex); // the new pointer is the address of the array + range.fst
+
+        let finalSliceType = copy SliceType(loc, innerType, isMutable-> true);
+        let finalSliceValue = copy SliceCtorValue(loc, finalSliceType,
+                                                  ptr-> newPtr,
+                                                  blk-> blkInfo,
+                                                  len-> newLen,
+                                                  isImplicitAlias-> false); // Construction of the slice from pointer and length
+
+        if (!context.getUnsafeContextLoc().isEof) {
+            ValueVerification::verifyUnsafeContext(alias context, loc);
+            return finalSliceValue;
+        }
+
+
+        if cteFst && cteScd && cteOrder { // all bound test are Cte
+            return finalSliceValue;
+        }
+
+        // The debug test is if (len < rng.scd || rng.scd < rng.fst) throw OutOfArray();
+        let cmpLen = copy CmpIntOperatorValue(loc,
+                                               BinaryOperators::INF,
+                                               sliceLen,
+                                               scdSizeIndex);
+
+        let cmpRange = copy CmpIntOperatorValue(loc, BinaryOperators::INF, scdSizeIndex, fstSizeIndex);
+        let cmp = copy LogicalBoolOperatorValue(loc, BinaryOperators::DPIPE, cmpLen, cmpRange);
+
+        let cond = ValueCreation::createOutOfArrayTest(loc, cmp);
+
+        return copy BlockValue(loc, finalSliceType, copy [cond, finalSliceValue], isSet-> true)
+
+    }
+}

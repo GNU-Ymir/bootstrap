@@ -1,0 +1,195 @@
+/*
+ * Implements semantic validation for calling method delegates in Ymir.
+ *
+ * Responsibilities:
+ *   - Reject calls on addressed method delegates(invalid syntax).
+ *   - Validate the underlying prototype call via PrototypeCallValidation.
+ *   - Compute overload-resolution scoring contributions.
+ *   - Construct MethodCallValue or PrototypeCallValue depending on the
+ *     method delegate kind.
+ *
+ * Method delegates represent bound methods, where the closure is the
+ * receiver object and the prototype describes the method signature.
+ *
+ * This module is invoked by CallMultSymValidation when the selected
+ * callable is a method delegate or a fake method delegate.
+ *
+ * <hr>
+ *
+ * @Package: ymirc
+ * @Module: ymirc::semantic::validator::value::operator::call::method
+ * @File: ymirc/semantic/validator/value/operator/call/method.yr
+ * @Author(s):
+ *   - Emile Cadorel <ecadorel@gmail.com>
+ *
+ * @Created(YYYY-MM-DD): 2026-04-25
+ * @Copyright(C) 2021–2026 GNU-Ymir
+ * @License
+ *   ```text
+ *   This file is part of the Ymir language project.
+ *
+ *   Ymir is free software: you can redistribute it and/or modify it
+ *   under the terms of the GNU General Public License as published by
+ *   the Free Software Foundation, either version 3 of the License, or
+ *   (at your option) any later version.
+ *
+ *   Ymir is distributed in the hope that it will be useful,
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *   GNU General Public License for more details.
+ *
+ *   You should have received a copy of the GNU General Public License
+ *   along with Ymir.  If not, see <https://www.gnu.org/licenses/>.
+ *   ```
+ */
+
+
+in method;
+
+use ymirc::semantic::validator;
+use ymirc::semantic::generator::{value::_, type::_};
+
+use ymirc::errors;
+use ymirc::utils::format;
+
+use ymirc::lexing::{word, tokens, keys};
+use ymirc::semantic::validator::value::operator::call::_;
+
+
+/**
+ * MethodCallValidation
+ *
+ * Provides semantic validation for calls on method delegates:
+ *
+ *      obj.method(arg1, arg2, ...)
+ *
+ * Supports two kinds of method delegates:
+ *
+ *   - MethodDelegateValue:
+ *       A normal method delegate with a bound receiver and a prototype.
+ *
+ *   - FakeMethodDelegateValue:
+ *       A synthetic delegate used for internal desugaring, where the
+ *       closure must be manually inserted as the first argument.
+ *
+ * This module:
+ *   - Validates argument lists against the method prototype.
+ *   - Rejects named parameters when invalid.
+ *   - Enforces unsafe-context restrictions.
+ *   - Computes overload-resolution scoring.
+ *   - Constructs MethodCallValue or PrototypeCallValue accordingly.
+ */
+pub mod MethodCallValidation {
+
+    /**
+     * Validate a call to a MethodDelegateValue.
+     *
+     * Candidate mode:
+     *   If `candidate` is true, errors are wrapped into a diagnostic note
+     *   instead of being thrown immediately. This is used during overload
+     *   resolution to report why a candidate failed.
+     *
+     * @params:
+     *   - context:   validation context
+     *   - loc:       location of the call operator
+     *   - left:      the method delegate being invoked
+     *   - rights:    list of argument values
+     *   - nbNamed:   number of named arguments in `rights`
+     *   - candidate: whether this validation is performed in candidate mode
+     *
+     * @returns:
+     *   (value, score)
+     *     - value: a MethodCallValue representing the call
+     *     - score: overload-resolution score contribution
+     *
+     * @throws:
+     *   ErrorMsg if validation fails and `candidate` is false.
+     *   If `candidate` is true, throws a wrapped note describing the failure.
+     */
+    pub fn validate(dmut context: &ValidationContext,
+                     loc:          &Word,
+                     left:         &MethodDelegateValue,
+                     rights:       [&Value],
+                     nbNamed:     usize,
+                     candidate:   bool = false)-> (&MethodCallValue, u32)
+        throws ErrorMsg
+    {
+        if left.isAddressed {
+            throw copy ErrorMsg::fatal(left.addressLoc, format(ValidateErrorMessage::UNECESSARY_ADDRESS_METHOD));
+        }
+
+        let (call: &PrototypeCallValue, score) = PrototypeCallValidation::validate(alias context, loc, left.proto, rights,
+                                                                                    nbNamed-> nbNamed,
+                                                                                    candidate-> candidate);
+
+
+        let addScore = if left.proto.isMutable { 1u32 } else { 0u32 };
+        return (copy MethodCallValue(call.loc, call.type, left, call.params, addParams-> call.addParams),
+                score + addScore);
+    }
+
+
+    /**
+     * Validate a call to a FakeMethodDelegateValue.
+     *
+     * Fake method delegates are synthetic delegates used internally when
+     * rewriting internal calls on object-like elements(range stepBy, map
+     * remove, etc.). Their prototype includes the receiver as the first
+     * parameter, which must be manually inserted into the argument list.
+     *
+     * Candidate mode:
+     *   If `candidate` is true, errors are wrapped into a diagnostic note
+     *   instead of being thrown immediately.
+     *
+     * @params:
+     *   - context:   validation context
+     *   - loc:       location of the call operator
+     *   - left:      the fake method delegate being invoked
+     *   - rights:    list of argument values
+     *   - nbNamed:   number of named arguments in `rights`
+     *   - candidate: whether this validation is performed in candidate mode
+     *
+     * @returns:
+     *   (value, score)
+     *     - value: a PrototypeCallValue representing the call
+     *     - score: overload-resolution score contribution
+     *
+     * @throws:
+     *   ErrorMsg if validation fails and `candidate` is false.
+     *   If `candidate` is true, throws a wrapped note describing the failure.
+     */
+    pub fn validate(dmut context: &ValidationContext,
+                     loc: &Word,
+                     left: &FakeMethodDelegateValue,
+                     rights: [&Value],
+                     nbNamed: usize,
+                     candidate: bool = false)-> (&PrototypeCallValue, u32)
+        throws ErrorMsg
+    {
+        let protoParams = left.proto.params[1us .. $];
+        let (params, rest) = CallParamListCreation::validateParamListSort(loc, protoParams, rights,
+                                                                           nbNamed-> nbNamed,
+                                                                           isVariadic-> false);
+
+        let (_, n_params, score) = CallParamListCreation::validateTypeParamList(alias context, loc, protoParams, params,
+                                                                                 verifType-> true,
+                                                                                 verifMemory-> true,
+                                                                                 isLambda-> false);
+
+        if (left.proto.isUnsafe) {
+            ValueVerification::verifyUnsafeContext(alias context, left.loc, msg-> ValidateErrorMessage::UNSAFE_CALL);
+        }
+
+        return (copy PrototypeCallValue(loc, left.proto.retType, left.proto, copy [left.closure] ~ n_params, addParams-> rest),
+                score + left.proto.templateScore);
+    }  catch {
+        err: &ErrorMsg => {
+            if (!candidate) throw err;
+            throw copy ErrorMsg::note(left.loc,
+                                       format(ValidateErrorMessage::CANDIDATE_ARE, CallParamListCreation::formatPrettyName(left)),
+                                       notes-> copy [err],
+                                       oneLine-> true,
+                                       withLoc-> true);
+        }
+    }
+}

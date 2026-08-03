@@ -1,0 +1,504 @@
+/*
+ * Implements semantic validation for slice list comprehensions(`[x for ...]`)
+ * and tuple comprehensions inside slice allocation expressions.
+ *
+ * This module handles:
+ *   - validation of `for`-loop variables inside slice comprehensions,
+ *   - static and dynamic allocation paths depending on literal usage,
+ *   - tuple-mode comprehensions with compile-time iteration,
+ *   - aliasing and copy-mode propagation,
+ *   - construction of ListComprValue, TupleValue, and associated types.
+
+ *
+ * <hr>
+ *
+ * @Package: ymirc
+ * @Module: ymirc::semantic::validator::value::compose::slicefor::slice
+ * @File: ymirc/semantic/validator/value/compose/slicefor/slice.yr
+ * @Author(s):
+ *   - Emile Cadorel <ecadorel@gmail.com>
+ *
+ * @Created(YYYY-MM-DD): 2026-05-14
+ * @Copyright(C) 2021–2026 GNU-Ymir
+ * @License
+ *   ```text
+ *   This file is part of the Ymir language project.
+ *
+ *   Ymir is free software: you can redistribute it and/or modify it
+ *   under the terms of the GNU General Public License as published by
+ *   the Free Software Foundation, either version 3 of the License, or
+ *   (at your option) any later version.
+ *
+ *   Ymir is distributed in the hope that it will be useful,
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *   GNU General Public License for more details.
+ *
+ *   You should have received a copy of the GNU General Public License
+ *   along with Ymir.  If not, see <https://www.gnu.org/licenses/>.
+ *   ```
+ */
+
+in slice;
+
+use ymirc::lexing::{keys, word};
+
+use ymirc::syntax::expression::_;
+use ymirc::semantic::{validator, interpret};
+
+use ymirc::errors;
+use ymirc::semantic::generator::{value::_, type::_};
+
+use ymirc::utils::{format, bigint};
+
+/**
+ * SliceListComprValidation module
+ *
+ * Provides semantic validation for slice list comprehensions and tuple
+ * comprehensions used inside slice allocator expressions. This includes:
+ *
+ *   - validating iterator variables,
+ *   - computing compile-time lengths when possible,
+ *   - generating loop structures for dynamic comprehensions,
+ *   - constructing tuple values for tuple-mode comprehensions,
+ *   - propagating aliasing and copy semantics,
+ *   - and producing the final Value representing the comprehension.
+ *
+ */
+pub mod SliceListComprValidation {
+
+    /**
+     * Validate a slice list comprehension or tuple comprehension.
+     *
+     * Determines whether the comprehension uses one or two iterator variables,
+     * dispatches to the appropriate iteration validator, and reports an error
+     * if the number of variables is unsupported.
+     *
+     * @params:
+     *   - context:    validation context
+     *   - slice:      the slice value being iterated
+     *   - sliceType:  the type of the slice
+     *   - floop:      the SliceForAllocatorExpr describing the comprehension
+     *   - inCopy:     whether the comprehension is evaluated in copy-mode
+     *   - byAlias:    whether aliasing is permitted
+     *
+     * @returns:
+     *   - (value, usedAlias): the resulting comprehension value and alias usage flag
+     *
+     * @throws:
+     *   - ErrorMsg if the number of iterator variables is invalid
+     */
+    pub fn validate(dmut context: &ValidationContext,
+                    slice:        &Value,
+                    sliceType:    &SliceType,
+                    floop:        &SliceForAllocatorExpr,
+                    inCopy:       bool,
+                    byAlias:      bool)-> (&Value, bool)
+        throws ErrorMsg
+    {
+        if floop.vars.len == 1 {
+            return SliceListComprValidation::validateIteration(alias context, slice, sliceType, floop, floop.vars[0], none,
+                                                               inCopy-> inCopy,
+                                                               byAlias-> byAlias);
+        }
+
+        if floop.vars.len == 2 {
+            return SliceListComprValidation::validateIteration(alias context, slice, sliceType, floop, floop.vars[1], (floop.vars[0])?,
+                                                               inCopy-> inCopy,
+                                                               byAlias-> byAlias);
+        }
+
+        throw copy ErrorMsg::fatal(floop.loc, format(ValidateErrorMessage::UNDEF_FOR_LOOP_OPERATOR, floop.vars.len, sliceType));
+    }
+
+    /**
+     * Validate a single iteration of a slice comprehension.
+     *
+     * Creates a block scope, binds the slice value, computes the slice length
+     * (using compile-time evaluation when possible), and dispatches to either
+     * tuple-mode or list-mode validation.
+     *
+     * @params:
+     *   - context:    validation context
+     *   - slice:      the slice value
+     *   - sliceType:  the slice type
+     *   - floop:      the comprehension expression
+     *   - elemIter:   element iterator variable
+     *   - indexIter:  optional index iterator variable
+     *   - inCopy:     copy-mode flag
+     *   - byAlias:    aliasing flag
+     *
+     * @returns:
+     *   - (value, usedAlias): the validated comprehension and alias usage
+     *
+     * @throws:
+     *   - ErrorMsg if validation fails inside the loop body
+     */
+    fn validateIteration(dmut context: &ValidationContext,
+                         slice:        &Value,
+                         sliceType:    &SliceType,
+                         floop:        &SliceForAllocatorExpr,
+                         elemIter:     &VarDeclExpr,
+                         indexIter:    (&VarDeclExpr)?,
+                         inCopy:       bool,
+                         byAlias:      bool)-> (&Value, bool)
+        throws ErrorMsg
+    {
+        let mut errors: (&ErrorMsg)? = none;
+        let loc = floop.loc;
+
+        context:.enterBlock();
+
+        let sliceDecl = copy VarDeclValue(slice.loc.locate(ForLoopKeys::VALUE ~ "_init"), sliceType, slice, isMutable-> false);
+        let sliceVref = VariableCreation::createVarFromDecl(sliceDecl, canCte-> false);
+
+        let len = {
+            let bi = context.cteInterpret:.computeInt(copy StructFieldAccessValue(loc, USIZE_TYPE, slice, SliceKeys::LEN));
+            copy IntValue(loc, USIZE_TYPE, bi)
+        } catch {
+            _ => {
+                context.cteInterpret:.reduce(copy StructFieldAccessValue(loc, USIZE_TYPE, sliceVref, SliceKeys::LEN))
+            }
+        };
+
+        let (result, usedAlias) = {
+            if floop.isTuple {
+                SliceListComprValidation::validateInnerForTuple(alias context, loc, sliceDecl, sliceVref, sliceType, floop, elemIter, indexIter, len,
+                                                                byAlias-> byAlias)
+            } else {
+                SliceListComprValidation::validateInnerForList(alias context, loc, sliceDecl, sliceVref, sliceType, floop, elemIter, indexIter, len,
+                                                               inCopy-> inCopy,
+                                                               byAlias-> byAlias)
+            }
+        } catch {
+            err => {
+                errors = (err)?;
+                (UNIT_VALUE, false)
+            }
+        }
+
+        {
+            context:.quitBlock(warnUnused-> !(errors.hasValue));
+        } catch {
+            err => {
+                errors = (err)?;
+            }
+        }
+
+        if let Ok(err) = errors {
+            throw err;
+        }
+
+        return (result, usedAlias);
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ======================================          LIST          ======================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Validate a list-mode slice comprehension.
+     *
+     * Handles dynamic or static allocation depending on literal usage,
+     * constructs the inner loop, and wraps the result in a ListComprValue or
+     * CopierValue when required.
+     *
+     * @params:
+     *   - context:    validation context
+     *   - loc:        source location
+     *   - sliceDecl:  declaration of the slice value
+     *   - sliceVref:  reference to the slice variable
+     *   - sliceType:  type of the slice
+     *   - floop:      comprehension expression
+     *   - elemIter:   element iterator variable
+     *   - indexIter:  optional index iterator
+     *   - len:        length of the slice
+     *   - inCopy:     copy-mode flag
+     *   - byAlias:    aliasing flag
+     *
+     * @returns:
+     *   - (value, usedAlias):
+     *      - value: the resulting list comprehension value
+     *      - usedAlias: true iff byAlias was useful
+     *
+     * @throws:
+     *   - ErrorMsg if allocation or loop construction fails
+     */
+    fn validateInnerForList(dmut context: &ValidationContext,
+                            loc:          &Word,
+                            sliceDecl:    &VarDeclValue,
+                            sliceVref:    &VarRefValue,
+                            sliceType:    &SliceType,
+                            floop:        &SliceForAllocatorExpr,
+                            elemIter:     &VarDeclExpr,
+                            indexIter:    (&VarDeclExpr)?,
+                            len:          &Value,
+                            inCopy:       bool,
+                            byAlias:      bool)-> (&Value, bool)
+        throws ErrorMsg
+    {
+        if !inCopy {
+            SliceForComposeValidation::computeCteLen(alias context, floop.iter.loc, len,
+                                                     fromType-> sliceType,
+                                                     forTuple-> false);
+        }
+
+        let (lp, resultRef, resultDecl, resultType, withoutLoop, usedAlias) = {
+            SliceListComprValidation::validateInnerLoopForList(alias context, loc, sliceVref, sliceType, floop, elemIter, indexIter, len,
+                                                               inCopy-> inCopy,
+                                                               byAlias-> byAlias)
+        };
+
+        let mut result: &Value = UNIT_VALUE;
+        if withoutLoop {
+            result = copy BlockValue(loc, lp.type, copy [sliceDecl, lp]);
+        } else {
+            let values = copy [sliceDecl, resultDecl, lp, resultRef];
+            let innerBlk = copy ListComprValue(loc, resultType, copy BlockValue(loc, resultType, values));
+            if inCopy {
+                result = copy CopierValue(loc, resultType, innerBlk,
+                                          isDone-> true);
+            } else {
+                result = innerBlk;
+            }
+        }
+
+        return (result, usedAlias);
+    }
+
+    /**
+     * Build the loop structure for a list-mode comprehension.
+     *
+     * Validates iterator variables, resolves the inner expression, determines
+     * whether static or dynamic allocation is required, and constructs:
+     *
+     *   - index initialization,
+     *   - loop test(`index < len`),
+     *   - element assignment,
+     *   - index increment,
+     *   - and the final LoopValue and result declarations.
+     *
+     * @params:
+     *   - context:    validation context
+     *   - loc:        source location
+     *   - sliceVref:  reference to the slice
+     *   - sliceType:  type of the slice
+     *   - floop:      comprehension expression
+     *   - elemIter:   element iterator
+     *   - indexIter:  optional index iterator
+     *   - len:        slice length
+     *   - inCopy:     copy-mode flag
+     *   - byAlias:    aliasing flag
+     *
+     * @returns:
+     *   - (loopBlock, resultRef, resultDecl, resultType, withoutLoop, usedAlias)
+     *
+     * @throws:
+     *   - ErrorMsg if iterator validation or loop construction fails
+     */
+    fn validateInnerLoopForList(dmut context: &ValidationContext,
+                                loc:          &Word,
+                                sliceVref:    &VarRefValue,
+                                sliceType:    &SliceType,
+                                floop:        &SliceForAllocatorExpr,
+                                elemIter:     &VarDeclExpr,
+                                indexIter:    (&VarDeclExpr)?,
+                                len:          &Value,
+                                inCopy:       bool,
+                                byAlias:      bool)-> (&Value, &Value, &Value, &Type, bool, bool)
+        throws ErrorMsg
+    {
+        let (indexVref, indexDecl, elemDecl, _, usedAlias) = SliceForLoopValidation::validateIteratorVars(alias context, sliceVref.loc, sliceVref, sliceType, elemIter, indexIter,
+                                                                                                          byMutRef-> false,
+                                                                                                          byAlias-> byAlias);
+
+        let innerValue = ValueValidation::validate(alias context, floop.value);
+        if innerValue.isFullLiteral {
+            let mut result: &Value = UNIT_VALUE;
+            if inCopy {
+                result = SliceComposeValidation::validateDynamicAlloc(alias context, loc, innerValue, len);
+            } else {
+                result = SliceComposeValidation::validateStaticAlloc(alias context, loc, innerValue, len);
+            }
+
+            return (result, UNIT_VALUE, UNIT_VALUE, VOID_TYPE, true, usedAlias);
+        }
+
+        let innerType = TypeInference::inferImplicitMutability(innerValue.type, innerValue);
+        let one = TypeInference::inferValueForType(alias context, indexVref.loc, copy IntValue(loc, USIZE_TYPE, 1), indexVref.type,
+                                                   byReference-> false);
+
+        let (resultDecl, resultVRef, resultAccess, resultType) = {
+            SliceForComposeValidation::validateResultValueDecl(alias context, loc, innerType, indexVref, len,
+                                                               fromType-> sliceType,
+                                                               inCopy-> inCopy)
+        }
+
+        let test = copy CmpIntOperatorValue(loc, BinaryOperators::INF, indexVref, len);
+        let increment = copy AffectValue(loc, indexVref.type, indexVref,
+                                         copy MathIntOperatorValue(loc, indexVref.type, BinaryOperators::PLUS, indexVref, one));
+
+        let set = copy AffectValue(loc, resultAccess.type, resultAccess, innerValue);
+        let blk = copy BlockValue(loc, VOID_TYPE, copy [elemDecl, set, increment]);
+        let lp = copy LoopValue(loc, VOID_TYPE, test, blk);
+
+        let retLp = copy BlockValue(loc, VOID_TYPE, copy [indexDecl, lp]);
+
+        return (retLp, resultVRef, resultDecl, resultType, false, usedAlias);
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * =====================================          tuple          ======================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Validate a tuple-mode slice comprehension.
+     *
+     * Performs compile-time iteration over the slice length, generating a
+     * sequence of element blocks and accumulating their types and values into a
+     * TupleType and TupleValue. Supports alias propagation and proper block
+     * scoping for each iteration.
+     *
+     * @params:
+     *   - context:    validation context
+     *   - loc:        source location
+     *   - sliceDecl:  slice declaration
+     *   - sliceVref:  slice reference
+     *   - sliceType:  type of the slice
+     *   - floop:      comprehension expression
+     *   - elemIter:   element iterator
+     *   - indexIter:  optional index iterator
+     *   - len:        slice length
+     *   - byAlias:    aliasing flag
+     *
+     * @returns:
+     *   - (tupleValue, usedAlias)
+     *
+     * @throws:
+     *   - ErrorMsg if any iteration fails
+     */
+    fn validateInnerForTuple(dmut context: &ValidationContext,
+                             loc:          &Word,
+                             sliceDecl:    &VarDeclValue,
+                             sliceVref:    &VarRefValue,
+                             sliceType:    &SliceType,
+                             floop:        &SliceForAllocatorExpr,
+                             elemIter:     &VarDeclExpr,
+                             indexIter:    (&VarDeclExpr)?,
+                             len:          &Value,
+                             byAlias:      bool)-> (&Value, bool)
+        throws ErrorMsg
+    {
+        let mut outerLoop: [&Value] = [];
+        let mut innerLoop: [&Value] = [];
+        let mut types: [&Type] = [];
+        let mut errors: (&ErrorMsg)? = none;
+        let mut usedAlias: bool = false;
+
+        let tabSize = SliceForComposeValidation::computeCteLen(alias context, floop.iter.loc, len,
+                                                               fromType-> sliceType,
+                                                               forTuple-> true);
+
+        let (indexDecl, indexVref) = SliceListComprValidation::validateIndexDeclForTuple(alias context, sliceType, elemIter, indexIter);
+
+        let mut index = copy BigInt(0);
+        while (index < tabSize) {
+            context:.enterBlock();
+            let (currValue, usedAlias_) = {
+                let indexI = TypeInference::inferValueForType(alias context, indexVref.loc, copy IntValue(loc, USIZE_TYPE, index), indexVref.type,
+                                                              byReference-> false);
+                let currIndex = copy AffectValue(loc, indexVref.type, indexVref, indexI);
+                let (elem, insert, _, usedAlias_) = SliceForLoopValidation::validateElemDecl(alias context, elemIter, sliceVref, sliceType, indexVref,
+                                                                                             byMutRef-> false,
+                                                                                             byAlias-> byAlias);
+                if insert {
+                    context:.insertLocal(elem.loc, elem.name, elem);
+                }
+
+                let value = ValueValidation::validate(alias context, floop.value);
+                let blk = copy BlockValue(loc, value.type, copy[currIndex, elem, value]);
+                (blk, usedAlias_)
+            } catch {
+                err => {
+                    errors = (err)?;
+                    (UNIT_VALUE, false)
+                }
+            };
+
+            {
+                context:.quitBlock(warnUnused-> !(errors.hasValue));
+            } catch {
+                err => {
+                    errors = (err)?;
+                }
+            }
+
+            if let Ok(err) = errors {
+                throw err;
+            }
+
+            TupleComposeValidation::addTupleType(currValue, ref innerLoop, ref types);
+            index += 1;
+            usedAlias = usedAlias || usedAlias_;
+        }
+
+        let tupleType = copy TupleType(loc, types, isMutable-> true);
+        let tupleValue = copy TupleValue(loc, tupleType, innerLoop);
+        outerLoop ~= [sliceDecl, indexDecl, tupleValue];
+
+        let blk = copy BlockValue(loc, tupleType, outerLoop);
+        return (blk, usedAlias);
+    }
+
+    /**
+     * Validate or synthesize the index iterator for tuple-mode comprehensions.
+     *
+     * Ensures that an index variable exists(creating one if omitted),
+     * validates its declaration, inserts it into the local scope when needed,
+     * and returns both the declaration and its VarRefValue.
+     *
+     * @params:
+     *   - context:    validation context
+     *   - sliceType:  type of the slice
+     *   - elemIter:   element iterator
+     *   - indexIter:  optional index iterator
+     *
+     * @returns:
+     *   - (indexDecl, indexVref)
+     *
+     * @throws:
+     *   - ErrorMsg if the index declaration is invalid
+     */
+    fn validateIndexDeclForTuple(dmut context: &ValidationContext,
+                                 sliceType:    &SliceType,
+                                 elemIter:     &VarDeclExpr,
+                                 indexIter:    (&VarDeclExpr)?)-> (&VarDeclValue, &VarRefValue)
+        throws ErrorMsg
+    {
+        let indexIterVdecl = if let Ok(vdecl) = indexIter {
+            vdecl
+        } else {
+            copy VarDeclExpr(elemIter.loc, elemIter.name.locate(Keys::UNDER), EMPTY_EXPR, EMPTY_EXPR, EOF_WORD, EOF_WORD)
+        };
+
+        let (indexDecl, insertIndex) = ForLoopValidation::validateIndexIterDecl(alias context, indexIterVdecl.loc, indexIterVdecl, sliceType,
+                                                                                value-> copy IntValue(indexIterVdecl.loc, USIZE_TYPE, 0),
+                                                                                canCte-> false);
+
+        let indexVref = VariableCreation::createVarFromDecl(indexDecl, canCte-> false, isIterator-> true);
+
+        if insertIndex {
+            context:.insertLocal(indexDecl.loc, indexDecl.name, indexDecl);
+        }
+
+        return (indexDecl, indexVref);
+    }
+}

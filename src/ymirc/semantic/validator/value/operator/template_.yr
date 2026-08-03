@@ -1,0 +1,397 @@
+/*
+ * Implements semantic validation for template arguments, template calls,
+ * template specialization checks, and multi-symbol template dispatch.
+ *
+ * This module is responsible for:
+ *
+ *   - validating template argument lists(as types or compile-time values),
+ *   - validating template call expressions,
+ *   - performing template specialization checks(`template checker`),
+ *   - resolving multi-symbol template calls with scoring and finalization,
+ *   - rewriting template references into concrete symbols or delegates.
+ *
+ * <hr>
+ *
+ * @Package: ymirc
+ * @Module: ymirc::semantic::validator::value::operator::template_
+ * @File: ymirc/semantic/validator/value/operator/template_.yr
+ * @Author(s):
+ *   - Emile Cadorel <ecadorel@gmail.com>
+ *
+ * @Created(YYYY-MM-DD): 2026-05-26
+ * @Copyright(C) 2021–2026 GNU-Ymir
+ * @License
+ *   ```text
+ *   This file is part of the Ymir language project.
+ *
+ *   Ymir is free software: you can redistribute it and/or modify it
+ *   under the terms of the GNU General Public License as published by
+ *   the Free Software Foundation, either version 3 of the License, or
+ *   (at your option) any later version.
+ *
+ *   Ymir is distributed in the hope that it will be useful,
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *   GNU General Public License for more details.
+ *
+ *   You should have received a copy of the GNU General Public License
+ *   along with Ymir.  If not, see <https://www.gnu.org/licenses/>.
+ *   ```
+ */
+
+in template_;
+
+use std::{io, stream};
+use ymirc::syntax::{_, declaration::_, expression::_};
+use ymirc::semantic::generator::{value::_, type::_};
+
+use ymirc::semantic::{validator, template_, symbol};
+
+use ymirc::lexing::word;
+use ymirc::errors;
+
+use ymirc::utils::format;
+
+/**
+ * TemplateValidation module
+ *
+ * Provides the full semantic pipeline for template argument validation,
+ * template calls, template specialization checks, and multi-symbol template
+ * dispatch.
+ *
+ */
+pub mod TemplateValidation {
+
+    /**
+     * Validate a list of template arguments.
+     *
+     * @returns:
+     *   - array of &Generator(either &Type or &Value)
+     *
+     * @throws:
+     *   - ErrorMsg::list if any argument cannot be interpreted as type or value
+     */
+    pub fn validateArgumentList(dmut context: &ValidationContext, lst: [&Expression])-> [&Generator]
+        throws ErrorMsg
+    {
+        let mut errors: [&ErrorMsg] = [];
+        let mut results: [mut &Generator] = [];
+        for i in lst {
+            if let list: &TypeListWrapperExpr = i {
+                results ~= list.types;
+            } else {
+                let asType = TemplateValidation::validateArgumentAsType(alias context, i, ref errors);
+                if let Ok(type) = asType {
+                    TypeVerification::verifyComplete(i.loc, type, construct-> true);
+                    results ~= [type];
+                } else {
+                    let asValue = TemplateValidation::validateArgumentAsValue(alias context, i, ref errors);
+                    if let Ok(val) = asValue {
+                        results ~= [val];
+                        errors = []; // ignore type error
+                    }
+                }
+            }
+
+            if errors.len != 0 {
+                throw copy ErrorMsg::list(errors);
+            }
+        }
+
+        return results;
+    }
+
+    /**
+     * Attempt to interpret an expression as a type argument.
+     *
+     * @returns:
+     *   - (&Type)? — Some(type) on success, none on failure
+     */
+    fn validateArgumentAsType(dmut context: &ValidationContext, v: &Expression, ref mut errors: [&ErrorMsg])-> (&Type)? {
+        {
+            let type = TypeValidation::validate(alias context, v);
+            return type?;
+        } catch {
+            err => {
+                errors ~= [err];
+            }
+        }
+
+        return none;
+    }
+
+    /**
+     * Attempt to interpret an expression as a compile-time value argument.
+     *
+     * @returns:
+     *   - (&Value)? — Some(value) on success, none on failure
+     *
+     * @throws:
+     *   - ErrorMsg if the value is not compile-time evaluable
+     */
+    fn validateArgumentAsValue(dmut context: &ValidationContext, v: &Expression, ref mut errors: [&ErrorMsg])-> (&Value)? {
+        {
+            let val = context.cteInterpret:.reduce(ValueValidation::validate(alias context, v));
+            if (!context.cteInterpret.isCte(val)) {
+                throw copy ErrorMsg::fatal(val.loc, format(ValidateErrorMessage::UNKNOWN_AT_COMPILE_TIME, val.type));
+            }
+
+            return val?;
+        } catch {
+            err => {
+                let note = copy ErrorMsg::note(v.loc, ValidateErrorMessage::TEMPLATE_VALUE_TRY, notes-> copy [err]);
+                errors ~= [note];
+            }
+        }
+
+        return none;
+    }
+
+    /**
+     * Validate a template call expression.
+     *
+     * @returns:
+     *   - the instantiated Value
+     */
+    pub fn validateCall(dmut context: &ValidationContext, t: &TemplateCallExpr)-> &Value
+        throws ErrorMsg
+    {
+        let left = ValueValidation::validate(alias context, t.left);
+
+        // validate the list of argument of the template call
+        let list = TemplateValidation::validateArgumentList(alias context, t.rights);
+
+        return TemplateValidation::validateCall(alias context, t.loc, left, list);
+    }
+
+    /**
+     * Validate a template call given a left Value and argument list.
+     *
+     * @returns:
+     *   - the instantiated Value
+     */
+    pub fn validateCall(dmut context: &ValidationContext,
+                        loc:          &Word,
+                        left:         &Value,
+                        rights:       [&Generator])-> &Value
+        throws ErrorMsg
+    {
+        let value: &MultSymValue = match left {
+            m: &MultSymValue => { m }
+            tmp: _ => { copy MultSymValue(left.loc, copy [tmp], prettyStr-> format("%", tmp, tags-> FormatTags(withParams-> true))) }
+        };
+
+        return TemplateValidation::validateCallMultSym(alias context, loc, value, rights);
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * =====================================          CHECK          ======================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Validate a template checker expression.
+     *
+     * @returns:
+     *   - BoolValue(true) or BoolValue(false)
+     */
+    pub fn validateCheck(dmut context: &ValidationContext, t: &TemplateCheckerExpr)-> &Value
+        throws ErrorMsg
+    {
+        let list = TemplateValidation::validateArgumentList(alias context, t.params);
+        {
+            // use the template solver to perform a specialization
+            let mapper = TemplateSolving::solveChecker(alias context, t.loc, t.rules, list);
+
+            // use the mapper to remove set template specialization, and keep only those without value/type association
+            let syntTmp = TemplateRewriting::rewriteTemplateParams(mapper, t.rules);
+
+            // the template specialization passed, and there is no template left in the checker
+            if (syntTmp.len == 0us) {
+                return copy BoolValue(t.loc, isTrue-> true); // Then the expression is evaluated to "true"
+            }
+        } catch {
+            // every error of template specialization are caught, they just mean that the expression is evaluated to "false"
+            _ => {}
+        }
+
+        return copy BoolValue(t.loc, isTrue-> false);
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          MULT SYM          ====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Resolve a template call on a MultSymValue.
+     *
+     * @returns:
+     *   - the instantiated Value
+     *
+     * @throws:
+     *   - ErrorMsg if no candidate matches
+     */
+    fn validateCallMultSym(dmut context: &ValidationContext,
+                           loc:          &Word,
+                           left:         &MultSymValue,
+                           rights:       [&Generator])-> &Value
+        throws ErrorMsg
+    {
+        // We store the results inside a vector, where to each valid values is associated the correct mapper
+        let mut results: [u32 => mut[(TemplateMapper, &Value)]] = copy [];
+        let mut notFinalized: [(TemplateMapper, &Value)] = [];
+        let mut maxScore = 0u32;
+        let mut errors: [&ErrorMsg] = [];
+
+        for it in left.values {
+            {
+                let mapper = TemplateSolving::solveCall(alias context, left.loc, it, rights);
+                let (mut isFinalized, mut score) = (true, mapper.score);
+                if let t: &TemplateRefValue = it {
+                    if let Ok(mp) = t.sym.templateMapper {
+                        score += mp.score;
+                    }
+
+                    isFinalized = TemplateDeclaration::isFinalized(mapper, t);
+                }
+
+                if isFinalized {
+                    if score > maxScore { maxScore = score; }
+                    if let Ok(lst) = results[score] {
+                        let r = lst ~ [(mapper, it)];
+                        results[score] = r;
+                    } else {
+                        results[score] = copy [(mapper, it)];
+                    }
+                } else {
+                    notFinalized ~= [(mapper, it)];
+                }
+            } catch {
+                err: &ErrorMsg => {
+                    errors ~= [err];
+                }
+            }
+        }
+
+        // No value succeded, and there was some errors
+        if (results.len == 0 && notFinalized.len == 0 && errors.len != 0us) {
+            throw copy ErrorMsg::fatal(loc,
+                                       format(ValidateErrorMessage::UNDEFINED_TEMPLATE_CALL, left, rights, tags-> FormatTags(withParams-> true)), notes-> errors);
+        }
+
+        if let Ok(z) = results[maxScore] {
+            notFinalized = (z ~ notFinalized);
+        }
+
+        {
+            return TemplateValidation::finalizeCallMultSym(alias context, left.loc, notFinalized);
+        } catch {
+            err: &ErrorMsg => {
+                throw copy ErrorMsg::fatal(loc, format(ValidateErrorMessage::UNDEFINED_TEMPLATE_CALL, left, rights, tags-> FormatTags(withParams-> true)), notes-> copy [err]);
+            }
+        }
+    }
+
+    /**
+     * Finalize a list of template-mapper pairs.
+     *
+     * @throws:
+     *   - ErrorMsg if all finalizations fail
+     */
+    fn finalizeCallMultSym(dmut context: &ValidationContext, loc: &Word, list: [(TemplateMapper, &Value)])-> &Value
+        throws ErrorMsg
+    {
+        let mut finalResults: [dmut &Symbol] = [];
+        let mut delegates: [&Value] = [];
+        let mut errors: [&ErrorMsg] = [];
+
+        for it in list { // for each value that can be rewritten
+            {
+                match it._1 {
+                    m: &MethodDelegateTemplateValue => {
+                        delegates ~= [TemplateValidation::finalizeMethod(alias context, loc, it._0, m)];
+                    }
+                    c: &CtorDelegateTemplateValue => {
+                        delegates ~= [TemplateValidation::finalizeCtor(alias context, loc, it._0, c)];
+                    }
+                    x: &TemplateRefValue => {
+                        let dmut val = alias TemplateDeclaration::declare(alias context, loc, it._0, x);
+                        finalResults ~= [alias val];
+                    }
+                    z: _ => {
+                        eprintln("internal template finalization error; ", z.__typeinfo__.name);
+                        panic;
+                    }
+                }
+            } catch {
+                err: &ErrorMsg => { // symbol declaration failed(rewrite cannot fail)
+                    errors ~= [err];
+                }
+            }
+        }
+
+        if (finalResults.len == 0us && delegates.len == 0us) { // if there is not symbol with validation
+            throw copy ErrorMsg::list(errors);
+        }
+
+        // transform the standard declared symbols into values
+        return VariableValidation::validateMultSymbols(alias context, loc, alias finalResults, base-> delegates);
+    }
+
+    /**
+     * Finalize a constructor delegate template.
+     *
+     * @throws:
+     *   - ErrorMsg if declaration or prototype validation fails
+     */
+    fn finalizeCtor(dmut context: &ValidationContext, loc: &Word, r: TemplateMapper, c: &CtorDelegateTemplateValue)-> &Value
+        throws ErrorMsg
+    {
+        let dmut val = alias TemplateDeclaration::declare(alias context, loc, r, c.proto);
+        if let dmut func: &CtorSymbol = alias val {
+            if let Ok(clRef: &ClassRefType) = c.proto.classSym.classRef {
+                let proto: &CtorPrototypeValue = CtorValidation::validateProto(alias context, alias func, clRef);
+                return copy CtorDelegateValue(loc, c.retType, proto, instance-> c.instance, nextCtor-> c.nextCtor);
+            }
+        }
+
+        else if let z: &TemplateSymbol = val {
+            let meth = copy TemplateRefCtorValue(z.loc, c.proto.classSym, z);
+            return copy CtorDelegateTemplateValue(loc, c.retType, meth, instance-> c.instance);
+        }
+
+        panic;
+    }
+
+    /**
+     * Finalize a method delegate template.
+     *
+     * @throws:
+     *   - ErrorMsg if declaration or prototype validation fails
+     */
+    fn finalizeMethod(dmut context: &ValidationContext, loc: &Word, r: TemplateMapper, m: &MethodDelegateTemplateValue)-> &Value
+        throws ErrorMsg
+    {
+        let dmut val = alias TemplateDeclaration::declare(alias context, loc, r, m.proto);
+        if let dmut func: &FunctionSymbol = alias val {
+            if let Ok(clRef: &ClassRefType) = m.proto.classSym.classRef {
+                let proto: &MethodPrototypeValue = MethodValidation::validateProto(alias context, alias func, clRef);
+                return copy MethodDelegateValue(loc, proto, closure-> m.closure, direct-> true, vtableIndex-> 0us, isStruct-> m.isStruct);
+            }
+        }
+
+        else if let z: &TemplateSymbol = val {
+            let meth = copy TemplateRefMethodValue(z.loc, m.proto.classSym, z);
+            return copy MethodDelegateTemplateValue(loc, meth, m.closure, isStruct-> m.isStruct);
+        }
+
+        panic;
+    }
+}

@@ -1,0 +1,761 @@
+/*
+ * LiteralExpander — expands literal expressions into YIL values.
+ *
+ * The LiteralExpander lowers all literal constructs into concrete YILValue
+ * nodes. It handles:
+ *
+ *   - primitive literals(string, bool, char, float, int),
+ *   - null and unit,
+ *   - array literals and array allocations,
+ *   - tuple literals,
+ *   - struct initializers,
+ *   - map literals,
+ *   - option and error-option literals,
+ *   - range literals,
+ *   - slice constructors,
+ *   - typeinfo literals,
+ *   - function pointer literals.
+ *
+ * Complex literals are expanded into YILTupleValue, YILArrayValue, or
+ * YILStringValue depending on their structure. Dynamic allocations emit
+ * runtime calls(ALLOC_SET_SLICE, MAP_EMPTY, MAP_INSERT, etc.).
+ *
+ * <hr>
+ *
+ * @Package: ymirc
+ * @Module: ymirc::lint::expander::value::literal
+ * @File: ymirc/lint/expander/value/literal.yr
+ * @Author(s):
+ *   - Emile Cadorel <ecadorel@gmail.com>
+ *
+ * @Created(YYYY-MM-DD): 2026-06-23
+ * @Copyright(C) 2021–2026 GNU-Ymir
+ * @License
+ *   ```text
+ *   This file is part of the Ymir language project.
+ *
+ *   Ymir is free software: you can redistribute it and/or modify it
+ *   under the terms of the GNU General Public License as published by
+ *   the Free Software Foundation, either version 3 of the License, or
+ *   (at your option) any later version.
+ *
+ *   Ymir is distributed in the hope that it will be useful,
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *   GNU General Public License for more details.
+ *
+ *   You should have received a copy of the GNU General Public License
+ *   along with Ymir.  If not, see <https://www.gnu.org/licenses/>.
+ *   ```
+ */
+
+in literal;
+
+use ymirc::lint::expander;
+use ymirc::lint::node::_;
+
+use ymirc::semantic::{symbol, generator::_};
+use ymirc::semantic::generator::{type::_, value::_};
+
+use ymirc::global::{core_, state};
+use ymirc::lexing::{word, keys};
+
+use ymirc::lint::expander::value::_;
+use std::io;
+
+/**
+ * LiteralExpander
+ *
+ * Expands all literal semantic nodes into YILValue expressions. Handles
+ * primitive literals, composite literals, dynamic allocations, map and
+ * option construction, range and slice constructors, and typeinfo tuples.
+ *
+ * All functions return a YILValue representing the literal and append
+ * instructions to a StmtList when necessary.
+ */
+pub mod LiteralExpander {
+
+    /**
+     * Finalize a literal expression.
+     *
+     * Dispatches to the appropriate literal finalizer based on the concrete
+     * literal type. Simple literals(string, bool, char, float, int, null,
+     * unit) are returned directly. Complex literals are expanded and optionally
+     * registered as unique values when used as r-values.
+     *
+     * @params:
+     *   - context: the expansion context
+     *   - l:       the literal value to expand
+     *   - list:    the statement list to append instructions to
+     *   - asLeft:  whether the literal is used as an l-value
+     *
+     * @returns:
+     *   - &YILValue: the finalized literal
+     *
+     * @throws:
+     *   - panic: for unsupported literal types
+     */
+    pub fn finalize(dmut context: &Expander, l: &LiteralValue, ref mut list: StmtList, asLeft: bool)-> &YILValue {
+        match l { // simple literals
+            s: &StringValue => {
+                return LiteralExpander::finalizeStr(alias context, s);
+            }
+            b: &BoolValue => {
+                return LiteralExpander::finalizeBool(alias context, b);
+            }
+            c: &CharValue => {
+                return LiteralExpander::finalizeChar(alias context, c);
+            }
+            f: &FloatValue => {
+                return LiteralExpander::finalizeFloat(alias context, f);
+            }
+            i: &IntValue => {
+                return LiteralExpander::finalizeInt(alias context, i);
+            }
+            NullValue() => { return YIL_NULL_VALUE; }
+            UnitValue() => { return YIL_UNIT_VALUE; }
+        }
+
+        match context.getVariable(l.uniqId) {
+            Ok(u: &YILValue) => { // The call was already seen and validated
+                return u;
+            }
+        };
+
+        let val = match l {
+            a: &ArrayAllocValue => { LiteralExpander::finalizeArrayAlloc(alias context, a, ref list) }
+            a: &ArrayValue => { LiteralExpander::finalizeArray(alias context, a, ref list) }
+            f: &ProtoFuncPtrValue => { LiteralExpander::finalizeNameFptr(alias context, f, ref list) }
+            m: &MapValue => { LiteralExpander::finalizeMap(alias context, m, ref list) }
+            o: &ErrOptionValue => { LiteralExpander::finalizeErrOpt(alias context, o, ref list) }
+            o: &OptionValue => { LiteralExpander::finalizeOption(alias context, o, ref list) }
+            r: &RangeValue => { LiteralExpander::finalizeRange(alias context, r, ref list) }
+            s: &StructInitValue => { LiteralExpander::finalizeStructInit(alias context, s, ref list) }
+            t: &TupleValue => { LiteralExpander::finalizeTuple(alias context, t, ref list) }
+            t: &TypeInfoValue => { LiteralExpander::finalizeTypeInfo(alias context, t, ref list) }
+            s: &SliceCtorValue => { LiteralExpander::finalizeSliceCtor(alias context, s, ref list) }
+            _ => {
+                eprintln("internal literal expansion error: ", l.__typeinfo__.name);
+                panic;
+            }
+        }
+
+        if (!asLeft) {
+            return ValueExpander::registerUniqValue(alias context, l, val, ref list);
+        } else return val;
+    }
+
+    /**
+     * Finalize a string literal.
+     *
+     * Behavior:
+     *   - encodes the string into UTF-8/UTF-16/UTF-32 depending on encodingSize,
+     *   - appends a null terminator,
+     *   - constructs a YILStringValue array containing the encoded bytes,
+     *   - returns a slice tuple: (len, ptr, blk_info).
+     *
+     * @params:
+     *   - context: the expansion context
+     *   - str:     the string literal
+     *
+     * @returns:
+     *   - &YILValue: the slice tuple representing the string
+     */
+    pub fn finalizeStr(dmut context: &Expander, str: &StringValue)-> &YILValue {
+        let slc = if let s: &SliceType = str.type { s } else panic;
+        let type = context:.finalizeType(slc);
+
+        if (str.len == 0us) {
+            let len = copy YILIntValue(str.loc, YIL_UINT_MAX, str.len);
+            return copy YILTupleValue(str.loc, type, copy [len, YIL_NULL_VALUE, YIL_NULL_VALUE],
+                                      fieldNames-> copy [SliceKeys::LEN, SliceKeys::PTR, SliceKeys::BLK_INFO]);
+        }
+
+        let dmut res: [u8] = [];
+        let content = str.value;
+        let innerType = match str.encodingSize {
+            8u16 => {
+                for i in 0us .. str.len {
+                    res ~= [content.utf8[i]];
+                }
+                res ~= [0u8];
+                YIL_UINT_8
+            }
+            16u16 => {
+                for i in 0us .. str.len {
+                    let utf16c = content.utf16[i];
+                    let c1 = cast!u8((utf16c >> 8) & 0xFF);
+                    let c2 = cast!u8(utf16c & 0xFF);
+
+                    res ~= [c2, c1];
+                }
+                res ~= [0u8, 0u8];
+                YIL_UINT_16
+            }
+            _ => {
+                for i in 0us .. str.len {
+                    let utf32c = content.utf32[i];
+                    let c1 = cast!u8((utf32c >> 24) & 0xFF);
+                    let c2 = cast!u8((utf32c >> 16) & 0xFF);
+                    let c3 = cast!u8((utf32c >> 8) & 0xFF);
+                    let c4 = cast!u8((utf32c) & 0xFF);
+                    res ~= [c4, c3, c2, c1];
+                }
+                res ~= [0u8, 0u8, 0u8, 0u8];
+                YIL_UINT_32
+            }
+        };
+
+        let array = copy YILStringValue(str.loc, context.typeExpander:.finalizeArray(innerType, res.len), res);
+        let len = copy YILIntValue(str.loc, YIL_UINT_MAX, str.len);
+        return copy YILTupleValue(str.loc,
+                                  type,
+                                  copy [len, array, YIL_NULL_VALUE],
+                                  fieldNames-> copy [SliceKeys::LEN, SliceKeys::PTR, SliceKeys::BLK_INFO]);
+    }
+
+    /**
+     * Finalize a UTF-8 string literal from raw bytes.
+     *
+     * Constructs a YILStringValue array and returns a slice tuple:
+     *   (len, ptr, blk_info).
+     *
+     * @params:
+     *   - context: the expansion context
+     *   - loc:     source location
+     *   - str:     UTF-8 byte sequence
+     *
+     * @returns:
+     *   - &YILValue: the slice tuple
+     */
+    pub fn finalizeStrUtf8(dmut context: &Expander, loc: &Word, str: [c8])-> &YILValue {
+        let type = context.typeExpander:.finalizeSlice(YIL_UINT_8);
+
+        if (str.len == 0us) {
+            let len = copy YILIntValue(loc, YIL_UINT_MAX, 0);
+            return copy YILTupleValue(loc, type, copy [len, YIL_NULL_VALUE, YIL_NULL_VALUE],
+                                      fieldNames-> copy [SliceKeys::LEN, SliceKeys::PTR, SliceKeys::BLK_INFO]);
+        }
+
+        let dmut res = copy [cast!u8(u) for u in str];
+        res ~= [0u8];
+
+        let array = copy YILStringValue(loc, context.typeExpander:.finalizeArray(YIL_UINT_8, res.len), res);
+        let len = copy YILIntValue(loc, YIL_UINT_MAX, str.len);
+
+        return copy YILTupleValue(loc,
+                                  type,
+                                  copy [len, array, YIL_NULL_VALUE],
+                                  fieldNames-> copy [SliceKeys::LEN, SliceKeys::PTR, SliceKeys::BLK_INFO]);
+    }
+
+    /**
+     * Finalize a boolean literal.
+     *
+     * Produces a YILIntValue of type u8 with value 0 or 1.
+     *
+     * @params:
+     *   - context: unused
+     *   - b:       the boolean literal
+     *
+     * @returns:
+     *   - &YILValue: the integer literal
+     */
+    pub fn finalizeBool(dmut _: &Expander, b: &BoolValue)-> &YILValue {
+        return copy YILIntValue(b.loc, YIL_UINT_8, if b.isTrue { 1us } else { 0us });
+    }
+
+    /**
+     * Finalize a character literal.
+     *
+     * Produces a YILIntValue of the appropriate integer type.
+     *
+     * @params:
+     *   - context: the expansion context
+     *   - c:       the character literal
+     *
+     * @returns:
+     *   - &YILValue: the integer literal
+     */
+    pub fn finalizeChar(dmut context: &Expander, c: &CharValue)-> &YILValue {
+        let type = context:.finalizeType(c.type);
+        return copy YILIntValue(c.loc, type, c.valueAsInt);
+    }
+
+    /**
+     * Finalize a floating-point literal.
+     *
+     * Produces a YILFloatValue of the appropriate float type.
+     *
+     * @params:
+     *   - context: the expansion context
+     *   - f:       the float literal
+     *
+     * @returns:
+     *   - &YILValue: the float literal
+     */
+    pub fn finalizeFloat(dmut context: &Expander, f: &FloatValue)-> &YILValue {
+        let type = context:.finalizeType(f.type);
+        return copy YILFloatValue(f.loc, type, f.value);
+    }
+
+    /**
+     * Finalize an integer literal.
+     *
+     * Produces a YILIntValue of the appropriate integer type.
+     *
+     * @params:
+     *   - context: the expansion context
+     *   - i:       the integer literal
+     *
+     * @returns:
+     *   - &YILValue: the integer literal
+     */
+    pub fn finalizeInt(dmut context: &Expander, i: &IntValue)-> &YILValue {
+        let type = context:.finalizeType(i.type);
+        return copy YILIntValue(i.loc, type, i.value);
+    }
+
+    /**
+     * Finalize an array literal.
+     *
+     * Expands each element and constructs a YILArrayValue.
+     *
+     * @params:
+     *   - context: the expansion context
+     *   - a:       the array literal
+     *   - list:    the statement list to append instructions to
+     *
+     * @returns:
+     *   - &YILValue: the array literal
+     */
+    pub fn finalizeArray(dmut context: &Expander, a: &ArrayValue, ref mut list: StmtList)-> &YILValue {
+        let atype = context:.finalizeType(a.type);
+        let inners = copy [ValueExpander::finalize(alias context, i, ref list, asLeft-> false) for i in a.values];
+        return copy YILArrayValue(a.loc, atype, inners);
+    }
+
+    /**
+     * Finalize an array allocation literal.
+     *
+     * Behavior:
+     *   - dynamic allocation:
+     *       * expands length and optional initializer,
+     *       * emits ALLOC_NO_SET_SLICE or ALLOC_SET_SLICE,
+     *       * returns the allocated slice,
+     *   - static allocation:
+     *       * expands initializer,
+     *       * constructs a YILArrayValue of repeated values.
+     *
+     * @params:
+     *   - context: the expansion context
+     *   - a:       the array allocation literal
+     *   - list:    the statement list to append instructions to
+     *
+     * @returns:
+     *   - &YILValue: the allocated array or slice
+     */
+    pub fn finalizeArrayAlloc(dmut context: &Expander, a: &ArrayAllocValue, ref mut list: StmtList)-> &YILValue {
+        let type = context:.finalizeType(a.type);
+
+        if (a.isDynamic) {
+            let len = ValueExpander::finalize(alias context, a.len, ref list, asLeft-> false);
+            let (resultVar, addrResult) = ValueExpander::createVarForBlock(alias context, a.loc, a.type, type, ref list, getAddr-> true);
+
+            let size = if let s: &SliceType = a.type {
+                let innerType = context:.finalizeType(s.inners[0]);
+                let size = copy YILIntValue(a.loc, YIL_UINT_MAX, innerType.size);
+                size
+            } else panic;
+
+            if (a.value of UnitValue) {
+                list:.append(copy YILCall(a.loc,
+                                          copy YILNameCallValue(a.loc,
+                                                                YIL_VOID,
+                                                                YRuntimeFuncs::ALLOC_NO_SET_SLICE, copy [addrResult, len, size])));
+            } else {
+                let valPtr = MemoryExpander::finalizeAddressFromAny(alias context, a.value, ref list);
+                list:.append(copy YILCall(a.loc,
+                                          copy YILNameCallValue(a.loc,
+                                                                YIL_VOID, YRuntimeFuncs::ALLOC_SET_SLICE,
+                                                                copy [addrResult, valPtr, len, size])));
+            }
+
+            return resultVar;
+        }
+
+        let mut inner: &YILValue = YIL_UNIT_VALUE;
+        if (a.value !of UnitValue) {
+            inner = ValueExpander::finalize(alias context, a.value, ref list, asLeft-> false);
+        }
+
+        if let i: &IntValue = a.len {
+            let len = i.value.toT!{usize} ();
+            let params = copy [inner for _ in 0 .. len];
+
+            return copy YILArrayValue(a.loc, type, params);
+        } else panic;
+    }
+
+    /**
+     * Finalize a tuple literal.
+     *
+     * Expands each element and constructs a YILTupleValue.
+     *
+     * @params:
+     *   - context: the expansion context
+     *   - t:       the tuple literal
+     *   - list:    the statement list to append instructions to
+     *
+     * @returns:
+     *   - &YILValue: the tuple literal
+     */
+    pub fn finalizeTuple(dmut context: &Expander, t: &TupleValue, ref mut list: StmtList)-> &YILValue {
+        let res = copy [ValueExpander::finalize(alias context, i, ref list, asLeft-> false) for i in t.values];
+
+        let ttype = context:.finalizeType(t.type);
+        return copy YILTupleValue(t.loc, ttype, res);
+    }
+
+    /**
+     * Finalize a struct initializer literal.
+     *
+     * Expands each field value and constructs a YILTupleValue with field names.
+     *
+     * @params:
+     *   - context: the expansion context
+     *   - s:       the struct initializer literal
+     *   - list:    the statement list to append instructions to
+     *
+     * @returns:
+     *   - &YILValue: the struct literal
+     */
+    pub fn finalizeStructInit(dmut context: &Expander, s: &StructInitValue, ref mut list: StmtList)-> &YILValue {
+        let res = copy [ValueExpander::finalize(alias context, i, ref list, asLeft-> false) for i in s.values];
+
+        let ttype = context:.finalizeType(s.type);
+        return copy YILTupleValue(s.loc, ttype, res, fieldNames-> s.fields);
+    }
+
+    /**
+     * Finalize a map literal.
+     *
+     * Behavior:
+     *   - allocates an empty map instance,
+     *   - inserts each key/value pair via MAP_INSERT,
+     *   - returns the map instance.
+     *
+     * @params:
+     *   - context: the expansion context
+     *   - m:       the map literal
+     *   - list:    the statement list to append instructions to
+     *
+     * @returns:
+     *   - &YILValue: the map instance
+     */
+    pub fn finalizeMap(dmut context: &Expander, m: &MapValue, ref mut list: StmtList)-> &YILValue {
+        if let mapType: &MapType = m.type {
+            let (mapInst, mpAddr) = LiteralExpander::finalizeMapInstance(alias context, m.loc, mapType, ref list);
+
+            if (m.keys.len == 0us) return mapInst;
+
+            for i in 0us .. m.keys.len {
+                let keyAddr = MemoryExpander::finalizeAddressFromAny(alias context, m.keys[i], ref list);
+                let valueAddr = MemoryExpander::finalizeAddressFromAny(alias context, m.values[i], ref list);
+
+                list:.append(copy YILCall(m.loc,
+                                          copy YILNameCallValue(m.loc,
+                                                                YIL_VOID,
+                                                                YRuntimeFuncs::MAP_INSERT,
+                                                                copy [mpAddr, keyAddr, valueAddr])));
+            }
+
+            return mapInst;
+        } else panic;
+    }
+
+    /**
+     * Finalize an empty map instance.
+     *
+     * Allocates a map tuple and initializes it via MAP_EMPTY.
+     *
+     * @params:
+     *   - context: the expansion context
+     *   - loc:     source location
+     *   - m:       the map type
+     *   - list:    the statement list to append instructions to
+     *
+     * @returns:
+     *   - (&YILValue, &YILValue): (mapInstance, mapAddress)
+     */
+    pub fn finalizeMapInstance(dmut context: &Expander, loc: &Word, m: &MapType, ref mut list: StmtList)-> (&YILValue, &YILValue) {
+        let mtype = context:.finalizeType(m);
+        let vtableName = Mangler::mangleMapInfo(m);
+        context:.registerTouchSym(vtableName, m.loc);
+
+        let vtableAddr = copy YILAddrValue(loc, YIL_PTR_2_VOID, copy YILVar(loc, vtableName, YIL_PTR_VOID, 0us));
+
+        let (res, resAddr) = ValueExpander::createVarForBlock(alias context, loc, NONE_TYPE, mtype, ref list,
+                                                              name-> "__map_%",
+                                                              getAddr-> true);
+        list:.append(copy YILCall(loc,
+                                  copy YILNameCallValue(loc, YIL_VOID, YRuntimeFuncs::MAP_EMPTY, copy [resAddr, vtableAddr])));
+
+        return (res, resAddr);
+    }
+
+    /**
+     * Finalize a variable reference literal.
+     *
+     * Handles:
+     *   - lazy variable references(unref of CALL_LAZY),
+     *   - normal variable references,
+     *   - fallback to a YILVar when unresolved.
+     *
+     * @params:
+     *   - context: the expansion context
+     *   - v:       the variable reference literal
+     *   - list:    the statement list to append instructions to
+     *
+     * @returns:
+     *   - &YILValue: the referenced variable
+     */
+    pub fn finalizeVarRef(dmut context: &Expander, v: &VarRefValue, ref mut list: StmtList)-> &YILValue {
+        if (v.isLazy) {
+            let type = context:.finalizeType(v.type);
+            match context.getVariable(v.uniqId) {
+                Ok(u: &YILValue) => { return copy YILUnrefValue(v.loc, type, u); }
+            }
+
+            match context.getVariable(v.refId) {
+                Ok(u: &YILValue) => {
+                    return copy YILUnrefValue(v.loc, type,
+                                              ValueExpander::registerUniqValue(alias context, v, type-> u.type, u, ref list));
+                }
+            }
+        } else {
+            match context.getVariable(v.refId) {
+                Ok(vref: &YILValue) => { return vref; }
+            };
+        }
+
+        let type = context:.finalizeType(v.type);
+        return copy YILVar(v.loc, v.declLoc.str, type, 0us);
+    }
+
+    /**
+     * Finalize a global variable reference literal.
+     *
+     * Handles:
+     *   - lazy global variables via CALL_LAZY,
+     *   - normal global variables via YILVar,
+     *   - symbol registration for global variables.
+     *
+     * @params:
+     *   - context: the expansion context
+     *   - v:       the global variable reference literal
+     *   - list:    the statement list to append instructions to
+     *
+     * @returns:
+     *   - &YILValue: the referenced global variable
+     */
+    pub fn finalizeGlobalVarRef(dmut context: &Expander, v: &GlobalVarRefValue, ref mut list: StmtList)-> &YILValue {
+        let type = context:.finalizeType(v.type);
+        if (v.isLazy) {
+            match context.getVariable(v.uniqId) {
+                Ok(u: &YILValue) => return copy YILUnrefValue(v.loc, type, u);
+            }
+        }
+
+        let vname = Mangler::mangleGlobalVar(v.var);
+        context:.registerTouchSym(vname, v.var.loc);
+
+        if (v.isLazy) {
+            let lazyType = context.typeExpander:.finalizeLazy();
+            let mut vref = copy YILVar(v.loc, vname, lazyType, 0us,
+                                       isThreadLocal-> v.sym.isThreadLocal);
+
+            let addr = copy YILAddrValue(v.loc, context.typeExpander:.finalizePointer(lazyType), vref);
+            let ret = copy YILNameCallValue(v.loc,
+                                            context.typeExpander:.finalizePointer(type),
+                                            YRuntimeFuncs::CALL_LAZY,
+                                            copy [addr]);
+
+            return copy YILUnrefValue(v.loc, type,
+                                      ValueExpander::registerUniqValue(alias context, v, type-> ret.type, ret, ref list));
+        } else {
+            return copy YILVar(v.loc, vname, type, 0us);
+        }
+    }
+
+    /**
+     * Finalize an error-option literal.
+     *
+     * Constructs:
+     *   {.set = 0, .content = {.error = errValue}}
+     *
+     * @params:
+     *   - context: the expansion context
+     *   - n:       the error-option literal
+     *   - list:    the statement list to append instructions to
+     *
+     * @returns:
+     *   - &YILValue: the option literal
+     */
+    pub fn finalizeErrOpt(dmut context: &Expander, n: &ErrOptionValue, ref mut list: StmtList)-> &YILValue {
+        let type = context:.finalizeType(n.type);
+        if let t: &YILTuple = type {
+            let contentType = t.inners[1]; // {.ok, .content}
+            let errValue = ValueExpander::finalize(alias context, n.err, ref list, asLeft-> false);
+
+            let content = copy YILTupleValue(n.loc, contentType,
+                                             fieldNames-> copy [OptionKeys::ERROR],
+                                             copy [errValue]);
+
+            copy YILTupleValue(n.loc, type,
+                               fieldNames-> copy [OptionKeys::SET, OptionKeys::CONTENT],
+                               copy [copy YILIntValue(n.loc, YIL_UINT_8, 0us), content]) // {.set = 0, .content = {.error = null}}
+
+        } else panic;
+    }
+
+    /**
+     * Finalize an option literal.
+     *
+     * Constructs:
+     *   {.set = 1, .content = {.value = innerValue}}
+     *
+     * Handles void/none options by replacing the inner value with a u8 zero.
+     *
+     * @params:
+     *   - context: the expansion context
+     *   - o:       the option literal
+     *   - list:    the statement list to append instructions to
+     *
+     * @returns:
+     *   - &YILValue: the option literal
+     */
+    pub fn finalizeOption(dmut context: &Expander, o: &OptionValue, ref mut list: StmtList)-> &YILValue {
+        let mut innerValue = ValueExpander::finalize(alias context, o.value, ref list, asLeft-> false);
+        if let opt: &OptionType = o.type {
+            let innerType = opt.inners[0];
+            if (innerType of VoidType || innerType of NoneType) {
+                innerValue = copy YILIntValue(o.loc, YIL_UINT_8, 0us);
+            }
+        }
+
+        let type = context:.finalizeType(o.type);
+        if let t: &YILTuple = type {
+            let contentType = t.inners[1]; // {.ok, .content}
+            let content = copy YILTupleValue(o.loc, contentType,
+                                             fieldNames-> copy [OptionKeys::VALUE],
+                                             copy [innerValue]);
+
+            // {.set = 1, .content = {.value = value}}
+            return copy YILTupleValue(o.loc, type, fieldNames-> copy [OptionKeys::SET, OptionKeys::CONTENT],
+                                      copy [copy YILIntValue(o.loc, YIL_UINT_8, 1us), content]);
+        } else panic;
+    }
+
+    /**
+     * Finalize a function-pointer literal.
+     *
+     * Produces a YILAddrValue pointing to the function symbol.
+     *
+     * @params:
+     *   - context: the expansion context
+     *   - name:    the function-pointer literal
+     *   - list:    unused
+     *
+     * @returns:
+     *   - &YILValue: the function pointer
+     */
+    pub fn finalizeNameFptr(dmut context: &Expander, name: &ProtoFuncPtrValue, ref mut _: StmtList)-> &YILValue {
+        let pname = Mangler::mangle(name.proto);
+        context:.registerTouchSym(pname, name.proto.implLoc);
+
+        return copy YILAddrValue(name.loc, YIL_PTR_VOID,
+                                 copy YILVar(name.loc, pname, YIL_VOID, 0us));
+    }
+
+    /**
+     * Finalize a range literal.
+     *
+     * Expands left, right, step, and contains expressions and constructs a
+     * YILTupleValue with fields:
+     *   (fst, scd, step, contains).
+     *
+     * @params:
+     *   - context: the expansion context
+     *   - rng:     the range literal
+     *   - list:    the statement list to append instructions to
+     *
+     * @returns:
+     *   - &YILValue: the range tuple
+     */
+    pub fn finalizeRange(dmut context: &Expander, rng: &RangeValue, ref mut list: StmtList)-> &YILValue {
+        let left = ValueExpander::finalize(alias context, rng.left, ref list, asLeft-> false);
+        let right = ValueExpander::finalize(alias context, rng.right, ref list, asLeft-> false);
+        let step = ValueExpander::finalize(alias context, rng.step, ref list, asLeft-> false);
+        let contain = ValueExpander::finalize(alias context, rng.isFull, ref list, asLeft-> false);
+        let type = context:.finalizeType(rng.type);
+
+        return copy YILTupleValue(rng.loc, type,
+                                  copy [left, right, step, contain],
+                                  fieldNames-> copy [RangeKeys::FST, RangeKeys::SCD, RangeKeys::STEP, RangeKeys::CONTAINS]);
+    }
+
+    /**
+     * Finalize a slice constructor literal.
+     *
+     * Constructs a slice tuple:
+     *   (len, ptr, blk_info).
+     *
+     * @params:
+     *   - context: the expansion context
+     *   - ctor:    the slice constructor literal
+     *   - list:    the statement list to append instructions to
+     *
+     * @returns:
+     *   - &YILValue: the slice tuple
+     */
+    pub fn finalizeSliceCtor(dmut context: &Expander, ctor: &SliceCtorValue, ref mut list: StmtList)-> &YILValue {
+        let type = context:.finalizeType(ctor.type);
+        let len = ValueExpander::finalize(alias context, ctor.len, ref list, asLeft-> false);
+        let ptr = ValueExpander::finalize(alias context, ctor.ptr, ref list, asLeft-> false);
+        let blk = ValueExpander::finalize(alias context, ctor.blk, ref list, asLeft-> false);
+
+        return copy YILTupleValue(ctor.loc, type,
+                                  copy [len, ptr, blk],
+                                  fieldNames-> copy [SliceKeys::LEN, SliceKeys::PTR, SliceKeys::BLK_INFO]);
+    }
+
+    /**
+     * Finalize a typeinfo literal.
+     *
+     * Expands all fields(id, size, subInfos, name) and constructs a
+     * YILTupleValue matching the typeinfo tuple layout.
+     *
+     * @params:
+     *   - context: the expansion context
+     *   - ti:      the typeinfo literal
+     *   - list:    the statement list to append instructions to
+     *
+     * @returns:
+     *   - &YILValue: the typeinfo tuple
+     */
+    pub fn finalizeTypeInfo(dmut context: &Expander, ti: &TypeInfoValue, ref mut list: StmtList)-> &YILValue {
+        let id = ValueExpander::finalize(alias context, ti.id, ref list, asLeft-> false);
+        let size = ValueExpander::finalize(alias context, ti.size, ref list, asLeft-> false);
+        let inner = ValueExpander::finalize(alias context, ti.subInfos, ref list, asLeft-> false);
+        let name = ValueExpander::finalize(alias context, ti.name, ref list, asLeft-> false);
+
+        let type = context:.finalizeType(ti.type);
+        if let t: &YILTuple = type {
+            let fields = t.fieldNames;
+            return copy YILTupleValue(ti.loc, type,
+                                      copy [id, size, inner, name],
+                                      fieldNames-> fields);
+        } else panic;
+    }
+}

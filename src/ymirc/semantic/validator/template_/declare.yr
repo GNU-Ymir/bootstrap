@@ -1,0 +1,230 @@
+/*
+ * Root module for template declaration dispatch.
+ *
+ * TemplateDeclaration provides the high-level entry points used to declare
+ * template-instantiated symbols. After template solving and rewriting are
+ * complete, this module dispatches to the appropriate declaration module:
+ *
+ *   - TemplateMethodDeclaration  for method templates,
+ *   - TemplateCtorDeclaration    for constructor templates,
+ *   - TemplateBasicDeclaration   for all other template
+ *
+ * <hr>
+ *
+ * @Package: ymirc
+ * @Module: ymirc::semantic::validator::template_::declare
+ * @File: ymirc/semantic/validator/template_/declare.yr
+ * @Author(s):
+ *   - Emile Cadorel <ecadorel@gmail.com>
+ *
+ * @Created(YYYY-MM-DD): 2026-05-26
+ * @Copyright(C) 2021–2026 GNU-Ymir
+ * @License
+ *   ```text
+ *   This file is part of the Ymir language project.
+ *
+ *   Ymir is free software: you can redistribute it and/or modify it
+ *   under the terms of the GNU General Public License as published by
+ *   the Free Software Foundation, either version 3 of the License, or
+ *   (at your option) any later version.
+ *
+ *   Ymir is distributed in the hope that it will be useful,
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *   GNU General Public License for more details.
+ *
+ *   You should have received a copy of the GNU General Public License
+ *   along with Ymir.  If not, see <https://www.gnu.org/licenses/>.
+ *   ```
+ */
+
+in declare;
+
+use ymirc::syntax::{_, declaration::_, expression::_};
+use ymirc::semantic::generator::{value::_, type::_};
+
+use ymirc::semantic::{validator, template_, symbol};
+
+use ymirc::lexing::word;
+use ymirc::errors;
+
+use ymirc::utils::format;
+
+use std::{io, stream};
+
+use ymirc::semantic::validator::template_::declare::_;
+
+/*!
+ * ====================================================================================================
+ * ====================================================================================================
+ * ====================================          SUBMODS          =====================================
+ * ====================================================================================================
+ * ====================================================================================================
+ */
+
+mod ::finalize;
+mod ::method;
+mod ::basic;
+mod ::ctor;
+
+/*!
+ * ====================================================================================================
+ * ====================================================================================================
+ * ======================================          ROOT          ======================================
+ * ====================================================================================================
+ * ====================================================================================================
+ */
+
+/**
+ * TemplateDeclaration module
+ *
+ * Provides the root-level dispatch and prototype-finalization logic for
+ * template-instantiated symbols. This includes:
+ *
+ *   - dispatching template declarations to the correct specialized module,
+ *   - finalizing function and constructor prototypes after template rewriting,
+ *   - verifying template guards,
+ *   - determining whether a template instantiation is fully resolved.
+ *
+ */
+pub mod TemplateDeclaration {
+
+    /**
+     * Dispatch template declaration to the appropriate specialized module.
+     *
+     * @params:
+     *   - context: validation context used for declaration
+     *   - loc:     source location of the template instantiation
+     *   - mapper:  TemplateMapper produced by template solving
+     *   - value:   template reference value to declare
+     *
+     * @returns:
+     *   - &Symbol: the declared symbol(existing or newly created)
+     *
+     * @throws:
+     *   - TEMPLATE_SPECIALIZATION_FAILS if declaration fails
+     */
+    pub fn declare(dmut context: &ValidationContext, loc: &Word, mapper: TemplateMapper, value: &Value)-> dmut &Symbol
+        throws ErrorMsg
+    {
+        match value {
+            m: &TemplateRefMethodValue => {
+                return TemplateMethodDeclaration::declare(alias context, loc, mapper, m);
+            }
+            c: &TemplateRefCtorValue => {
+                return TemplateCtorDeclaration::declare(alias context, loc, mapper, c);
+            }
+            x: &TemplateRefValue => {
+                return TemplateBasicDeclaration::declare(alias context, loc, mapper, x);
+            }
+        }
+
+        eprintln("internal template declaration error: ", value.__typeinfo__.name);
+        panic;
+    }
+
+    /**
+     * Finalize a function prototype produced by template instantiation.
+     *
+     * @params:
+     *   - context: validation context used for rewriting and validation
+     *   - loc:     source location of the template instantiation
+     *   - value:   TemplateRefValue representing the function template reference
+     *   - mapper:  TemplateMapper produced by template solving
+     *   - func:    function declaration to rewrite and validate
+     *
+     * @returns:
+     *   - (&PrototypeValue, bool):
+     *        * validated function prototype,
+     *        * true if a guard expression was evaluated, false otherwise
+     *
+     * @throws:
+     *   - TEMPLATE_TEST_FAILED if the guard evaluates to false
+     *   - TEMPLATE_SPECIALIZATION_FAILS if prototype validation fails
+     */
+    pub fn finalizeFunctionPrototype(dmut context: &ValidationContext,
+                                     loc: &Word,
+                                     value: &TemplateRefValue,
+                                     mapper: TemplateMapper,
+                                     func: &FunctionDecl)-> (&PrototypeValue, bool)
+        throws ErrorMsg
+    {
+        let (decl, test, finalMapper) = TemplateDeclareFinalization::finalizePrototypeRewrite(alias context, loc, value, mapper, func);
+        let dmut sym = context:.getSymbolFromRef(value.sym);
+
+        let funcProto = if let funcRewriten: &FunctionDecl = decl {
+            if let m: &TemplateRefMethodValue = value {
+                let cref = m.classSym.classRefUnwrapped;
+                MethodValidation::validateProto(alias context, alias sym, loc, funcRewriten, cref,
+                                                mapper-> finalMapper)
+            } else {
+                FunctionValidation::validateProto(alias context, alias sym, loc, funcRewriten,
+                                                  mapper-> finalMapper)
+            }
+        } else panic; // this is not a function ?? so how do you expect a prototype
+
+        return (funcProto, (test !of EmptyExpr));
+    }
+
+    /**
+     * Finalize a constructor prototype produced by template instantiation.
+     *
+     * @params:
+     *   - context: validation context used for rewriting and validation
+     *   - loc:     source location of the template instantiation
+     *   - value:   TemplateRefCtorValue representing the constructor template reference
+     *   - mapper:  TemplateMapper produced by template solving
+     *   - ctor:    constructor declaration to rewrite and validate
+     *
+     * @returns:
+     *   - (&CtorPrototypeValue, bool):
+     *        * validated constructor prototype,
+     *        * true if a guard expression was evaluated, false otherwise
+     *
+     * @throws:
+     *   - TEMPLATE_TEST_FAILED if the guard evaluates to false
+     *   - TEMPLATE_SPECIALIZATION_FAILS if prototype validation fails
+     */
+    pub fn finalizeCtorPrototype(dmut context: &ValidationContext,
+                                 loc: &Word,
+                                 value: &TemplateRefCtorValue,
+                                 mapper: TemplateMapper,
+                                 ctor: &CtorDecl)-> (&CtorPrototypeValue, bool)
+        throws ErrorMsg
+    {
+        let (decl, test, finalMapper) = TemplateDeclareFinalization::finalizePrototypeRewrite(alias context, loc, value, mapper, ctor);
+        let dmut sym = context:.getSymbolFromRef(value.sym);
+
+        let funcProto = if let ctorDecl: &CtorDecl = decl {
+            let cref = value.classSym.classRefUnwrapped;
+            CtorValidation::validateProto(alias context, alias sym, ctorDecl, cref,
+                                          mapper-> finalMapper)
+        } else panic;
+
+        return (funcProto, (test !of EmptyExpr));
+    }
+
+    /**
+     * Determine whether a template instantiation is fully resolved.
+     *
+     * @params:
+     *   - mapper: TemplateMapper produced by template solving
+     *   - value:  TemplateRefValue whose parameters must be checked
+     *
+     * @returns:
+     *   - bool: true if all template parameters are resolved, false otherwise
+     *
+     * @throws:
+     *   - nothing
+     */
+    pub fn isFinalized(mapper: TemplateMapper, value: &TemplateRefValue)-> bool {
+        let mut mergedMapper = TemplateMapper();
+        mergedMapper:.merge(mapper);
+        if let Ok(map) = value.sym.templateMapper {
+            mergedMapper:.merge(map);
+        }
+
+        let mut templates = TemplateRewriting::rewriteTemplateParams(mapper, value.sym.decl.params);
+        return (templates.len == 0us);
+    }
+}

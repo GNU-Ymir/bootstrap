@@ -1,0 +1,451 @@
+
+/*
+ * Implements validation for catch-pattern matching in Ymir.
+ *
+ * A catch expression matches thrown exceptions against a list of
+ * catch-patterns. Each pattern may:
+ *
+ *   - bind the thrown value to a variable
+ *   - destructure the thrown value using call-patterns
+ *   - include additional tests(guards)
+ *
+ * Responsibilities:
+ *   - validate catch patterns in order
+ *   - ensure all thrown types are eventually caught
+ *   - detect unreachable catch patterns
+ *   - validate variable declarations inside catch patterns
+ *   - validate call-operator patterns inside catch blocks
+ *   - compute the combined test expressions for each catch branch
+ *   - propagate memory information
+ *   - construct the final conditional expression for the catch block
+ *
+ * The module produces:
+ *   - a final value representing the catch expression
+ *   - the resulting type of the catch block
+ *
+ * <hr>
+ *
+ * @Package: ymirc
+ * @Module: ymirc::semantic::validator::value::control::match_::catch_
+ * @File: ymirc/semantic/validator/value/control/match_/catch_.yr
+ * @Author(s):
+ *   - Emile Cadorel <ecadorel@gmail.com>
+ *
+ * @Created(YYYY-MM-DD): 2026-04-07
+ * @Copyright(C) 2021–2026 GNU-Ymir
+ * @License
+ *   ```text
+ *   This file is part of the Ymir language project.
+ *
+ *   Ymir is free software: you can redistribute it and/or modify it
+ *   under the terms of the GNU General Public License as published by
+ *   the Free Software Foundation, either version 3 of the License, or
+ *   (at your option) any later version.
+ *
+ *   Ymir is distributed in the hope that it will be useful,
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *   GNU General Public License for more details.
+ *
+ *   You should have received a copy of the GNU General Public License
+ *   along with Ymir.  If not, see <https://www.gnu.org/licenses/>.
+ *   ```
+ */
+
+in catch_;
+
+use ymirc::lexing::{word, keys, tokens};
+use ymirc::syntax::expression::_;
+use ymirc::semantic::validator;
+use ymirc::semantic::generator::{value::_, type::_};
+
+use ymirc::errors;
+use ymirc::utils::format;
+
+use ymirc::semantic::validator::value::control::match_::_;
+
+/**
+ * CatchValidation module
+ *
+ * Provides validation for catch-pattern matching in Ymir. A catch block
+ * receives:
+ *
+ *   - the type of the try block
+ *   - the thrown value
+ *   - a list of catch patterns
+ *   - the list of possible thrown types(throwers)
+ *
+ * Semantics:
+ *   - Each catch pattern is validated in order.
+ *   - A pattern may catch a thrown type if:
+ *        - its declared type matches a thrown type
+ *        - or its call-pattern extracts a matching type
+ *   - Once a type is caught, it is removed from the remaining throwers.
+ *   - A catch pattern is unreachable if all throwers were already caught.
+ *   - The catch block must catch all thrown types.
+ *
+ * The module enforces:
+ *   - no unreachable catch patterns
+ *   - no uncaught thrown types
+ *   - correct type-matching for thrown values
+ *   - correct variable binding inside catch patterns
+ *   - correct guard typing
+ */
+pub mod CatchValidation {
+
+    /**
+     * Validate an entire catch expression and produce:
+     *   - the final conditional value
+     *   - the resulting type of the catch block
+     *
+     * Steps:
+     *   1. Validate all catch patterns via validateMatchers.
+     *   2. If any pattern produced errors => throw CATCH_VALIDATION.
+     *   3. If any thrown types remain uncaught => throw EXCEPTION_NOT_CAUGHT.
+     *   4. Build the final nested conditional expression.
+     *
+     * @params:
+     *   - context:   validation context
+     *   - m:         matcher expression inside the catch block
+     *   - tryType:   type of the try block being caught
+     *   - catchVar:  variable referencing the thrown value
+     *   - throwers:  list of all possible thrown types
+     *
+     * @returns:
+     *   (finalValue, resultingType)
+     *
+     * @throws:
+     *   ErrorMsg if validation fails or some exceptions remain uncaught.
+     */
+    pub fn validate(dmut context: &ValidationContext,
+                     m:            &MatcherExpr,
+                     tryType:      &Type,
+                     catchVar:     &VarRefValue,
+                     throwers:     [Thrower])-> (&Value, &Type)
+        throws ErrorMsg
+    {
+        let result  = CatchValidation::validateMatchers(alias context, m.loc, tryType, catchVar, m.matchers, throwers);
+        if (result.errors.len != 0us) {
+            throw copy ErrorMsg::fatal(m.loc, format(ValidateErrorMessage::CATCH_VALIDATION, catchVar.type), notes-> result.errors);
+        }
+
+        if (result.rests.len != 0us) {
+            let mut errorRest: [&ErrorMsg] = copy [copy ErrorMsg::fatal(m.loc,
+                                                                          end-> i.loc,
+                                                                          format(ValidateErrorMessage::EXCEPTION_NOT_CAUGHT, i.type))
+                                                    for i in result.rests];
+            throw copy ErrorMsg::list(errorRest);
+        }
+
+        let mut current: &Value = UNIT_VALUE;
+        for i in result.tests.len .. 0us {
+            current = MatchCreation::createConditional(m.loc,
+                                                        test-> result.tests[i - 1us],
+                                                        thenv-> result.values[i - 1us],
+                                                        elsev-> current,
+                                                        type-> result.type,
+                                                        isComplete-> true);
+        }
+
+        return (current, result.type);
+    }
+
+    /**
+     * Validate all catch patterns in order and accumulate:
+     *   - tests
+     *   - values
+     *   - resulting type
+     *   - memory information
+     *   - caught and remaining thrown types
+     *
+     * Steps:
+     *   1. For each catch line:
+     *        - enter a new block
+     *        - reject unreachable patterns(no remaining throwers)
+     *        - validate the line via validateLine
+     *        - accumulate tests, values, types
+     *        - update caught/remaining throwers
+     *        - collect errors
+     *        - exit block with unused-variable warnings
+     *
+     *   2. If resulting type is NoneType => replace with VoidType.
+     *
+     * @params:
+     *   - context:  validation context
+     *   - loc:      location of the catch expression
+     *   - tryType:  type of the try block
+     *   - value:    thrown value
+     *   - matchers: list of catch patterns
+     *   - throwers: list of all possible thrown types
+     *
+     * @returns:
+     *   CatchResult
+     *
+     */
+    fn validateMatchers(dmut context: &ValidationContext,
+                         loc:          &Word,
+                         tryType:      &Type,
+                         value:        &Value,
+                         matchers:     [MatchLine],
+                         throwers:     [Thrower])-> CatchResult
+    {
+        let mut result = CatchResult(tryType, throwers);
+
+        for line in matchers {
+            let mut succeed = true;
+            context:.enterBlock();
+            {
+                if (result.rests.len == 0) { // everything was caught, so further patterns are useless
+                    throw copy ErrorMsg::fatal(line.filter.loc, format(ValidateErrorMessage::UNREACHABLE_MATCHER));
+                }
+
+                let resultLine = CatchValidation::validateLine(alias context, line, result.type, value, result.rests, result.used);
+                result.tests ~= [resultLine.guard.test];
+                result.values ~= [copy BlockValue(line.value.loc, resultLine.blockType, copy [resultLine.blockValue])];
+
+                result.type = resultLine.blockType;
+                if (MatchVerification::isTautology(alias context, resultLine.guard.guard) && !resultLine.hasSubTests) { // the guard is always true, and there is no other tests than type equality
+                    result.used ~= [Thrower(line.filter.loc, resultLine.type)]; // so the type is caught
+                    result.rests = MatchVerification::listNonCaughtThrowers(result.used, throwers); // list the types that are not yet caught
+                }
+            } catch {
+                err: &ErrorMsg => {
+                    result.errors ~= [err];
+                    succeed = false;
+                }
+            }
+
+            {
+                context:.quitBlock(warnUnused-> succeed);
+            } catch {
+                err: &ErrorMsg => {
+                    result.errors ~= [err];
+                }
+            }
+        }
+
+        if result.type of NoneType {
+            result.type = copy VoidType(loc);
+        }
+
+        return result;
+    }
+
+    /**
+     * Validate a single catch pattern line.
+     *
+     * Steps:
+     *   1. Validate the pattern via validatePattern:
+     *        - compute test expression
+     *        - determine caught type
+     *        - detect whether sub-tests exist
+     *
+     *   2. Validate the guard using MatchValidation::validateGuard.
+     *
+     *   3. Validate the branch value:
+     *        - infer type if needed
+     *        - wrap in a BlockValue
+     *
+     * @params:
+     *   - context:  validation context
+     *   - line:     catch pattern line
+     *   - tryType:  type of the try block
+     *   - value:    thrown value
+     *   - throwers: list of all thrown types
+     *   - caught:   list of already caught types
+     *
+     * @returns:
+     *   CatchLineResult
+     *
+     * @throws:
+     *   ErrorMsg if pattern, guard, or value is invalid.
+     */
+    fn validateLine(dmut context: &ValidationContext,
+                     line:         MatchLine,
+                     tryType:      &Type,
+                     value:        &Value,
+                     throwers:     [Thrower],
+                     caught:       [Thrower])-> CatchLineResult
+        throws ErrorMsg
+    {
+        let mut vars: [&VarDeclValue] = [];
+        let (test, type, hasSubs) = CatchValidation::validatePattern(alias context, value, line.filter, throwers, caught, ref vars);
+        let guard = MatchValidation::validateGuard(alias context, line.guard, vars, currentCond-> test);
+
+        let mut val = ValueValidation::validate(alias context, line.value);
+        let (t, v) = if (!val.isBreaker && !val.isReturner) {
+            TypeInference::inferValueForBranch(alias context, tryType.loc, tryType, val)
+        } else {
+            (tryType, val)
+        };
+
+        return CatchLineResult(vars-> vars,
+                                test-> guard.test,
+                                hasSubTests-> hasSubs,
+                                type-> type,
+                                guard-> guard,
+                                blockValue-> v,
+                                blockType-> t);
+    }
+
+    /**
+     * Validate a catch pattern and return:
+     *   - test expression
+     *   - caught type
+     *   - whether the pattern contains sub-tests
+     *
+     * Dispatches based on pattern kind:
+     *   - VarDeclExpr => validateVarDecl
+     *   - MultOperatorExpr => validateCallOp
+     *
+     * @params:
+     *   - context:  validation context
+     *   - value:    thrown value
+     *   - mtch:     catch pattern expression
+     *   - throwers: list of all thrown types
+     *   - caught:   list of already caught types
+     *   - vars:     variable declarations introduced by the pattern
+     *
+     * @returns:
+     *   (testExpression, caughtType, hasSubTests)
+     *
+     * @throws:
+     *   ErrorMsg if pattern is invalid or unsupported.
+     */
+    fn validatePattern(dmut context: &ValidationContext,
+                        value:        &Value,
+                        mtch:         &Expression,
+                        throwers:     [Thrower],
+                        caught:       [Thrower],
+                        ref mut vars: [&VarDeclValue])-> (&Value, &Type, bool)
+        throws ErrorMsg
+    {
+        match mtch {
+            v: &VarDeclExpr => {
+                return CatchValidation::validateVarDecl(alias context, value, v, throwers, caught, ref vars);
+            }
+            m: &MultOperatorExpr => {
+                return CatchValidation::validateCallOp(alias context, value, m, throwers, caught, ref vars);
+            }
+        }
+
+        throw copy ErrorMsg::fatal(mtch.loc, format(ValidateErrorMessage::CATCH_PATTERN_MULT_OR_VDECL));
+    }
+
+    /**
+     * Validate a variable-declaration catch pattern:
+     *
+     *     x: T
+     *     x: T = pattern
+     *
+     * Steps:
+     *   1. Verify no shadowing inside the catch pattern.
+     *   2. Validate the declared type and value via MatchVarDeclValidation.
+     *   3. Ensure the declared type is one of the thrown types.
+     *   4. Insert the declared variable into the pattern scope.
+     *   5. If an initializer pattern exists:
+     *        - validate it using the casted thrown value
+     *   6. Determine whether sub-tests exist.
+     *   7. Combine type test AND value test.
+     *
+     * @params:
+     *   - context:  validation context
+     *   - value:    thrown value
+     *   - vdecl:    variable declaration pattern
+     *   - throwers: list of all thrown types
+     *   - caught:   list of already caught types
+     *   - vars:     variable declarations introduced by the pattern
+     *
+     * @returns:
+     *   (testExpression, caughtType, hasSubTests)
+     *
+     * @throws:
+     *   ErrorMsg if type is not thrown or pattern is invalid.
+     */
+    fn validateVarDecl(dmut context: &ValidationContext,
+                        value:        &Value,
+                        vdecl:        &VarDeclExpr,
+                        throwers:     [Thrower],
+                        caught:       [Thrower],
+                        ref mut vars: [&VarDeclValue])-> (&Value, &Type, bool)
+        throws ErrorMsg
+    {
+        VariableVerification::verifyShadow(context, vdecl.name, vdecl.name.str, isQuoted-> vdecl.isQuoted); // variable declaration, so no shadows are allowed
+        MatchVerification::verifyShadow(vdecl.name, vdecl.name.str, vars);  // verify that no variable declared within the pattern are shadowing each other
+
+        {
+            let declResult = MatchVarDeclValidation::validateValue(alias context, value, vdecl, false, MemoryInfo());
+            MatchVerification::verifyIsThrown(vdecl.loc, declResult.type, throwers, caught);
+
+            let var = copy VarDeclValue(vdecl.name,
+                                        declResult.type,
+                                        declResult.value,
+                                        isReference-> false,
+                                        isMutable-> false);
+
+            vars ~= [var]; // add the declaration in the pattern matching success block
+
+            let mut valueCond: &Value = TRUE_BOOL_VALUE;
+            if (vdecl.value !of EmptyExpr) { // x: T = V =>
+                // inner pattern matching on V using /cast!T(value)/ (since the type test was true)
+                let (x, _) = MatchValidation::validatePattern(alias context, declResult.castValue, vdecl.value, MemoryInfo(), ref vars);
+                valueCond = x;
+            }
+
+            let hasSubTest = !MatchVerification::isTautology(alias context, valueCond);
+            let finalCond = copy LogicalBoolOperatorValue(vdecl.loc, BinaryOperators::DAND, declResult.typeTest, valueCond);
+
+            // test type && test value to be a successful pattern matcher
+            return (finalCond, declResult.type, hasSubTest);
+        } catch {
+            err: &ErrorMsg => { // insert error variable to avoid undefined symbol errors
+                if (vdecl.name.str != Keys::UNDER) {
+                    let var = copy VarDeclValue(vdecl.loc, copy ErrorType(vdecl.loc), UNIT_VALUE, isReference-> false, isMutable-> false);
+                    vars ~= [var];
+                }
+
+                throw err;
+            }
+        }
+    }
+
+    /**
+     * Validate a call-operator catch pattern:
+     *
+     *     SomeType(field-> x)
+     *
+     * Steps:
+     *   1. Validate the call-pattern via MatchCallValidation.
+     *   2. Ensure the resulting type is one of the thrown types.
+     *   3. Determine whether sub-tests exist(field tests).
+     *
+     * @params:
+     *   - context:  validation context
+     *   - value:    thrown value
+     *   - cl:       call-operator pattern
+     *   - throwers: list of all thrown types
+     *   - caught:   list of already caught types
+     *   - vars:     variable declarations introduced by the pattern
+     *
+     * @returns:
+     *   (testExpression, caughtType, hasSubTests)
+     *
+     * @throws:
+     *   ErrorMsg if type is not thrown or pattern is invalid.
+     */
+    fn validateCallOp(dmut context: &ValidationContext,
+                       value:        &Value,
+                       cl:           &MultOperatorExpr,
+                       throwers:     [Thrower],
+                       caught:       [Thrower],
+                       ref mut vars: [&VarDeclValue])-> (&Value, &Type, bool)
+        throws ErrorMsg
+    {
+        let callResult = MatchCallValidation::validateValue(alias context, value, cl, MemoryInfo(), ref vars);
+        MatchVerification::verifyIsThrown(cl.loc, callResult.type, throwers, caught);
+
+        let hasSubTest = !MatchVerification::isTautology(alias context, callResult.fieldTest);
+        return (callResult.test, callResult.type, hasSubTest);
+    }
+
+}

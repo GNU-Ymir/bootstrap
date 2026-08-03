@@ -1,0 +1,337 @@
+/*
+ * Implements semantic validation for tuple-based `for` loops in Ymir.
+ *
+ * Responsibilities:
+ *   - Validate iteration over tuple values.
+ *   - Support both single-variable and dual-variable tuple iteration:
+ *        for x: tuple in tuple { ... }
+ *        for i, x: tuple in tuple { ... }
+ *   - Validate iterator variable declarations and type compatibility.
+ *   - Handle reference iteration, alias iteration, and mutable iteration.
+ *   - Construct loop bodies as BlockValue and LoopValue nodes.
+ *   - Track alias/ref usage for the enclosing loop.
+ *   - Manage loop/block context and error aggregation.
+ *
+ * This module is invoked when the iterated operand of a `for` loop is a tuple.
+ *
+ * <hr>
+ *
+ * @Package: ymirc
+ * @Module: ymirc::semantic::validator::value::control::for_::tuple
+ * @File: ymirc/semantic/validator/value/control/for_/tuple.yr
+ * @Author(s):
+ *   - Emile Cadorel <ecadorel@gmail.com>
+ *
+ * @Created(YYYY-MM-DD): 2026-05-14
+ * @Copyright(C) 2021–2026 GNU-Ymir
+ * @License
+ *   ```text
+ *   This file is part of the Ymir language project.
+ *
+ *   Ymir is free software: you can redistribute it and/or modify it
+ *   under the terms of the GNU General Public License as published by
+ *   the Free Software Foundation, either version 3 of the License, or
+ *   (at your option) any later version.
+ *
+ *   Ymir is distributed in the hope that it will be useful,
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *   GNU General Public License for more details.
+ *
+ *   You should have received a copy of the GNU General Public License
+ *   along with Ymir.  If not, see <https://www.gnu.org/licenses/>.
+ *   ```
+ */
+
+in tuple;
+
+use ymirc::lexing::{word, keys};
+
+use ymirc::syntax::expression::_;
+use ymirc::semantic::validator;
+use ymirc::semantic::generator::{value::_, type::_};
+
+use ymirc::errors;
+
+use ymirc::utils::format;
+
+/**
+ * TupleForLoopValidation
+ *
+ * Provides semantic validation for tuple iteration in `for` loops.
+ *
+ * Supports:
+ *   - Single-variable iteration:
+ *         for x: tuple in tuple { ... }
+ *
+ *   - Dual-variable iteration(index + value):
+ *         for i, x: tuple in tuple { ... }
+ *
+ */
+pub mod TupleForLoopValidation {
+
+    /**
+     * Validate a `for` loop iterating over a tuple.
+     *
+     * Supports:
+     *   - One iterator variable  → element only
+     *   - Two iterator variables → index + element
+     *
+     *
+     * @params:
+     *   - context:   validation context
+     *   - tuple:     tuple value being iterated
+     *   - tupleType: static type of the tuple
+     *   - floop:     for-loop expression
+     *   - byMutRef:  whether iteration is by mutable reference
+     *   - byAlias:   whether iteration is by alias
+     *
+     * @returns:
+     *   (loopValue, usedRef, usedAlias)
+     *     - loopValue: LoopValue representing the validated loop
+     *     - usedRef:   true if any iteration used a reference
+     *     - usedAlias: true if any iteration used an alias
+     *
+     * @throws:
+     *   ErrorMsg if the iterator count is unsupported.
+     */
+    pub fn validate(dmut context: &ValidationContext,
+                    tuple:         &Value,
+                    tupleType:    &TupleType,
+                    floop:        &ForLoopExpr,
+                    byMutRef:     bool,
+                    byAlias:      bool)-> (&Value, bool, bool)
+        throws ErrorMsg
+    {
+        if floop.vars.len == 1 {
+            return TupleForLoopValidation::validateIteration(alias context, tuple, tupleType, floop, floop.vars[0], none,
+                                                             byMutRef-> byMutRef,
+                                                             byAlias-> byAlias);
+        }
+
+        if floop.vars.len == 2 {
+            return TupleForLoopValidation::validateIteration(alias context, tuple, tupleType, floop, floop.vars[1], (floop.vars[0])?,
+                                                             byMutRef-> byMutRef,
+                                                             byAlias-> byAlias);
+        }
+
+
+        throw copy ErrorMsg::fatal(floop.loc, format(ValidateErrorMessage::UNDEF_FOR_LOOP_OPERATOR, floop.vars.len, tupleType));
+    }
+
+    /**
+     * Validate iteration over all elements of the tuple.
+     *
+     * @params:
+     *   - context:   validation context
+     *   - tuple:     tuple value
+     *   - tupleType: tuple type
+     *   - floop:     for-loop expression
+     *   - elemIter:  primary iterator variable
+     *   - indexIter: optional secondary iterator variable(index)
+     *   - byMutRef:  iteration by mutable reference
+     *   - byAlias:   iteration by alias
+     */
+    fn validateIteration(dmut context: &ValidationContext,
+                         tuple:        &Value,
+                         tupleType:    &TupleType,
+                         floop:        &ForLoopExpr,
+                         elemIter:     &VarDeclExpr,
+                         indexIter:    (&VarDeclExpr)?,
+                         byMutRef:     bool,
+                         byAlias:      bool)-> (&Value, bool, bool)
+        throws ErrorMsg
+    {
+        let mut usedRef = false;
+        let mut usedAlias = false;
+        let mut content: [&Value] = [];
+
+        context:.enterLoop();
+        context:.setCurrentLoopType(copy VoidType(floop.loc));
+
+        {
+            for i in 0 .. tupleType.inners.len {
+                let (value_, useRef_, useAlias_) = TupleForLoopValidation::validateInnerLoop(alias context, i, elemIter, indexIter, tuple, tupleType, floop.block,
+                                                                                             byMutRef-> byMutRef,
+                                                                                             byAlias-> byAlias);
+
+                content ~= [value_];
+                usedAlias = (usedAlias || useAlias_);
+                usedRef = (usedRef || useRef_);
+            }
+        } exit {
+            context:.quitLoop();
+        }
+
+        let inner = copy BlockValue(floop.loc, VOID_TYPE, content);
+        let ret = copy LoopValue(floop.loc, VOID_TYPE, UNIT_VALUE, inner,
+                                 isCteFor-> true);
+
+        return (ret, usedRef, usedAlias);
+    }
+
+    /**
+     * Validate a single iteration of the tuple loop.
+     *
+     * @params:
+     *   - context:   validation context
+     *   - i:         tuple element index
+     *   - elemIter:  primary iterator declaration
+     *   - indexIter: optional secondary iterator declaration(index)
+     *   - tuple:     tuple value
+     *   - tupleType: tuple type
+     *   - blk:       loop body expression
+     *   - byMutRef:  iteration by mutable reference
+     *   - byAlias:   iteration by alias
+     *
+     * @returns:
+     *   (blockValue, usedRef, usedAlias)
+     */
+    pub fn validateInnerLoop(dmut context: &ValidationContext,
+                             i:            usize,
+                             elemIter:     &VarDeclExpr,
+                             indexIter:    (&VarDeclExpr)?,
+                             tuple:        &Value,
+                             tupleType:    &TupleType,
+                             blk:          &Expression,
+                             byMutRef:     bool,
+                             byAlias:      bool)-> (&BlockValue, bool, bool)
+        throws ErrorMsg
+    {
+        let mut errors: (&ErrorMsg)? = none;
+        let mut pre: [&Value] = [];
+        let mut inner: &Value = UNIT_VALUE;
+        let mut usedRef: bool = false;
+        let mut usedAlias: bool = false;
+
+        context:.enterBlock();
+        {
+            if let Ok(vdecl: &VarDeclExpr) = indexIter {
+                let indexVal = copy IntValue(vdecl.loc, USIZE_TYPE, i);
+                let (indexDecl, insertIndex) = ForLoopValidation::validateIndexIterDecl(alias context, vdecl.loc, vdecl, tupleType,
+                                                                                        value-> indexVal,
+                                                                                        isMutable-> false,
+                                                                                        canCte-> true);
+                if insertIndex {
+                    context:.insertLocal(indexDecl.loc, indexDecl.name, indexDecl);
+                }
+
+                pre ~= [indexDecl];
+            }
+
+            let (elemDecl, insert, useRef, useAlias) = TupleForLoopValidation::validateIterDecl(alias context, elemIter, i, tuple, tupleType,
+                                                                                                byMutRef-> byMutRef,
+                                                                                                byAlias-> byAlias);
+            if insert {
+                context:.insertLocal(elemIter.loc, elemIter.name.str, elemDecl);
+            }
+
+            pre ~= [elemDecl];
+            usedRef = useRef;
+            usedAlias = useAlias;
+            inner = ValueValidation::validate(alias context, blk);
+        } catch {
+            err => {
+                errors = (err)?;
+            }
+        }
+
+        {
+            context:.quitBlock(warnUnused-> !(errors.hasValue));
+        } catch {
+            err => {
+                errors = err?;
+            }
+        }
+
+        if let Ok(err) = errors {
+            throw err;
+        }
+
+        let blkRes = copy BlockValue(blk.loc, copy VoidType(blk.loc), pre ~ [inner]);
+        return (blkRes, usedRef, usedAlias);
+    }
+
+    /**
+     * Validate a tuple iterator variable declaration.
+     *
+     * @params:
+     *   - context:   validation context
+     *   - vdecl:     iterator variable declaration
+     *   - i:         tuple element index
+     *   - tuple:     tuple value
+     *   - type:      tuple type
+     *   - byMutRef:  iteration by mutable reference
+     *   - byAlias:   iteration by alias
+     *
+     * @returns:
+     *   (declValue, usedRef, usedAlias)
+     */
+    fn validateIterDecl(dmut context: &ValidationContext,
+                        vdecl:        &VarDeclExpr,
+                        i:            usize,
+                        tuple:        &Value,
+                        type:         &TupleType,
+                        byMutRef:     bool,
+                        byAlias:      bool)-> (&VarDeclValue, bool, bool, bool)
+        throws ErrorMsg
+    {
+        let curTupleType = type.inners[i];
+        let mut usedRef = false;
+        let mut usedAlias = false;
+
+        let vtype = if (vdecl.type !of EmptyExpr) {
+            let vtype = TypeValidation::validateForVarDecl(alias context, vdecl.type, vdecl,
+                                                           canBeRef-> true,
+                                                           canBeLazy-> false);
+            TypeVerification::verifyCompatible(vdecl.type.loc, curTupleType.loc, vtype, curTupleType);
+            vtype
+        } else {
+            TypeValidation::validateForVarDecl(alias context, copy TypeWrapperExpr(tuple.loc, curTupleType), vdecl,
+                                               canBeRef-> true,
+                                               canBeLazy-> false)
+        };
+
+        TypeVerification::verifyMutableIterator(vdecl.isMutOrDmut, vtype, isRef-> vdecl.isRef);
+
+        let indexValue = TupleFieldValidation::validate(vdecl.loc, tuple, type, i,
+                                                        reduce-> false);
+        let reducedValue = if (!byMutRef && !vdecl.isRef) {
+            context.cteInterpret:.reduce(indexValue)
+        } else {
+            indexValue
+        };
+
+        let iterValue = TypeInference::inferValueForType(alias context, vdecl.loc, reducedValue, vtype,
+                                                         byReference-> vdecl.isRef);
+
+        let access = if byMutRef && vdecl.isRef && curTupleType.isMutable && iterValue.isLvalue {
+            usedRef = true;
+            copy ReferencerValue(vdecl.loc, iterValue.type, iterValue, isMutable-> true)
+        } else if (!vdecl.isRef && byAlias && curTupleType.isMutable && vtype.needsExplicitAlias) {
+            usedAlias = true;
+            copy AliaserValue(vdecl.loc, iterValue.type, iterValue)
+        } else if (vdecl.isRef && !byMutRef && iterValue.isLvalue) {
+            copy ReferencerValue(vdecl.loc, iterValue.type, iterValue, isMutable-> false)
+        } else {
+            iterValue
+        };
+
+        MemoryVerification::verifyMemoryOwner(vdecl.loc, vtype, access,
+                                              construct-> true,
+                                              byReference-> vdecl.isRef);
+
+        let (name, insert) = if vdecl.name == Keys::UNDER {
+            (vdecl.name.locate(ForLoopKeys::ITER), false)
+        } else {
+            (vdecl.name, true)
+        };
+
+        let decl = copy VarDeclValue(name, vtype, access,
+                                     isMutable-> (vdecl.isMutable || vdecl.isDeeplyMutable),
+                                     isReference-> vdecl.isRef,
+                                     isIterator-> true);
+
+        return (decl, insert, usedRef, usedAlias);
+    }
+}

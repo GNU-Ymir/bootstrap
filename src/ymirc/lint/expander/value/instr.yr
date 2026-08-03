@@ -1,0 +1,362 @@
+/*
+ * InstructionExpander — expands instruction-level semantic nodes into YIL instructions.
+ *
+ * The InstructionExpander lowers high-level control-flow and instruction constructs into
+ * concrete YIL instructions. It handles:
+ *
+ *   - variable declarations,
+ *   - break and continue,
+ *   - return (inline-aware),
+ *   - throw and panic,
+ *   - implicit destructor scheduling for movable values,
+ *   - lazy variable initialization,
+ *   - reference variable initialization.
+ *
+ * <hr>
+ *
+ * @Package: ymirc
+ * @Module: ymirc::lint::expander::value::instr
+ * @File: ymirc/lint/expander/value/instr.yr
+ * @Author(s):
+ *   - Emile Cadorel <ecadorel@gmail.com>
+ *
+ * @Created(YYYY-MM-DD): 2026-06-23
+ * @Copyright(C) 2021–2026 GNU-Ymir
+ * @License
+ *   ```text
+ *   This file is part of the Ymir language project.
+ *
+ *   Ymir is free software: you can redistribute it and/or modify it
+ *   under the terms of the GNU General Public License as published by
+ *   the Free Software Foundation, either version 3 of the License, or
+ *   (at your option) any later version.
+ *
+ *   Ymir is distributed in the hope that it will be useful,
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *   GNU General Public License for more details.
+ *
+ *   You should have received a copy of the GNU General Public License
+ *   along with Ymir.  If not, see <https://www.gnu.org/licenses/>.
+ *   ```
+ */
+
+in instr;
+
+use ymirc::lint::expander;
+use ymirc::lint::node::_;
+
+use ymirc::semantic::{symbol, generator::_};
+use ymirc::semantic::generator::{type::_, value::_};
+
+use ymirc::global::{core_, state};
+
+use ymirc::lint::expander::value::_;
+
+/**
+ * InstructionExpander
+ *
+ * Expands instruction-level semantic nodes into YIL instructions. Handles:
+ *
+ *   - variable declarations(including lazy and reference semantics),
+ *   - break and continue inside loops,
+ *   - return statements(rewritten inside inline blocks),
+ *   - throw and panic instructions,
+ *   - destructor scheduling for movable variables.
+ *
+ * All functions append instructions to a StmtList and return YIL_UNIT_VALUE.
+ */
+pub mod InstructionExpander {
+
+    /**
+     * Finalize a variable declaration.
+     *
+     * Behavior:
+     *   - lambda declarations are ignored,
+     *   - expands the initializer value,
+     *   - handles lazy variables by creating a lazy tuple and registering a lazy reference,
+     *   - handles reference variables by storing a pointer and registering an unref,
+     *   - schedules destructors for movable non‑reference variables,
+     *   - registers the declared variable in the context.
+     *
+     * @params:
+     *   - context: the expansion context
+     *   - v:       the variable declaration value
+     *   - list:    the statement list to append instructions to
+     *
+     * @returns:
+     *   - &YILValue: always YIL_UNIT_VALUE
+     */
+    pub fn finalizeVarDecl(dmut context: &Expander,
+                           v:            &VarDeclValue,
+                           ref mut list: StmtList)-> &YILValue
+    {
+        // Lambda definition, is not generated
+        if (v.varType of LambdaType) return YIL_UNIT_VALUE;
+
+        let inner = ValueExpander::finalize(alias context, v.value, ref list,
+                                            asLeft-> false);
+        let mut type = context:.finalizeType(v.varType);
+
+        if (v.isLazy) {
+            let lazyType = context.typeExpander:.finalizeLazy();
+            let varId = context:.generateVarId();
+            let decl = copy YILVarDecl(v.loc, v.loc.str, lazyType, varId);
+            let varref = copy YILVar(v.loc, v.loc.str, lazyType, varId);
+
+            list:.append(decl);
+            if (inner !of YILUnit) {
+                OperatorExpander::finalizeAffect(v.loc, varref, inner, ref list);
+            }
+
+            let addr = copy YILAddrValue(v.loc, context.typeExpander:.finalizePointer(lazyType), varref);
+            context:.registerLazyRef(v.uniqId, varref);
+            context:.registerVariable(v.uniqId, copy YILNameCallValue(v.loc,
+                                                                      context.typeExpander:.finalizePointer(type),
+                                                                      YRuntimeFuncs::CALL_LAZY,
+                                                                      copy [addr]));
+        } else {
+            if (v.isReference) {
+                type = context.typeExpander:.finalizePointer(type);
+            }
+
+            let varId = context:.generateVarId();
+            let decl = copy YILVarDecl(v.loc, v.loc.str, type, varId);
+            let mut varref = copy YILVar(v.loc, v.loc.str, type, varId);
+
+            list:.append(decl);
+            if (inner !of YILUnit) {
+                OperatorExpander::finalizeAffect(v.loc, varref, inner, ref list);
+            }
+
+            if (v.varType.isMovable && !v.isReference) {
+                ValueExpander::registerDestroy(alias context, varref, v.varType,
+                                               ref list,
+                                               implicit-> false);
+            }
+
+            if (v.isReference) {
+                if let pt: &YILPointer = type {
+                    context:.registerVariable(v.uniqId,
+                                              copy YILUnrefValue(v.loc, pt.inner, varref));
+                } else panic;
+            } else {
+                context:.registerVariable(v.uniqId, varref);
+            }
+        }
+
+        return YIL_UNIT_VALUE;
+    }
+
+    /**
+     * Finalize a break instruction.
+     *
+     * Behavior:
+     *   - if the loop has a result variable, assigns the break value into it,
+     *   - emits a goto to the loop's exit label.
+     *
+     * @params:
+     *   - context: the expansion context
+     *   - b:       the break value
+     *   - list:    the statement list to append instructions to
+     *
+     * @returns:
+     *   - &YILValue: always YIL_UNIT_VALUE
+     */
+    pub fn finalizeBreak(dmut context: &Expander,
+                         b:            &BreakValue,
+                         ref mut list: StmtList)-> &YILValue
+    {
+        let endLabel = context.getLoopExitLabel();
+        let decl = context.getLoopVarRef();
+        if (decl !of YILUnit) {
+            let inner = ValueExpander::finalize(alias context, b.value,
+                                                asLeft-> false,
+                                                list-> ref list);
+
+            OperatorExpander::finalizeAffect(b.loc, decl, inner, ref list);
+        }
+
+        list:.append(copy YILGoto(b.loc, endLabel));
+        return YIL_UNIT_VALUE;
+    }
+
+    /**
+     * Finalize a continue instruction.
+     *
+     * Emits a goto to the loop's next-iteration label.
+     *
+     * @params:
+     *   - context: the expansion context
+     *   - c:       the continue value
+     *   - list:    the statement list to append instructions to
+     *
+     * @returns:
+     *   - &YILValue: always YIL_UNIT_VALUE
+     */
+    pub fn finalizeContinue(dmut context: &Expander,
+                            c:            &ContinueValue,
+                            ref mut list: StmtList)-> &YILValue
+    {
+        let nextLabel = context.getLoopNextLabel();
+
+        list:.append(copy YILGoto(c.loc, nextLabel));
+        return YIL_UNIT_VALUE;
+    }
+
+    /**
+     * Finalize a return instruction.
+     *
+     * Behavior:
+     *   - expands the returned expression,
+     *   - removes pending destructor scheduling for the returned value,
+     *   - if inside an inline block:
+     *       * assigns the returned value into the inline result variable,
+     *       * emits a goto to the inline block's exit label,
+     *       * does not emit a real YILReturn,
+     *   - otherwise emits a normal YILReturn instruction.
+     *
+     * @params:
+     *   - context: the expansion context
+     *   - r:       the return value
+     *   - list:    the statement list to append instructions to
+     *
+     * @returns:
+     *   - &YILValue: always YIL_UNIT_VALUE
+     */
+    pub fn finalizeReturn(dmut context: &Expander,
+                          r:            &ReturnValue,
+                          ref mut list: StmtList)-> &YILValue
+    {
+        let inner = ValueExpander::finalize(alias context, r.value,
+                                            ref list,
+                                            asLeft-> false);
+
+        ValueExpander::removeDestroy(inner, ref list);
+        if context.isInline() {
+            let varref = context.getInlineVarRef();
+            let endLabel = context.getInlineExitLabel();
+            if (varref !of YILUnit) {
+                OperatorExpander::finalizeAffect(r.loc, varref, inner, ref list);
+            }
+
+            list:.append(copy YILGoto(r.loc, endLabel));
+        } else {
+            list:.append(copy YILReturn(r.loc, inner));
+        }
+
+        return YIL_UNIT_VALUE;
+    }
+
+    /**
+     * Finalize a throw instruction.
+     *
+     * Behavior:
+     *   - expands the thrown value,
+     *   - constructs file name and function name strings,
+     *   - extracts their pointer components,
+     *   - emits a call to THROW_EXCEPT with:
+     *         (filePtr, funcPtr, lineNumber, thrownValue)
+     *
+     * @params:
+     *   - context: the expansion context
+     *   - t:       the throw value
+     *   - list:    the statement list to append instructions to
+     *
+     * @returns:
+     *   - &YILValue: always YIL_UNIT_VALUE
+     */
+    pub fn finalizeThrow(dmut context: &Expander,
+                         t:            &ThrowValue,
+                         ref mut list: StmtList)-> &YILValue
+    {
+        let inner = ValueExpander::finalize(alias context, t.value,
+                                            ref list,
+                                            asLeft-> false);
+
+        let line = copy YILIntValue(t.loc, YIL_UINT_32, cast!usize(t.loc.line));
+        let filename = state::relativePath(t.loc.filename);
+
+        let fileStr = ValueExpander::finalize(alias context, copy StringValue(t.loc, filename),
+                                              ref list,
+                                              asLeft-> false);
+
+        let funcStr = ValueExpander::finalize(alias context, copy StringValue(t.loc, context.getCurrentFrameName()),
+                                              ref list,
+                                              asLeft-> false);
+
+        let fileStrType = if let t_: &YILTuple = fileStr.type { t_.inners[1] } else panic;
+        let fileStrPtr = if let t_: &YILTupleValue = fileStr { t_.values[1] } else panic;
+
+        let funcStrType = if let t_: &YILTuple = funcStr.type { t_.inners[1] } else panic;
+        let funcStrPtr = if let t_: &YILTupleValue = funcStr { t_.values[1] } else panic;
+
+        let (fileStrPtrU, _) = ValueExpander::createVarForBlock(alias context, t.loc, NONE_TYPE, fileStrType,
+                                                                ref list,
+                                                                withValue-> fileStrPtr);
+
+        let (funcStrPtrU, _) = ValueExpander::createVarForBlock(alias context, t.loc, NONE_TYPE, funcStrType,
+                                                                ref list,
+                                                                withValue-> funcStrPtr);
+
+        let call = copy YILNameCallValue(t.loc,
+                                         YIL_VOID,
+                                         YRuntimeFuncs::THROW_EXCEPT,
+                                         copy [fileStrPtrU, funcStrPtrU, line, inner]);
+
+        list:.append(copy YILCall(t.loc, call));
+        return YIL_UNIT_VALUE;
+    }
+
+    /**
+     * Finalize a panic instruction.
+     *
+     * Behavior:
+     *   - constructs file name and function name strings,
+     *   - extracts their pointer components,
+     *   - emits a call to PANIC with:
+     *         (filePtr, funcPtr, lineNumber)
+     *
+     * @params:
+     *   - context: the expansion context
+     *   - p:       the panic value
+     *   - list:    the statement list to append instructions to
+     *
+     * @returns:
+     *   - &YILValue: always YIL_UNIT_VALUE
+     */
+    pub fn finalizePanic(dmut context: &Expander, p: &PanicValue, ref mut list: StmtList)-> &YILValue {
+        let line = copy YILIntValue(p.loc, YIL_UINT_32, cast!usize(p.loc.line));
+        let filename = state::relativePath(p.loc.filename);
+
+        let fileStr = ValueExpander::finalize(alias context, copy StringValue(p.loc, filename),
+                                              ref list,
+                                              asLeft-> false);
+
+        let funcStr = ValueExpander::finalize(alias context, copy StringValue(p.loc, context.getCurrentFrameName()),
+                                              ref list,
+                                              asLeft-> false);
+
+        let fileStrType = if let t: &YILTuple = fileStr.type { t.inners[1] } else panic;
+        let fileStrPtr = if let t: &YILTupleValue = fileStr { t.values[1] } else panic;
+
+        let funcStrType = if let t: &YILTuple = funcStr.type { t.inners[1] } else panic;
+        let funcStrPtr = if let t: &YILTupleValue = funcStr { t.values[1] } else panic;
+
+        let (fileStrPtrU, _) = ValueExpander::createVarForBlock(alias context, p.loc, NONE_TYPE, fileStrType,
+                                                                ref list,
+                                                                withValue-> fileStrPtr);
+
+        let (funcStrPtrU, _) = ValueExpander::createVarForBlock(alias context, p.loc, NONE_TYPE, funcStrType,
+                                                                ref list,
+                                                                withValue-> funcStrPtr);
+
+        let call = copy YILNameCallValue(p.loc,
+                                         YIL_VOID,
+                                         YRuntimeFuncs::PANIC,
+                                         copy [fileStrPtrU, funcStrPtrU, line]);
+
+        list:.append(copy YILCall(p.loc, call));
+        return YIL_UNIT_VALUE;
+    }
+}

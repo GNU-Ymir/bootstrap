@@ -1,0 +1,268 @@
+/*
+ * Implements semantic validation for tuple list comprehensions.
+ *
+ * This module handles:
+ *   - validating iterator variables for tuple iteration,
+ *   - supporting both tuple-mode and array-mode comprehensions,
+ *   - constructing TupleValue or ArrayValue results,
+ *   - propagating aliasing rules across iterations,
+ *   - delegating per-element validation to TupleForLoopValidation.
+ *
+ * Tuple list comprehensions iterate over tuple elements using compile-time
+ * indexing and produce either a tuple or an array depending on the
+ * comprehension mode.
+ *
+ * <hr>
+ *
+ * @Package: ymirc
+ * @Module: ymirc::semantic::validator::value::compose::slicefor::tuple
+ * @File: ymirc/semantic/validator/value/compose/slicefor/tuple.yr
+ * @Author(s):
+ *   - Emile Cadorel <ecadorel@gmail.com>
+ *
+ * @Created(YYYY-MM-DD): 2026-05-15
+ * @Copyright(C) 2021–2026 GNU-Ymir
+ * @License
+ *   ```text
+ *   This file is part of the Ymir language project.
+ *
+ *   Ymir is free software: you can redistribute it and/or modify it
+ *   under the terms of the GNU General Public License as published by
+ *   the Free Software Foundation, either version 3 of the License, or
+ *   (at your option) any later version.
+ *
+ *   Ymir is distributed in the hope that it will be useful,
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *   GNU General Public License for more details.
+ *
+ *   You should have received a copy of the GNU General Public License
+ *   along with Ymir.  If not, see <https://www.gnu.org/licenses/>.
+ *   ```
+ */
+
+in tuple;
+
+use ymirc::lexing::{keys, word};
+
+use ymirc::syntax::expression::_;
+use ymirc::semantic::{validator, interpret};
+
+use ymirc::errors;
+use ymirc::semantic::generator::{value::_, type::_};
+
+use ymirc::utils::format;
+
+
+/**
+ * TupleListComprValidation module
+ *
+ * Provides semantic validation for list comprehensions applied to tuples.
+ * Tuple comprehensions support two modes:
+ *
+ *   - tuple-mode: produces a new tuple with one element per iteration,
+ *   - array-mode: produces a new array with one element per iteration.
+ *
+ */
+pub mod TupleListComprValidation {
+
+    /**
+     * Validate a list comprehension applied to a tuple.
+     *
+     * Determines whether the comprehension uses one or two iterator variables,
+     * dispatches to validate, and reports an error if the number of
+     * variables is unsupported.
+     *
+     * @params:
+     *   - context:    validation context
+     *   - tuple:      the tuple value being iterated
+     *   - tupleType:  the type of the tuple
+     *   - floop:      the SliceForAllocatorExpr describing the comprehension
+     *   - byAlias:    whether aliasing is permitted
+     *
+     * @returns:
+     *   - (value, usedAlias): the resulting comprehension value and alias usage flag
+     *
+     * @throws:
+     *   - ErrorMsg if the number of iterator variables is invalid
+     */
+    pub fn validate(dmut context: &ValidationContext,
+                    tuple:        &Value,
+                    tupleType:    &TupleType,
+                    floop:        &SliceForAllocatorExpr,
+                    byAlias:      bool)-> (&Value, bool)
+        throws ErrorMsg
+    {
+        if floop.vars.len == 1 {
+            return TupleListComprValidation::validate(alias context, tuple, tupleType, floop.vars[0], none, floop,
+                                                      byAlias-> byAlias);
+        }
+
+        if floop.vars.len == 2 {
+            return TupleListComprValidation::validate(alias context, tuple, tupleType, floop.vars[1], (floop.vars[0])?, floop,
+                                                      byAlias-> byAlias);
+        }
+
+        throw copy ErrorMsg::fatal(floop.loc, format(ValidateErrorMessage::UNDEF_FOR_LOOP_OPERATOR, floop.vars.len, tupleType));
+    }
+
+    /**
+     * Validate a list comprehension applied to a tuple.
+     *
+     * @params:
+     *   - context:    validation context
+     *   - tuple:      the tuple value
+     *   - tupleType:  the tuple type
+     *   - elemIter:   element iterator variable
+     *   - indexIter:  optional index iterator variable
+     *   - floop:      comprehension expression
+     *   - byAlias:    aliasing flag
+     *
+     * @returns:
+     *   - (value, usedAlias)
+     *
+     * @throws:
+     *   - ErrorMsg if validation fails in either mode
+     */
+    fn validate(dmut context: &ValidationContext,
+                tuple:       &Value,
+                tupleType:   &TupleType,
+                elemIter:    &VarDeclExpr,
+                indexIter:   (&VarDeclExpr)?,
+                floop:       &SliceForAllocatorExpr,
+                byAlias:     bool)-> (&Value, bool)
+        throws ErrorMsg
+    {
+        if floop.isTuple {
+            return TupleListComprValidation::validateForTuple(alias context, tuple, tupleType, elemIter, indexIter, floop,
+                                                              byAlias-> byAlias);
+        } else {
+            return TupleListComprValidation::validateForArray(alias context, tuple, tupleType, elemIter, indexIter, floop,
+                                                              byAlias-> byAlias);
+        }
+    }
+
+    /**
+     * Validate a tuple-mode comprehension over a tuple.
+     *
+     * Performs compile-time iteration over the tuple’s arity. For each index:
+     *   - validates the element and optional index iterator,
+     *   - evaluates the comprehension body,
+     *   - accumulates the resulting value and inferred type.
+     *
+     * Produces a new TupleValue with one element per iteration.
+     *
+     * @params:
+     *   - context:    validation context
+     *   - tuple:      the tuple value
+     *   - tupleType:  the tuple type
+     *   - elemIter:   element iterator variable
+     *   - indexIter:  optional index iterator variable
+     *   - floop:      comprehension expression
+     *   - byAlias:    aliasing flag
+     *
+     * @returns:
+     *   - (tupleValue, usedAlias)
+     *
+     * @throws:
+     *   - ErrorMsg if any iteration fails
+     */
+    fn validateForTuple(dmut context: &ValidationContext,
+                        tuple:       &Value,
+                        tupleType:   &TupleType,
+                        elemIter:    &VarDeclExpr,
+                        indexIter:   (&VarDeclExpr)?,
+                        floop:       &SliceForAllocatorExpr,
+                        byAlias:     bool)-> (&Value, bool)
+        throws ErrorMsg
+    {
+        let loc = floop.loc;
+        let mut content: [&Value] = [];
+        let mut innerTypes: [&Type] = [];
+        let mut usedAlias = false;
+
+        for i in 0 .. tupleType.inners.len {
+            let (blk, _, usedAlias_) = TupleForLoopValidation::validateInnerLoop(alias context, i, elemIter, indexIter, tuple, tupleType, floop.value,
+                                                                                   byMutRef-> false,
+                                                                                   byAlias-> byAlias);
+
+            let innerValue = blk.values[$ - 1];
+            let innerType = if (!MemoryVerification::needsExplicitAlias(innerValue) && innerValue.type.needsExplicitAlias) {
+                innerValue.type
+            } else {
+                innerValue.type.cloneMutableUntilBorrow()
+            };
+
+            let resultBlk = copy BlockValue(blk.loc, innerType, blk.values);
+            TupleComposeValidation::addTupleType(resultBlk,
+                                                 ref content,
+                                                 ref innerTypes);
+            usedAlias = (usedAlias || usedAlias_);
+        }
+
+        let resultType = copy TupleType(loc, innerTypes, isMutable-> true);
+        let resultValue = copy TupleValue(loc, resultType, content);
+
+        return (resultValue, usedAlias);
+    }
+
+    /**
+     * Validate an array-mode comprehension over a tuple.
+     *
+     * Performs compile-time iteration over the tuple’s arity. For each index:
+     *   - validates the element and optional index iterator,
+     *   - evaluates the comprehension body,
+     *   - accumulates the resulting value into an array buffer,
+     *   - infers the array element type using SliceComposeValidation.
+     *
+     * Produces a new ArrayValue with one element per iteration.
+     *
+     * @params:
+     *   - context:    validation context
+     *   - tuple:      the tuple value
+     *   - tupleType:  the tuple type
+     *   - elemIter:   element iterator variable
+     *   - indexIter:  optional index iterator variable
+     *   - floop:      comprehension expression
+     *   - byAlias:    aliasing flag
+     *
+     * @returns:
+     *   - (arrayValue, usedAlias)
+     *
+     * @throws:
+     *   - ErrorMsg if any iteration fails
+     */
+    fn validateForArray(dmut context: &ValidationContext,
+                        tuple:       &Value,
+                        tupleType:   &TupleType,
+                        elemIter:    &VarDeclExpr,
+                        indexIter:   (&VarDeclExpr)?,
+                        floop:       &SliceForAllocatorExpr,
+                        byAlias:     bool)-> (&Value, bool)
+        throws ErrorMsg
+    {
+        let loc = floop.loc;
+        let mut content: [&Value] = [];
+        let mut innerType: &Type = NONE_TYPE;
+        let mut usedAlias = false;
+
+        for i in 0 .. tupleType.inners.len {
+            let (value, _, usedAlias_) = TupleForLoopValidation::validateInnerLoop(alias context, i, elemIter, indexIter, tuple, tupleType, floop.value,
+                                                                                   byMutRef-> false,
+                                                                                   byAlias-> byAlias);
+
+            innerType = SliceComposeValidation::addArrayType(alias context, value, innerType,
+                                                             ref content);
+            usedAlias = (usedAlias || usedAlias_);
+        }
+
+        if content.len == 0 && innerType of NoneType {
+            innerType = VOID_TYPE;
+        }
+
+        let arrayType = copy ArrayType(loc, innerType, content.len, isMutable-> true);
+        let arrayValue = copy ArrayValue(loc, arrayType, content);
+
+        return (arrayValue, usedAlias);
+    }
+}

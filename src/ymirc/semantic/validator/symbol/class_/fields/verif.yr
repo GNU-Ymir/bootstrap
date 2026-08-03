@@ -1,0 +1,276 @@
+/*
+ * Implements semantic verification for class fields.
+ *
+ * This module handles:
+ *   - detection of illegal borrowing-union types inside class fields,
+ *   - detection of field–field name collisions between ancestor and child classes,
+ *   - detection of field–method name collisions,
+ *   - detection of shadowing between fields declared in the same class.
+ *
+ * Borrowing-union detection ensures that classes do not embed types that borrow
+ * data in illegal ways(e.g., nested borrowing inside records or overlaid
+ * classes). Collision detection ensures that field names do not conflict with
+ * inherited fields or methods.
+ *
+ * <hr>
+ *
+ * @Package: ymirc
+ * @Module: ymirc::semantic::validator::symbol::class_::fields::verif
+ * @File: ymirc/semantic/validator/symbol/class_/fields/verif.yr
+ * @Author(s):
+ *   - Emile Cadorel <ecadorel@gmail.com>
+ *
+ * @Created(YYYY-MM-DD): 2026-05-27
+ * @Copyright(C) 2021–2026 GNU-Ymir
+ * @License
+ *   ```text
+ *   This file is part of the Ymir language project.
+ *
+ *   Ymir is free software: you can redistribute it and/or modify it
+ *   under the terms of the GNU General Public License as published by
+ *   the Free Software Foundation, either version 3 of the License, or
+ *   (at your option) any later version.
+ *
+ *   Ymir is distributed in the hope that it will be useful,
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *   GNU General Public License for more details.
+ *
+ *   You should have received a copy of the GNU General Public License
+ *   along with Ymir.  If not, see <https://www.gnu.org/licenses/>.
+ *   ```
+ */
+
+in verif;
+
+use ymirc::semantic::{symbol, declarator, validator};
+use ymirc::semantic::generator::{value::_, type::_};
+use ymirc::errors;
+use ymirc::lexing::{word, keys};
+
+use ymirc::utils::format;
+
+/**
+ * ClassFieldVerification module
+ *
+ * Provides semantic verification for class fields. Responsibilities:
+ *
+ *   - detect illegal borrowing-union types,
+ *   - detect field collisions with ancestor fields,
+ *   - detect field collisions with methods(vtable entries),
+ *   - detect shadowing between fields declared in the same class.
+ *
+ * These checks ensure that:
+ *   - class fields do not embed illegal borrowing structures,
+ *   - field names remain unique across inheritance,
+ *   - field names do not collide with method names,
+ *   - fields declared in the same class do not shadow each other.
+ */
+pub mod ClassFieldVerification {
+
+    /**
+     * Verify whether a type may be declared as a field inside a class.
+     *
+     * This check enforces class-level restrictions on contained types. It is
+     * invoked during class layout validation to ensure that the class does not
+     * embed types that violate Ymir’s memory, aliasing, or representation rules.
+     *
+     * Responsibilities:
+     *   - reject movable types inside non-entity classes,
+     *   - provide specialized diagnostics for structs vs non-struct classes,
+     *   - reject aliasable(borrowing-overlay) types inside overlaid classes,
+     *   - attach contextual notes pointing to the class declaration.
+     *
+     * @params:
+     *   - loc:  location of the field being declared
+     *   - sym:  the class in which the field is declared
+     *   - type: the type of the field
+     *
+     * @throws:
+     *   - ErrorMsg if the type cannot legally be declared as a field
+     */
+
+    pub fn verifyDeclarable(loc: &Word, sym: &ClassSymbol, type: &Type)
+        throws ErrorMsg
+    {
+        if (!sym.isEntity) {
+            if (type.isMovable) {
+                if (!sym.isStruct) {
+                    throw copy ErrorMsg::fatal(loc, format(ValidateErrorMessage::CONTAIN_MOVABLE_TYPE, type),
+                                               end-> type.loc,
+                                               notes-> copy [copy ErrorMsg::note(sym.loc, format(ValidateErrorMessage::CONTAIN_MOVABLE_TYPE_NOTE))]);
+                } else {
+                    throw copy ErrorMsg::fatal(loc, format(ValidateErrorMessage::CONTAIN_MOVABLE_TYPE, type),
+                                               end-> type.loc,
+                                               notes-> copy [copy ErrorMsg::note(sym.loc, format(ValidateErrorMessage::CONTAIN_MOVABLE_TYPE_RECORD))]);
+                }
+            }
+
+            if (sym.isOverlaid && ClassFieldVerification::checkBorrowingOverlay(type)) {
+                throw copy ErrorMsg::fatal(loc, format(ValidateErrorMessage::CONTAIN_ALIASABLE_TYPE, type),
+                                           end-> type.loc,
+                                           notes-> copy [copy ErrorMsg::note(sym.loc, format(ValidateErrorMessage::CONTAIN_ALIASABLE_TYPE_NOTE))]);
+            }
+        }
+    }
+
+    /**
+     * Determine whether a type contains illegal borrowing-union structures.
+     *
+     * A type is considered a borrowing-union if:
+     *   - it borrows data(`type.borrowsData == true`), AND
+     *   - it is not a pointer type, AND
+     *   - it is not a legal container of borrowing types(e.g., record class pointers).
+     *
+     * The function recursively inspects:
+     *   - arrays,
+     *   - options,
+     *   - futures,
+     *   - enums(via proxy),
+     *   - tuples,
+     *   - class pointers(with special rules for records and overlaid classes).
+     *
+     * @params:
+     *   - type: the type to inspect
+     *
+     * @returns:
+     *   - true  if the type contains an illegal borrowing-union,
+     *   - false otherwise
+     */
+    pub fn checkBorrowingOverlay(type: &Type)-> bool {
+        if (!type.borrowsData) {
+            return false;
+        }
+
+        match type {
+            PointerType() => return false;
+            a: &ArrayType => {
+                return checkBorrowingOverlay(a.value);
+            }
+            o: &OptionType => {
+                return checkBorrowingOverlay(o.wrapped);
+            }
+            f: &FutureType => {
+                return checkBorrowingOverlay(f.retType);
+            }
+            e: &EnumType => {
+                return checkBorrowingOverlay(e.proxy);
+            }
+            t: &TupleType => {
+                for j in t.inners if checkBorrowingOverlay(j) {
+                    return true;
+                }
+
+                return false;
+            }
+            c: &ClassPtrType => {
+                if c.isRecord || c.sym.isOverlaid {
+                    {
+                        for v in c.inner.fields if checkBorrowingOverlay(v.varType) {
+                            return true;
+                        }
+                    } catch {
+                        _ => {}
+                    }
+                    return false;
+                }
+            }
+        }
+
+        return true;
+    }
+
+    /**
+     * Detect field–field name collisions between ancestor and child classes.
+     *
+     * @params:
+     *   - ancestorFields: list of VarDeclValue from ancestor classes
+     *   - localFields:    list of VarDeclValue declared in the current class
+     *
+     * @throws:
+     *   - ErrorMsg::list if any field shadows an inherited field
+     */
+    pub fn verifyCollisions(ancestorFields: [&VarDeclValue], localFields: [&VarDeclValue])
+        throws ErrorMsg
+    {
+        let mut errors: [&ErrorMsg] = [];
+
+        for lvar in localFields {
+            let mut lst: [&ErrorMsg] = [];
+            for avar in ancestorFields {
+                if (lvar.name == avar.name) {
+                    lst ~= [copy ErrorMsg::note(avar.loc, format(ValidateErrorMessage::DECLARED_HERE),
+                                                oneLine-> true)];
+                }
+            }
+
+            if lst.len != 0 {
+                errors ~= [copy ErrorMsg::fatal(lvar.loc, format(ValidateErrorMessage::SHADOWING_DECL, lvar.name),
+                                                notes-> lst)];
+            }
+        }
+
+        if (errors.len != 0) {
+            throw copy ErrorMsg::list(errors);
+        }
+    }
+
+    /**
+     * Detect field–method name collisions.
+     *
+     * A field must not have the same name as a method in the class’s vtable.
+     * This prevents ambiguous member access and ensures consistent method lookup.
+     *
+     * @params:
+     *   - localFields: list of VarDeclValue declared in the class
+     *   - vtable:      list of MethodPrototypeValue representing methods
+     *
+     * @throws:
+     *   - ErrorMsg::list if any field shadows a method
+     */
+    pub fn verifyCollisionsMethods(localFields: [&VarDeclValue], vtable: [&MethodPrototypeValue])
+        throws ErrorMsg
+    {
+        let mut errors: [&ErrorMsg] = [];
+
+        for lvar in localFields {
+            let dmut lst: [&ErrorMsg] = [];
+
+            for at in vtable {
+                if (lvar.name == at.sym.path.file) {
+                    lst ~= [copy ErrorMsg::note(at.loc, format(ValidateErrorMessage::DECLARED_HERE),
+                                                oneLine-> true)];
+                }
+            }
+
+            if lst.len != 0 {
+                errors ~= [copy ErrorMsg::fatal(lvar.loc, // Shadowing error
+                                                format(ValidateErrorMessage::SHADOWING_DECL, lvar.name),
+                                                notes-> lst)];
+            }
+        }
+
+        if (errors.len != 0) {
+            throw copy ErrorMsg::list(errors);
+        }
+    }
+
+    /**
+     * Detect shadowing between fields declared in the same class.
+     *
+     * @params:
+     *   - v:        VarDeclValue representing the field
+     *   - declared: map from field name → first definition location
+     *
+     * @throws:
+     *   - ErrorMsg if the field shadows a previously declared field
+     */
+    pub fn verifyShadow(v: &VarDeclValue, declared: [[c8] => &Word])
+        throws ErrorMsg
+    {
+        if let Ok(l) = declared[v.name] {
+            throw copy ErrorMsg::fatal(v.loc, format(ValidateErrorMessage::SHADOWING_DECL, v.name),
+                                       notes-> copy [copy ErrorMsg::note(l, ValidateErrorMessage::FIRST_DEFINED)]);
+        }
+    }
+}

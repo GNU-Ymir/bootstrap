@@ -1,0 +1,224 @@
+/*
+ * Top-level orchestrator for macro solving in the Ymir compiler.
+ *
+ * This module coordinates the entire macro-matching and macro-rewriting
+ * pipeline. It is responsible for:
+ *
+ *   - selecting the correct macro constructor(`MacroCtorSymbol`),
+ *   - solving macro rules(`MacroRuleSymbol`),
+ *   - applying skip-patterns,
+ *   - aggregating and reporting errors,
+ *   - computing precise mismatch locations,
+ *   - invoking the macro rewriter to produce final expanded content.
+ *
+ * <hr>
+ *
+ * @Package: ymirc
+ * @Module: ymirc::semantic::validator::value::operator::macro_::solve
+ * @File: ymirc/semantic/validator/value/operator/macro_/solve.yr
+ * @Author(s):
+ *   - Emile Cadorel <ecadorel@gmail.com>
+ *
+ * @Created(YYYY-MM-DD): 2024-09-02
+ * @Copyright(C) 2021–2026 GNU-Ymir
+ * @License
+ *   ```text
+ *   This file is part of the Ymir language project.
+ *
+ *   Ymir is free software: you can redistribute it and/or modify it
+ *   under the terms of the GNU General Public License as published by
+ *   the Free Software Foundation, either version 3 of the License, or
+ *   (at your option) any later version.
+ *
+ *   Ymir is distributed in the hope that it will be useful,
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *   GNU General Public License for more details.
+ *
+ *   You should have received a copy of the GNU General Public License
+ *   along with Ymir.  If not, see <https://www.gnu.org/licenses/>.
+ *   ```
+ */
+
+in solve;
+
+use ymirc::lexing::word;
+use ymirc::syntax::{declaration::_, expression::_};
+use ymirc::semantic::{symbol, validator};
+use ymirc::semantic::generator::value::_;
+
+use ymirc::errors;
+use ymirc::utils::format;
+
+use ymirc::semantic::validator::value::operator::macro_::{_, solve::_};
+
+/*!
+ * ====================================================================================================
+ * ====================================================================================================
+ * ====================================          SUBMODS          =====================================
+ * ====================================================================================================
+ * ====================================================================================================
+ */
+
+mod ::model;
+mod ::expr;
+mod ::ident;
+mod ::mult;
+mod ::or;
+mod ::token;
+mod ::utils;
+mod ::var;
+
+/*!
+ * ====================================================================================================
+ * ====================================================================================================
+ * ======================================          ROOT          ======================================
+ * ====================================================================================================
+ * ====================================================================================================
+ */
+
+/**
+ * MacroSolving module
+ *
+ * Provides the top-level solving logic for macro constructors and macro
+ * rules.
+ *
+ */
+pub mod MacroSolving {
+
+    /**
+     * Solve a macro constructor call.
+     *
+     * @returns:
+     *   - (&Word, [c8]) representing the constructor location and rewritten output.
+     *
+     * @throws:
+     *   - ErrorMsg::fatal for ambiguity or undefined constructors
+     *   - ErrorMsg::list for multiple constructor failures
+     */
+    pub fn solve(dmut context: &ValidationContext, loc: &Word, value: &MacroRefValue, str: [c8], trim: usize)-> (&Word, [c8])
+        throws ErrorMsg
+    {
+        let mut errors: [&ErrorMsg] = [];
+        let mut lefts: [&MacroCtorSymbol] = [];
+        let mut values: [[c8]] = [];
+
+        for it in value.sym.getAllLocalSymbols(protection-> Protection::PRIVATE) {
+            if let mct: &MacroCtorSymbol = it {
+                {
+                    values ~= [MacroSolving::solveCtor(alias context, loc, value, mct, MacroContent(str, trim))];
+                    lefts ~= [mct];
+                } catch {
+                    err => {
+                        errors ~= [err];
+                    }
+                }
+            }
+        }
+
+        if values.len == 0 {
+            if (errors.len == 0) {
+                throw copy ErrorMsg::fatal(loc, format(ValidateErrorMessage::UNDEFINED_CTOR_MACRO, value));
+            } else {
+                throw copy ErrorMsg::list(errors);
+            }
+        }
+
+        if (values.len != 1) {
+            let mut candidates = copy [copy ErrorMsg::note(i.loc, format(ValidateErrorMessage::CANDIDATE_ARE, i.path))
+                                       for i in lefts];
+
+            throw copy ErrorMsg::fatal(loc, format(ValidateErrorMessage::WORKS_WITH_BOTH),
+                                       notes-> candidates);
+        }
+
+        return (lefts[0].loc, values[0]);
+    }
+
+    /**
+     * Solve a specific macro constructor.
+     *
+     * @returns:
+     *   - rewritten macro output as[c8]
+     *
+     * @throws:
+     *   - ErrorMsg::fatal if trailing input remains
+     *   - ErrorMsg::note if solving fails inside the constructor
+     */
+    fn solveCtor(dmut context: &ValidationContext,
+                 loc:          &Word,
+                 msym:         &MacroRefValue,
+                 ctor:         &MacroCtorSymbol,
+                 full:         MacroContent)-> [c8]
+        throws ErrorMsg
+    {
+        let mult = ctor.decl.rule;
+        let skips = MacroSolvingUtils::createSkips(alias context, ctor.decl.skips);
+        {
+            let (retMapper, mut rest) = MacroMultSolving::solve(alias context, loc, msym, mult, full.content, skips, full, 0);
+            if let sk: &MacroMultExpr = skips {
+                let (_, postSkip) = MacroMultSolving::solveRepeat(alias context, loc, msym, sk, rest, EMPTY_EXPR, full, 0);
+                rest = postSkip;
+            }
+
+            if (rest.len != 0) {
+                let realLoc = full.computeLoc(loc, rest);
+                let centering = utils::string::center("", utils::string::maxLineLength(rest), concat-> '=');
+                throw copy ErrorMsg::fatal(ctor.loc, format(ValidateErrorMessage::MACRO_REST, centering, rest, centering),
+                                           end-> realLoc);
+            }
+            
+            if let s: &StringExpr = ctor.decl.body {
+                return MacroRewriting::rewrite(s, retMapper, 0);
+            }
+
+            return "";
+        } catch {
+            err => {
+                throw copy ErrorMsg::note(loc, format(ValidateErrorMessage::MACRO_IN_CTOR),
+                                          end-> ctor.loc,
+                                          notes-> copy [err]);
+            }
+        }
+    }
+
+    /**
+     * Solve a macro rule(`MacroRuleSymbol`) inside a macro constructor or
+     * identifier-based rule.
+     *
+     * @returns:
+     *   - (MacroMapper, [c8]) representing rewritten content and remaining input.
+     *
+     * @throws:
+     *   - ErrorMsg::note if solving fails inside the rule
+     */
+    pub fn solveRule(dmut context: &ValidationContext,
+                     loc:          &Word,
+                     msym:         &MacroRefValue,
+                     rule:         &MacroRuleSymbol,
+                     str:          [c8],
+                     full:      MacroContent,
+                     ruleIndex:    usize)-> (MacroMapper, [c8])
+        throws ErrorMsg
+    {
+        let mult = rule.decl.rule;
+        let skips = MacroSolvingUtils::createSkips(alias context, rule.decl.skips);
+
+        {
+            let (retMapper, rest) = MacroMultSolving::solve(alias context, loc, msym, mult, str, skips, full, ruleIndex);
+            if let s: &StringExpr = rule.decl.body {
+                let content = MacroRewriting::rewrite(s, retMapper, ruleIndex);
+                return (MacroMapper(content), rest);
+            }
+
+            return (MacroMapper(""), rest);
+        } catch {
+            err => {
+                let eLoc = full.computeLoc(loc, str);
+                throw copy ErrorMsg::note(eLoc, format(ValidateErrorMessage::MACRO_IN_RULE, rule.loc.str),
+                                          end-> rule.loc,
+                                          notes-> copy [err]);
+            }
+        }
+    }
+}

@@ -1,0 +1,339 @@
+/*
+ * Implements validation for variable-declaration patterns inside match
+ * expressions. A variable declaration pattern has the form:
+ *
+ *     x: T = pattern
+ *     ref x: T
+ *     lazy x
+ *     mut x: T
+ *     x
+ *
+ * and may appear inside a matcher, where it introduces a new variable binding
+ * conditioned on the success of the pattern.
+ *
+ * Responsibilities:
+ *   - validate type constraints on the declared variable
+ *   - validate implicit or explicit type tests
+ *   - validate memory-ownership semantics(ref, alias, lazy, move)
+ *   - insert the declared variable into the pattern-success scope
+ *   - recursively validate inner patterns when an initializer is present
+ *   - produce a boolean test expression for pattern success
+ *   - propagate memory-information for the matched value
+ *
+ * <hr>
+ *
+ * @Package: ymirc
+ * @Module: ymirc::semantic::validator::value::control::match_::vardecl
+ * @File: ymirc/semantic/validator/value/control/match_/vardecl.yr
+ * @Author(s):
+ *   - Emile Cadorel <ecadorel@gmail.com>
+ *
+ * @Created(YYYY-MM-DD): 2026-04-07
+ * @Copyright(C) 2021–2026 GNU-Ymir
+ * @License
+ *   ```text
+ *   This file is part of the Ymir language project.
+ *
+ *   Ymir is free software: you can redistribute it and/or modify it
+ *   under the terms of the GNU General Public License as published by
+ *   the Free Software Foundation, either version 3 of the License, or
+ *   (at your option) any later version.
+ *
+ *   Ymir is distributed in the hope that it will be useful,
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *   GNU General Public License for more details.
+ *
+ *   You should have received a copy of the GNU General Public License
+ *   along with Ymir.  If not, see <https://www.gnu.org/licenses/>.
+ *   ```
+ */
+
+
+in vardecl;
+
+use ymirc::lexing::{word, tokens, keys};
+use ymirc::syntax::expression::_;
+use ymirc::semantic::validator;
+use ymirc::semantic::generator::{value::_, type::_};
+
+use ymirc::errors;
+use ymirc::utils::format;
+
+use ymirc::semantic::validator::value::control::match_::_;
+
+
+/**
+ * MatchVarDeclValidation module
+ *
+ * Provides validation for variable-declaration patterns used inside
+ * match expressions. These declarations may introduce:
+ *
+ *   - type constraints
+ *   - reference bindings(ref)
+ *   - lazy bindings
+ *   - mutability constraints
+ *   - inner pattern matching on an initializer
+ *
+ * Semantics:
+ *   - The declared variable is inserted into the pattern-success block.
+ *   - A type test is generated when the declared type is not trivially
+ *     compatible with the matched value.
+ *   - The matched value may be cast to the declared type when safe.
+ *   - Memory semantics(ref, alias, lazy, move) are propagated and
+ *     verified.
+ *   - If an initializer pattern is present, it is validated using the
+ *     casted value.
+ *
+ */
+pub mod MatchVarDeclValidation {
+
+    /**
+     * Validate a variable-declaration pattern and return:
+     *   - a boolean test expression for pattern success
+     *   - updated memory information
+     *
+     * Error handling:
+     *   - On failure, an error-typed variable is inserted(unless `_`) to
+     *     avoid undefined-symbol errors in later patterns.
+     *
+     * @returns:
+     *   (testExpression, memoryInfo)
+     *
+     * @throws:
+     *   ErrorMsg if the declaration or its initializer is invalid.
+     */
+    pub fn validate(dmut context: &ValidationContext,
+                    value:        &Value,
+                    vdecl:        &VarDeclExpr,
+                    memInfo:      MemoryInfo,
+                    canBeLazy:    bool,
+                    ref mut vars: [&VarDeclValue])-> (&Value, MemoryInfo)
+        throws ErrorMsg
+    {
+        VariableVerification::verifyShadow(context, vdecl.name, name-> vdecl.name.str, isQuoted-> vdecl.isQuoted);
+        MatchVerification::verifyShadow(vdecl.name, vdecl.name.str, vars);
+
+        {
+            let result = MatchVarDeclValidation::validateValue(alias context, value, vdecl, memInfo,
+                                                               isRef-> vdecl.isRef,
+                                                               isLazy-> vdecl.isLazy,
+                                                               canBeLazy-> canBeLazy);
+
+            let mut tLoc = vdecl.name;
+            if (vdecl.type !of EmptyExpr) {
+                tLoc = vdecl.type.loc;
+            }
+
+            TypeVerification::verifyNonVoid(tLoc, result.type, true);
+
+            // if the variable is lazy it cannot be mutable unless it borrows mutable data
+            if (result.type.isMutable && !result.type.needsExplicitAlias && vdecl.isLazy) {
+                throw copy ErrorMsg::fatal(vdecl.isMutOrDmut,
+                                           format(format(ValidateErrorMessage::MUTABLE_LAZY_VAR)));
+            }
+
+            if ((vdecl.isMutable || vdecl.isDeeplyMutable) && result.type of LambdaType) {
+                throw copy ErrorMsg::fatal(vdecl.isMutOrDmut,
+                                           format(ValidateErrorMessage::MUTABLE_LAMBDA_VAR));
+            }
+
+            let var = copy VarDeclValue(vdecl.name,
+                                        result.type,
+                                        result.value,
+                                        isReference-> vdecl.isRef,
+                                        isLazy-> vdecl.isLazy,
+                                        isMutable-> result.type.isMutable);
+
+            vars ~= [var]; // add the declaration in the pattern matching success block
+
+            let mut valueTest: &Value = TRUE_BOOL_VALUE;
+            let mut innerMemInfo = MemoryInfo();
+            if (vdecl.value !of EmptyExpr) { // x: T = V => // inner pattern matching on V using /cast!T(value)/ (since the type test was true)
+                let innerResult = MatchValidation::validatePattern(alias context, result.castValue, vdecl.value, memInfo, ref vars);
+                valueTest = innerResult._0;
+                innerMemInfo = innerResult._1;
+            }
+
+            // test type && test value to be a successful pattern matcher
+            let finalCond = copy LogicalBoolOperatorValue(vdecl.loc, BinaryOperators::DAND, result.typeTest, valueTest);
+            return (finalCond, result.memInfo | innerMemInfo);
+        } catch {
+            err: &ErrorMsg => { // insert error variable to avoid undefined symbol errors
+                if (vdecl.name != Keys::UNDER) {
+                    let var = copy VarDeclValue(vdecl.name,
+                                                copy ErrorType(vdecl.name),
+                                                UNIT_VALUE,
+                                                isReference-> vdecl.isRef,
+                                                isLazy-> vdecl.isLazy,
+                                                isMutable-> false);
+
+                    vars ~= [var];
+                }
+
+                throw err;
+            }
+        }
+    }
+
+    /**
+     * Validate the type and memory semantics of a variable-declaration pattern,
+     * without inserting the variable or validating initializer patterns.
+     *
+     * @returns:
+     *   VarDeclPatternResult
+     *
+     * @throws:
+     *   ErrorMsg if type or memory semantics are invalid.
+     */
+    pub fn validateValue(dmut context: &ValidationContext,
+                         value:        &Value,
+                         vdecl:        &VarDeclExpr,
+                         isRef:        bool,
+                         memInfo:      MemoryInfo,
+                         isLazy:       bool = false,
+                         canBeLazy:    bool = false)-> VarDeclPatternResult
+        throws ErrorMsg
+    {
+        let (typeTest, castedValue, resType) = match vdecl.type {
+            EmptyExpr() => {
+                let type = TypeValidation::validateForVarDecl(alias context,
+                                                              copy TypeWrapperExpr(value.loc, value.type),
+                                                              vdecl,
+                                                              canBeRef-> true,
+                                                              canBeLazy-> canBeLazy);
+                (TRUE_BOOL_VALUE, value, type)
+            }
+            _ => {
+                MatchVarDeclValidation::validateType(alias context, value, vdecl, isRef, canBeLazy)
+            }
+        };
+
+        let dmut interpret = if (memInfo.isByMutRef || isRef) {
+            alias context.cteInterpretForRef
+        } else { alias context.cteInterpret };
+
+        // Reducing the value if it's not by reference
+        // Transform the value to be implicit casted to the type
+        let mut retInfo = MemoryInfo(byLazy-> (isLazy && memInfo.isByLazy));
+        let mut postCtdValue = TypeInference::inferValueForType(alias context,
+                                                                vdecl.name,
+                                                                interpret:.reduce(castedValue),
+                                                                resType,
+                                                                byReference-> isRef);
+
+        if (memInfo.isByMutRef && isRef && postCtdValue.isLvalue && postCtdValue.type.isMutable) {
+            postCtdValue = copy ReferencerValue(postCtdValue.loc, postCtdValue.type, postCtdValue, isMutable-> true);
+            retInfo = MemoryInfo(byMutRef-> true);
+        }
+
+        else if (!isRef && (memInfo.isByAlias || memInfo.isByMutRef) && resType.isMutable && resType.needsExplicitAlias) {
+            // if we mix pattern using ref and alias, then ref has priority and can be used as alias
+            postCtdValue = copy AliaserValue(value.loc, postCtdValue.type, postCtdValue);
+            retInfo = MemoryInfo(byAlias-> true, byLazy-> (isLazy && memInfo.isByLazy));
+        }
+
+        else if (isRef && !memInfo.isByMutRef && postCtdValue.isLvalue) {
+            postCtdValue = copy ReferencerValue(postCtdValue.loc, postCtdValue.type, postCtdValue, isMutable-> false);
+            retInfo = MemoryInfo();
+        }
+
+        // Verify memory implicit alias/ref and mutability
+        MemoryVerification::verifyMemoryOwner(vdecl.name,
+                                              resType,
+                                              postCtdValue,
+                                              construct-> true,
+                                              byReference-> isRef,
+                                              byLazy-> isLazy,
+                                              byMove-> memInfo.isByMove);
+
+        return VarDeclPatternResult(typeTest-> typeTest,
+                                    type-> resType,
+                                    value-> postCtdValue,
+                                    castValue-> castedValue,
+                                    memInfo-> retInfo);
+    }
+
+
+    /**
+     * Validate the explicit type annotation of a variable-declaration pattern
+     * and determine:
+     *
+     *   - the type-test expression
+     *   - the casted value
+     *   - the resulting type
+     *
+     * Handles class-pointer casting rules:
+     *
+     *   - Derived => Base is allowed(handled by binary operator validator).
+     *   - Base => Derived requires a runtime type-test and cast.
+     *   - ref mut x: &Base = ref y: Derived is forbidden(unsafe).
+     *   - ref mut x: Derived = ref y: Base is allowed.
+     *
+     * @returns:
+     *   (typeTestExpression, castedValue, resultingType)
+     *
+     * @throws:
+     *   ErrorMsg if the cast is unsafe or the type is invalid.
+     */
+    fn validateType(dmut context: &ValidationContext,
+                    value:        &Value,
+                    vdecl:        &VarDeclExpr,
+                    isRef:        bool,
+                    canBeLazy:    bool)-> (&Value, &Value, &Type)
+        throws ErrorMsg
+    {
+        let mut resType: &Type = TypeValidation::validateForVarDecl(alias context,
+                                                                    vdecl.type,
+                                                                    vdecl,
+                                                                    canBeRef-> true,
+                                                                    canBeLazy-> canBeLazy);
+
+        let mut typeTest: &Value = TRUE_BOOL_VALUE;
+        let mut castedValue: &Value = value;
+
+        // a class reverse casting: Base-> Derived can only be known at cte
+        if let (valueType: &ClassPtrType, declType: &ClassPtrType) = (value.type, resType) {
+
+            // value is a Derived of derived, or derived is a Derived of value,
+            // both are allowed but one has to be runtime evaluated(Derived <-
+            // Base)
+            //
+            if !declType.isCompatible(valueType) {
+                // unless it is a Derived-> Base, but that is already managed
+                // by the binary operator validator
+                //
+                // ref mut x: &Base = ref y: Derived is not allowed, because x =
+                // copy Base() will result in undefined behavior
+                //
+                if (isRef && TypeVerification::isAncestor(declType, valueType)) {
+                    throw copy ErrorMsg::fatal(vdecl.name,
+                                               end-> value.loc,
+                                               format(ValidateErrorMessage::CANNOT_CASTTO_BASE_CLASS, valueType, declType),
+                                               notes-> copy [copy ErrorMsg::note(vdecl.refLoc, "")]);
+                }
+
+                // However, ref mut x: Derived = ref y: Base, is allowed we can
+                // only put a Derived into x, thus y will always contain a Base
+                // so no problem
+                //
+                // Create the runtime test to check wether the value is
+                // containing an instance of the type of the variable decl
+                //
+                typeTest = BinaryTypeValidation::validate(vdecl.type.loc,
+                                                          BinaryOperators::OF,
+                                                          value,
+                                                          declType.inner);
+
+                // we clone the derived type to match the base type mutability
+                let castType = declType.clone(pattern-> valueType);
+
+                // cast the value into the type of the variable decl
+                castedValue = copy CastValue(resType.loc, castType, value, isLvalue-> value.isLvalue);
+            }
+        }
+
+        return (typeTest, castedValue, resType);
+    }
+
+}

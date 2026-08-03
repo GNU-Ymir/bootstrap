@@ -1,0 +1,563 @@
+/*
+ * Implements overload resolution and call dispatch for multi-symbol values
+ * (MultSymValue) in Ymir.
+ *
+ * Responsibilities:
+ *   - Partition callable candidates into template and non-template groups.
+ *   - Validate calls against all non-template candidates and select the
+ *     highest-scoring overload.
+ *   - Validate calls against template candidates when non-template
+ *     candidates fail.
+ *   - Perform template instantiation and implicit template declaration.
+ *   - Detect ambiguous overloads and score collisions.
+ *   - Dispatch calls to the appropriate call validator:
+ *
+ * <hr>
+ *
+ * @Package: ymirc
+ * @Module: ymirc::semantic::validator::value::operator::call::multsym
+ * @File: ymirc/semantic/validator/value/operator/call/multsym.yr
+ * @Author(s):
+ *   - Emile Cadorel <ecadorel@gmail.com>
+ *
+ * @Created(YYYY-MM-DD): 2026-04-25
+ * @Copyright(C) 2021–2026 GNU-Ymir
+ * @License
+ *   ```text
+ *   This file is part of the Ymir language project.
+ *
+ *   Ymir is free software: you can redistribute it and/or modify it
+ *   under the terms of the GNU General Public License as published by
+ *   the Free Software Foundation, either version 3 of the License, or
+ *   (at your option) any later version.
+ *
+ *   Ymir is distributed in the hope that it will be useful,
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *   GNU General Public License for more details.
+ *
+ *   You should have received a copy of the GNU General Public License
+ *   along with Ymir.  If not, see <https://www.gnu.org/licenses/>.
+ *   ```
+ */
+
+in multsym;
+
+use ymirc::syntax::declaration::_;
+use ymirc::semantic::{validator, template_};
+use ymirc::semantic::generator::{value::_, type::_};
+
+use ymirc::errors;
+use ymirc::utils::format;
+
+use ymirc::lexing::{word, tokens, keys};
+use ymirc::semantic::validator::value::operator::call::_;
+
+use std::io;
+
+/**
+ * MultSymCallValidation
+ *
+ * Core overload-resolution engine for call expressions.
+ *
+ * A MultSymValue represents a set of callable candidates:
+ *
+ *      { f, g, h, T!(), method, ctor, ... }
+ *
+ * This module:
+ *   - Splits candidates into template and non-template groups.
+ *   - Attempts non-template overload resolution first.
+ *   - Falls back to template overload resolution if needed.
+ *   - Computes overload scores and selects the highest-scoring candidate.
+ *   - Detects ambiguous overloads(score collisions).
+ *   - Performs template instantiation when a template candidate wins.
+ *   - Dispatches the final call to the appropriate call validator.
+ *
+ *
+ */
+pub mod MultSymCallValidation {
+
+    /**
+     * Validate a call on a multi-symbol value(MultSymValue).
+     *
+     * @params:
+     *   - context: validation context
+     *   - loc:     location of the call operator
+     *   - left:    the multi-symbol value containing callable candidates
+     *   - rights:  list of argument values
+     *   - nbNamed: number of named arguments in `rights`
+     *   - inCopy:  whether the call occurs inside a copy expression
+     *
+     * @returns:
+     *   (value, score)
+     *     - value: the selected callable result
+     *     - score: overload-resolution score contribution
+     *
+     * @throws:
+     *   ErrorMsg if no candidate matches or if overload resolution is ambiguous.
+     */
+    pub fn validate(dmut context: &ValidationContext,
+                     loc:          &Word,
+                     left:         &MultSymValue,
+                     rights:       [&Value],
+                     nbNamed:      usize,
+                     inCopy:       bool)-> (&Value, u32)
+        throws ErrorMsg
+    {
+        let prettyName = CallParamListCreation::formatPrettyName(left);
+        let (nonTemplates, templates) = MultSymCallValidation::divideByPriority(left.values);
+
+        let mut nonTemplateError: (&ErrorMsg)? = none;
+        let mut call: [&Value] = [];
+        let mut res: [&Value] = [];
+        let mut rewrite: [TemplateMapper] = [];
+        let mut score: u32 = 0;
+
+        if nonTemplates.len != 0 {
+            let (c, r, s) = MultSymCallValidation::validateValueList(alias context, loc, prettyName, nonTemplates, rights,
+                                                                      nbNamed-> nbNamed,
+                                                                      inCopy-> inCopy);
+
+            call = c;
+            res = r;
+            score = s;
+        } catch { // there is no need to worry of empty list, it is managed in validateValueList
+            err => { // there is no value in non template values that works with rigths
+                if (templates.len == 0us) throw err;
+                nonTemplateError = err?;
+            }
+        }
+
+        if templates.len != 0 && res.len == 0 {
+            let (c, r, rw, s) = MultSymCallValidation::validateValueTemplateList(alias context, loc, prettyName, templates, rights,
+                                                                                  nbNamed-> nbNamed);
+
+            if (r.len == 1us) {
+                MultSymCallValidation::finalizeImplicitTemplateDeclaration(alias context, loc, rw[0us], c[0us]);
+            }
+
+            call = c;
+            res = r;
+            rewrite = rw;
+            score = s;
+        } catch { // there is no need to worry of empty list here either, it is managed in validateValueList
+            templateError => { // Does not work with both template and non templates
+                if let Ok(err) = nonTemplateError {
+                    throw copy ErrorMsg::list(copy [err, templateError]);
+                }
+
+                throw templateError;
+            }
+        }
+
+        MultSymCallValidation::checkNoScoreCollision(loc, call, prettyName, rewrite, rights);
+        return (res[0], score);
+    }
+
+    /**
+     * Partition a list of callable values into:
+     *   - non-template candidates
+     *   - template candidates
+     *
+     * @params:
+     *   - list: list of callable values
+     *
+     * @returns:
+     *   (nonTemplates, templates)
+     */
+    fn divideByPriority(list: [&Value])-> ([&Value], [&Value]) {
+        let mut nonTemplates: [&Value] = [];
+        let mut templates: [&Value] = [];
+
+        for i in list match i {
+            t: &TemplateRefValue => { templates ~= [t]; }
+            m: &MethodDelegateTemplateValue => { templates ~= [m]; }
+            c: &CtorDelegateTemplateValue => { templates ~= [c]; }
+            _ => { nonTemplates ~= [i]; }
+        }
+
+        return (nonTemplates, templates);
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * =================================          NON TEMPLATES          ==================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Attempt overload resolution among non-template candidates.
+     *
+     * For each candidate:
+     *   - validateCall() is invoked in candidate mode
+     *   - successful candidates are scored
+     *   - the highest-scoring candidates are retained
+     *
+     * If no candidate succeeds, a fatal UNDEFINED_CALL_OP error is thrown.
+     *
+     * @params:
+     *   - context:     validation context
+     *   - loc:         call location
+     *   - prettyName:  formatted name of the call target
+     *   - lefts:       list of non-template candidates
+     *   - rights:      argument list
+     *   - nbNamed:     number of named arguments
+     *   - inCopy:      whether the call occurs inside a copy expression
+     *
+     * @returns:
+     *   (callValues, results, highestScore)
+     */
+    fn validateValueList(dmut context: &ValidationContext,
+                          loc:          &Word,
+                          prettyName:   [c8],
+                          lefts:        [&Value],
+                          rights:       [&Value],
+                          nbNamed:      usize,
+                          inCopy:       bool = false)-> ([&Value], [&Value], u32)
+        throws ErrorMsg
+    {
+        let mut results: [&Value] = []; // stores the list of call validation left[i] (rigths)
+        let mut call: [&Value] = []; // stores the list of used values left[i]
+        let mut highestScore = 0u32;
+        let mut errors: [&ErrorMsg] = [];
+
+        for it in lefts { // traverse all the candidates
+            {
+                let (gen, score) = MultSymCallValidation::validateCall(alias context, loc, it, rights,
+                                                                        nbNamed-> nbNamed,
+                                                                        candidate-> true,
+                                                                        inCopy-> inCopy);
+
+                if (score > highestScore) { // It works and has a better score than previous candidates
+                    highestScore = score;
+                    results = copy [gen]; // all the last success are removed, they have a lesser score
+                    call = copy [it];
+                } else if (score == highestScore) { // It works and has the same score
+                    results ~= [gen];
+                    call ~= [it];
+                } // Does work, but with a lesser score, just skip it
+            } catch {
+                err: &ErrorMsg => { // Does not work
+                    errors ~= [err]; // we store the error, if no candidate works we need to use the error
+                }
+            }
+        }
+
+        if (results.len == 0us) { // No candidates work, we throw all the stored errors
+            throw copy ErrorMsg::fatal(loc, format(ValidateErrorMessage::UNDEFINED_CALL_OP, prettyName, CallParamListCreation::formatParamsWithTypes(rights)),
+                                        notes-> errors)
+        }
+
+        // Some values succeeded in the call, so we return them, along with the score they generate
+        return (call, results, highestScore);
+    }
+
+    /**
+     * Dispatch a call to the appropriate call validator based on the
+     * dynamic type of the left operand.
+     *
+     * Supports:
+     *   - FuncPtrType
+     *   - DelegateType
+     *   - MethodDelegateValue
+     *   - FakeMethodDelegateValue
+     *   - CtorDelegateValue
+     *   - PrototypeValue
+     *   - VarRefValue(recursively dereferenced)
+     *   - LambdaValue
+     *
+     * @params:
+     *   - context:   validation context
+     *   - loc:       call location
+     *   - left:      the callable value
+     *   - rights:    argument list
+     *   - nbNamed:   number of named arguments
+     *   - candidate: whether this is candidate-mode validation
+     *   - inCopy:    whether the call occurs inside a copy expression
+     *
+     * @returns:
+     *   (value, score)
+     */
+    pub fn validateCall(dmut context: &ValidationContext,
+                         loc:          &Word,
+                         left:         &Value,
+                         rights:       [&Value],
+                         nbNamed:      usize,
+                         candidate:    bool = true,
+                         inCopy:       bool = false)-> (&Value, u32)
+        throws ErrorMsg
+    {
+        match left.type {
+            fptr: &FuncPtrType => {
+                return FuncPtrCallValidation::validate(alias context, loc, fptr, left, rights,
+                                                        nbNamed-> nbNamed,
+                                                        candidate-> candidate);
+            }
+            dl: &DelegateType => {
+                return DelegateCallValidation::validate(alias context, loc, dl, left, rights,
+                                                         nbNamed-> nbNamed,
+                                                         candidate-> candidate);
+            }
+        }
+
+        match left {
+            m: &MethodDelegateValue => {
+                return MethodCallValidation::validate(alias context, loc, m, rights,
+                                                       nbNamed-> nbNamed,
+                                                       candidate-> candidate);
+            }
+            m: &FakeMethodDelegateValue => {
+                return MethodCallValidation::validate(alias context, loc, m, rights,
+                                                       nbNamed-> nbNamed,
+                                                       candidate-> candidate);
+            }
+            m: &CtorDelegateValue => {
+                return CtorCallValidation::validate(alias context, loc, m, rights,
+                                                     nbNamed-> nbNamed,
+                                                     candidate-> candidate,
+                                                     inCopy-> inCopy);
+            }
+            f: &PrototypeValue => {
+                return PrototypeCallValidation::validate(alias context, loc, f, rights,
+                                                          nbNamed-> nbNamed,
+                                                          candidate-> candidate);
+            }
+            v: &VarRefValue => {
+                if (v.value !of UnitValue) {
+                    return MultSymCallValidation::validateCall(alias context, loc, v.value, rights,
+                                                                nbNamed-> nbNamed,
+                                                                candidate-> candidate,
+                                                                inCopy-> inCopy); // we pass inCopy, it might be a global VarRef to a def class ctor
+                }
+
+                throw copy ErrorMsg::fatal(v.declLoc, ValidateErrorMessage::DEFINED_HERE,
+                                            notes-> copy [copy ErrorMsg::note(loc, format(ValidateErrorMessage::NOT_CALLABLE, v.type),
+                                                                               oneLine-> true,
+                                                                               withLoc-> true)]);
+            }
+            l: &LambdaValue => {
+                return LambdaCallValidation::validate(alias context, loc, l, rights,
+                                                       nbNamed-> nbNamed,
+                                                       candidate-> candidate);
+            }
+        }
+
+        throw copy ErrorMsg::fatal(left.loc,
+                                    format(ValidateErrorMessage::IS_NOT_CALLABLE, CallParamListCreation::formatPrettyName(left)));
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ===================================          TEMPLATES          ====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Attempt overload resolution among template candidates.
+     *
+     * For each template candidate:
+     *   - validateTemplateCall() is invoked in candidate mode
+     *   - successful candidates are scored
+     *   - the highest-scoring candidates are retained
+     *
+     * If no candidate succeeds, a fatal UNDEFINED_CALL_OP error is thrown.
+     *
+     * @params:
+     *   - context:     validation context
+     *   - loc:         call location
+     *   - prettyName:  formatted name of the call target
+     *   - lefts:       list of template candidates
+     *   - rights:      argument list
+     *   - nbNamed:     number of named arguments
+     *
+     * @returns:
+     *   (callValues, results, mappers, highestScore)
+     */
+    fn validateValueTemplateList(dmut context: &ValidationContext,
+                                  loc:          &Word,
+                                  prettyName:   [c8],
+                                  lefts:        [&Value],
+                                  rights:       [&Value],
+                                  nbNamed:      usize)-> ([&Value], [&Value], [TemplateMapper], u32)
+        throws ErrorMsg
+    {
+        // We store the results inside a vector, where to each valid values is associated the correct mapper
+        let mut results: [&Value] = [];; // stores the list of call validation(left[i] (rigths)
+        let mut call: [&Value] = []; // stores the list of used values(left[i])
+        let mut syms: [TemplateMapper] = []; // stores the list of generated symbols
+        let mut highestScore = 0u32;
+        let mut errors: [&ErrorMsg] = [];
+
+        for it in lefts {
+            {
+                let (value, sym, score) = MultSymCallValidation::validateTemplateCall(alias context, loc, it, rights,
+                                                                                       nbNamed-> nbNamed,
+                                                                                       candidate-> true);
+
+                if (score > highestScore) { // It works and has a better score than previous candidates
+                    highestScore = score;
+                    results = copy [value]; // all the last success are removed, they have a lesser score
+                    call = copy [it];
+                    syms = copy [sym];
+                } else if (score == highestScore) { // It works and has the same score
+                    results ~= [value];
+                    call ~= [it];
+                    syms ~= [sym];
+                }
+            } catch {
+                err: &ErrorMsg => { // does not work
+                    errors ~= [err];
+                }
+            }
+        }
+
+        if (results.len == 0us) { // No candidates work, we throw all the stored errors
+            throw copy ErrorMsg::fatal(loc, format(ValidateErrorMessage::UNDEFINED_CALL_OP, prettyName, CallParamListCreation::formatParamsWithTypes(rights)),
+                                        notes-> errors)
+        }
+
+        // Some values succeeded in the call, so we return them, along with the score they generate
+        return (call, results, syms, highestScore);
+    }
+
+    /**
+     * Dispatch a template call to the appropriate template-call validator.
+     *
+     * Supports:
+     *   - MethodDelegateTemplateValue
+     *   - CtorDelegateTemplateValue
+     *   - TemplateRefValue(function templates)
+     *
+     * @params:
+     *   - context:   validation context
+     *   - loc:       call location
+     *   - left:      template candidate
+     *   - rights:    argument list
+     *   - nbNamed:   number of named arguments
+     *   - candidate: whether this is candidate-mode validation
+     *
+     * @returns:
+     *   (value, mapper, score)
+     */
+    fn validateTemplateCall(dmut context: &ValidationContext,
+                             loc:          &Word,
+                             left:         &Value,
+                             rights:       [&Value],
+                             nbNamed:      usize,
+                             candidate:    bool = false)-> (&Value, TemplateMapper, u32)
+        throws ErrorMsg
+    {
+        match left {
+            m: &MethodDelegateTemplateValue => {
+                return TemplatePrototypeCallValidation::validateMethod(alias context, loc, m, rights,
+                                                                        nbNamed-> nbNamed,
+                                                                        candidate-> candidate);
+            }
+            c: &CtorDelegateTemplateValue => {
+                return TemplatePrototypeCallValidation::validateCtor(alias context, loc, c, rights,
+                                                                      nbNamed-> nbNamed,
+                                                                      candidate-> candidate);
+            }
+            t: &TemplateRefValue => {
+                if let f: &FunctionDecl = t.sym.decl.decl {
+                    return TemplatePrototypeCallValidation::validateFunction(alias context, loc, t, f, rights,
+                                                                              nbNamed-> nbNamed,
+                                                                              candidate-> candidate);
+                }
+            }
+        }
+
+        throw copy ErrorMsg::fatal(left.loc,
+                                    format(ValidateErrorMessage::IS_NOT_CALLABLE, CallParamListCreation::formatPrettyName(left)));
+    }
+
+    /**
+     * Perform implicit template declaration when a template candidate wins
+     * overload resolution and exactly one candidate succeeded.
+     *
+     * The mapper contains the instantiated template parameters.
+     *
+     * @params:
+     *   - context:  validation context
+     *   - loc:      call location
+     *   - mapper: template mapper describing the instantiation
+     *   - value:    the template candidate being instantiated
+     */
+    fn finalizeImplicitTemplateDeclaration(dmut context: &ValidationContext, loc: &Word, mapper: TemplateMapper, value: &Value)
+        throws ErrorMsg
+    {
+        match value {
+            m: &MethodDelegateTemplateValue => {
+                TemplateDeclaration::declare(alias context, loc, mapper, m.proto);
+            }
+            c: &CtorDelegateTemplateValue => {
+                TemplateDeclaration::declare(alias context, loc, mapper, c.proto);
+            }
+            x: &TemplateRefValue => {
+                TemplateDeclaration::declare(alias context, loc, mapper, x);
+            }
+            z: _ => {
+                eprintln("internal compiler error, in template call finalization ", z.__typeinfo__.name);
+                panic;
+            }
+        }
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          CHECKING          ====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Detect ambiguous overloads where multiple candidates have the same
+     * highest score.
+     *
+     * If more than one candidate succeeded, a WORKS_WITH_BOTH error is thrown,
+     * with notes describing each candidate and its template specialization(if
+     * any).
+     *
+     * @params:
+     *   - loc:        call location
+     *   - call:       list of successful candidates
+     *   - prettyName: formatted name of the call target
+     *   - rewrite:    list of template mappers(may be empty)
+     *   - rights:     argument list
+     *
+     * @throws:
+     *   ErrorMsg describing the ambiguity.
+     */
+    fn checkNoScoreCollision(loc: &Word, call: [&Value], prettyName: [c8], rewrite: [TemplateMapper], rights: [&Value])
+        throws ErrorMsg
+    {
+        if (call.len != 1us) {
+            // there are more than one success in the call validation, so we need to throw the error of 'works with both'
+            // This error is not managed in validateValueList, because we don't want to validate templates when it occurs
+
+            let mut errors: [&ErrorMsg] = [];
+            for i in 0us .. call.len {
+                let mut notes: [&ErrorMsg] = [];
+                if (rewrite.len > i) {
+                    notes = copy [copy ErrorMsg::note(call[i].loc, format(ValidateErrorMessage::TEMPLATE_SPE, rewrite[i]),
+                                                       oneLine-> true)];
+                }
+
+                let msg = copy ErrorMsg::note(call[i].loc, format(ValidateErrorMessage::CANDIDATE_ARE, CallParamListCreation::formatPrettyName(call[i])),
+                                               oneLine-> true,
+                                               withLoc-> true,
+                                               notes-> notes);
+
+                errors ~= [msg];
+            }
+
+            throw copy ErrorMsg::fatal(loc, format(ValidateErrorMessage::WORKS_WITH_BOTH, prettyName, rights),
+                                        notes-> errors);
+        }
+    }
+}

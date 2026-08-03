@@ -1,0 +1,362 @@
+/*
+ * Implements semantic validation for range-based `for` loops in Ymir.
+ *
+ * Responsibilities:
+ *   - Validate iteration over ranges, both at runtime and compile-time.
+ *   - Extract and reduce range fields(fst, scd, step, contains).
+ *   - Compute iteration count using RangeInterpret::reduceLen().
+ *   - Build iterator variables and loop control expressions.
+ *   - Support constant-folded(cte) range loops with full unrolling.
+ *   - Manage loop and block scopes, including error aggregation.
+ *
+ * This module is invoked when the left operand of a `for` loop is a range.
+ *
+ * <hr>
+ *
+ * @Package: ymirc
+ * @Module: ymirc::semantic::validator::value::control::for_::range
+ * @File: ymirc/semantic/validator/value/control/for_/range.yr
+ * @Author(s):
+ *   - Emile Cadorel <ecadorel@gmail.com>
+ *
+ * @Created(YYYY-MM-DD): 2026-05-14
+ * @Copyright(C) 2021–2026 GNU-Ymir
+ * @License
+ *   ```text
+ *   This file is part of the Ymir language project.
+ *
+ *   Ymir is free software: you can redistribute it and/or modify it
+ *   under the terms of the GNU General Public License as published by
+ *   the Free Software Foundation, either version 3 of the License, or
+ *   (at your option) any later version.
+ *
+ *   Ymir is distributed in the hope that it will be useful,
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *   GNU General Public License for more details.
+ *
+ *   You should have received a copy of the GNU General Public License
+ *   along with Ymir.  If not, see <https://www.gnu.org/licenses/>.
+ *   ```
+ */
+
+in range;
+
+use ymirc::lexing::{word, keys};
+
+use ymirc::syntax::expression::_;
+use ymirc::semantic::{validator, interpret};
+use ymirc::semantic::generator::{value::_, type::_};
+
+use ymirc::errors;
+
+use ymirc::utils::{format, bigint};
+
+
+/**
+ * RangeForLoopValidation
+ *
+ * Provides semantic validation for `for` loops iterating over ranges.
+ *
+ * Supports:
+ *   - Runtime range loops:
+ *         for i in a .. b { ... }
+ *
+ *   - Compile-time range loops:
+ *         cte for i in 0 .. 10 { ... }
+ *
+ */
+pub mod RangeForLoopValidation {
+
+    /**
+     * Validate a runtime `for` loop iterating over a range.
+     *
+     * @params:
+     *   - context:   validation context
+     *   - range:     range value
+     *   - rangeType: static type of the range
+     *   - floop:     for-loop expression
+     *
+     * @returns:
+     *   A BlockValue containing iterator declarations and the loop.
+     *
+     * @throws:
+     *   ErrorMsg if the iterator count is not 1 or if range fields are invalid.
+     */
+    pub fn validate(dmut context: &ValidationContext,
+                    range:         &Value,
+                    rangeType:    &RangeType,
+                    floop:        &ForLoopExpr)-> &Value
+        throws ErrorMsg
+    {
+        if floop.vars.len != 1 {
+            throw copy ErrorMsg::fatal(floop.loc, format(ValidateErrorMessage::UNDEF_FOR_LOOP_OPERATOR, floop.vars.len, rangeType));
+        }
+
+        let loc = floop.loc;
+        let (fst, scd, step, contains) = ValueCreation::createRangeUnwrap(alias context, range, rangeType,
+                                                                          reduce-> true);
+
+        let iterDecl = copy VarDeclValue(loc.locate(ForLoopKeys::ITER), USIZE_TYPE, copy IntValue(loc, USIZE_TYPE, 0),
+                                         isMutable-> true);
+        let iterVref = VariableCreation::createVarFromDecl(iterDecl,
+                                                           canCte-> false,
+                                                           isIterator-> true);
+
+        let nbIteration = RangeInterpret::reduceLen(alias context.cteInterpret, loc, fst, scd, step, contains);
+        let nbIterDecl = copy VarDeclValue(loc.locate(ForLoopKeys::NB_ITER), USIZE_TYPE, nbIteration, isMutable-> false);
+        let nbIterVref = VariableCreation::createVarFromDecl(nbIterDecl,
+                                                             canCte-> true);
+
+        let lp = RangeForLoopValidation::validateInner(alias context, rangeType, floop, iterVref, nbIterVref, fst, step);
+
+        return copy BlockValue(loc, VOID_TYPE, copy [iterDecl, nbIterDecl, lp]);
+    }
+
+    /**
+     * Validate a compile-time range loop.
+     *
+     * @params:
+     *   - context:   validation context
+     *   - range:     range value
+     *   - rangeType: static type of the range
+     *   - floop:     for-loop expression
+     *
+     * @returns:
+     *   A BlockValue containing all unrolled iteration blocks.
+     *
+     * @throws:
+     *   ErrorMsg if iteration count exceeds limits or if validation fails.
+     */
+    pub fn validateCte(dmut context: &ValidationContext,
+                       range:         &Value,
+                       rangeType:    &RangeType,
+                       floop:        &ForLoopExpr)-> &Value
+        throws ErrorMsg
+    {
+        if floop.vars.len != 1 {
+            throw copy ErrorMsg::fatal(floop.loc, format(ValidateErrorMessage::UNDEF_FOR_LOOP_OPERATOR, floop.vars.len, rangeType));
+        }
+
+        let mut errors: (&ErrorMsg)? = none;
+        let mut values: [&Value] = [];
+
+        let loc = floop.loc;
+        let (fst, scd, step, contains) = ValueCreation::createRangeUnwrap(alias context, range, rangeType,
+                                                                          reduce-> true);
+
+        let nbIterations = context.cteInterpret:.computeInt(RangeInterpret::reduceLen(alias context.cteInterpret, loc, fst, scd, step, contains));
+
+        if nbIterations > global::state::maxCteLoopIter() {
+            throw copy ErrorMsg::fatal(loc, format(ValidateErrorMessage::MAX_LOOP_ITERATIONS, nbIterations, global::state::maxCteLoopIter()));
+        }
+
+        let fstI = context.cteInterpret:.computeInt(fst);
+        let stepI = context.cteInterpret:.computeInt(step);
+
+        context:.enterBlock();
+        {
+            let mut index = copy BigInt(0);
+            while index < nbIterations {
+                let current = copy IntValue(loc, rangeType.start, index * stepI + fstI);
+                let block = ForLoopValidation::createCurrentCteBlock(alias context, floop.block, rangeType, floop.vars, copy [current]);
+                values ~= [ValueValidation::validate(alias context, block)];
+                index += 1;
+            }
+        } catch {
+            err => {
+                errors = (err)?;
+            }
+        }
+
+        {
+            context:.quitBlock(warnUnused-> (!errors.hasValue));
+        } catch {
+            err => {
+                errors = (err)?;
+            }
+        }
+
+        if let Ok(err) = errors {
+            throw err;
+        }
+
+        return copy BlockValue(loc, VOID_TYPE, values);
+    }
+
+    /**
+     * Validate the runtime loop body for a range-based `for` loop.
+     *
+     * @params:
+     *   - context:    validation context
+     *   - rangeType:  range type
+     *   - floop:      for-loop expression
+     *   - iterVref:   VarRefValue for the iteration counter
+     *   - nbIterVref: VarRefValue for the iteration count
+     *   - fst:        reduced start value
+     *   - step:       reduced step value
+     *
+     * @returns:
+     *   A LoopValue representing the validated loop.
+     */
+    fn validateInner(dmut context: &ValidationContext,
+                     rangeType:     &RangeType,
+                     floop:         &ForLoopExpr,
+                     iterVref:      &VarRefValue,
+                     nbIterVref:    &VarRefValue,
+                     fst:           &Value,
+                     step:          &Value)-> &LoopValue
+        throws ErrorMsg
+    {
+        let loc = floop.loc;
+        let mut errors: (&ErrorMsg)? = none;
+        let mut values: [&Value] = [];
+        let mut test: &Value = UNIT_VALUE;
+
+        context:.enterLoop();
+        context:.setCurrentLoopType(VOID_TYPE);
+        context:.enterBlock();
+        {
+            let (vref, vdecl, insert) = RangeForLoopValidation::validateIteratorVar(alias context, loc, rangeType, floop.vars[0]);
+            let (increment, setIndex, test_) = RangeForLoopValidation::validateIncrement(alias context, loc, iterVref, nbIterVref, vref, fst, step);
+            if insert {
+                values ~= [vdecl];
+                values ~= [setIndex];
+            }
+
+            values ~= [ValueValidation::validate(alias context, floop.block)];
+            values ~= [increment];
+            test = test_;
+        } catch {
+            err => {
+                errors = (err)?;
+            }
+        }
+
+        {
+            context:.quitLoop();
+            context:.quitBlock(warnUnused-> (!errors.hasValue));
+        } catch {
+            err => {
+                errors = (err)?;
+            }
+        }
+
+        if let Ok(err) = errors {
+            throw err;
+        }
+
+        let blk = copy BlockValue(loc, VOID_TYPE, values);
+        return copy LoopValue(loc, VOID_TYPE, test, blk);
+    }
+
+    /**
+     * Validate the iterator variable declaration for a range loop.
+     *
+     * @params:
+     *   - context:   validation context
+     *   - loc:       loop location
+     *   - rangeType: range type
+     *   - iterExpr:  iterator variable declaration
+     *
+     * @returns:
+     *   (vref, decl, insert)
+     *     - vref:   VarRefValue referencing the iterator
+     *     - decl:   VarDeclValue for the iterator
+     *     - insert: whether to insert the variable into the local scope
+     */
+    pub fn validateIteratorVar(dmut context: &ValidationContext,
+                               loc:          &Word,
+                               rangeType:    &RangeType,
+                               iterExpr:     &VarDeclExpr,
+                               isMutable:    bool = true)-> (&VarRefValue, &VarDeclValue, bool)
+        throws ErrorMsg
+    {
+        let iterType = rangeType.start.clone(0);
+        let (iterDecl, insert) = ForLoopValidation::validateIndexIterDecl(alias context, iterExpr.loc, iterExpr, rangeType,
+                                                                          value-> copy IntValue(loc, iterType, 0),
+                                                                          defaultType-> iterType,
+                                                                          isMutable-> isMutable,
+                                                                          canCte-> false);
+
+        let vref = copy VarRefValue(iterDecl.loc, iterDecl.loc, iterDecl.varType, iterDecl.uniqId,
+                                    isSelf-> false,
+                                    canCte-> false,
+                                    isIterator-> true);
+
+        if insert {
+            context:.insertLocal(iterDecl.loc, iterDecl.name, iterDecl);
+        }
+
+        return (vref, iterDecl, insert);
+    }
+
+    /**
+     * Build the increment, index assignment, and test expressions for a range loop.
+     *
+     * @params:
+     *   - context:    validation context
+     *   - loc:        operator location
+     *   - iterVref:   VarRefValue for the iteration counter
+     *   - nbIterVref: VarRefValue for the iteration count
+     *   - indexVref:  VarRefValue for the user iterator variable
+     *   - fst:        reduced start value
+     *   - step:       reduced step value
+     *
+     * @returns:
+     *   (increment, setIndex, test)
+     */
+    pub fn validateIncrement(dmut context: &ValidationContext,
+                             loc:          &Word,
+                             iterVref:     &VarRefValue,
+                             nbIter:       &Value,
+                             indexVref:    &VarRefValue,
+                             fst:          &Value,
+                             step:         &Value)-> (&Value, &Value, &Value)
+        throws ErrorMsg
+    {
+        let test = copy CmpIntOperatorValue(loc, BinaryOperators::INF, iterVref, nbIter);
+        let increment = copy AffectValue(loc, VOID_TYPE,
+                                         iterVref,
+                                         copy MathIntOperatorValue(loc, iterVref.type,
+                                                                   BinaryOperators::PLUS,
+                                                                   iterVref,
+                                                                   copy IntValue(loc, USIZE_TYPE, 1)));
+
+        let (stepInf0, stepInt) = {
+            let i = context.cteInterpret:.computeInt(step);
+            if i < 0 {
+                (true, i)
+            } else {
+                (false, copy BigInt(0))
+            }
+        } catch {
+            _ => { (false, copy BigInt(0)) }
+        };
+
+
+        let mut currIndex: &Value = UNIT_VALUE;
+        if !stepInf0 {
+            let indexMul = copy MathIntOperatorValue(loc, iterVref.type,
+                                                     BinaryOperators::STAR,
+                                                     iterVref,
+                                                     copy CastValue(loc, iterVref.type, step));
+            currIndex = copy MathIntOperatorValue(loc, indexVref.type,
+                                                  BinaryOperators::PLUS,
+                                                  fst,
+                                                  copy CastValue(loc, indexVref.type, indexMul));
+        } else {
+            let indexMul = copy MathIntOperatorValue(loc, iterVref.type,
+                                                     BinaryOperators::STAR,
+                                                     iterVref,
+                                                     copy CastValue(loc, iterVref.type, copy IntValue(loc, ISIZE_TYPE, 0 - stepInt)));
+            currIndex = copy MathIntOperatorValue(loc, indexVref.type,
+                                                  BinaryOperators::MINUS,
+                                                  fst,
+                                                  copy CastValue(loc, indexVref.type, indexMul));
+        }
+
+        let affect = copy AffectValue(loc, indexVref.type, indexVref, context.cteInterpret:.reduce(currIndex));
+        return (increment, affect, test);
+    }
+}

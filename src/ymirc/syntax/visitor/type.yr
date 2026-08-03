@@ -1,0 +1,1414 @@
+/*
+ * Declares the syntax visitor in charge of reading a class declaration.
+ *
+ * <hr>
+ *
+ * @Package: ymirc
+ * @Module: ymirc::syntax::visitor::type
+ * @File: ymirc/syntax/visitor/type.yr
+ * @Author(s):
+ *   - Emile Cadorel <ecadorel@gmail.com>
+ *
+ * @Created(YYYY-MM-DD): 2026-02-20
+ * @Copyright(C) 2021–2026 GNU-Ymir
+ * @License
+ *   ```text
+ *   This file is part of the Ymir language project.
+ *
+ *   Ymir is free software: you can redistribute it and/or modify it
+ *   under the terms of the GNU General Public License as published by
+ *   the Free Software Foundation, either version 3 of the License, or
+ *   (at your option) any later version.
+ *
+ *   Ymir is distributed in the hope that it will be useful,
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *   GNU General Public License for more details.
+ *
+ *   You should have received a copy of the GNU General Public License
+ *   along with Ymir.  If not, see <https://www.gnu.org/licenses/>.
+ *   ```
+ */
+
+in type;
+
+use ymirc::errors;
+use ymirc::syntax::{_,
+                    visitor::_,
+                    declaration::_,
+                    expression::{empty, instruction}};
+
+
+use ymirc::lexing::{word, tokens, keys};
+use ymirc::utils::_;
+
+use std::io;
+
+
+pub mod TypeVisitor {
+
+    /**
+     * Read a type declaration
+     *
+     * @params:
+     *   - context: the context of the reading
+     *   - loc:     the location of the(class|record|entity) keyword
+     *   - comm:    the comment attached to the type
+     *   - attrs: the list of attributes defined in the type
+     *
+     * @grammar
+     *
+     * ```
+     * TypeDecl:=
+     *     TemplateTypeDecl
+     *   | NormalTypeDecl
+     *
+     * TemplateTypeDecl:=
+     *   TypeKw TemplateTest? Identifier TemplateParams '{' TypeDeclarations '}'
+     *
+     * NormalTypeDecl:=
+     *   TypeKw Identifier '{' TypeDeclarations '}'
+     *
+     * TypeKw:= 'class' | 'record' | 'entity'
+     * ```
+     * */
+    pub fn read(dmut context: &SyntaxVisitor, loc: &Word, comm: [c8], attrs: [AttributeWord])-> &Declaration
+        throws ErrorMsg
+    {
+        let kind = TypeVisitor::toTypeKind(loc.str);
+
+        let tryTemplateLoc = context.getSeek();
+        let mut normErr: (&ErrorMsg)? = none;
+        let mut templateErr: (&ErrorMsg)? = none;
+
+        { // Try to read a normal type
+            return TypeVisitor::readNormalType(alias context,
+                                               loc,
+                                               comm,
+                                               attrs,
+                                               kind);
+        } catch {
+            err => {
+                normErr = (err)?;
+            }
+        }
+
+        // Go back to the `class` keyword
+        context:.rewindToSeek(tryTemplateLoc);
+        { // Read a template type
+            return TypeVisitor::readTemplateType(alias context,
+                                                 loc,
+                                                 comm,
+                                                 attrs,
+                                                 kind);
+        }  catch {
+            err => {
+                templateErr = (err.withNote(copy [copy ErrorMsg::note(EOF_WORD, format(SyntaxErrorMessage::TEMPLATE_SYMBOL),
+                                                                      oneLine-> true)]))?;
+            }
+        }
+
+        // Both failed, throwing the error
+        if let (Ok(ne), Ok(te)) = (normErr, templateErr) {
+            throw copy ErrorMsg::list(copy [ne, te]);
+        }
+
+        eprint("internal type syntax visitor: empty error messages");
+        panic;
+    }
+
+    /**
+     * Read a type without template parameters
+     *
+     * @params:
+     *   - context: the context of the reading
+     *   - loc:     the location of the keyword introducing the type
+     *   - comm:    the comment on top of the type
+     *   - attrs:   the list of attributes in the type
+     *   - kind:    the kind of type being read
+     *
+     * */
+    fn readNormalType(dmut context: &SyntaxVisitor, loc: &Word, comm: [c8], attrs: [AttributeWord], kind: TypeDeclKind)-> &TypeDecl
+        throws ErrorMsg
+    {
+        let (ident, _) = context:.readIdentifier();
+        let ancestor = TypeVisitor::readAncestor(alias context, kind);
+        let (open, _) = context:.readTokens(Tokens::LACC);
+
+        let decls = TypeVisitor::readDeclBlockTop(alias context, open, kind);
+
+        return copy TypeDecl(loc,
+                             name-> ident,
+                             comm-> comm,
+                             decls,
+                             attrs-> attrs,
+                             ancestor-> ancestor,
+                             kind-> kind);
+    }
+
+    /**
+     * Read a type with template parameters
+     *
+     * @params:
+     *   - context: the context of the reading
+     *   - loc:     the location of the keyword introducing the type
+     *   - comm:    the comment on top of the type
+     *   - attrs:   the list of attributes in the type
+     *   - kind:    the kind of type type read
+     *
+     * */
+    fn readTemplateType(dmut context: &SyntaxVisitor, loc: &Word, comm: [c8], attrs: [AttributeWord], kind: TypeDeclKind)-> &TemplateDecl
+        throws ErrorMsg
+    {
+        let (ifLoc, test) = context:.readTemplateTest();
+        let (ident, _) = context:.readIdentifier();
+        let templates = context:.readTemplateParameters(ifLoc-> ifLoc);
+
+        let ancestor = TypeVisitor::readAncestor(alias context, kind);
+        let (open, _) = context:.readTokens(Tokens::LACC);
+
+        let decls = TypeVisitor::readDeclBlockTop(alias context, open, kind);
+
+        let cl = copy TypeDecl(loc-> loc,
+                               name-> ident,
+                               comm,
+                               decls,
+                               attrs-> attrs,
+                               ancestor-> ancestor,
+                               kind-> kind);
+
+
+        return copy TemplateDecl(loc-> ident,
+                                 comm-> comm,
+                                 params-> templates,
+                                 decl-> cl,
+                                 guard-> test);
+    }
+
+    /**
+     * Reads the ancestor part of a type declaration
+     *
+     * @params:
+     *    - context: the context of the reading
+     *    - kind:    reading an ancestor is only valid if `kind == TypeDeclKind::CLASS`
+     *
+     * @grammar:
+     * ```
+     * Ancestor:= ('over' OperandSimple(0))?
+     * ```
+     * */
+    fn readAncestor(dmut context: &SyntaxVisitor, kind: TypeDeclKind)-> &Expression
+        throws ErrorMsg
+    {
+        let (has, _) = context:.readIf(Keys::OVER);
+        if has.isEof
+            return EMPTY_EXPR;
+
+        if kind != TypeDeclKind::CLASS { // Ancestor on a struct
+            throw copy ErrorMsg::fatal(has, format(SyntaxErrorMessage::UNEXPECTED, has.str));
+        }
+
+        return ExpressionVisitor::readOperandSimple0(alias context);
+    }
+
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ===================================          TYPE BLOCK          ===================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Read a list of declarations that can be found inside a type
+     *
+     * @params:
+     *    - context: the context of the reading
+     *    - loc:     the token introducing the block reading
+     *
+     * @grammar:
+     * ```
+     * TypeDeclTop(Kind) :=
+     *    '{' TypeDeclItem(Kind)* '}'
+     *
+     * TypeDeclItem(Kind = (Entity | Type)) :=
+     *      TypeProtectionBlock(Kind)
+     *    | TypeIfBlock(Kind)
+     *    | UseDecl
+     *    | TypeImplBlock(Kind)
+     *    | TypeCtor(Kind)
+     *    | TypeDtor
+     *    | TypeMethod
+     *    | TypeVar
+     *
+     * TypeDeclItem(Kind = (Record | Union)) :=
+     *      TypeProtectionBlock(Kind)
+     *    | TypeIfBlock(Kind)
+     *    | UseDecl
+     *    | TypeImplBlock(Kind)
+     *    | TypeCtor(Kind)
+     *    | TypeMethod
+     *    | TypeVar
+     *
+     * ```
+     * */
+    fn readDeclBlockTop(dmut context: &SyntaxVisitor, loc: &Word, kind: TypeDeclKind)-> [&Declaration]
+        throws ErrorMsg
+    {
+        let mut decls: [mut &Declaration] = [];
+        {
+            loop {
+                let (attrLoc, attrs, attrComm) = context:.readAttributes();
+                let (tok, tokComm) = context:.readToken();
+
+                match tok.str {
+                    Keys::PRIVATE | Keys::PUBLIC => {
+                        decls ~= [TypeVisitor::readProtectionBlock(alias context, tok, attrComm ~ tokComm, attrs-> (attrLoc, attrs), kind)];
+                    }
+                    Keys::PROTECTED if kind == TypeDeclKind::CLASS => {
+                        decls ~= [TypeVisitor::readProtectionBlock(alias context, tok, attrComm ~ tokComm, attrs-> (attrLoc, attrs), kind)];
+                    }
+                    Keys::CTE => {
+                        context.checkNoAttributes(tok, attrLoc, attrs);
+                        decls ~= [TypeVisitor::readIfBlock(alias context, tok, tokComm, kind)];
+                    }
+                    Keys::USE => {
+                        context.checkNoAttributes(tok, attrLoc, attrs);
+                        decls ~= GlobalVisitor::readUse(alias context, tok, tokComm);
+                    }
+                    Keys::IMPL => {
+                        context.checkNoAttributes(tok, attrLoc, attrs);
+                        decls ~= [TypeVisitor::readImpl(alias context, tok, tokComm, kind)];
+                    }
+                    Keys::LET => {
+                        context.checkNoAttributes(tok, attrLoc, attrs);
+                        decls ~= [TypeVisitor::readFieldDecl(alias context, tok, tokComm)];
+                    }
+                    Keys::SELF => {
+                        decls ~= [TypeVisitor::readCtor(alias context, tok, tokComm, attrs-> (attrLoc, attrs), kind)];
+                    }
+                    Keys::FUNCTION => {
+                        decls ~= [TypeVisitor::readMethod(alias context, tok, tokComm, attrs-> (attrLoc, attrs))];
+                    }
+                    Keys::OVER if kind == TypeDeclKind::CLASS => {
+                        decls ~= [TypeVisitor::readMethod(alias context, tok, tokComm, attrs-> (attrLoc, attrs))];
+                    }
+                    Keys::DTOR if (kind == TypeDeclKind::CLASS || kind == TypeDeclKind::ENTITY) => {
+                        context.checkNoAttributes(tok, attrLoc, attrs);
+                        decls ~= [TypeVisitor::readDtor(alias context, tok, tokComm)];
+                    }
+                    Tokens::RACC => {
+                        context.checkNoAttributes(tok, attrLoc, attrs);
+                        break;
+                    }
+                    _ => {
+                        if tok.isEof {
+                            throw copy ErrorMsg::fatal(loc, end-> tok, SyntaxErrorMessage::BLOCK_NEVER_CLOSED);
+                        }
+
+                        throw copy ErrorMsg::fatal(tok, format(SyntaxErrorMessage::UNEXPECTED_BUT_LST, TypeVisitor::getKeywordListTop(kind)));
+                    }
+                }
+            }
+        } catch {
+            err => {
+                throw copy ErrorMsg::note(loc, SyntaxErrorMessage::IN_DECL_BLOCK, notes-> copy [err]);
+            }
+        }
+
+        decls
+    }
+
+    /**
+     * Read a type conditional block
+     *
+     * @params:
+     *     - context: the context of the reading
+     *     - loc:     the location of the `cte` keyword
+     *     - comm:    the comment above the cte if
+     *
+     * @grammar:
+     * ```
+     * TypeIfBlock(Kind) :=
+     *   'if' ExpressionSimple(BOOL_LOGIC) '{' TypeDeclTop(Kind) '}' TypeIfFollow(Kind)?
+     *
+     * TypeIfFollow:=
+     *     'else' TypeIfBlock(Kind)
+     *   | 'else' '{' TypeDeclTop(Kind) '}'
+     *
+     * ```
+     * */
+    fn readIfBlock(dmut context: &SyntaxVisitor, loc: &Word, comm: [c8], kind: TypeDeclKind)-> &Declaration
+        throws ErrorMsg
+    {
+        // At least one if block is mandatory after reading 'cte'
+        let (begin, _) = context:.readTokens(Keys::IF, Keys::ASSERT);
+        if begin == Keys::ASSERT {
+            return TypeVisitor::readAssert(alias context, begin, comm);
+        }
+
+        let test = ExpressionVisitor::readExpressionSimple(alias context, BinaryOperatorsLevelNames::BOOL_LOGIC);
+        let (open, _) = context:.readTokens(Tokens::LACC);
+        let declsFst = TypeVisitor::readDeclBlockTop(alias context, open, kind);
+
+        let mut blocks: [(&Word, &Expression, [&Declaration], [c8])] = copy [(loc, test, declsFst, comm)];
+
+        // We create a list of else blocks
+        while let (next, nextComm) = context:.readIf(Keys::ELSE) && !next.isEof {
+            let (nextIf, _) = context:.readIf(Keys::IF);
+            if nextIf.isEof {
+                let (nextOpen, _) = context:.readTokens(Tokens::LACC);
+                let declsElse = TypeVisitor::readDeclBlockTop(alias context, nextOpen, kind);
+
+                blocks ~= [(next, EMPTY_EXPR, declsElse, nextComm)];
+                break;
+            }
+
+            let nextTest = ExpressionVisitor::readExpressionSimple(alias context, BinaryOperatorsLevelNames::BOOL_LOGIC);
+            let (nextOpen, _) = context:.readTokens(Tokens::LACC);
+            let declsElse = TypeVisitor::readDeclBlockTop(alias context, nextOpen, kind);
+
+            blocks ~= [(nextIf, nextTest, declsElse, nextComm)];
+        }
+
+        // And we wrap them in reverse order to build the conditional tree
+        let mut resultBlock = if blocks[$ - 1]._1 of EmptyExpr {
+            copy BlockDecl(loc-> blocks[$ - 1]._0,
+                           comm-> blocks[$ - 1]._3,
+                           decls-> blocks[$ - 1]._2,
+                           protection-> Protection::PRIVATE,
+                           isSet-> true)
+        } else {
+            copy CondBlockDecl(loc-> blocks[$ - 1]._0,
+                               comm-> blocks[$ - 1]._3,
+                               decls-> blocks[$ - 1]._2,
+                               test-> blocks[$ - 1]._1)
+        };
+
+        blocks = blocks[0 .. $ - 1];
+        for i in blocks.len .. 0 {
+            resultBlock = copy CondBlockDecl(loc-> blocks[i - 1]._0,
+                                             comm-> blocks[i - 1]._3,
+                                             decls-> blocks[i - 1]._2,
+                                             test-> blocks[$ - 1]._1,
+                                             else_-> resultBlock);
+        }
+
+        resultBlock
+    }
+
+    /**
+     * Read an declaration introduced by the keyword `assert`
+     *
+     * @params:
+     *    - context: the context of the reading
+     *    - loc:     the location of the `assert` keyword
+     *
+     * @grammar
+     * ```
+     * AssertDecl:=
+     *     'assert' '(' ExpressionComplex(BOOL_LOGIC) (',' ExpressionComplex(BOOL_LOGIC))? ')'
+     * ```
+     * */
+    fn readAssert(dmut context: &SyntaxVisitor, loc: &Word, comm: [c8])-> &Declaration
+        throws ErrorMsg
+    {
+        context:.readTokens(Tokens::LPAR);
+        let test = ExpressionVisitor::readExpressionComplex(alias context, BinaryOperatorsLevelNames::BOOL_LOGIC);
+
+        let mut msg: &Expression = EMPTY_EXPR;
+        let (hasMsg, _) = context:.readTokens(Tokens::COMA, Tokens::RPAR);
+        if hasMsg == Tokens::COMA {
+            msg = ExpressionVisitor::readExpressionComplex(alias context, BinaryOperatorsLevelNames::BOOL_LOGIC);
+            context:.readTokens(Tokens::RPAR);
+        }
+        context:.readTokens(Tokens::SEMI_COLON);
+
+        return copy AssertDecl(loc, comm, test, msg);
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ================================          TYPE PROTECTION          =================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Read a block introduced by a protection inside a type declaration
+     *
+     * @params:
+     *    - context: the context of the reading
+     *    - loc:     the location of the protection keyword
+     *    - comm:    the comment above the protection
+     *    - attrs: the list of attributes above the protection keyword
+     *
+     * @grammar:
+     * ```
+     * TypeProtectionBlock(Kind) :=
+     *    '{' TypeProtectedDeclaration(Kind)* '}'
+     *    | TypeProtectedDeclaration(Kind)
+     *
+     * TypeProtectedDeclaration(Kind) :=
+     *   | TypeCtor(Kind)
+     *   | TypeMethod
+     *   | TypeVar
+     * ```
+     * */
+    fn readProtectionBlock(dmut context: &SyntaxVisitor, loc: &Word, comm: [c8], attrs: (&Word, [AttributeWord]), kind: TypeDeclKind)-> &BlockDecl
+        throws ErrorMsg
+    {
+        let protection = block::toProtection(loc.str);
+        let (open, _) = context:.readToken();
+
+        if open == Tokens::LACC { // a protected block
+
+            // @attrib pub { ... } is not allowed
+            context.checkNoAttributes(open, attrs._0, attrs._1);
+            let decls = TypeVisitor::readProtectedBlock(alias context, kind);
+            return copy BlockDecl(loc-> loc,
+                                  comm-> comm,
+                                  decls-> decls,
+                                  protection-> protection,
+                                  isSet-> false);
+        }
+
+        // A single protection
+        let decls = copy [TypeVisitor::readProtectedSingle(alias context, open, comm, attrs, kind)];
+        return copy BlockDecl(loc-> loc,
+                              comm-> "",
+                              decls-> decls,
+                              protection-> protection,
+                              isSet-> false);
+    }
+
+    /**
+     * Read a block of declaration protected by a protection keyword
+     *
+     * @params:
+     *   - context: the context of the reading
+     *   - open:    the location of the opening '{'
+     *
+     * @grammar:
+     * ```
+     * TypeProtectedBlock:=
+     *    '{' TypeProtectedDeclaration(Kind)* '}'
+     * ```
+     * */
+    fn readProtectedBlock(dmut context: &SyntaxVisitor, kind: TypeDeclKind)-> [&Declaration]
+        throws ErrorMsg
+    {
+        let mut decls: [mut &Declaration] = [];
+        loop {
+            let (attrLoc, attrs, attrComm) = context:.readAttributes();
+            let (tok, tokComm) = context:.readToken();
+            if tok == Tokens::RACC {
+                context.checkNoAttributes(tok, attrLoc, attrs);
+                break;
+            }
+
+            decls ~= [TypeVisitor::readProtectedSingle(alias context, tok, attrComm ~ tokComm, attrs-> (attrLoc, attrs), kind)];
+        }
+
+        decls
+    }
+
+    /**
+     * Read a single declaration protected by a protection keyword
+     *
+     * @params:
+     *    - context: the context of the reading
+     *    - tok:     the declaration to read
+     *    - comm:    the comments above the declaration
+     *    - attrs: the list of attributes on top of the declaration
+     *
+     *
+     * */
+    fn readProtectedSingle(dmut context: &SyntaxVisitor, tok: &Word, comm: [c8], attrs: (&Word, [AttributeWord]), kind: TypeDeclKind)-> &Declaration
+        throws ErrorMsg
+    {
+        match tok.str {
+            Keys::LET => {
+                context.checkNoAttributes(tok, attrs._0, attrs._1);
+                return TypeVisitor::readFieldDecl(alias context, tok, comm);
+            }
+            Keys::SELF => {
+                return TypeVisitor::readCtor(alias context, tok, comm, attrs-> attrs, kind);
+            }
+            Keys::FUNCTION => {
+                return TypeVisitor::readMethod(alias context, tok, comm, attrs-> attrs);
+            }
+            Keys::OVER if (kind == TypeDeclKind::CLASS) => {
+                return TypeVisitor::readMethod(alias context, tok, comm, attrs-> attrs);
+            }
+            _ => {
+                throw copy ErrorMsg::fatal(tok, format(SyntaxErrorMessage::UNEXPECTED_BUT_LST, TypeVisitor::getKeywordListProtected(kind)))
+            }
+        }
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ===================================          TYPE IMPL          ====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Read an implementation block, in a type declaration block
+     *
+     * @params:
+     *    - context: the context of the reading
+     *    - tok:     the location of the impl token
+     *    - comm:    the comment above the impl token
+     *
+     * @grammar:
+     * ```
+     * TypeImplDecl:=
+     *     OperandSimple(0) ';'
+     *   | OperandSimple(0) '{' TypeImplDeclBlock* '}'
+     *
+     * TypeImplDeclBlock:=
+     *     Method
+     *   | ProtectionKw TypeProtectionImplBlock
+     *
+     *
+     * TypeProtectionImplBlock:=
+     *   Method
+     *   | '{' Method* '}'
+     * ```
+     *
+     *
+     * */
+    fn readImpl(dmut context: &SyntaxVisitor, tok: &Word, comm: [c8], kind: TypeDeclKind)-> &ImplDecl
+        throws ErrorMsg
+    {
+        let who = ExpressionVisitor::readOperandSimple0(alias context);
+        let (next, _) = context:.readTokens(Tokens::SEMI_COLON, Tokens::LACC);
+
+        let mut decls: [&Declaration] = [];
+        if next == Tokens::LACC { // Contains a block
+            loop {
+                let (attrLoc, attrs, attrComm) = context:.readAttributes();
+                let (intok, tokComm) = context:.readToken();
+                match intok.str {
+                    Tokens::RACC => {
+                        context.checkNoAttributes(intok, attrLoc, attrs);
+                        break;
+                    }
+                    Keys::PRIVATE | Keys::PUBLIC => {
+                        decls ~= [TypeVisitor::readImplProtectionBlock(alias context, intok, attrComm ~ tokComm, attrs-> (attrLoc, attrs))];
+                    }
+                    Keys::PROTECTED if (kind == TypeDeclKind::CLASS) => {
+                        decls ~= [TypeVisitor::readImplProtectionBlock(alias context, intok, attrComm ~ tokComm, attrs-> (attrLoc, attrs))];
+                    }
+                    Keys::OVER => {
+                        decls ~= [TypeVisitor::readMethod(alias context, intok, attrComm ~ tokComm, attrs-> (attrLoc, attrs))];
+                    }
+                    _ => {
+                        throw copy ErrorMsg::fatal(intok, format(SyntaxErrorMessage::UNEXPECTED_BUT_LST,
+                                                                 copy [Keys::PRIVATE, Keys::PUBLIC, Keys::OVER]));
+                    }
+                }
+            }
+        }
+
+        return copy ImplDecl(loc-> tok,
+                             comm-> comm,
+                             who-> who,
+                             decls-> decls);
+    }
+
+    /**
+     * Read a block introduced by a protection inside a impl of a type declaration
+     *
+     * @params:
+     *    - context: the context of the reading
+     *    - loc:     the location of the protection keyword
+     *    - comm:    the comment above the protection
+     *    - attrs: the list of attributes above the protection keyword
+     *
+     * @grammar:
+     * ```
+     * TypeImplProtectionBlock:=
+     *    '{' Method* '}'
+     *    | Method
+     *
+     * ```
+     * */
+    fn readImplProtectionBlock(dmut context: &SyntaxVisitor, loc: &Word, comm: [c8], attrs: (&Word, [AttributeWord]))-> &BlockDecl
+        throws ErrorMsg
+    {
+        let protection = block::toProtection(loc.str);
+        let (open, openComm) = context:.readTokens(Tokens::LACC, Keys::OVER);
+
+        let mut decls: [mut &Declaration] = [];
+
+        if open == Tokens::LACC { // a protected block
+            // @attrib pub { ... } is not allowed
+            context.checkNoAttributes(loc, attrs._0, attrs._1);
+            loop {
+                let tokAttrs = context:.readAttributes();
+                let (intok, tokComm) = context:.readToken();
+                match intok.str {
+                    Tokens::RACC => {
+                        context.checkNoAttributes(intok, tokAttrs._0, tokAttrs._1);
+                        break;
+                    }
+                    Keys::OVER => {
+                        decls ~= [TypeVisitor::readMethod(alias context, intok, tokAttrs._2 ~ tokComm, attrs-> (tokAttrs._0, tokAttrs._1))];
+                    }
+                    _ => {
+                        throw copy ErrorMsg::fatal(intok, format(SyntaxErrorMessage::UNEXPECTED_BUT_LST, copy [Keys::OVER]));
+                    }
+                }
+            }
+        } else {
+            decls ~= [TypeVisitor::readMethod(alias context, open, comm ~ openComm, attrs-> attrs)];
+        }
+
+        // A single protection
+        return copy BlockDecl(loc-> loc,
+                              comm-> "",
+                              decls-> decls,
+                              protection-> protection,
+                              isSet-> false);
+    }
+
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * =====================================          FIELD          ======================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Read a field decl, that was introduced by the keyword `let` in a type, or a struct
+     *
+     * @params:
+     *    - context: the context of the reading
+     *    - loc: the location of the `let` keyword
+     *    - comm: the comment above the field declaration
+     *
+     * @grammar:
+     * ```
+     * FieldDecl:=
+     *    'let' MutDeco Identifier ':' OperandSimple(0) ('=' ExpressionSimple(BOOL_LOGIC)) Tokens::SEMI_COLON
+     *
+     * MutDeco:= 'mut' | 'dmut'
+     * ```
+     * */
+    fn readFieldDecl(dmut context: &SyntaxVisitor, loc: &Word, comm: [c8])-> &Declaration
+        throws ErrorMsg
+    {
+        // let 'mut' | 'dmut', lazy and ref are undefined in this context
+        let (isMutOrDmut, _) = context:.readIf(Keys::MUTABLE, Keys::DMUTABLE);
+        let (name, _) = context:.readIdentifier();
+
+        // Type is mandatory in type field declaration
+        // And is a simple expression, ':' OperandSimple(0)
+        context:.readTokens(Tokens::COLON);
+        let type = ExpressionVisitor::readOperandSimple0(alias context);
+
+        // Value is optional, '=' ExpressionSimple(BOOL_LOGIC)
+        let (hasValue, _) = context:.readIf(Tokens::EQUAL);
+        let value = if !hasValue.isEof {
+            // But is simple if defined
+            ExpressionVisitor::readExpressionSimple(alias context, BinaryOperatorsLevelNames::BOOL_LOGIC)
+        } else {
+            EMPTY_EXPR
+        };
+
+        // Always end with a ';'
+        context:.readTokens(Tokens::SEMI_COLON);
+
+        let var = copy VarDeclExpr(loc,
+                                   name,
+                                   isMutOrDmut-> isMutOrDmut,
+                                   isLazyOrRef-> EOF_WORD,
+                                   value-> value,
+                                   type-> type);
+
+        return copy GlobalVarDecl(loc, comm, var, isField-> true, isStatic-> false, attrs-> []);
+    }
+
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ======================================          DTOR          ======================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Read a type or an entity destructor.
+     *
+     * @params:
+     *    - context: the context of the reading
+     *    - loc:     the location of the `__dtor` keyword
+     *    - comm:    the comment above the destructor
+     *
+     * @params:
+     * ```
+     * DtorDecl:=
+     *   '__dtor' '(' 'mut' 'self' ')' InstrOrExpr
+     *
+     * ```
+     * */
+    fn readDtor(dmut context: &SyntaxVisitor, loc: &Word, comm: [c8])-> &Declaration
+        throws ErrorMsg
+    {
+        // Read '(mut self)'
+        context:.readTokens(Tokens::LPAR);
+        let (isMut, _) = context:.readTokens(Keys::MUTABLE);
+        let (ident, _) = context:.readTokens(Keys::SELF);
+        context:.readTokens(Tokens::RPAR);
+
+        // Read the body of the dtor
+        let (open, _) = context:.readTokens(Tokens::LACC);
+        let body = ExpressionVisitor::readBlock(alias context, open, withGuards-> true);
+
+        let param = copy VarDeclExpr(loc-> ident,
+                                     name-> ident,
+                                     isMutOrDmut-> isMut,
+                                     isLazyOrRef-> EOF_WORD,
+                                     value-> EMPTY_EXPR,
+                                     type-> EMPTY_EXPR);
+
+        return copy DtorDecl(loc, comm, param, body);
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * =====================================          METHOD          =====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Read a method for a class or a struct
+     *
+     * @params:
+     *    - context: the context of the reading
+     *    - loc:     the location of the `fn` or `over` keyword
+     *    - comm:    the comments above the method declaration
+     *    - attrs: the list of attributes above the method declaration
+     *
+     * @grammar:
+     * ```
+     * MethodDecl:=
+     *      TemplateMethodDecl
+     *    | NormalMethodDecl
+     *
+     * TemplateMethodDecl:=
+     *    MethodKw TemplateTest? Identifier TemplateParams MethodPrototype Block(withGuards = true)
+     *
+     * NormalMethodDecl:=
+     *    MethodKw Identifier MethodPrototype Body
+     *
+     * MethodPrototype:=
+     *     '(' MutKw? 'self' (',' ParamDecl)* ')' MethodReturnType? MethodThrowers?
+     *
+     * ParamDecl:=
+     *   VariableModifier? Identifier ':' OperandSimple(0) ('=' ExpressionSimple(BOOL_LOGIC))
+     *
+     * MethodReturnType:= '-> ' OperandSimple(0)
+     *
+     * MethodThrowers:=
+     *    'throws' OperandSimple(0) (',' OperandSimple(0))
+     *
+     * MutKw:= 'mut'
+     * MethodKw:= 'fn' | 'over'
+     * Body:=
+     *      Block(withGuards = true)
+     *    | ';'
+     *
+     * ```
+     * */
+    fn readMethod(dmut context: &SyntaxVisitor, loc: &Word, comm: [c8], attrs: (&Word, [AttributeWord]))-> &Declaration
+        throws ErrorMsg
+    {
+        let tryTemplateLoc = context.getSeek();
+        let mut normErr: (&ErrorMsg)? = none;
+        let mut templateErr: (&ErrorMsg)? = none;
+
+        { // Try to read a normal method
+            return TypeVisitor::readNormalCommonMethod(alias context, loc, comm, attrs);
+        } catch {
+            err => {
+                normErr = (err)?;
+            }
+        }
+
+        // Rewind to the `over` | `fn` keyword
+        context:.rewindToSeek(tryTemplateLoc);
+        { // Try a template method
+            return TypeVisitor::readTemplateCommonMethod(alias context, loc, comm, attrs);
+        } catch {
+            err => {
+                templateErr = (err)?;
+            }
+        }
+
+
+        if let (Ok(ne), Ok(te)) = (normErr, templateErr) {
+            throw copy ErrorMsg::list(copy [ne, te]);
+        }
+
+        eprintln("internal type syntax visitor: empty errors");
+        panic;
+    }
+
+    /**
+     * Read a template method for a class or a struct
+     *
+     * @params:
+     *    - context: the context of the reading
+     *    - loc:     the location of the `fn` or `over` keyword
+     *    - comm:    the comments above the method declaration
+     *    - attrs: the list of attributes above the method declaration
+     *
+     * @grammar: Cf. `TypeVisitor::readMethod`
+     * */
+    fn readTemplateCommonMethod(dmut context: &SyntaxVisitor, loc: &Word, comm: [c8], attrs: (&Word, [AttributeWord]))-> &Declaration
+        throws ErrorMsg
+    {
+        let (ifLoc, test) = context:.readTemplateTest();
+        let (ident, _) = context:.readIdentifier();
+        let templates = context:.readTemplateParameters(ifLoc-> ifLoc);
+
+        let (proto, throwLoc, throwers) = TypeVisitor::readMethodPrototype(alias context);
+
+
+        let (open, _) = context:.readTokens(Tokens::LACC);
+        let body = ExpressionVisitor::readBlock(alias context, open, withGuards-> true);
+
+        let func = copy FunctionDecl(loc-> loc,
+                                     comm-> comm,
+                                     name-> ident,
+                                     proto-> proto,
+                                     body-> body,
+                                     attrs-> attrs._1,
+                                     throwers-> throwers,
+                                     throwerLoc-> throwLoc,
+                                     isOver-> (loc == Keys::OVER));
+
+        return copy TemplateDecl(ident, comm, templates, test, func);
+    }
+
+
+    /**
+     * Read a normal method for a class or a struct
+     *
+     * @params:
+     *    - context: the context of the reading
+     *    - loc:     the location of the `fn` or `over` keyword
+     *    - comm:    the comments above the method declaration
+     *    - attrs: the list of attributes above the method declaration
+     *
+     * @grammar: Cf. `TypeVisitor::readMethod`
+     *
+     * */
+    fn readNormalCommonMethod(dmut context: &SyntaxVisitor, loc: &Word, comm: [c8], attrs: (&Word, [AttributeWord]))-> &Declaration
+        throws ErrorMsg
+    {
+        let (ident, _) = context:.readIdentifier();
+
+        let (proto, throwLoc, throwers) = TypeVisitor::readMethodPrototype(alias context);
+
+        let mut body: &Expression = EMPTY_EXPR;
+        let (open, _) = context:.readTokens(Tokens::LACC, Tokens::SEMI_COLON);
+        if open == Tokens::LACC {
+            body = ExpressionVisitor::readBlock(alias context, open, withGuards-> true);
+        }
+
+        return copy FunctionDecl(loc-> loc,
+                                 comm-> comm,
+                                 name-> ident,
+                                 proto-> proto,
+                                 body-> body,
+                                 attrs-> attrs._1,
+                                 throwers-> throwers,
+                                 throwerLoc-> throwLoc,
+                                 isOver-> (loc == Keys::OVER));
+    }
+
+
+    /**
+     * Read the prototype of a method declaration
+     *
+     * @params:
+     *    - context: the context of the reading
+     *
+     * @returns:
+     *    - .0: the method prototype
+     *    - .1: the location of the `throws` keyword, or EOF
+     *    - .2: the list of throwers
+     *
+     * @grammar: Cf. `TypeVisitor::readMethod`
+     * */
+    pub fn readMethodPrototype(dmut context: &SyntaxVisitor)-> (FunctionPrototype, &Word, [&Expression])
+        throws ErrorMsg
+    {
+        context:.readTokens(Tokens::LPAR);
+        let (selfIsMut, _) = context:.readIf(Keys::MUTABLE);
+        let (selfIdent, _) = context:.readTokens(Keys::SELF);
+
+        let mut params = copy [copy VarDeclExpr(loc-> selfIdent, // no `let`, so the location of the variable is the identifier
+                                                name-> selfIdent, // first param is self
+                                                isMutOrDmut-> selfIsMut, // it can be 'mut'
+                                                isLazyOrRef-> EOF_WORD, // it cannot be lazy or ref
+                                                value-> EMPTY_EXPR,  // it cannot have a value
+                                                type-> EMPTY_EXPR)]; // and no type
+
+        // Read the parameters(',' Params)* ')'
+        // Break when ')' is read
+        while let (n, _) = context:.readTokens(Tokens::RPAR, Tokens::COMA) && n == Tokens::COMA {
+            // 'mut' 'lazy', etc.
+            let (isLazyOrRef, isMutOrDmut) = context:.readVariableModifiers();
+            let (ident, _) = context:.readIdentifier();
+
+            // ':' type is mandatory
+            context:.readTokens(Tokens::COLON);
+            let type = ExpressionVisitor::readOperandSimple0(alias context);
+
+            // '=' value is optional
+            let mut value: &Expression = EMPTY_EXPR;
+            let (hasValue, _) = context:.readIf(Tokens::EQUAL);
+            if !hasValue.isEof {
+                value = ExpressionVisitor::readExpressionSimple(alias context, level-> BinaryOperatorsLevelNames::BOOL_LOGIC);
+            }
+
+            let nparam = copy VarDeclExpr(loc-> ident, // no `let`
+                                          name-> ident,
+                                          isLazyOrRef-> isLazyOrRef,
+                                          isMutOrDmut-> isMutOrDmut,
+                                          type-> type,
+                                          value-> value);
+
+            params ~= [nparam];
+        }
+
+        // Read return type
+        let mut type: &Expression = EMPTY_EXPR;
+        let (arrow, _) = context:.readIf(Tokens::ARROW);
+        if !arrow.isEof {
+            type = ExpressionVisitor::readOperandSimple0(alias context);
+        }
+
+        // Read the throwers
+        let mut throwers: [&Expression] = [];
+        let (throwLoc, _) = context:.readIf(Keys::THROWS);
+        if !throwLoc.isEof {
+            loop { // throws X, Y, Z
+                throwers ~= [ExpressionVisitor::readOperandSimple0(alias context)];
+
+                let (coma, _) = context:.readIf(Tokens::COMA);
+                if coma.isEof
+                    break;
+            }
+        }
+
+        return (FunctionPrototype(params, type, false), throwLoc, throwers);
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * =====================================          CTORS          ======================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+
+
+    /**
+     * Read a constructor for a class or a struct
+     *
+     * @params:
+     *    - context: the context of the reading
+     *    - loc:     the location of the `self` keyword
+     *    - comm:    the comments above the ctor declaration
+     *    - attrs:   the list of attributes above the ctor declaration
+     *    - isType: true iif we are reading the ctor for a type
+     *
+     * @grammar:
+     * ```
+     * CtorDecl(Kind) :=
+     *     TemplateCtorDecl(Kind)
+     *   | NormalCtorDecl(Kind)
+     *
+     * TemplateCtorDecl(Kind) :=
+     *   'self' TemplateTest? Identifier? TemplateParams CtorParams WithCtor(Kind)? CtorThrowers? InstrOrExpr
+     *
+     * NormalCtorDecl(Kind) :=
+     *   'self' Identifier? CtorParams WithCtor(Kind)? CtorThrowers? InstrOrExpr
+     *
+     * CtorParams:=
+     *   '(' ParamList? ')'
+     *
+     * WithCtor(Kind = Type) :=
+     *    'with' 'self' RedirectCtor
+     *    'with' 'super' RedirectCtor(',' FieldCtor)*
+     *  | 'with' FieldCtor(',' FieldCtor)*
+     *
+     * WithCtor(Kind = (Record | Entity | Union)) :=
+     *    'with' RedirectCtor('self')
+     *  | 'with' FieldCtor(',' FieldCtor)*
+     *
+     * CtorThrowers:=
+     *    'throws' OperandSimple(0) (',' OperandSimple(0))*
+     *
+     * RedirectCtor:=
+     *     ('::' Identifier)? (TemplateCall)? '(' ExpressionList ')'
+     *
+     * FieldCtor:=
+     *    Identifier '=' ExpressionSimple(BOOL_LOGIC)
+     *
+     * TemplateCall:=
+     *    '!' OperandSimple(4)
+     *   | '!' '{' ExpressionList? '}'
+     *
+     * ExpressionList:=
+     *    ExpressionComplex(BOOL_LOGIC) (',' ExpressionComplex(BOOL_LOGIC))*
+     *
+     * ParamList:=
+     *    ParamDecl(',' ParamDecl)*
+     * ```
+     * */
+    fn readCtor(dmut context: &SyntaxVisitor, loc: &Word, comm: [c8], attrs: (&Word, [AttributeWord]), kind: TypeDeclKind)-> &Declaration
+        throws ErrorMsg
+    {
+        let tryTemplateLoc = context.getSeek();
+        let mut normErr: (&ErrorMsg)? = none;
+        let mut templateErr: (&ErrorMsg)? = none;
+
+        { // Try to read a normal ctor
+            return TypeVisitor::readNormalCommonCtor(alias context, loc, comm, attrs, kind);
+        } catch {
+            err => {
+                normErr = (err)?;
+            }
+        }
+
+        // Rewind to the `self`
+        context:.rewindToSeek(tryTemplateLoc);
+        { // Try a template ctor
+            return TypeVisitor::readTemplateCommonCtor(alias context, loc, comm, attrs, kind);
+        } catch {
+            err => {
+                templateErr = (err)?;
+            }
+        }
+
+
+        if let (Ok(ne), Ok(te)) = (normErr, templateErr) {
+            throw copy ErrorMsg::list(copy [ne, te]);
+        }
+
+        eprintln("internal type syntax visitor: empty errors");
+        panic;
+    }
+
+    /**
+     * Read a template ctor for a class or a struct
+     *
+     * @params:
+     *    - context: the context of the reading
+     *    - loc:     the location of the `self` keyword
+     *    - comm:    the comments above the ctor declaration
+     *    - attrs:   the list of attributes above the ctor declaration
+     *    - kind:    the kind of type being read
+     *
+     * @grammar: Cf. `TypeVisitor::readCtor`
+     * */
+    fn readTemplateCommonCtor(dmut context: &SyntaxVisitor, loc: &Word, comm: [c8], attrs: (&Word, [AttributeWord]), kind: TypeDeclKind)-> &Declaration
+        throws ErrorMsg
+    {
+        let (ifLoc, test) = context:.readTemplateTest();
+        let (ident, _) = context:.readIfIdentifier();
+        let templates = context:.readTemplateParameters(ifLoc-> ifLoc);
+
+        let proto = TypeVisitor::readCtorPrototype(alias context);
+        let (redirectCtor, fieldCtors) = TypeVisitor::readCtorWith(alias context, kind);
+        let (throwLoc, throwers) = TypeVisitor::readCtorThrowers(alias context);
+
+        let (open, _) = context:.readTokens(Tokens::LACC);
+        let body = ExpressionVisitor::readBlock(alias context, open, withGuards-> true);
+
+        let ctor = copy CtorDecl(loc-> loc,
+                                 comm-> comm,
+                                 rename-> ident,
+                                 proto-> proto,
+                                 body-> body,
+                                 redirect-> redirectCtor,
+                                 fields-> fieldCtors,
+                                 throwerLoc-> throwLoc,
+                                 throwers-> throwers,
+                                 attrs-> attrs._1);
+
+        return copy TemplateDecl(ident, comm, guard-> test, params-> templates, decl-> ctor);
+    }
+
+    /**
+     * Read a normal ctor for a class or a struct
+     *
+     * @params:
+     *    - context: the context of the reading
+     *    - loc:     the location of the `self` keyword
+     *    - comm:    the comments above the ctor declaration
+     *    - attrs:   the list of attributes above the ctor declaration
+     *    - kind:    the kind of type being read
+     *
+     * @grammar: Cf. `TypeVisitor::readCtor`
+     * */
+    fn readNormalCommonCtor(dmut context: &SyntaxVisitor, loc: &Word, comm: [c8], attrs: (&Word, [AttributeWord]), kind: TypeDeclKind)-> &Declaration
+        throws ErrorMsg
+    {
+        let (ident, _) = context:.readIfIdentifier();
+
+        let proto = TypeVisitor::readCtorPrototype(alias context);
+        let (redirectCtor, fieldCtors) = TypeVisitor::readCtorWith(alias context, kind);
+        let (throwLoc, throwers) = TypeVisitor::readCtorThrowers(alias context);
+
+        let (open, _) = context:.readTokens(Tokens::LACC);
+        let body = ExpressionVisitor::readBlock(alias context, open, withGuards-> true);
+
+        return copy CtorDecl(loc-> loc,
+                             comm-> comm,
+                             rename-> ident,
+                             proto-> proto,
+                             body-> body,
+                             redirect-> redirectCtor,
+                             fields-> fieldCtors,
+                             throwerLoc-> throwLoc,
+                             throwers-> throwers,
+                             attrs-> attrs._1);
+    }
+
+    /**
+     * Read the list of parameters in the ctor for a class or a struct
+     *
+     * @params:
+     *    - context: the context of the reading
+     *
+     * @grammar: Cf. `TypeVisitor::readCtor`
+     * */
+    fn readCtorPrototype(dmut context: &SyntaxVisitor)-> FunctionPrototype
+        throws ErrorMsg
+    {
+        let mut params: [&VarDeclExpr] = [];
+        context:.readTokens(Tokens::LPAR);
+
+        let (close, _) = context:.readIf(Tokens::RPAR);
+        if close.isEof loop { // not '()', so there are parameters
+            // 'mut' 'lazy', etc.
+            let (isLazyOrRef, isMutOrDmut) = context:.readVariableModifiers();
+            let (ident, _) = context:.readIdentifier();
+
+            // ':' type is mandatory
+            context:.readTokens(Tokens::COLON);
+            let type = ExpressionVisitor::readOperandSimple0(alias context);
+
+            // '=' value is optional
+            let mut value: &Expression = EMPTY_EXPR;
+            let (hasValue, _) = context:.readIf(Tokens::EQUAL);
+            if !hasValue.isEof {
+                value = ExpressionVisitor::readExpressionSimple(alias context, BinaryOperatorsLevelNames::BOOL_LOGIC);
+            }
+
+            let nparam = copy VarDeclExpr(loc-> ident, // no `let`
+                                          name-> ident,
+                                          isLazyOrRef-> isLazyOrRef,
+                                          isMutOrDmut-> isMutOrDmut,
+                                          type-> type,
+                                          value-> value);
+
+            params ~= [nparam];
+
+            let (coma, _) = context:.readTokens(Tokens::COMA, Tokens::RPAR);
+            if coma == Tokens::RPAR
+                break;
+        }
+
+        return FunctionPrototype(params, EMPTY_EXPR, false);
+    }
+
+    /**
+     * Read the thrower part of a ctor for a class or a struct
+     *
+     * @params:
+     *    - context: the context of the reading
+     *
+     * */
+    fn readCtorThrowers(dmut context: &SyntaxVisitor)-> (&Word, [&Expression])
+        throws ErrorMsg
+    {
+        let (throwLoc, _) = context:.readIf(Keys::THROWS);
+        if throwLoc.isEof
+            return (EOF_WORD, []);
+
+        let mut throwers: [&Expression] = [];
+        loop {
+            throwers ~= [ExpressionVisitor::readOperandSimple0(alias context)];
+            let (coma, _) = context:.readIf(Tokens::COMA);
+            if coma.isEof
+                break;
+        }
+
+        return (throwLoc, throwers);
+    }
+
+    /**
+     * Read the redirect ctor, and field ctor part of a constructor for a class or a struct
+     *
+     * @params:
+     *    - context: the context of the reading
+     *    - kind:    the kind of type being read
+     *
+     * */
+    fn readCtorWith(dmut context: &SyntaxVisitor, kind: TypeDeclKind)-> (RedirectCtor?, [FieldCtor])
+        throws ErrorMsg
+    {
+        let (hasWith, _) = context:.readIf(Keys::WITH);
+        if hasWith.isEof
+            return (none, []);
+
+        // Try to read the redirection ctor
+
+        let mut redirect: (RedirectCtor)? = none;
+        let (isRedirect, _) = if (kind == TypeDeclKind::CLASS) {
+            context:.readIf(Keys::SUPER, Keys::SELF)
+        } else {
+            context:.readIf(Keys::SELF)
+        };
+
+        if !isRedirect.isEof {
+            let redirect_ = TypeVisitor::readCtorRedirect(alias context, isRedirect);
+            if isRedirect == Keys::SELF // no field construction allowed after a self redirection
+                return (redirect_?, []);
+
+            let (coma, _) = context:.readIf(Tokens::COMA);
+            if coma.isEof // there's no following fields
+                return (redirect_?, []);
+
+            redirect = redirect_?; // There are, we store the redirection read
+        }
+
+        // Read the fields
+        //
+        let mut fields: [FieldCtor] = [];
+        loop {
+            let (ident, _) = context:.readIdentifier();
+            let (eq, _) = context:.readTokens(Tokens::EQUAL);
+
+            let value = ExpressionVisitor::readExpressionSimple(alias context, BinaryOperatorsLevelNames::BOOL_LOGIC);
+            fields ~= [FieldCtor(eq, ident, value)];
+
+            let (coma, _) = context:.readIf(Tokens::COMA);
+            if coma.isEof
+                break;
+        }
+
+        return (redirect, fields);
+    }
+
+    /**
+     * Read a ctor redirection
+     * @params:
+     *    - context: the context of the reading
+     *    - start:   the keyword opening the ctor redirection
+     * */
+    fn readCtorRedirect(dmut context: &SyntaxVisitor, start: &Word)-> RedirectCtor
+        throws ErrorMsg
+    {
+        let mut params: [&Expression] = [];
+        let mut templateParams: [&Expression] = [];
+        let mut rename: &Word = EOF_WORD;
+
+        // '::' Identifier
+        let (dcolon, _) = context:.readIf(Tokens::DCOLON);
+        if !dcolon.isEof {
+            rename = context:.readIdentifier()._0;
+        }
+
+        // '!' TemplateCall
+        let (not, _) = context:.readIf(Tokens::NOT);
+        if !not.isEof {
+            templateParams = ExpressionVisitor::readTemplateCallList(alias context, not);
+        }
+
+
+        context:.readTokens(Tokens::LPAR);
+        let (close, _) = context:.readIf(Tokens::RPAR);
+        if close.isEof loop { // not '()', so there are parameters
+            params ~= [ExpressionVisitor::readExpressionComplex(alias context, BinaryOperatorsLevelNames::BOOL_LOGIC)];
+
+            let (coma, _) = context:.readTokens(Tokens::COMA, Tokens::RPAR);
+            if coma == Tokens::RPAR
+                break;
+        }
+
+        return RedirectCtor(start, rename, params, templateParams);
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * =====================================          UTILS          ======================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Transform a string into a TypeDeclKind
+     *
+     * @warning: panic if str is not a TypeDeclKind
+     * */
+    fn toTypeKind(str: [c8])-> TypeDeclKind {
+        for i in TypeDeclKind::__members__ {
+            if i == str { return i; }
+        }
+
+        panic;
+    }
+
+    /**
+     * @returns: the list of allowed keyword at top level type declaration
+     *
+     * @params:
+     *    - kind: the kind of type being read
+     * */
+    fn getKeywordListTop(kind: TypeDeclKind)-> [[c8]] {
+        match kind {
+            TypeDeclKind::CLASS => return __SPECIAL_CLASS__.classDeclTop;
+            TypeDeclKind::ENTITY => return __SPECIAL_CLASS__.entityDeclTop;
+        }
+
+        return __SPECIAL_CLASS__.recordUnionDeclTop;
+    }
+
+
+    /**
+     * @returns: the list of allowed keyword in a protected level type declaration
+     *
+     * @params:
+     *    - kind: the kind of type being read
+     * */
+    fn getKeywordListProtected(kind: TypeDeclKind)-> [[c8]] {
+        match kind {
+            TypeDeclKind::CLASS => return __SPECIAL_CLASS__.classDeclProtected;
+        }
+
+        return __SPECIAL_CLASS__.structDeclProtected;
+    }
+
+
+}

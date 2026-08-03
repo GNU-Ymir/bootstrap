@@ -1,38 +1,104 @@
+/*
+ * Declares the MultSymValue class.
+ *
+ * MultSymValue represents a generator value produced when name resolution
+ * returns multiple possible symbols, without yet knowing which one is the
+ * correct semantic choice. This situation typically arises during early
+ * semantic analysis, before overload resolution, template instantiation, or
+ * operator/call disambiguation.
+ *
+ * Each candidate symbol is already wrapped in a Value(prototype, delegate,
+ * class constructor, etc.), so MultSymValue aggregates Values rather than raw
+ * symbol-table entries. Later semantic passes will score and filter these
+ * candidates until only one remains.
+ *
+ * MultSymValue may itself contain other MultSymValue instances; the constructor
+ * flattens them to maintain a simple linear list of candidates.
+ *
+ * A MultSymValue is considered a full literal only if all contained Values are
+ * full literals.
+ *
+ * The optional `prettyStr` is used for improved diagnostic messages when
+ * reporting ambiguous or unresolved symbol references.
+ *
+ * <hr>
+ *
+ * @Package: ymirc
+ * @Module: ymirc::semantic::generator::value::multsym
+ * @File: ymirc/semantic/generator/value/multsym.yr
+ * @Author(s):
+ *   - Emile Cadorel <ecadorel@gmail.com>
+ *
+ * @Created(YYYY-MM-DD): 2021-11-20
+ * @Copyright(C) 2021–2026 GNU-Ymir
+ * @License
+ *   ```text
+ *   This file is part of the Ymir language project.
+ *
+ *   Ymir is free software: you can redistribute it and/or modify it
+ *   under the terms of the GNU General Public License as published by
+ *   the Free Software Foundation, either version 3 of the License, or
+ *   (at your option) any later version.
+ *
+ *   Ymir is distributed in the hope that it will be useful,
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *   GNU General Public License for more details.
+ *
+ *   You should have received a copy of the GNU General Public License
+ *   along with Ymir.  If not, see <https://www.gnu.org/licenses/>.
+ *   ```
+ */
+
 in multsym;
 
 use ymirc::lexing::word;
-use ymirc::utils::format;
+use ymirc::utils::{format, comparison};
 use std::stream;
 
-use ymirc::semantic::generator::type::native::scalar::none_;
+use ymirc::semantic::generator::type::native;
 
-/**
- * A mult sym value, is a value that contains references to multiple symbols
- * It can happen when multiple symbols have the same name for example
- */
 @final
 pub class MultSymValue over Value {
 
-    // The content of the multiple sym
-    let _values : [&Value];
+    pub {
+        /**
+         * The list of candidate Values associated with this ambiguous symbol.
+         * This list is flattened: if any element is itself a MultSymValue, its
+         * contents are expanded directly into this array.
+         */
+        let values: [&Value];
 
-    // The string to print for pretty error formatting
-    let _prettyStr : [c8];
-    
+        /**
+         * Optional human-readable string used for pretty-printing in error
+         * messages. When empty, a generic placeholder is used instead.
+         */
+        let prettyStr: [c8];
+    }
+
     /**
-     * @params: 
-     *   - loc: the location of the reference
-     * 
+     * Construct a MultSymValue from a list of candidate Values.
+     *
+     * @params:
+     *   - loc:       source location where the ambiguous symbol appears
+     *   - content:   list of candidate Values returned by name resolution
+     *   - prettyStr: optional string used for diagnostic formatting
+     *
+     * The constructor flattens nested MultSymValue instances so that the
+     * resulting `values` array contains only direct Value references.
+     *
+     * MultSymValue is always considered reduced, since it does not represent a
+     * runtime computation but a semantic placeholder.
      */
-    pub self (loc : &Word, content : [&Value], prettyStr : [c8] = ""s8)
-        with super (loc, NONE_TYPE, isReduced-> true)
-        , _prettyStr = prettyStr
-        , _values = {
+    pub self (loc: &Word, content: [&Value], prettyStr: [c8] = ""s8)
+        with super (loc, NONE_TYPE, isReduced-> true, isLvalue-> false)
+        , prettyStr = prettyStr
+        , values = {
             // Flattening mult symbols
-            let mut res : [mut &Value] = [];
+            let mut res: [mut &Value] = [];
             for c in content {
-                if let m : &MultSymValue = c {
-                    res ~= m._values;
+                if let m: &MultSymValue = c {
+                    res ~= m.values;
                 }
                 else res ~= [c];
             }
@@ -40,92 +106,82 @@ pub class MultSymValue over Value {
         }
     {}
 
-    /*!
-     * ================================================================================
-     * ================================================================================
-     * =========================           GETTERS            =========================
-     * ================================================================================
-     * ================================================================================
-     */
-
     /**
-     * @returns: the list of values contained in the mult sym
+     * A MultSymValue is a full literal only if *all* contained Values are
+     * themselves full literals.
+     *
+     * This allows literal propagation through ambiguous constructs when all
+     * candidates are literal values.
      */
-    pub fn getValues (self)-> [&Value] {
-        self._values
-    }
-
-    /*!
-     * ================================================================================
-     * ================================================================================
-     * =========================          COMPARISON          =========================
-     * ================================================================================
-     * ================================================================================
-     */
-
-    pub over opEquals (self, o : &Generator)-> bool {
-        if (!self.super.opEquals (o)) return false;
-
-        match o {
-            p : &MultSymValue => {
-                if (p._values.len != self._values.len) return false;
-                for i in 0us .. self._values.len {
-                    if (p._values [i] != self._values [i]) return false;
-                }
-
-                true
-            }
-            _ => { false }
-        }
-    }
-
-    pub over isFullLiteral (self)-> bool {
-        for i in self._values {
-            if (!i.isFullLiteral ()) return false;
+    @field
+    pub over isFullLiteral(self)-> bool {
+        for i in self.values {
+            if (!i.isFullLiteral) return false;
         }
 
         true
     }
 
-
-    /*!
-     * ====================================================================================================
-     * ====================================================================================================
-     * ====================================          CLONING          =====================================
-     * ====================================================================================================
-     * ====================================================================================================
-     */
-
     /**
-     * Create an exact copy of the value with a different uniqId
-     * */
-    pub over clone (self)-> &Value {
-        let mut result = copy [i.clone () for i in self._values];
-        copy MultSymValue (self._loc, result, prettyStr-> self._prettyStr)
+     * Create a deep clone of this MultSymValue.
+     *
+     * Each contained Value is cloned recursively, and the resulting list is
+     * used to construct a new MultSymValue instance. The pretty string is
+     * preserved unchanged.
+     */
+    pub over clone(self)-> &Value {
+        let mut result = copy [i.clone() for i in self.values];
+
+        return copy MultSymValue(self.loc,
+                                  result,
+                                  prettyStr-> self.prettyStr);
     }
 
-    /*!
-     * ================================================================================
-     * ================================================================================
-     * =========================             MISC             =========================
-     * ================================================================================
-     * ================================================================================
-     */
+    impl Comparable!{&Generator} {
+
+        /**
+         * Compare two MultSymValue instances for structural equality.
+         *
+         * Two MultSymValue objects are equal if:
+         *   - their base Value properties compare equal, and
+         *   - their flattened lists of candidate Values compare equal.
+         *
+         * This comparison does not attempt semantic equivalence; it is purely
+         * structural. PrettyString is ignored.
+         */
+        pub over opEquals(self, o: &Generator)-> bool {
+            if let p: &MultSymValue = o {
+                if (!self.super.opEquals(o)) return false;
+                if self.values != p.values return false;
+
+                return true;
+            }
+
+            return false;
+        }
+
+    }
 
     impl Streamable;
     impl Formattable {
 
-        pub over format (self, dmut stream : &Formatter) {
-            match self._prettyStr {
+        /**
+         * Format the MultSymValue for diagnostic output.
+         *
+         * If a custom pretty string was provided, it is printed directly.
+         * Otherwise, a generic placeholder "<multsym-value>" is emitted.
+         *
+         * This formatting is intended for error messages and debugging, not for
+         * code generation.
+         */
+        pub over format(self, dmut stream: &Formatter) {
+            match self.prettyStr {
                 "" =>
-                    stream:.write ("<mutlsym-value>");
+                    stream:.write("<mutlsym-value>");
                 _ =>
-                    stream:.write (self._prettyStr);
-            };                    
-        }        
+                    stream:.write(self.prettyStr);
+            };
+        }
     }
-    
+
 }
-
-
-

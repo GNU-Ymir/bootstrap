@@ -1,0 +1,490 @@
+/*
+ * Implements semantic validation for the call operator `(...)` and all
+ * syntactic variants of function invocation in Ymir.
+ *
+ * Responsibilities:
+ *   - Validate the left operand of a call expression, including:
+ *       - direct callable values
+ *       - multi-symbol sets(overload groups)
+ *       - dot-call syntax(a.b(x) → b(a, x))
+ *       - template call rewrites( (a.b)!{T}(x) )
+ *
+ *   - Validate and normalize right-hand operands(arguments):
+ *       - positional arguments
+ *       - named arguments
+ *       - expanded arguments(`...`)
+ *       - lazy and reference arguments
+ *
+ *   - Detect and reject calls containing error-typed parameters early,
+ *     preventing cascading diagnostics.
+ *
+ *   - Dispatch the final call to MultSymCallValidation, which performs
+ *     overload resolution, scoring, and final selection.
+ *
+ *   - Produce precise diagnostics for:
+ *       - invalid call targets
+ *       - invalid dot-call rewrites
+ *       - invalid named arguments
+ *       - invalid expansions
+ *       - undefined call operators
+ *
+ * This module defines the complete semantics of the call operator.
+ *
+ * <hr>
+ *
+ * @Package: ymirc
+ * @Module: ymirc::semantic::validator::value::operator::call
+ * @File: ymirc/semantic/validator/value/operator/call.yr
+ * @Author(s):
+ *   - Emile Cadorel <ecadorel@gmail.com>
+ *
+ * @Created(YYYY-MM-DD): 2026-03-26
+ * @Copyright(C) 2021–2026 GNU-Ymir
+ * @License
+ *   ```text
+ *   This file is part of the Ymir language project.
+ *
+ *   Ymir is free software: you can redistribute it and/or modify it
+ *   under the terms of the GNU General Public License as published by
+ *   the Free Software Foundation, either version 3 of the License, or
+ *   (at your option) any later version.
+ *
+ *   Ymir is distributed in the hope that it will be useful,
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *   GNU General Public License for more details.
+ *
+ *   You should have received a copy of the GNU General Public License
+ *   along with Ymir.  If not, see <https://www.gnu.org/licenses/>.
+ *   ```
+ */
+
+in call;
+
+use ymirc::syntax::{_, declaration::_, expression::_};
+
+use ymirc::semantic::{declarator, validator, template_, symbol};
+use ymirc::semantic::generator::{value::_, type::_};
+use ymirc::semantic::generator::_;
+
+use ymirc::global::core_;
+use ymirc::errors;
+use ymirc::utils::format;
+
+use ymirc::lexing::{word, tokens, keys};
+
+use ymirc::semantic::validator::value::operator::call::_;
+use std::stream;
+
+/*!
+ * ====================================================================================================
+ * ====================================================================================================
+ * ====================================          SUBMODS          =====================================
+ * ====================================================================================================
+ * ====================================================================================================
+ */
+
+pub mod ::params;
+
+mod ::multsym;
+mod ::fptr;
+mod ::delegate;
+mod ::method;
+mod ::proto;
+mod ::ctor;
+mod ::lambda;
+mod ::template_;
+
+
+/*!
+ * ====================================================================================================
+ * ====================================================================================================
+ * ======================================          ROOT          ======================================
+ * ====================================================================================================
+ * ====================================================================================================
+ */
+
+/**
+ * CallValidation
+ *
+ * Root validator for all call expressions:
+ *
+ *      left( arg1, arg2, ... )
+ *
+ * This module handles:
+ *
+ *   - Direct calls on values
+ *   - Calls on multi-symbol sets(overload groups)
+ *   - Dot-call syntax:
+ *         a.b(x)  →  b(a, x)
+ *
+ *   - Template-call rewrites:
+ *         (a.b)!{T}(x)  →  b!{T}(a, x)
+ *
+ *   - Named arguments and argument reordering
+ *   - Argument expansion(`...`)
+ *   - Error-parameter detection
+ *
+ * After normalization, the call is delegated to:
+ *
+ *      MultSymCallValidation::validate()
+ *
+ * which performs overload resolution and returns the final callable.
+ *
+ */
+pub mod CallValidation {
+
+    /**
+     * Entry point for validating a call expression represented as a
+     * MultOperatorExpr.
+     *
+     * Steps:
+     *   1. Validate the left operand via validateLeftOperand().
+     *   2. Validate and normalize right operands via validateRightOperands().
+     *   3. Reject calls containing error-typed parameters.
+     *   4. Dispatch to the core call validator.
+     *
+     * This function handles dot-call rewriting and UFC rewriting.
+     *
+     * @returns:
+     *   A &Value representing the result of the call.
+     *
+     * @throws:
+     *   ErrorMsg if the call cannot be resolved.
+     */
+    pub fn validate(dmut context: &ValidationContext, mult: &MultOperatorExpr)-> &Value
+        throws ErrorMsg
+    {
+        let (left, rightDot) = CallValidation::validateLeftOperand(alias context, mult, mult.left, mult.canBeDotCall);
+        let (rights, nbNamed) = CallValidation::validateRightOperands(alias context, mult.rights, rightDot);
+
+        // If one of the param is "error" then no need to actually perform the call, nothing will work
+        // And it will show an extremely long error for nothing
+        CallParamListCreation::checkNoErrorParams(mult.loc, left, rights);
+
+        return CallValidation::validate(alias context, mult.loc, left, rights,
+                                         nbNamed-> nbNamed,
+                                         inCopy-> context.isInCopy(mult));
+    }
+
+    /**
+     * Validate a call expression when the left operand and argument list
+     * are already known.
+     *
+     * Responsibilities:
+     *   - Separate named and positional arguments.
+     *   - Reject calls containing error-typed parameters.
+     *   - Forward to the core call dispatcher with nbNamed.
+     *
+     * @params:
+     *   - context: validation context
+     *   - loc:     source location of the call operator
+     *   - left:    the left operand(call target)
+     *   - rights:  list of argument values(named + positional)
+     *   - inCopy:  whether the call occurs inside a copy expression
+     *
+     * @returns:
+     *   A &Value representing the resolved call.
+     *
+     * @throws:
+     *   ErrorMsg if the call cannot be resolved.
+     */
+    pub fn validate(dmut context: &ValidationContext,
+                     loc:          &Word,
+                     left:         &Value,
+                     rights:       [&Value],
+                     inCopy:       bool = false)-> &Value
+        throws ErrorMsg
+    {
+        let mut finRights: [&Value] = [];
+        let mut named: [&Value] = [];
+        for r in rights match r {
+            n: &NamedValue => { named ~= [n]; }
+            _ => { finRights ~= [r]; }
+        }
+
+        let rights_ = (named ~ finRights);
+
+        // If one of the param is "error" then no need to actually perform the call, nothing will work
+        // And it will show an extremely long error for nothing
+        CallParamListCreation::checkNoErrorParams(loc, left, rights_);
+
+        return CallValidation::validate(alias context, loc, left, rights_,
+                                         nbNamed-> named.len,
+                                         inCopy-> inCopy);
+    }
+
+    /**
+     * Core call dispatcher.
+     *
+     * Ensures that the left operand is a MultSymValue(overload group).
+     * If it is not, it wraps it into a single-element MultSymValue.
+     *
+     * Delegates overload resolution to:
+     *
+     *      MultSymCallValidation::validate()
+     *
+     * @params:
+     *   - context: validation context
+     *   - loc:     operator location
+     *   - left:    the call target(value or overload group)
+     *   - rights:  normalized argument list
+     *   - nbNamed: number of named arguments in `rights`
+     *   - inCopy:  whether the call occurs inside a copy expression
+     *
+     * @returns:
+     *   The selected overload result.
+     *
+     * @throws:
+     *   ErrorMsg if overload resolution fails.
+     */
+    pub fn validate(dmut context: &ValidationContext,
+                     loc:          &Word,
+                     left:         &Value,
+                     rights:       [&Value],
+                     nbNamed:      usize,
+                     inCopy:       bool = false)-> &Value
+        throws ErrorMsg
+    {
+        let value: &MultSymValue = match left {
+            m: &MultSymValue => { m }
+            l: _ => { copy MultSymValue(l.loc, copy [l], prettyStr-> format("%", l)) }
+        };
+
+        let (result, _score_) = MultSymCallValidation::validate(alias context, loc, value, rights,
+                                                                 nbNamed-> nbNamed,
+                                                                 inCopy-> inCopy);
+
+        return result;
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ==================================          LEFT OPERAND          ==================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Validate the left operand of a call expression.
+     *
+     * Steps:
+     *   1. Enter call-context(context.enterCall).
+     *   2. Attempt to validate the left expression normally.
+     *   3. If validation fails and dot-call syntax is allowed:
+     *        - attempt dot-call rewriting via validateDotCall().
+     *
+     * Dot-call syntax allows:
+     *      a.b(x)  →  b(a, x)
+     *
+     * @params:
+     *   - context:      validation context
+     *   - m:            the full call expression
+     *   - left:         the left-hand expression before call
+     *   - canBeDotCall: whether dot-call rewriting is permitted
+     *
+     * @returns:
+     *   (validatedLeftValue, preValidatedArguments)
+     *
+     * @throws:
+     *   ErrorMsg if neither normal nor dot-call validation succeeds.
+     */
+    fn validateLeftOperand(dmut context: &ValidationContext,
+                            m:            &MultOperatorExpr,
+                            left:         &Expression,
+                            canBeDotCall: bool)-> (&Value, [&Value])
+        throws ErrorMsg
+    {
+        {
+            context:.enterCall(m);
+
+            {
+                let l = ValueCreation::createEnumUnwrap(ValueValidation::validate(alias context, left));
+                return (l, []);
+            } catch {
+                err: &ErrorMsg => {
+
+                    // If left was not correct, maybe it is a dotCall syntax
+                    if (canBeDotCall) {
+                        return CallValidation::validateDotCall(alias context, left, err);
+                    }
+
+                    throw err;
+                }
+            }
+        } exit {
+            context:.exitCall();
+        }
+    }
+
+    /**
+     * Attempt to rewrite a dot-call expression into a normal call.
+     *
+     * Examples:
+     *      a.b(x)          →  b(a, x)
+     *      a.b!{T}(x)      →  b!{T}(a, x)
+     *
+     * Steps:
+     *   1. Rewrite the syntax via rewriteDotCallSyntax().
+     *   2. Validate the rewritten left operand.
+     *   3. Reject dot-call on error-typed values.
+     *   4. Validate the right operand.
+     *
+     * If rewriting fails, the error is combined with the original error
+     * to produce a multi-note diagnostic.
+     *
+     * @params:
+     *   - context: validation context
+     *   - left:    original left expression
+     *   - err:     the error raised by normal validation
+     *
+     * @returns:
+     *   (rewrittenLeftValue, extraArguments)
+     *
+     * @throws:
+     *   ErrorMsg if rewriting or validation fails.
+     */
+    fn validateDotCall(dmut context: &ValidationContext, left: &Expression, err: &ErrorMsg)-> (&Value, [&Value])
+        throws ErrorMsg
+    {
+        let (lValRewritten, rightSynt) = CallValidation::rewriteDotCallSyntax(alias context, left, err);
+        let lval = ValueCreation::createEnumUnwrap(lValRewritten);
+
+        // Cannot use dot call syntax on error values
+        if lval.type of ErrorType {
+            throw err;
+        }
+
+        // Otherwise we try the UFC rewritting
+        {
+            let rval = ValueCreation::createEnumUnwrap(ValueValidation::validate(alias context, rightSynt));
+            return (rval, copy [lval]);
+        } catch {
+            rerr: &ErrorMsg => {
+                // We add the error, in case the user really wanted a dot call but the function is miswritten or something
+                let note = copy ErrorMsg::note(rightSynt.loc, ValidateErrorMessage::UFC_REWRITING, notes-> copy [rerr]);
+
+                throw copy ErrorMsg::list(copy [note, err]);
+            }
+        }
+    }
+
+    /**
+     * Rewrite syntactic forms of dot-call expressions.
+     *
+     * Supported rewrites:
+     *   - a.b              →  (a, b)
+     *   - a.b!{params}     →  (a, b!{params})
+     *
+     * @params:
+     *   - context: validation context
+     *   - left:    original left expression
+     *   - err:     error to throw if no dot-call pattern matches
+     *
+     * @returns:
+     *   (rewrittenLeftValue, rewrittenRightExpression)
+     *
+     * @throws:
+     *   ErrorMsg if no dot-call pattern matches.
+     */
+    fn rewriteDotCallSyntax(dmut context: &ValidationContext, left: &Expression, err: &ErrorMsg)-> (&Value, &Expression)
+        throws ErrorMsg
+    {
+
+        if let bin: &BinaryExpr = left && bin.op == BinaryOperators::DOT { // rewrite(a.b)
+            let l = ValueValidation::validate(alias context, bin.left);
+            return (l, bin.right);
+        }
+
+        if let t: &TemplateCallExpr = left {
+            if let bin: &BinaryExpr = t.left && bin.op == BinaryOperators::DOT {  // rewrite( (a.b)!{params} )
+                let l = ValueValidation::validate(alias context, bin.left);
+                let right: &Expression = copy TemplateCallExpr(t.loc, bin.right, t.rights);
+                return (l, right);
+            }
+        }
+
+        throw err;
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * =====================================          RIGHTS          =====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Validate and normalize the argument list of a call expression.
+     *
+     * Responsibilities:
+     *   - Merge pre-validated arguments(from dot-call rewriting).
+     *   - Validate each argument expression.
+     *   - Verify that each argument has a complete type.
+     *   - Handle:
+     *       - ExpandValue(argument expansion)
+     *       - NamedValue(named arguments)
+     *       - Positional arguments
+     *
+     * @params:
+     *   - context:   validation context
+     *   - rightOps:  list of argument expressions
+     *   - validated: pre-validated arguments from dot-call rewriting
+     *
+     * @returns:
+     *   (normalizedArguments, numberOfNamedArguments)
+     *
+     * @throws:
+     *   ErrorMsg if any argument fails validation.
+     */
+    fn validateRightOperands(dmut context: &ValidationContext,
+                              rightOps:     [&Expression],
+                              validated:    [&Value])-> ([&Value], usize)
+        throws ErrorMsg
+    {
+        let mut errors: [&ErrorMsg] = [];
+        let mut rights: [&Value] = [];
+        let mut named: [&Value] = [];
+
+        for r in validated match r {
+            n: &NamedValue => { named ~= [n]; }
+            _ => { rights ~= [r]; }
+        }
+
+        for r in rightOps {
+            {
+                let v = ValueValidation::validate(alias context, r,
+                                                   canBeRef-> true,
+                                                   canBeLazy-> true);
+
+                TypeVerification::verifyCompleteWithValue(r.loc,  v.type, v,
+                                                           construct-> true);
+
+                match v {
+                    e: &ExpandValue => {
+                        rights ~= e.values;
+                    }
+                    n: &NamedValue => {
+                        named ~= [n];
+                    }
+                    _ => {
+                        rights ~= [v];
+                    }
+                }
+            } catch {
+                err: &ErrorMsg => {
+                    errors ~= [err];
+                }
+            }
+        }
+
+        if (errors.len != 0us) throw copy ErrorMsg::list(errors);
+
+        return (named ~ rights, named.len);
+    }
+
+
+
+}

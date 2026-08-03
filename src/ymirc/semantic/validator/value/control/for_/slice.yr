@@ -1,0 +1,353 @@
+/*
+ * Implements semantic validation for slice-based `for` loops in Ymir.
+ *
+ * Responsibilities:
+ *   - Validate iteration over slices.
+ *   - Support both element-only and element+index iteration forms.
+ *   - Create and manage iterator variables for element and index.
+ *   - Construct loop control expressions: test, increment, and body.
+ *   - Track reference and alias usage across the loop.
+ *   - Manage loop and block scopes, including error aggregation.
+ *
+ * This module is invoked when the left operand of a `for` loop is a slice.
+
+ *
+ * <hr>
+ *
+ * @Package: ymirc
+ * @Module: ymirc::semantic::validator::value::control::for_::slice
+ * @File: ymirc/semantic/validator/value/control/for_/slice.yr
+ * @Author(s):
+ *   - Emile Cadorel <ecadorel@gmail.com>
+ *
+ * @Created(YYYY-MM-DD): 2026-05-14
+ * @Copyright(C) 2021–2026 GNU-Ymir
+ * @License
+ *   ```text
+ *   This file is part of the Ymir language project.
+ *
+ *   Ymir is free software: you can redistribute it and/or modify it
+ *   under the terms of the GNU General Public License as published by
+ *   the Free Software Foundation, either version 3 of the License, or
+ *   (at your option) any later version.
+ *
+ *   Ymir is distributed in the hope that it will be useful,
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *   GNU General Public License for more details.
+ *
+ *   You should have received a copy of the GNU General Public License
+ *   along with Ymir.  If not, see <https://www.gnu.org/licenses/>.
+ *   ```
+ */
+
+in slice;
+
+use ymirc::lexing::{word, keys};
+
+use ymirc::syntax::expression::_;
+use ymirc::semantic::validator;
+use ymirc::semantic::generator::{value::_, type::_};
+
+use ymirc::errors;
+
+use ymirc::utils::format;
+use ymirc::semantic::validator::value::control::for_::_;
+
+
+/**
+ * SliceForLoopValidation
+ *
+ * Provides semantic validation for `for` loops iterating over slices.
+ *
+ * Supports:
+ *   - Single-variable iteration:
+ *         for e in slice { ... }
+ *
+ *   - Dual-variable iteration(index + element):
+ *         for i, e in slice { ... }
+ *
+ */
+pub mod SliceForLoopValidation {
+
+    /**
+     * Validate a `for` loop iterating over a slice.
+     *
+     * @params:
+     *   - context:   validation context
+     *   - slice:     slice value being iterated
+     *   - sliceType: static type of the slice
+     *   - floop:     for-loop expression
+     *   - byMutRef:  whether iteration is by mutable reference
+     *   - byAlias:   whether iteration is by alias
+     *
+     * @returns:
+     *   (loopValue, usedRef, usedAlias)
+     *     - loopValue: BlockValue representing the validated loop
+     *     - usedRef:   true if any iteration used a reference
+     *     - usedAlias: true if any iteration used an alias
+     *
+     * @throws:
+     *   ErrorMsg if the iterator count is unsupported.
+     */
+    pub fn validate(dmut context: &ValidationContext,
+                    slice: &Value,
+                    sliceType: &SliceType,
+                    floop: &ForLoopExpr,
+                    byMutRef: bool,
+                    byAlias: bool)-> (&Value, bool, bool)
+        throws ErrorMsg
+    {
+        if floop.vars.len == 1 {
+            return SliceForLoopValidation::validateIteration(alias context, slice, sliceType, floop, floop.vars[0], none,
+                                                             byMutRef-> byMutRef,
+                                                             byAlias-> byAlias);
+        }
+
+        if floop.vars.len == 2 {
+            return SliceForLoopValidation::validateIteration(alias context, slice, sliceType, floop, floop.vars[1], (floop.vars[0])?,
+                                                             byMutRef-> byMutRef,
+                                                             byAlias-> byAlias);
+        }
+
+        throw copy ErrorMsg::fatal(floop.loc, format(ValidateErrorMessage::UNDEF_FOR_LOOP_OPERATOR, floop.vars.len, sliceType));
+    }
+
+    /**
+     * Validate the full iteration logic for a slice-based `for` loop.
+     *
+     * @params:
+     *   - context:   validation context
+     *   - slice:     slice value
+     *   - sliceType: slice type
+     *   - floop:     for-loop expression
+     *   - elemIter:  element iterator declaration
+     *   - indexIter: optional index iterator declaration
+     *   - byMutRef:  iteration by mutable reference
+     *   - byAlias:   iteration by alias
+     *
+     * @returns:
+     *   (blockValue, usedRef, usedAlias)
+     */
+    fn validateIteration(dmut context: &ValidationContext,
+                         slice:        &Value,
+                         sliceType:    &SliceType,
+                         floop:        &ForLoopExpr,
+                         elemIter:     &VarDeclExpr,
+                         indexIter:    (&VarDeclExpr)?,
+                         byMutRef:     bool,
+                         byAlias:      bool)-> (&Value, bool, bool)
+        throws ErrorMsg
+    {
+        let loc = floop.loc;
+        let mut errors: (&ErrorMsg)? = none;
+        let mut innerValues: [&Value] = [];
+        let mut values: [&Value] = [];
+        let mut test: &Value = UNIT_VALUE;
+        let mut usedRef = false, mut usedAlias = false;
+
+        context:.enterLoop();
+        context:.setCurrentLoopType(copy VoidType(loc));
+        context:.enterBlock();
+        {
+            let sliceDecl = copy VarDeclValue(slice.loc.locate(ForLoopKeys::VALUE), sliceType, slice,
+                                              isMutable-> (byMutRef || byAlias) && sliceType.isMutable);
+            let sliceVref = VariableCreation::createVarFromDecl(sliceDecl, canCte-> false);
+
+            values ~= [sliceDecl];
+            // First we create the iteration variables, that will store the value at the current array index, and the value of the index
+            let vars = SliceForLoopValidation::validateIteratorVars(alias context, slice.loc, sliceVref, sliceType, elemIter, indexIter,
+                                                                    byMutRef-> byMutRef,
+                                                                    byAlias-> byAlias);
+            let iter = vars._0; // the value of the current index
+
+            values ~= [vars._1]; // declare index iterator outside the content of the loop
+
+            usedRef = vars._3;
+            usedAlias = vars._4;
+
+            let one = copy IntValue(loc, USIZE_TYPE, 1us);
+
+            // access the size of the array to verify test when to exit the loop
+            let len = {
+                // Compute the len from the initial value, because the generator #_value may lose the cte len(e.g. a[0 .. 2], [1, 2, 3], ...)
+                let bi = context.cteInterpret:.computeInt(copy StructFieldAccessValue(loc, USIZE_TYPE, slice, SliceKeys::LEN));
+                copy IntValue(loc, USIZE_TYPE, bi)
+            } catch {
+                _ => { // it is not cte, so we can use the value from the uniq value instead, to avoid recreating the slice at each iteration
+                    context.cteInterpret:.reduce(copy StructFieldAccessValue(loc, USIZE_TYPE, sliceVref, SliceKeys::LEN))
+                }
+            };
+
+            test = copy CmpIntOperatorValue(loc, BinaryOperators::INF, iter, len); // if the iterator is greater than the value of the array the loop is stopped
+            let increment = copy AffectValue(loc, iter.type, iter,
+                                             copy MathIntOperatorValue(loc, iter.type,
+                                                                       BinaryOperators::PLUS,
+                                                                       iter,
+                                                                       one));
+
+            // the loop has three steps: value iterator declarations, content, increment
+            innerValues ~= [vars._2];
+            innerValues ~= [ValueValidation::validate(alias context, floop.block)]; // execute the content of the loop
+            innerValues ~= [increment];
+            // go to the next iteration
+        } catch {
+            err => {
+                errors = (err)?;
+            }
+        }
+
+        {
+            context:.quitLoop();
+            context:.quitBlock(warnUnused-> (!errors.hasValue));
+        } catch {
+            err => {
+                errors = (err)?;
+            }
+        }
+
+        if let Ok(err) = errors {
+            throw err;
+        }
+
+        let innerBlk = copy BlockValue(loc, VOID_TYPE, innerValues);
+        values ~= [copy LoopValue(loc, VOID_TYPE, test, innerBlk)];
+
+        let blk = copy BlockValue(loc, VOID_TYPE, values);
+        return (blk, usedRef, usedAlias);
+    }
+
+    /**
+     * Validate and construct iterator variables for slice iteration.
+     *
+     * @params:
+     *   - context:   validation context
+     *   - loc:       loop location
+     *   - sliceVref: VarRefValue referencing the slice
+     *   - sliceType: slice type
+     *   - elemIter:  element iterator declaration
+     *   - indexIter: optional index iterator declaration
+     *   - byMutRef:  iteration by mutable reference
+     *   - byAlias:   iteration by alias
+     *
+     * @returns:
+     *   (indexVref, indexDecl, elemDecl, usedRef, usedAlias)
+     */
+    pub fn validateIteratorVars(dmut context: &ValidationContext,
+                                loc:          &Word,
+                                sliceVref:    &VarRefValue,
+                                sliceType:    &SliceType,
+                                elemIter:     &VarDeclExpr,
+                                indexIter:    (&VarDeclExpr)?,
+                                byMutRef:     bool,
+                                byAlias:      bool)-> (&VarRefValue, &VarDeclValue, &VarDeclValue, bool, bool)
+        throws ErrorMsg
+    {
+        let indexIterVdecl = if let Ok(vdecl) = indexIter {
+            vdecl
+        } else {
+            copy VarDeclExpr(elemIter.loc, elemIter.name.locate(Keys::UNDER), EMPTY_EXPR, EMPTY_EXPR, EOF_WORD, EOF_WORD)
+        };
+
+        let (indexDecl, insertIndex) = ForLoopValidation::validateIndexIterDecl(alias context, indexIterVdecl.loc, indexIterVdecl, sliceType,
+                                                                                value-> copy IntValue(loc, USIZE_TYPE, 0),
+                                                                                canCte-> false);
+
+        let indexVref = VariableCreation::createVarFromDecl(indexDecl, canCte-> false, isIterator-> true);
+
+        let (elemDecl, insertElem, usedRef, usedAlias) = SliceForLoopValidation::validateElemDecl(alias context, elemIter, sliceVref, sliceType, indexVref,
+                                                                                                  byMutRef-> byMutRef,
+                                                                                                  byAlias-> byAlias);
+
+        if insertElem {
+            context:.insertLocal(elemDecl.loc, elemDecl.name, elemDecl);
+        }
+
+        if insertIndex {
+            context:.insertLocal(indexDecl.loc, indexDecl.name, indexDecl);
+        }
+
+        return (indexVref, indexDecl, elemDecl, usedRef, usedAlias);
+    }
+
+    /**
+     * Validate the element iterator declaration for slice iteration.
+     *
+     * @params:
+     *   - context:   validation context
+     *   - elemIter:  element iterator declaration
+     *   - sliceVref: VarRefValue referencing the slice
+     *   - sliceType: slice type
+     *   - indexVref: VarRefValue referencing the index iterator
+     *   - byMutRef:  iteration by mutable reference
+     *   - byAlias:   iteration by alias
+     *
+     * @returns:
+     *   (declValue, insert, usedRef, usedAlias)
+     */
+    pub fn validateElemDecl(dmut context: &ValidationContext,
+                            elemIter:     &VarDeclExpr,
+                            sliceVref:    &VarRefValue,
+                            sliceType:    &SliceType,
+                            indexVref:    &VarRefValue,
+                            byMutRef:     bool,
+                            byAlias:      bool)-> (&VarDeclValue, bool, bool, bool)
+        throws ErrorMsg
+    {
+        let innerType = sliceType.value;
+        let mut usedRef = false;
+        let mut usedAlias = false;
+
+        let vType = if (elemIter.type !of EmptyExpr) {
+            let vType = TypeValidation::validateForVarDecl(alias context, elemIter.type, elemIter,
+                                                           canBeRef-> true);
+            TypeVerification::verifyCompatible(elemIter.type.loc, sliceVref.loc, vType, innerType);
+            vType
+        } else {
+            TypeValidation::validateForVarDecl(alias context, copy TypeWrapperExpr(sliceVref.loc, innerType), elemIter,
+                                               canBeRef-> true)
+        }
+
+        TypeVerification::verifyNonVoid(elemIter.loc, vType, construct-> true);
+        TypeVerification::verifyMutableIterator(elemIter.isMutOrDmut, vType, isRef-> elemIter.isRef);
+
+        let slcAcc: &Value = copy SliceAccessValue(sliceVref.loc, innerType, sliceVref, indexVref);
+        let reducedValue = if !(byMutRef && !elemIter.isRef) {
+            context.cteInterpret:.reduce(slcAcc)
+        } else {
+            slcAcc
+        };
+
+        let iterValue = TypeInference::inferValueForType(alias context, elemIter.loc, reducedValue, vType,
+                                                         byReference-> elemIter.isRef);
+
+        let mut access: &Value = iterValue;
+        if byMutRef && elemIter.isRef && innerType.isMutable && iterValue.isLvalue {
+            usedRef = true;
+            access = copy ReferencerValue(elemIter.loc, iterValue.type, iterValue, isMutable-> true);
+        } else if !elemIter.isRef && byAlias && innerType.isMutable && vType.needsExplicitAlias {
+            usedAlias = true;
+            access = copy AliaserValue(elemIter.loc, iterValue.type, iterValue);
+        } else if elemIter.isRef && !byMutRef && iterValue.isLvalue {
+            access = copy ReferencerValue(elemIter.loc, iterValue.type, iterValue, isMutable-> false);
+        }
+
+        MemoryVerification::verifyMemoryOwner(elemIter.loc, vType, access,
+                                              construct-> true,
+                                              byReference-> elemIter.isRef);
+
+
+        let (name, insert) = if elemIter.name == Keys::UNDER {
+            (elemIter.name.locate(ForLoopKeys::ITER), false)
+        } else {
+            (elemIter.name, true)
+        };
+
+        let decl = copy VarDeclValue(name, vType, access,
+                                     isMutable-> (elemIter.isMutable || elemIter.isDeeplyMutable),
+                                     isReference-> elemIter.isRef,
+                                     isIterator-> true);
+
+        return (decl, insert, usedRef, usedAlias);
+    }
+}

@@ -1,0 +1,670 @@
+/*
+ * Declares the TypeSize module, responsible for computing and validating the
+ * type of types during semantic analysis.
+ *
+ * <hr>
+ *
+ * @Package: ymirc
+ * @Module: ymirc::semantic::validator::type::size
+ * @File: ymirc/semantic/validator/type/size.yr
+ * @Author(s):
+ *   - Emile Cadorel <ecadorel@gmail.com>
+ *
+ * @Created(YYYY-MM-DD): 2026-03-21
+ * @Copyright(C) 2021–2026 GNU-Ymir
+ * @License
+ *   ```text
+ *   This file is part of the Ymir language project.
+ *
+ *   Ymir is free software: you can redistribute it and/or modify it
+ *   under the terms of the GNU General Public License as published by
+ *   the Free Software Foundation, either version 3 of the License, or
+ *   (at your option) any later version.
+ *
+ *   Ymir is distributed in the hope that it will be useful,
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *   GNU General Public License for more details.
+ *
+ *   You should have received a copy of the GNU General Public License
+ *   along with Ymir.  If not, see <https://www.gnu.org/licenses/>.
+ *   ```
+ */
+
+
+in size;
+
+use ymirc::lexing::word;
+use ymirc::semantic::{symbol, validator, generator::{value::_, type::_}};
+use ymirc::errors;
+
+use ymirc::utils::{format, math};
+
+/**
+ * The TypeSize module computes the size of Ymir types during semantic
+ * validation. It supports:
+ *   - native scalar types,
+ *   - pointer-based compound types,
+ *   - user-defined structs and classes,
+ *   - tuples, arrays, options,
+ *   - and proxy types such as enums.
+ *
+ * The module also detects recursive sizeof expressions, forward references,
+ * and invalid types with no size.
+ */
+pub mod TypeSize {
+
+    /**
+     * Compute the size of a type and return it as an IntValue.
+     *
+     * @params:
+     *    - context: the validation context
+     *    - loc:     the location of the sizeof expression
+     *    - type:    the type whose size is being computed
+     *
+     * @returns: an IntValue containing the computed size
+     *
+     * @throws:
+     *    - &ErrorMsg: if the type has no size or cannot be validated
+     */
+    pub fn validate(dmut context: &ValidationContext, loc: &Word, type: &Type)-> &IntValue
+        throws ErrorMsg
+    {
+        let size = TypeSize::validateInner(alias context, loc, type);
+        return copy IntValue(loc, size, size-> 32u16, isSigned-> false);
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ==================================          COMPUTATIONS          ==================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Compute the offset and size of each field of a class or struct.
+     *
+     * For structs:
+     *   - fields are laid out sequentially,
+     *   - alignment and padding are applied unless the struct is packed,
+     *   - unions place all fields at offset 0 and take the max size.
+     *
+     * For classes:
+     *   - the first two fields are vtable and monitor pointers,
+     *   - alignment is pointer-based,
+     *   - classes cannot be packed or overlaid.
+     *
+     * @params:
+     *    - context: the validation context
+     *    - loc:     the location of the type
+     *    - cl:      the class or struct reference type
+     *
+     * @returns: a list of (offset, size) pairs for each field
+     *
+     * @throws:
+     *    - &ErrorMsg: if a field has no size or alignment cannot be computed
+     */
+    pub fn computeSizeAndAligns(dmut context: &ValidationContext, loc: &Word, cl: &ClassRefType)-> [(usize, usize)]
+        throws ErrorMsg
+    {
+        let mut res: [mut(usize, usize)] = [];
+        let (mut current, mut globAlign) = if (cl.sym.isStruct) {
+            (0us, 1us)
+        } else {
+            res = copy [(0us, 8us), (8us, 8us)];
+            (cast!usize(global::state::pointerArchSize() / 8u32) * 2us,
+             cast!usize(global::state::pointerArchSize() / 8u32)) // align of pointers
+        }; // classes have a vtable and monitor, structures dont
+
+
+        for v in cl.fields {
+            let innerS = TypeSize::validateInner(alias context, loc, v.varType);
+            let mut align = TypeAlign::validate(alias context, loc, v.varType);
+            if cl.sym.isPacked {
+                align = 1;
+            }
+
+            if (align > globAlign) { globAlign = align; }
+
+            let mut padding = (align - (current % align)) % align;
+            if cl.sym.isPacked || cl.sym.isOverlaid {
+                padding = 0;
+            }
+
+            let aligned = current + padding;
+
+            res ~= [(aligned, innerS)];
+
+            // Union: puts every fields at offset = 0
+            if (!cl.sym.isOverlaid) {
+                current = aligned + innerS;
+            }
+        }
+
+        res
+    }
+
+    /**
+     * Compute the offset and size of each element of a tuple.
+     *
+     * Tuple layout is sequential, with padding inserted to satisfy alignment.
+     *
+     * @params:
+     *    - context: the validation context
+     *    - loc:     the location of the tuple
+     *    - t:       the tuple type
+     *
+     * @returns: a list of (offset, size) pairs for each tuple element
+     *
+     * @throws:
+     *    - &ErrorMsg: if an element has no size
+     */
+    pub fn computeSizeAndAligns(dmut context: &ValidationContext, loc: &Word, t: &TupleType)-> [(usize, usize)]
+        throws ErrorMsg
+    {
+        let mut res: [mut(usize, usize)] = [];
+        let mut globAlign = 1us, mut current = 0us;
+
+        for inner in t.inners {
+            let innerS = TypeSize::validateInner(alias context, loc, inner);
+            let align = TypeAlign::validate(alias context, loc, inner);
+            if (align > globAlign) { globAlign = align; }
+
+            let padding = (align - (current % align)) % align;
+            let aligned = (current + padding);
+
+            res ~= [(aligned, innerS)];
+            current = aligned + innerS;
+        }
+
+        res
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * =====================================          INNER          ======================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Compute the raw size of a type(inner sizeof logic).
+     *
+     * This function dispatches to the appropriate validator depending on the
+     * concrete type. It also handles recursive types, proxy types, and
+     * forward-reference detection.
+     *
+     * @params:
+     *    - context: the validation context
+     *    - loc:     the location of the sizeof expression
+     *    - t:       the type whose size is being computed
+     *
+     * @returns: the size of the type in bytes
+     *
+     * @throws:
+     *    - &ErrorMsg: if the type has no size or cannot be validated
+     */
+    fn validateInner(dmut context: &ValidationContext, loc: &Word, t: &Type)-> usize
+        throws ErrorMsg
+    {
+        match t {
+            // Immediate sizeable
+            b: &BoolType => {
+                return TypeSize::validateBool(loc, b);
+            }
+            it: &IntType => {
+                return TypeSize::validateInt(loc, it);
+            }
+            c: &CharType => {
+                return TypeSize::validateChar(loc, c);
+            }
+            d: &DelegateType => {
+                return TypeSize::validateDelegate(loc, d);
+            }
+            f: &FloatType => {
+                return TypeSize::validateFloat(loc, f);
+            }
+            f: &FutureType => {
+                return TypeSize::validateFuture(loc, f);
+            }
+            f: &FuncPtrType => {
+                return TypeSize::validateFuncPtr(loc, f);
+            }
+            v: &VoidType => {
+                return TypeSize::validateVoid(loc, v);
+            }
+            p: &PointerType => {
+                return TypeSize::validatePointer(loc, p);
+            }
+            s: &SliceType => {
+                return TypeSize::validateSlice(loc, s);
+            }
+            m: &MapType => {
+                return TypeSize::validateMap(loc, m);
+            }
+            r: &RangeType => {
+                return TypeSize::validateRange(loc, r);
+            }
+
+            // Stack recursive
+            a: &ArrayType => {
+                return TypeSize::validateArray(alias context, loc, a);
+            }
+            tu: &TupleType => {
+                return TypeSize::validateTuple(alias context, loc, tu);
+            }
+            c: &ClassPtrType => {
+                return TypeSize::validateClassPtr(alias context, loc, c);
+            }
+            c: &ClassRefType => {
+                return TypeSize::validateClassRef(alias context, loc, c);
+            }
+            o: &OptionType => {
+                return TypeSize::validateOption(alias context, loc, o);
+            }
+
+            // Proxy
+            e: &EnumType => {
+                return TypeSize::validateInner(alias context, loc, e.getLastLevelProxy());
+            }
+        }
+
+        throw copy ErrorMsg::fatal(loc, format(ValidateErrorMessage::TYPE_HAS_NO_SIZE, t));
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ==================================          STRUCT/CLASS          ==================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Compute the size of a class pointer type.
+     *
+     * @params:
+     *    - context: the validation context
+     *    - loc:     the location of the sizeof
+     *    - c:       the class pointer type
+     *
+     * @returns: the size of the class pointer or struct instance
+     *
+     * @throws:
+     *    - &ErrorMsg: if the struct cannot be sized
+     */
+    fn validateClassPtr(dmut context: &ValidationContext, loc: &Word, c: &ClassPtrType)-> usize
+        throws ErrorMsg
+    {
+        if (c.sym.isStruct) { // on the stack
+            return TypeSize::validateClassRef(alias context, loc, c.inner);
+        }
+
+        // In the heap
+        return cast!usize(global::state::pointerArchSize() / 8u32);
+    }
+
+    /**
+     * Compute the size of a class or struct instance.
+     *
+     * For structs:
+     *   - detects recursive sizeof,
+     *   - computes field layout with alignment and padding,
+     *   - supports packed and overlaid(union) structs.
+     *
+     * For classes:
+     *   - includes vtable and monitor pointers,
+     *   - uses pointer alignment,
+     *   - classes cannot be packed or overlaid.
+     *
+     * @params:
+     *    - context: the validation context
+     *    - loc:     the location of the sizeof
+     *    - cl:      the class reference type
+     *
+     * @returns: the total size of the instance
+     *
+     * @throws:
+     *    - &ErrorMsg: on forward references or invalid field sizes
+     */
+    fn validateClassRef(dmut context: &ValidationContext, loc: &Word, cl: &ClassRefType)-> usize
+        throws ErrorMsg
+    {
+        if (cl.sym.isStruct) {
+            if (cl.sym in context.sizeofContext) {
+                throw copy ErrorMsg::fatal(cl.sym.loc, format(ValidateErrorMessage::NO_SIZE_FORWARD_REF, cl));
+            }
+
+            context.sizeofContext:.insert(cl.sym);
+        }
+
+        let (mut current, mut glob, mut globAlign) = if (cl.sym.isStruct) {
+            if (cl.sym.isEntity) {
+                (1us, 1us, 1us) // entities starts with a bool used to check wether the value was moved or not
+            } else {
+                (0us, 0us, 1us)
+            }
+        } else {
+            (cast!usize(global::state::pointerArchSize() / 8u32) * 2us,
+             cast!usize(global::state::pointerArchSize() / 8u32) * 2us, // 2 pointers for vtable and monitor
+             cast!usize(global::state::pointerArchSize() / 8u32)) // align of pointers
+        }; // classes have a vtable and monitor, structures dont
+        // We don't need to worry of aligning vtable, in packed/overlaid, since classes can't be packed or overlaid, only records
+
+        {
+            for v in cl.fields {
+                {
+                    let innerS = TypeSize::validateInner(alias context, v.loc, v.varType);
+                    let mut align = TypeAlign::validate(alias context, loc, v.varType);
+                    if cl.sym.isPacked {
+                        align = 1;
+                    }
+
+                    if (align > globAlign) { globAlign = align; }
+
+                    let mut padding = (align - (current % align)) % align;
+                    if cl.sym.isPacked {
+                        padding = 0;
+                    }
+
+                    let aligned = current + padding;
+
+                    if (cl.sym.isOverlaid) { // union puts every fields at offset = 0
+                        // And therefore takes the size of the biggest field
+                        if (glob < padding + innerS) glob = (padding + innerS);
+                    } else {
+                        current = aligned + innerS;
+                        glob += padding + innerS;
+                    }
+                } catch {
+                    err: &ErrorMsg => {
+                        let note = copy ErrorMsg::note(cl.sym.loc, format(ValidateErrorMessage::WITHIN_TYPE, cl));
+                        throw err.withNote(copy [copy ErrorMsg::note(v.loc, format(ValidateErrorMessage::FOR_FIELD, v.loc.str),
+                                                                       notes-> copy [note])]);
+                    }
+                }
+            }
+        } exit {
+            if (cl.sym.isStruct) {
+                context.sizeofContext:.remove(cl.sym);
+            }
+        }
+
+        if !cl.sym.isPacked && glob % globAlign != 0us {
+            glob = glob + (globAlign - (glob % globAlign));
+        }
+
+        return glob;
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * =====================================          TUPLES          =====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Compute the size of a tuple type.
+     *
+     * Tuple layout is sequential, with padding inserted to satisfy alignment.
+     *
+     * @params:
+     *    - context: the validation context
+     *    - loc:     the location of the sizeof
+     *    - t:       the tuple type
+     *
+     * @returns: the total size of the tuple
+     *
+     * @throws:
+     *    - &ErrorMsg: if an element has no size
+     */
+    fn validateTuple(dmut context: &ValidationContext, loc: &Word, t: &TupleType)-> usize
+        throws ErrorMsg
+    {
+        let mut current = 0us;
+        let mut glob = 0us;
+        let mut globAlign = 1us;
+
+        for inner in t.inners {
+            let innerS = TypeSize::validateInner(alias context, loc, inner);
+            let align = TypeAlign::validate(alias context, loc, inner);
+            if (align > globAlign) { globAlign = align; }
+
+            let padding = (align - (current % align)) % align;
+            let aligned = (current + padding);
+
+            current = aligned + innerS;
+            glob += padding + innerS;
+        }
+
+        if (glob % globAlign != 0us) {
+            glob = glob + (globAlign - (glob % globAlign));
+        }
+
+        glob
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          OPTIONS          =====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Compute the size of an option type.
+     *
+     * Option!{T} is represented as:
+     *   { set: bool, value: OptionInner!T }
+     *
+     * OptionInner!{T} is overlaid and stores either:
+     *   - an exception pointer, or
+     *   - the wrapped value.
+     *
+     * @params:
+     *    - context: the validation context
+     *    - loc:     the location of the sizeof
+     *    - t:       the option type
+     *
+     * @returns: the size of the option container
+     */
+    fn validateOption(dmut context: &ValidationContext, loc: &Word, t: &OptionType)-> usize
+        throws ErrorMsg
+    {
+        // @overlaid
+        // record OptionInner {T} {
+        //     err: &Exception;
+        //     value: T;
+        // }
+        //
+        // record Option {T} {
+        //     set: bool; // aligned /ptr/
+        //     value: OptionInner!{T};
+        // }
+
+        let inner = TypeSize::validateInner(alias context, loc, t.wrapped);
+        let errorSize = cast!usize(global::state::pointerArchSize() / 8u32);
+
+        let contentSize = if (inner > errorSize) { inner } else { errorSize };
+
+        return contentSize + cast!usize(global::state::pointerArchSize() / 8u32);
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * =====================================          ARRAY          ======================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Compute the size of a fixed-length array.
+     *
+     * @params:
+     *    - context: the validation context
+     *    - loc:     the location of the sizeof
+     *    - a:       the array type
+     *
+     * @returns: element_size × length
+     *
+     * @throws:
+     *    - &ErrorMsg: if the element type has no size
+     */
+    fn validateArray(dmut context: &ValidationContext, loc: &Word, a: &ArrayType)-> usize
+        throws ErrorMsg
+    {
+        TypeSize::validateInner(alias context, loc, a.value) * a.len
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ===============================          SIMPLE DIRECT SIZE          ===============================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Compute the size of a range type.
+     *
+     * A range is represented as:
+     *   { fst: T, scd: T, step: T, contains: bool }
+     *
+     * @params:
+     *    - loc: the location of the sizeof
+     *    - r:   the range type
+     *
+     * @returns: the size of the range structure
+     */
+    fn validateRange(loc: &Word, r: &RangeType)-> usize {
+        TypeSize::validateInt(loc, r.start) * 4us
+    }
+
+    /**
+     * Compute the size of a slice type.
+     *
+     * A slice is represented as:
+     *   { len: usize, ptr: *void, blk_info: *void }
+     *
+     * @returns: the size of the slice structure
+     */
+    fn validateSlice(_: &Word, _: &SliceType)-> usize {
+        cast!usize(global::state::pointerArchSize() / 8u32 * 3u32)
+    }
+
+    /**
+     * Compute the size of a map type.
+     *
+     * A map is represented as:
+     *   { minfo: *void, data: **void, allocLen: usize, loaded: usize, len: usize }
+     *
+     * @returns: the size of the map structure
+     */
+    fn validateMap(_: &Word, _: &MapType)-> usize {
+        cast!usize(global::state::pointerArchSize() / 8u32 * 5u32)
+    }
+
+    /**
+     * Compute the size of a future type.
+     *
+     * A future is represented as:
+     *   { thread_id: usize, content: *void }
+     *
+     * @returns: the size of the future structure
+     */
+    fn validateFuture(_: &Word, _: &FutureType)-> usize {
+        cast!usize(global::state::pointerArchSize() / 8u32) * 2
+    }
+
+    /**
+     * Compute the size of a pointer type.
+     *
+     * @returns: the pointer size of the target architecture
+     */
+    fn validatePointer(_: &Word, _: &PointerType)-> usize {
+        cast!usize(global::state::pointerArchSize() / 8u32)
+    }
+
+    /**
+     * Compute the size of a delegate type.
+     *
+     * A delegate is represented as:
+     *   { context_ptr: *void, function_ptr: *void }
+     *
+     * @returns: the size of the delegate structure
+     */
+    fn validateDelegate(_: &Word, _: &DelegateType)-> usize {
+        cast!usize(global::state::pointerArchSize() / 8u32 * 2u32)
+    }
+
+    /**
+     * Compute the size of a function pointer type.
+     *
+     * @returns: the pointer size of the target architecture
+     */
+    fn validateFuncPtr(_: &Word, _: &FuncPtrType)-> usize {
+        cast!usize(global::state::pointerArchSize() / 8u32)
+    }
+
+    /**
+     * Compute the size of a void type.
+     *
+     * Void is treated as a 1-byte type for sizeof purposes.
+     *
+     * @returns: 1
+     */
+    fn validateVoid(_: &Word, _: &VoidType)-> usize {
+        1us
+    }
+
+    /**
+     * Compute the size of a char type.
+     *
+     * @returns: the size of the char type
+     */
+    fn validateChar(_: &Word, c: &CharType)-> usize {
+        return cast!usize(c.size / 8u16);
+    }
+
+    /**
+     * Compute the size of a float type.
+     *
+     * @returns: the size of the float type
+     */
+    fn validateFloat(_: &Word, f: &FloatType)-> usize {
+        if f.size == 0 {
+            return cast!usize(global::state::floatArchSize() / 8u16);
+        }
+
+        return nextPow2(cast!usize(f.size / 8u16));
+    }
+
+    /**
+     * Compute the size of a bool type.
+     *
+     * @returns: 1
+     */
+    fn validateBool(_: &Word, _: &BoolType)-> usize {
+        1us
+    }
+
+    /**
+     * Compute the size of an int type.
+     *
+     * @returns: the size of the int type
+     */
+    fn validateInt(_: &Word, i: &IntType)-> usize {
+        if i.size == 0 {
+            return cast!usize(global::state::pointerArchSize() / 8u32);
+        }
+
+        return cast!usize(i.size / 8);
+    }
+
+}

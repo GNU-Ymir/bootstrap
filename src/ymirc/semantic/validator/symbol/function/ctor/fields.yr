@@ -1,0 +1,302 @@
+/*
+ * Implements semantic validation for field initialization inside constructors.
+ *
+ * This module handles:
+ *   - validation of default field initializers,
+ *   - validation of explicit field initializers in constructor declarations,
+ *   - detection of missing or duplicated field initialization,
+ *   - creation of proxy accessors for `self` and `super`,
+ *   - enforcement of struct/class initialization rules,
+ *   - construction of the pre-construction block for constructors.
+ *
+ * <hr>
+ *
+ * @Package: ymirc
+ * @Module: ymirc::semantic::validator::symbol::function::ctor::fields
+ * @File: ymirc/semantic/validator/symbol/function/ctor/fields.yr
+ * @Author(s):
+ *   - Emile Cadorel <ecadorel@gmail.com>
+ *
+ * @Created(YYYY-MM-DD): 2026-05-22
+ * @Copyright(C) 2021–2026 GNU-Ymir
+ * @License
+ *   ```text
+ *   This file is part of the Ymir language project.
+ *
+ *   Ymir is free software: you can redistribute it and/or modify it
+ *   under the terms of the GNU General Public License as published by
+ *   the Free Software Foundation, either version 3 of the License, or
+ *   (at your option) any later version.
+ *
+ *   Ymir is distributed in the hope that it will be useful,
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *   GNU General Public License for more details.
+ *
+ *   You should have received a copy of the GNU General Public License
+ *   along with Ymir.  If not, see <https://www.gnu.org/licenses/>.
+ *   ```
+ */
+
+in fields;
+
+use ymirc::syntax::{expression::_, declaration::_};
+use ymirc::semantic::{validator, template_};
+use ymirc::semantic::{generator::_, symbol};
+use ymirc::semantic::generator::{value::_, type::_};
+
+use ymirc::errors;
+use ymirc::utils::{format, log};
+use ymirc::lexing::{word, tokens, keys};
+
+use ymirc::semantic::validator::symbol::function::{_, ctor::_};
+
+/**
+ * CtorFieldInitValidation module
+ *
+ * Provides semantic validation for field initialization inside constructors.
+ * Responsibilities:
+ *
+ *   - insert proxy accessors for `self` and `super`,
+ *   - validate default field initializers,
+ *   - validate explicit field initializers in constructor declarations,
+ *   - detect missing initializers,
+ *   - detect duplicate initializers,
+ *   - ensure redirecting constructors do not initialize fields,
+ *   - produce a BlockValue representing the pre-construction phase.
+ *
+ * This module is used by both struct and class constructor validators.
+ */
+pub mod CtorFieldInitValidation {
+
+    /**
+     * Validate all field initializers for a constructor.
+     *
+     * Errors:
+     *   - missing initialization for fields without defaults,
+     *   - invalid default expressions,
+     *   - invalid explicit initializers,
+     *   - duplicate explicit initializers.
+     *
+     * @params:
+     *   - context:   validation context
+     *   - func:      constructor declaration
+     *   - cref:      ClassRefType of the enclosing class
+     *   - selfVref:  VarRefValue for `self`
+     *
+     * @returns:
+     *   - UNIT_VALUE if no initialization is needed,
+     *   - otherwise a BlockValue containing initialization instructions
+     *
+     * @throws:
+     *   - ErrorMsg::list if any initializer is invalid
+     */
+    pub fn validateFieldCtors(dmut context: &ValidationContext,
+                              func:         &CtorDecl,
+                              cref:         &ClassRefType,
+                              selfVref:     &Value)-> &Value
+        throws ErrorMsg
+    {
+        let mut instrs: [&Value] = [];
+        let mut errors: [&ErrorMsg] = [];
+
+        context:.enterFieldConstruction(cref);
+        context:.enterBlock();
+        let dmut selfProxyType = CtorFieldInitValidation::insertFieldCtorProxies(alias context, cref, selfVref);
+
+        {
+            let mut willBeValidated: [[c8] => mut()] = copy [];
+            for it in func.fields {
+                willBeValidated[it.name.str] = ();
+            }
+
+            let defaultInstrs = CtorFieldInitValidation::validateFieldDefaultValues(alias context, cref, selfVref, willBeValidated,
+                                                                                    selfProxyType-> alias selfProxyType,
+                                                                                    errors-> ref errors);
+
+            let setInstrs = CtorFieldInitValidation::validateFieldSetValues(alias context, func, cref, selfVref,
+                                                                            selfProxyType-> alias selfProxyType,
+                                                                            errors-> ref errors);
+
+            instrs = defaultInstrs ~ setInstrs;
+        }
+
+        context:.safeQuitBlock();
+        context:.quitFieldConstruction();
+        if errors.len != 0 {
+            throw copy ErrorMsg::list(errors);
+        }
+
+        if instrs.len == 0 {
+            return UNIT_VALUE;
+        }
+
+        return copy BlockValue(func.loc, VOID_TYPE, instrs);
+    }
+
+    /**
+     * Insert proxy accessors for `self` and `super` during field initialization.
+     *
+     * Creates:
+     *   - a SuperProxyValue for the ancestor(if any),
+     *   - a SuperProxyValue for `self` with a ClassFieldAccType,
+     *   - local bindings for `self` and `super` that shadow outer scopes.
+     *
+     * These proxies allow field access validation to treat constructor
+     * initialization as if it were inside the class body.
+     *
+     * @params:
+     *   - context:   validation context
+     *   - cref:      ClassRefType of the enclosing class
+     *   - selfVref:  VarRefValue for `self`
+     *
+     * @returns:
+     *   - a mutable ClassFieldAccType used to track validated fields
+     */
+    fn insertFieldCtorProxies(dmut context: &ValidationContext,
+                              cref: &ClassRefType,
+                              selfVref: &Value)-> dmut &ClassFieldAccType
+        throws ErrorMsg
+    {
+        if let Ok(anc: &ClassRefType) = cref.ancestor {
+            let superProxy = copy SuperProxyValue(selfVref.loc,
+                                                  copy ClassFieldAccType(selfVref.loc, anc, full-> true),
+                                                  selfVref);
+            context:.insertLocal(selfVref.loc, Keys::SUPER, superProxy,
+                                 canShadow-> true);
+        }
+
+        let dmut selfProxyType = copy ClassFieldAccType(selfVref.loc, cref);
+        let selfProxy = copy SuperProxyValue(selfVref.loc,
+                                             selfProxyType,
+                                             selfVref,
+                                             isSelf-> true);
+
+        context:.insertLocal(selfVref.loc, Keys::SELF, selfProxy,
+                             canShadow-> true);
+
+        return alias selfProxyType;
+    }
+
+    /**
+     * Validate default field initializers for fields not explicitly initialized.
+     *
+     * For each field in the class:
+     *   - if the field is not explicitly initialized in the constructor:
+     *        * if it has no default value → error UNINIT_FIELD,
+     *        * otherwise validate the default expression and generate:
+     *              AffectValue(self.field, defaultValue)
+     *   - mark the field as validated in both the context and proxy type.
+     *
+     * @params:
+     *   - context:        validation context
+     *   - cref:           ClassRefType of the class
+     *   - selfVref:       VarRefValue for `self`
+     *   - willBeValidated: set of field names explicitly initialized
+     *   - selfProxyType:  proxy type used to track validated fields
+     *   - errors:         accumulator for validation errors
+     *
+     * @returns:
+     *   - list of AffectValue instructions for default initializers
+     */
+    fn validateFieldDefaultValues(dmut context:    &ValidationContext,
+                                  cref:            &ClassRefType,
+                                  selfVref:        &Value,
+                                  willBeValidated: [[c8] => ()],
+                                  dmut selfProxyType:   &ClassFieldAccType,
+                                  ref mut errors: [&ErrorMsg])-> [&Value] {
+        let mut instrs: [&Value] = [];
+        for v in cref.localFields {
+            {
+                if v.name !in willBeValidated {
+                    if v.value of UnitValue {
+                        errors ~= [copy ErrorMsg::fatal(v.loc, format(ValidateErrorMessage::UNINIT_FIELD, v.name))];
+                    } else {
+                        let field = ClassFieldAccessValidation::validate(alias context, v.loc, selfVref, cref,
+                                                                         field-> copy VarExpr(v.loc.locate(v.name), true),
+                                                                         withAncestor-> false);
+                        instrs ~= [copy AffectValue(v.loc, field.type, field, v.value)];
+                        context:.setFieldValidated(v.loc.str);
+                        selfProxyType:.insertValidated(v.loc.str);
+                    }
+                }
+            } catch {
+                err => {
+                    errors ~= [err];
+                }
+            }
+        }
+
+        return instrs;
+    }
+
+    /**
+     * Validate explicit field initializers from the constructor declaration.
+     *
+     * For each explicit initializer:
+     *   - detect duplicate initializers,
+     *   - validate field access,
+     *   - validate the initializer expression,
+     *   - infer its type to match the field type,
+     *   - verify memory ownership,
+     *   - generate an AffectValue instruction,
+     *   - mark the field as validated.
+     *
+     * Errors:
+     *   - MULTIPLE_FIELD_INIT,
+     *   - invalid field access,
+     *   - invalid initializer expression,
+     *   - type mismatch,
+     *   - memory-ownership violations.
+     *
+     * @params:
+     *   - context:       validation context
+     *   - func:          constructor declaration
+     *   - cref:          ClassRefType of the class
+     *   - selfVref:      VarRefValue for `self`
+     *   - selfProxyType: proxy type used to track validated fields
+     *   - errors:        accumulator for validation errors
+     *
+     * @returns:
+     *   - list of AffectValue instructions for explicit initializers
+     */
+    fn validateFieldSetValues(dmut context:       &ValidationContext,
+                              func:               &CtorDecl,
+                              cref:               &ClassRefType,
+                              selfVref:           &Value,
+                              dmut selfProxyType: &ClassFieldAccType,
+                              ref mut errors:     [&ErrorMsg])-> [&Value] {
+        let mut instrs: [&Value] = [];
+        let mut init: [[c8] => mut &Word] = copy [];
+        for field in func.fields {
+            {
+                if let Ok(w) = init[field.name.str] {
+                    let notes = copy [copy ErrorMsg::note(w, format(ValidateErrorMessage::HERE))];
+                    errors ~= [copy ErrorMsg::fatal(field.name, format(ValidateErrorMessage::MULTIPLE_FIELD_INIT, field.name.str),
+                                                    notes-> notes)];
+                } else {
+                    let fieldAcc = ClassFieldAccessValidation::validate(alias context, field.name, selfVref, cref,
+                                                                        field-> copy VarExpr(field.name, true),
+                                                                        withAncestor-> false);
+                    let mut value = ValueValidation::validate(alias context, field.value);
+                    value = TypeInference::inferValueForType(alias context, field.name, value, fieldAcc.type,
+                                                             byReference-> false);
+
+                    MemoryVerification::verifyMemoryOwner(field.name, fieldAcc.type, value,
+                                                          byReference-> false);
+
+                    instrs ~= [copy AffectValue(field.loc, fieldAcc.type, fieldAcc, value)];
+                    init[field.name.str] = field.name;
+                    context:.setFieldValidated(field.name.str);
+                    selfProxyType:.insertValidated(field.name.str);
+                }
+            } catch {
+                err => {
+                    errors ~= [err];
+                }
+            }
+        }
+
+        return instrs;
+    }
+}

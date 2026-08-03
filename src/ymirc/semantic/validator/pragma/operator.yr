@@ -1,0 +1,196 @@
+/*
+ * Implements validation for the `__pragma!operator(...)` construct.
+ *
+ * The `operator` pragma checks whether a given operator is valid for one or two
+ * operand types. It is primarily used for compile-time feature detection and
+ * operator-overload probing.
+ *
+ * Syntax:
+ *
+ *     __pragma!operator("op", T)
+ *     __pragma!operator("op", T1, T2)
+ *
+ * Behavior:
+ *   - The first parameter must be a string representing the operator token.
+ *   - The remaining parameters must be types.
+ *   - A synthetic unary or binary expression is constructed using FakeValue
+ *     wrappers around the types.
+ *   - The expression is validated; success yields `true`, failure yields `false`.
+ *
+ * The pragma has no side effects and always returns a boolean.
+ *
+ * <hr>
+ *
+ * @Package: ymirc
+ * @Module: ymirc::semantic::validator::pragma::operator
+ * @File: ymirc/semantic/validator/pragma/operator.yr
+ * @Author(s):
+ *   - Emile Cadorel <ecadorel@gmail.com>
+ *
+ * @Created(YYYY-MM-DD): 2026-03-27
+ * @Copyright(C) 2021–2026 GNU-Ymir
+ * @License
+ *   ```text
+ *   This file is part of the Ymir language project.
+ *
+ *   Ymir is free software: you can redistribute it and/or modify it
+ *   under the terms of the GNU General Public License as published by
+ *   the Free Software Foundation, either version 3 of the License, or
+ *   (at your option) any later version.
+ *
+ *   Ymir is distributed in the hope that it will be useful,
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *   GNU General Public License for more details.
+ *
+ *   You should have received a copy of the GNU General Public License
+ *   along with Ymir.  If not, see <https://www.gnu.org/licenses/>.
+ *   ```
+ */
+
+in operator;
+
+use ymirc::lexing::word;
+
+use ymirc::syntax::expression::operator;
+use ymirc::semantic::validator;
+use ymirc::semantic::generator::{value::{literal, syntax}, type};
+
+use ymirc::utils::format;
+use ymirc::errors;
+
+use std::io;
+
+/**
+ * PragmaOperatorValidation module
+ *
+ * Provides the implementation of the `__pragma!operator` pragma. This pragma
+ * determines whether a unary or binary operator is valid for the given operand
+ * types by constructing a synthetic expression and invoking the standard
+ * semantic validator on it.
+ *
+ * Supported forms:
+ *   - __pragma!operator("op", T)
+ *   - __pragma!operator("op", T1, T2)
+ *
+ * If the operator is semantically valid for the provided types, the pragma
+ * returns `true`; otherwise it returns `false`. No diagnostics are emitted
+ * unless the pragma itself is malformed.
+ *
+ */
+pub mod PragmaOperatorValidation {
+
+    /**
+     * Entry point for the pragma handler.
+     *
+     * Wraps `validate` in an option type, allowing integration with the pragma
+     * dispatch system. The handler itself never throws; any semantic error is
+     * returned as Err(&ErrorMsg).
+     *
+     * @params:
+     *   - context: validation context
+     *   - p:       the pragma expression
+     *
+     * @returns:
+     *   - Ok(&Value) containing the result of `validate`
+     *   - Err(&ErrorMsg) if validation fails
+     */
+    pub fn handle(dmut context: &ValidationContext, p: &PragmaExpr)-> (&Value)? {
+        return (PragmaOperatorValidation::validate(alias context, p))?;
+    }
+
+    /**
+     * Validate the `__pragma!operator` pragma.
+     *
+     * Expected forms:
+     *   - __pragma!operator("op", T)
+     *   - __pragma!operator("op", T1, T2)
+     *
+     * Steps:
+     *   1. Ensure the pragma has 2 or 3 parameters.
+     *   2. Decode the operator string from the first parameter.
+     *   3. Validate the remaining parameters as types.
+     *   4. Construct a synthetic unary or binary expression using FakeValue
+     *      wrappers around the operand types.
+     *   5. Invoke ValueValidation on the synthetic expression.
+     *   6. Return `true` if validation succeeds, `false` otherwise.
+     *
+     * No diagnostics are emitted for operator failure; the result is purely
+     * boolean. Malformed pragmas(wrong arity) produce a fatal error.
+     *
+     * @params:
+     *   - context: validation context
+     *   - p:       the pragma expression
+     *
+     * @returns:
+     *   - BoolValue(true)  if the operator is valid for the given types
+     *   - BoolValue(false) otherwise
+     *
+     * @throws:
+     *   - &ErrorMsg if the pragma is malformed(wrong number of parameters)
+     */
+    pub fn validate(dmut context: &ValidationContext, p: &PragmaExpr)-> &Value
+        throws ErrorMsg
+    {
+        if (p.params.len != 2 && p.params.len != 3) {
+            throw copy ErrorMsg::fatal(p.loc, format(ValidateErrorMessage::MALFORMED_PRAGMA, p.loc.str));
+        }
+
+        let opStr = context.cteInterpret:.decodeString(ValueValidation::validate(alias context, p.params[0]));
+        let syntOp = if (p.params.len == 2) {
+            let v = copy FakeValue(TypeValidation::validate(alias context, p.params[1]));
+            copy UnaryExpr(p.loc.locate(opStr), copy ValueWrapperExpr(p.loc, v))
+        } else {
+            let vl = copy FakeValue(TypeValidation::validate(alias context, p.params[1]));
+            let vr = copy FakeValue(TypeValidation::validate(alias context, p.params[2]));
+
+            copy BinaryExpr(p.loc.locate(opStr),
+                             copy ValueWrapperExpr(p.loc, vl),
+                             copy ValueWrapperExpr(p.loc, vr))
+        };
+
+
+        let b = match ValueValidation::validate(alias context, syntOp)? {
+            Ok() => { true }
+            _ => { false }
+        };
+
+        return copy BoolValue(p.loc, b);
+    }
+
+    /**
+     * Validate a binary operator for two operand types.
+     *
+     * Constructs a synthetic BinaryExpr using FakeValue wrappers around the
+     * provided types, then invokes ValueValidation on the expression.
+     *
+     * This helper is used internally and may also be used by other parts of the
+     * compiler to probe operator validity.
+     *
+     * @params:
+     *   - context: validation context
+     *   - loc:     location of the operator
+     *   - op:      operator token as a string
+     *   - left:    left operand type
+     *   - right:   right operand type
+     *
+     * @returns:
+     *   - the resulting Value if the operator is valid
+     *
+     * @throws:
+     *   - ErrorMsg if the operator is not valid for the given types
+     */
+    pub fn validateBinary(dmut context: &ValidationContext, loc: &Word, op: [c8], left: &Type, right: &Type)-> &Value
+        throws ErrorMsg
+    {
+        let vl = copy FakeValue(left);
+        let vr = copy FakeValue(right);
+
+        let bin = copy BinaryExpr(loc.locate(op),
+                                   copy ValueWrapperExpr(loc, vl),
+                                   copy ValueWrapperExpr(loc, vr));
+
+        return ValueValidation::validate(alias context, bin);
+    }
+
+}

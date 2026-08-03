@@ -1,0 +1,293 @@
+/*
+ * Implements validation and construction of literal values.
+ *
+ * This module dispatches literal expressions to the appropriate specialized
+ * validator(int, float, char, string, array, tuple, map, etc.) and provides
+ * direct validation routines for primitive literals such as:
+ *
+ *   - bool
+ *   - null
+ *   - none
+ *   - unit
+ *   - dollar expressions($)
+ *
+ * The validator ensures that each literal is converted into the correct
+ * semantic Value node and enforces contextual rules(e.g., $ outside a slice
+ * context).
+ *
+ * <hr>
+ *
+ * @Package: ymirc
+ * @Module: ymirc::semantic::validator::value::literal::root
+ * @File: ymirc/semantic/validator/value/literal/root.yr
+ * @Author(s):
+ *   - Emile Cadorel <ecadorel@gmail.com>
+ *
+ * @Created(YYYY-MM-DD): 2026-03-26
+ * @Copyright(C) 2021–2026 GNU-Ymir
+ * @License
+ *   ```text
+ *   This file is part of the Ymir language project.
+ *
+ *   Ymir is free software: you can redistribute it and/or modify it
+ *   under the terms of the GNU General Public License as published by
+ *   the Free Software Foundation, either version 3 of the License, or
+ *   (at your option) any later version.
+ *
+ *   Ymir is distributed in the hope that it will be useful,
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *   GNU General Public License for more details.
+ *
+ *   You should have received a copy of the GNU General Public License
+ *   along with Ymir.  If not, see <https://www.gnu.org/licenses/>.
+ *   ```
+ */
+
+in literal;
+
+use ymirc::lexing::{word, keys};
+use ymirc::syntax::expression::_;
+
+use ymirc::semantic::{interpret, validator};
+use ymirc::semantic::generator::{value::_, type::_};
+
+use ymirc::global::core_;
+use ymirc::errors;
+use ymirc::utils::format;
+
+use std::io;
+
+/*!
+ * ====================================================================================================
+ * ====================================================================================================
+ * ====================================          SUBMODS          =====================================
+ * ====================================================================================================
+ * ====================================================================================================
+ */
+
+pub mod ::float;
+pub mod ::int;
+pub mod ::string;
+pub mod ::char;
+pub mod ::version_;
+
+/*!
+ * ====================================================================================================
+ * ====================================================================================================
+ * ======================================          ROOT          ======================================
+ * ====================================================================================================
+ * ====================================================================================================
+ */
+
+/**
+ * LiteralValidation module
+ *
+ * Central dispatch for validating literal expressions. Routes each literal
+ * expression to its dedicated validator and provides built-in validation for
+ * primitive literals and the `$` operator. Ensures that every literal produces
+ * a well-typed semantic Value and that contextual constraints(such as dollar
+ * contexts) are respected.
+ *
+ * All functions assume syntactic correctness and operate during semantic
+ * validation.
+ */
+pub mod LiteralValidation {
+
+    /**
+     * Validate a literal expression and construct its semantic value.
+     *
+     * Dispatches based on the concrete expression type:
+     *   - BoolExpr, NullExpr, NoneExpr, EmptyExpr, DollarExpr
+     *   - FixedExpr(integer), FloatExpr, CharExpr, StringExpr
+     *   - ListExpr(array or tuple), ListMapExpr(map)
+     *   - SliceAllocatorExpr([value ; size])
+     *   - VarExpr(variable reference)
+     *
+     * @params:
+     *   - context: validation context
+     *   - lit:     the literal expression
+     *
+     * @returns:
+     *   - a semantic Value corresponding to the literal
+     *
+     * @throws:
+     *   - ErrorMsg if the literal cannot be used as a value
+     */
+    pub fn validate(dmut context: &ValidationContext, lit: &LiteralExpr)-> &Value
+        throws ErrorMsg
+    {
+        match lit {
+            b: &BoolExpr => return LiteralValidation::validateBool(b);
+            n: &NoneExpr => return LiteralValidation::validateNone(n);
+            n: &NullExpr => return LiteralValidation::validateNull(n);
+            d: &DollarExpr => return LiteralValidation::validateDollar(alias context, d);
+
+            c: &CharExpr => return CharLiteralValidation::validate(c);
+            f: &FixedExpr => return IntLiteralValidation::validate(f);
+            f: &FloatExpr => return FloatLiteralValidation::validate(f);
+            s: &StringExpr => return StringLiteralValidation::validate(alias context, s);
+
+            v: &VarExpr => return VariableValidation::validate(alias context, v);
+            v: &VersionExpr => return VersionLiteralValidation::validate(v);
+            _ => {
+                eprintln("internal literal validation; ", lit.__typeinfo.name);
+                panic;
+            }
+        }
+    }
+
+    /**
+     * Validate a boolean literal.
+     *
+     * @params:
+     *   - b: the BoolExpr
+     *
+     * @returns:
+     *   - a BoolValue representing true or false
+     */
+    fn validateBool(b: &BoolExpr)-> &Value {
+        return copy BoolValue(b.loc, isTrue-> (b.loc == Keys::TRUE));
+    }
+
+    /**
+     * Validate a null literal.
+     *
+     * @params:
+     *   - n: the NullExpr
+     *
+     * @returns:
+     *   - a NullValue
+     */
+    fn validateNull(n: &NullExpr)-> &Value {
+        return copy NullValue(n.loc);
+    }
+
+    /**
+     * Validate a none literal(error option).
+     *
+     * @params:
+     *   - n: the NoneExpr
+     *
+     * @returns:
+     *   - an ErrOptionValue
+     */
+    fn validateNone(n: &NoneExpr)-> &Value {
+        return copy ErrOptionValue(n.loc);
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * =====================================          DOLLAR          =====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Validate a `$` expression.
+     *
+     * A `$` expression is only valid inside a dollar context(e.g., inside a
+     * slice or array operation). Retrieves the current dollar context and
+     * forwards to validateDollarValue.
+     *
+     * @params:
+     *   - context: validation context
+     *   - d:       the DollarExpr
+     *
+     * @returns:
+     *   - the result of applying `$` to the contextual value
+     *
+     * @throws:
+     *   - ErrorMsg if `$` is used outside a valid context
+     */
+    fn validateDollar(dmut context: &ValidationContext, d: &DollarExpr)-> &Value
+        throws ErrorMsg
+    {
+
+        if let Ok(val: &Value) = context.getCurrentDollarContext() {
+            return LiteralValidation::validateDollarValue(alias context, d.loc, val);
+        }
+
+        throw copy ErrorMsg::fatal(d.loc, ValidateErrorMessage::DOLLAR_OUTSIDE_CONTEXT);
+    }
+
+    /**
+     * Apply the `$` operator to a value.
+     *
+     * Supported cases:
+     *   - SliceType => return length(either static or via field access)
+     *   - ArrayType => return static length
+     *   - TupleType => return number of elements
+     *   - ClassPtrType => call the class's opDollar method
+     *
+     * @params:
+     *   - context: validation context
+     *   - loc:     location of the `$` operator
+     *   - val:     the value being accessed
+     *
+     * @returns:
+     *   - a Value representing the result of `$`
+     *
+     * @throws:
+     *   - &ErrorMsg if the type does not support `$`
+     */
+    fn validateDollarValue(dmut context: &ValidationContext, loc: &Word, val: &Value)-> &Value
+        throws ErrorMsg
+    {
+        match val.type {
+            s: &SliceType => {
+                if s.size !of UnitValue {
+                    return s.size;
+                }
+
+                return copy StructFieldAccessValue(loc, USIZE_TYPE, val, SliceKeys::LEN);
+            }
+            a: &ArrayType => {
+                return copy IntValue(loc, USIZE_TYPE, a.len)
+            }
+            t: &TupleType => {
+                return copy IntValue(loc, USIZE_TYPE, t.inners.len);
+            }
+            c: &ClassPtrType => {
+                return LiteralValidation::validateOpDollarClass(alias context, loc, c, val);
+            }
+        }
+
+        throw copy ErrorMsg::fatal(loc, format(ValidateErrorMessage::UNDEFINED_DOLLAR_OP, val.type));
+    }
+
+    /**
+     * Validate `$` applied to a class instance.
+     *
+     * Attempts to resolve and call the class's `opDollar` method. If the call
+     * is invalid, wraps the underlying error in a fatal `$`-operator error.
+     *
+     * @params:
+     *   - context: validation context
+     *   - loc:     location of the `$` operator
+     *   - cptr:    the class pointer type
+     *   - val:     the class instance value
+     *
+     * @returns:
+     *   - the result of calling `opDollar`
+     *
+     * @throws:
+     *   - &ErrorMsg if the class does not define a valid `opDollar` method
+     */
+    pub fn validateOpDollarClass(dmut context: &ValidationContext, loc: &Word, cptr: &ClassPtrType, val: &Value)-> &Value
+        throws ErrorMsg
+    {
+        {
+            let acc = ValueCreation::createObjectMethodAcc(alias context, loc, cptr, val, OpOverrideNames::DOLLAR);
+            return CallValidation::validate(alias context, loc, acc, []);
+        } catch {
+            err: &ErrorMsg => {
+                throw copy ErrorMsg::fatal(loc, format(ValidateErrorMessage::UNDEFINED_DOLLAR_OP, cptr),
+                                            notes-> copy [err]);
+            }
+        }
+    }
+
+
+}

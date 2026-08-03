@@ -1,0 +1,212 @@
+/*
+ * Implements semantic validation for type-comparison operators in Ymir.
+ *
+ * Supported operator:
+ *   - of   (left of Type)
+ *
+ * Supported operand categories:
+ *   - left:  class pointer value
+ *   - right: class reference type
+ *
+ * This module is invoked by BinaryValidation when the operator kind is
+ * OperatorType::TYPE.
+ *
+ * <hr>
+ *
+ * @Package: ymirc
+ * @Module: ymirc::semantic::validator::value::operator::binary::type
+ * @File: ymirc/semantic/validator/value/operator/binary/type.yr
+ * @Author(s):
+ *   - Emile Cadorel <ecadorel@gmail.com>
+ *
+ * @Created(YYYY-MM-DD): 2026-04-10
+ * @Copyright(C) 2021–2026 GNU-Ymir
+ * @License
+ *   ```text
+ *   This file is part of the Ymir language project.
+ *
+ *   Ymir is free software: you can redistribute it and/or modify it
+ *   under the terms of the GNU General Public License as published by
+ *   the Free Software Foundation, either version 3 of the License, or
+ *   (at your option) any later version.
+ *
+ *   Ymir is distributed in the hope that it will be useful,
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *   GNU General Public License for more details.
+ *
+ *   You should have received a copy of the GNU General Public License
+ *   along with Ymir.  If not, see <https://www.gnu.org/licenses/>.
+ *   ```
+ */
+
+in type;
+
+use ymirc::lexing::{word, tokens, keys};
+
+use ymirc::syntax::expression::operator;
+use ymirc::semantic::validator;
+use ymirc::semantic::generator::{value::_, type::_};
+
+use ymirc::errors;
+use ymirc::utils::format;
+
+/**
+ * BinaryTypeValidation
+ *
+ * Provides semantic validation for the type-comparison operator:
+ *
+ *      value of Type
+ *
+ *
+ * This module defines the complete semantics of the OF operator in Ymir.
+ */
+pub mod BinaryTypeValidation {
+
+    /**
+     * Validate a type-comparison expression.
+     *
+     * @params:
+     *   - context: the validation context
+     *   - bin:     the binary expression node
+     *   - op:      the type-comparison operator(OF)
+     *
+     * @returns:
+     *   A &Value representing the validated type-comparison expression.
+     */
+    pub fn validate(dmut context: &ValidationContext, bin: &BinaryExpr, op: BinaryOperators)-> &Value
+        throws ErrorMsg
+    {
+        return BinaryTypeValidation::validate(bin.loc, op,
+                                               left-> ValueValidation::validate(alias context, bin.left),
+                                               right-> TypeValidation::validate(alias context, bin.right));
+    }
+
+    /**
+     * Validate a type-comparison expression after both operands have been validated.
+     *
+     * Enum values are unwrapped before validation so that the operator applies
+     * to the underlying class pointer value.
+     *
+     * @params:
+     *   - loc:   operator location
+     *   - op:    type-comparison operator
+     *   - left:  validated left operand(value)
+     *   - right: validated right operand(type)
+     *
+     * @returns:
+     *   A &Value representing the validated type-comparison expression.
+     */
+    pub fn validate(loc:          &Word,
+                     op:           BinaryOperators,
+                     left:         &Value,
+                     right:        &Type)-> &Value
+        throws ErrorMsg
+    {
+        let lvalue = ValueCreation::createEnumUnwrap(left);
+        return BinaryTypeValidation::validateImpl(loc, op, lvalue, right);
+    }
+
+    /**
+     * Core implementation of type-comparison validation.
+     *
+     * Dispatch strategy:
+     *   - Match(left.type, right) pairs:
+     *        (ClassPtrType, ClassRefType) => validateClassRight()
+     *
+     *   - If no rule matches, emit a fatal UNDEFINED_BIN_OP error with
+     *     aggregated notes.
+     *
+     * @params:
+     *   - loc:   operator location
+     *   - op:    type-comparison operator
+     *   - left:  validated left operand(value)
+     *   - right: validated right operand(type)
+     *
+     * @returns:
+     *   A &Value representing the validated type-comparison expression.
+     */
+    fn validateImpl(loc:          &Word,
+                     op:           BinaryOperators,
+                     left:         &Value,
+                     right:        &Type)-> &Value
+        throws ErrorMsg
+    {
+        let mut errors: [&ErrorMsg] = [];
+        {
+            match (left.type, right) {
+                (cl: &ClassPtrType, cr: &ClassRefType) => {
+                    return BinaryTypeValidation::validateClassRight(loc, op, left, cl, cr);
+                }
+                (cl: &ClassPtrType, cr: &ClassPtrType) => {
+                    if cr.isStruct {
+                        return BinaryTypeValidation::validateClassRight(loc, op, left, cl, cr.inner);
+                    }
+                    throw copy ErrorMsg::fatal(loc, end-> right.loc, format(ValidateErrorMessage::CLASS_THROW_PTR, cr));
+                }
+            }
+        } catch {
+            err => {
+                errors ~= [err];
+            }
+        }
+
+        throw copy ErrorMsg::fatal(loc,
+                                    format(ValidateErrorMessage::UNDEFINED_BIN_OP, op, left.type, right),
+                                    notes-> errors);
+    }
+
+    /**
+     * Validate a type-comparison where:
+     *
+     *      left: ClassPtrType
+     *      right: ClassRefType
+     *
+     * Supported semantics:
+     *
+     *   1. Direct compatibility:
+     *        classRef.isCompatible(leftType.inner)
+     * => return true if operator is OF
+     *
+     *   2. classRef is an ancestor of leftType.inner:
+     *        TypeVerification::isAncestor(classRef, leftType.inner)
+     * => return true if operator is OF
+     *
+     *   3. leftType.inner is an ancestor of classRef:
+     *        TypeVerification::isAncestor(leftType.inner, classRef)
+     * => return a CmpClassTypeOperatorValue for runtime comparison
+     *
+     * If none of the above apply, the operation is invalid.
+     *
+     * @params:
+     *   - loc:       operator location
+     *   - op:        type-comparison operator(OF)
+     *   - left:      validated left operand(class pointer value)
+     *   - leftType:  class pointer type of the left operand
+     *   - classRef:  class reference type on the right operand
+     *
+     * @returns:
+     *   A &Value representing the validated type-comparison expression.
+     */
+    fn validateClassRight(loc:      &Word,
+                           op:       BinaryOperators,
+                           left:     &Value,
+                           leftType: &ClassPtrType,
+                           classRef: &ClassRefType)-> &Value
+        throws ErrorMsg
+    {
+        if classRef.isCompatible(leftType.inner) {
+            return copy BoolValue(loc, isTrue-> (op == BinaryOperators::OF));
+        }
+
+        if TypeVerification::isAncestor(classRef, leftType.inner) {
+            return copy BoolValue(loc, isTrue-> (op == BinaryOperators::OF));
+        }
+
+        if TypeVerification::isAncestor(leftType.inner, classRef) {
+            return copy CmpClassTypeOperatorValue(loc, op, left, classRef);
+        }
+
+        throw copy ErrorMsg::list([]);
+    }
+}

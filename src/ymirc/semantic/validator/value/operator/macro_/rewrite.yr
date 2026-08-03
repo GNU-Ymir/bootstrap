@@ -1,0 +1,212 @@
+/*
+ * Implements the rewriting phase of the Ymir macro system.
+ *
+ * MacroRewriting is responsible for transforming a macro-generated string
+ * into its final expanded form. It processes the rewritten content produced
+ * by MacroSolving and applies:
+ *
+ *   - embedded macro evaluations(`#{ ... }`, `#( ... )`, `#[ ... ]`),
+ *   - macro `for` loops(`#{ for x in expr { ... } }`),
+ *   - nested rewriting of blocks,
+ *   - mapper-based substitution of captured macro variables,
+ *   - trimming and indentation handling.
+ *
+ * <hr>
+ *
+ * @Package: ymirc
+ * @Module: ymirc::semantic::validator::value::operator::macro_::rewrite
+ * @File: ymirc/semantic/validator/value/operator/macro_/rewrite.yr
+ * @Author(s):
+ *   - Emile Cadorel <ecadorel@gmail.com>
+ *
+ * @Created(YYYY-MM-DD): 2024-09-11
+ * @Copyright(C) 2021–2026 GNU-Ymir
+ * @License
+ *   ```text
+ *   This file is part of the Ymir language project.
+ *
+ *   Ymir is free software: you can redistribute it and/or modify it
+ *   under the terms of the GNU General Public License as published by
+ *   the Free Software Foundation, either version 3 of the License, or
+ *   (at your option) any later version.
+ *
+ *   Ymir is distributed in the hope that it will be useful,
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *   GNU General Public License for more details.
+ *
+ *   You should have received a copy of the GNU General Public License
+ *   along with Ymir.  If not, see <https://www.gnu.org/licenses/>.
+ *   ```
+ */
+
+in rewrite;
+
+use ymirc::semantic::validator::value::operator::macro_::_;
+
+use ymirc::syntax::{_, declaration::_, expression::_};
+use ymirc::semantic::generator::{value::_, type::_};
+
+use ymirc::syntax::{visitor, errors};
+use ymirc::semantic::validator;
+
+use ymirc::lexing::_;
+use ymirc::errors;
+use ymirc::utils::format;
+
+use std::stream;
+use ymirc::semantic::validator::value::operator::macro_::{_, rewrite::_};
+
+/*!
+ * ====================================================================================================
+ * ====================================================================================================
+ * ====================================          SUBMODS          =====================================
+ * ====================================================================================================
+ * ====================================================================================================
+ */
+
+mod ::read;
+mod ::model;
+mod ::eval;
+
+/*!
+ * ====================================================================================================
+ * ====================================================================================================
+ * ======================================          ROOT          ======================================
+ * ====================================================================================================
+ * ====================================================================================================
+ */
+
+/**
+ * MacroRewriting module
+ *
+ * Provides the rewriting engine for macro-generated content.
+ *
+ */
+pub mod MacroRewriting {
+
+    /**
+     * Rewrite a macro string expression.
+     *
+     * @returns:
+     *   - the fully rewritten byte sequence.
+     */
+    pub fn rewrite(str: &StringExpr, mapper: MacroMapper, ruleIndex: usize)-> [c8]
+        throws ErrorMsg
+    {
+        return MacroRewriting::rewrite(str.seq, mapper, ruleIndex, str.trim);
+    }
+
+    /**
+     * Rewrite a raw macro string.
+     *
+     * @throws:
+     *   - ErrorMsg if rewriting fails inside nested constructs.
+     */
+    fn rewrite(str: [c8], mapper: MacroMapper, ruleIndex: usize, trim: usize)-> [c8]
+        throws ErrorMsg
+    {
+        let dmut context = copy MacroRewriteContext(mapper, ruleIndex);
+        let dmut lex = copy MacroLexer(content-> str, trim-> trim);
+        loop {
+            let next = lex:.next();
+            if (next.isEof) {
+                break;
+            }
+
+            match next.str {
+                MacroPatternTokens::MACRO_ACC | MacroPatternTokens::MACRO_PAR | MacroPatternTokens::MACRO_CRO => {
+                    MacroRewriting::rewriteRule(alias context, alias lex, next.str);
+                }
+                _ => {
+                    context:.write(next.str);
+                }
+            }
+        }
+
+        return context[];
+    }
+
+    /**
+     * Rewrite a macro rule starting at an opening token.
+     *
+     * @throws:
+     *   - ErrorMsg if the rule is malformed.
+     */
+    fn rewriteRule(dmut context: &MacroRewriteContext, dmut lexer: &MacroLexer, opening: [c8])
+        throws ErrorMsg
+    {
+        let inner = MacroReadingUtils::readIf(alias lexer, Keys::FOR); // skips are activated in here
+        if (inner.str == Keys::FOR) {
+            MacroRewriting::rewriteFor(alias context, alias lexer, opening);
+        } else {
+            MacroRewriting::rewriteEval(alias context, alias lexer, opening);
+        }
+    }
+
+    /**
+     * Rewrite a macro `for` loop.
+     *
+     * Syntax:
+     *     #{ for ident in expr { ... } }
+     *
+     * @throws:
+     *   - ErrorMsg if block structure is invalid or evaluation fails.
+     */
+    fn rewriteFor(dmut context: &MacroRewriteContext, dmut lexer: &MacroLexer, opening: [c8])
+        throws ErrorMsg
+    {
+        let ident = MacroReadingUtils::readIdentifier(alias lexer);
+        MacroReadingUtils::readToken(alias lexer, Keys::IN);
+
+        let mappers = {
+            MacroEvaluation::evaluate(context, alias lexer)
+        } catch {
+            _ => { [] } // macro for can be used for a macro repeat generating no values
+        };
+
+
+        MacroReadingUtils::readClosing(alias lexer, opening);
+        MacroReadingUtils::readToken(alias lexer, Tokens::LACC);
+
+        let dmut block = copy StringStream();
+        let mut nbOpen = 1us;
+        loop {
+            let n = lexer:.next();
+            if (n.str == Tokens::LACC) nbOpen += 1us;
+            else if (n.str == Tokens::MACRO_ACC) nbOpen += 1us;
+            else if (n.str == Tokens::RACC) nbOpen -= 1us;
+
+            if (nbOpen == 0us) break;
+            block:.write(n.str);
+        }
+
+        for m in mappers {
+            let mut nMapper = MacroMapper(m.value);
+            nMapper:.insert(ident.str, m);
+
+            let nContent = MacroRewriting::rewrite(block[], nMapper, context.ruleIndex, 0);
+            context:.write(nContent);
+        }
+    }
+
+    /**
+     * Rewrite an embedded macro evaluation.
+     *
+     * Syntax:
+     *     #{ expr }
+     *
+     * @throws:
+     *   - ErrorMsg if evaluation fails or closing token is missing.
+     */
+    fn rewriteEval(dmut context: &MacroRewriteContext, dmut lexer: &MacroLexer, opening: [c8])
+        throws ErrorMsg
+    {
+        let mappers = MacroEvaluation::evaluate(context, alias lexer);
+        MacroReadingUtils::readClosing(alias lexer, opening);
+
+        for i in mappers {
+            context:.write(i.value);
+        }
+    }
+}

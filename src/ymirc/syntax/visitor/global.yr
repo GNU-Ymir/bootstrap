@@ -1,0 +1,1026 @@
+/*
+ * Syntax visitor of global symbols that are declared within a module.
+ *
+ * <hr>
+ *
+ * @Package: ymirc
+ * @Module: ymirc::syntax::visitor::global
+ * @File: ymirc/syntax/visitor/global.yr
+ * @Author(s):
+ *   - Emile Cadorel <ecadorel@gmail.com>
+ *
+ * @Created(YYYY-MM-DD): 2026-02-06
+ * @Copyright(C) 2021–2026 GNU-Ymir
+ * @License
+ *   ```text
+ *   This file is part of the Ymir language project.
+ *
+ *   Ymir is free software: you can redistribute it and/or modify it
+ *   under the terms of the GNU General Public License as published by
+ *   the Free Software Foundation, either version 3 of the License, or
+ *   (at your option) any later version.
+ *
+ *   Ymir is distributed in the hope that it will be useful,
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *   GNU General Public License for more details.
+ *
+ *   You should have received a copy of the GNU General Public License
+ *   along with Ymir.  If not, see <https://www.gnu.org/licenses/>.
+ *   ```
+ */
+
+in global;
+
+use ymirc::errors;
+use ymirc::syntax::{_,
+                    visitor::_,
+                    declaration::_,
+                    expression::{operator, literal, empty, instruction}};
+
+use ymirc::lexing::{word, tokens, keys};
+use ymirc::utils::_;
+
+use std::io;
+
+
+/**
+ * The global syntax visitor responsible for reading top-level declarations
+ * (modules, extern, pub/prv, declarations).
+ *
+ * It doesn't read declarations, but dispatch the reading to the context reader,
+ * i.e. SyntaxVisitor.
+ *
+ */
+pub mod GlobalVisitor {
+
+    /**
+     * Read a declaration block
+     * @params:
+     *   - context: the context of the reading
+     *   - loc: the location of the first read word
+     *   - comm: the comment on top of the block to read
+     *
+     * @returns: the block read
+     *
+     *
+     * @verbatim
+     * ```
+     * Module:=
+     *    DeclBlock EOF
+     *
+     * ```
+     * */
+    pub fn readBlock(dmut context: &SyntaxVisitor, loc: &Word, comm: [c8])-> &BlockDecl
+        throws ErrorMsg
+    {
+        GlobalVisitor::readBlockTop(alias context,
+                                    loc,
+                                    comm,
+                                    closing-> false)
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * =====================================          BLOCKS          =====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Read a declaration block at top level(module level)
+     * @params:
+     *   - context: the context of the reading
+     *   - loc:     the location of the block being read
+     *   - comm:    the comment on top of the block to read
+     *   - closing: true iif a Tokens: : LACC was read, and a RACC needs to be read to close the current block
+     *
+     * @returns: the block read
+     *
+     * @verbatim:
+     * ```
+     * DeclBlock:=
+     *   DeclBlockItem DeclBlock
+     *   | <empty>
+     *
+     * DeclBlockItem:=
+     *      ProtectionBlock
+     *    | UseDecl
+     *    | ExternBlockDecl
+     *    | Declaration
+     * ```
+     * */
+    fn readBlockTop(dmut context: &SyntaxVisitor, loc: &Word, comm: [c8], closing: bool)-> &BlockDecl
+        throws ErrorMsg
+    {
+        let mut decls: [mut &Declaration] = [];
+        {
+            loop {
+                // Read attributes for the next declaration
+                let (attrLoc, attrs, attrComm) = context:.readAttributes();
+
+                let (tok, tokComm) = context:.readToken();
+                match tok.str {
+                    Keys::PUBLIC | Keys::PRIVATE => { // attributes applies to the declaration that is protected
+                        decls ~= [GlobalVisitor::readProtectionBlock(alias context, tok, tokComm, attrs-> (attrLoc, attrs, attrComm))];
+                    }
+                    Keys::USE => {
+                        context.checkNoAttributes(tok, attrLoc, attrs); // no attributes allowed on top of a use
+                        decls ~= GlobalVisitor::readUse(alias context, tok, tokComm);
+                    }
+                    Keys::EXTERN => { // attributes applies to the extern declaration
+                        decls ~= [GlobalVisitor::readExternBlock(alias context,
+                                                                 loc-> tok,
+                                                                 comm-> attrComm ~ tokComm,
+                                                                 attrs-> (attrLoc, attrs, attrComm))]
+                    }
+                    Tokens::RACC => { // if the block is closing
+                        if !closing throw copy ErrorMsg::fatal(tok, format(SyntaxErrorMessage::UNEXPECTED, tok));
+                        context.checkNoAttributes(tok, attrLoc, attrs); // dangling attributes are not allowed
+                        break;
+                    }
+                    _ => {
+                        // We read nothing, because there's nothing to read
+                        if tok.isEof { // the block is closing, but was not opened(Global block)
+                            if closing throw copy ErrorMsg::fatal(loc, end-> tok, SyntaxErrorMessage::BLOCK_NEVER_CLOSED);
+                            context.checkNoAttributes(tok, attrLoc, attrs);  // dangling attributes are not allowed
+                            break;
+                        }
+
+                        // We read something, it might be a declaration
+                        // We pass the keywords for error message, stating we come from global block
+                        decls ~= [GlobalVisitor::readDeclaration(alias context,
+                                                                 tok,
+                                                                 comm-> attrComm ~ tokComm,
+                                                                 attrs-> (attrLoc, attrs),
+                                                                 expected-> __SPECIAL_GLOBAL__.listKeysExternPubPrvUse)];
+                    }
+                }
+            }
+        } catch {
+            err => {
+                if (!loc.isEof) {
+                    throw copy ErrorMsg::note(loc, SyntaxErrorMessage::IN_DECL_BLOCK, notes-> copy [err]);
+                } else {
+                    throw err;
+                }
+            }
+        }
+
+        // Global block is always private as pub is needed to set it public
+        copy BlockDecl(loc-> loc,
+                       comm-> comm,
+                       decls-> decls,
+                       protection-> Protection::PRIVATE,
+                       isSet-> false)
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ===================================          PROTECTION          ===================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Reads a protection block introduced by `pub` or `prv`.
+     *
+     * @params:
+     *   - context:  the current syntax-visitor context
+     *   - loc:      the location of the `pub` or `prv` keyword
+     *   - comm:     leading comments attached to the protection keyword
+     *   - attrs:  attributes applied to the protected declaration(if any)
+     *
+     * @grammar:
+     * ```
+     *   ProtectionBlock:=
+     *       AttributesOpt ProtectionKw Declaration
+     *     | AttributesOpt ProtectionKw ExternBlockDecl
+     *     | ProtectionKw '{' DeclBlockProtected '}'
+     *
+     *   ProtectionKw ::= 'pub' | 'prv'
+     *```
+     *
+     * A protection block either:
+     *   - applies `pub`/`prv` to a single declaration,
+     *   - applies `pub`/`prv` to an extern block, or
+     *   - opens a `{ ... }` block containing only protected declarations.
+     *
+     * Nested protection blocks are not allowed inside a protected block.
+     */
+    fn readProtectionBlock(dmut context: &SyntaxVisitor, loc: &Word, comm: [c8], attrs: (&Word, [AttributeWord], [c8]))-> &BlockDecl
+        throws ErrorMsg
+    {
+
+        let protection = block::toProtection(loc.str);
+        let (tok, _) = context:.readToken();
+        let decls = match tok.str {
+            Tokens::LACC => { // opening a new block
+                context.checkNoAttributes(tok, attrs._0, attrs._1); // no attribute allowed '@attr pub { ... }' is forbidden
+                GlobalVisitor::readBlockProtected(alias context, tok) // read the list of declaration in the block
+            }
+            Keys::EXTERN => { // only one extern declaration, we pass it the attributes '@attr pub extern decl'
+                copy [GlobalVisitor::readExternBlock(alias context,
+                                                     loc-> tok,
+                                                     comm-> comm,
+                                                     attrs-> attrs)]
+            }
+            _ => {
+                // only one declaration, '@attr pub decl'
+                // We pass the list of keyword allowed in that context(same as in readBlockProtected)
+                copy [GlobalVisitor::readDeclaration(alias context,
+                                                     tok,
+                                                     comm-> comm,
+                                                     attrs-> (attrs._0, attrs._1),
+                                                     expected-> __SPECIAL_GLOBAL__.listKeysExtern)]
+            }
+        }
+
+        // We create a block with the correct protection
+        copy BlockDecl(loc-> loc,
+                       comm-> comm,
+                       decls-> decls,
+                       protection-> protection,
+                       isSet-> false)
+    }
+
+    /**
+     * Reads a declaration block inside a `pub { ... }` or `prv { ... }` protection block.
+     *
+     * @params:
+     *   - context: the current syntax-visitor context
+     *   - loc:     the location of the opening '{' of the protected block
+     *
+     * @grammar:
+     *
+     * ```
+     *   DeclBlockProtected:=
+     *       DeclProtectedItem*
+     *
+     *   DeclProtectedItem:=
+     *       ExternBlockDecl
+     *     | Declaration
+     * ```
+     *
+     * @returns: a list of declaration, the block is created by `readProtectionBlock`
+     *
+     * */
+    fn readBlockProtected(dmut context: &SyntaxVisitor, loc: &Word)-> [&Declaration]
+        throws ErrorMsg
+    {
+        let mut decls: [mut &Declaration] = [];
+        {
+            loop {
+                // Read attributes for the next declaration
+                let (attrLoc, attrs, attrComm) = context:.readAttributes();
+
+                let (tok, tokComm) = context:.readToken();
+                match tok.str {
+                    Keys::EXTERN => { // attributes applies to the declaration that is extern
+                        decls ~= [GlobalVisitor::readExternBlock(alias context,
+                                                                 loc-> tok,
+                                                                 comm-> attrComm ~ tokComm,
+                                                                 attrs-> (attrLoc, attrs, attrComm))]
+                    }
+                    Tokens::RACC => { // a protected block always start with '{'
+                        context.checkNoAttributes(tok, attrLoc, attrs); // dangling attributes are not allowed
+                        break;
+                    }
+                    _ => {
+                        // We read nothing, because there's nothing to read, but protection block are always opened
+                        if tok.isEof {
+                            throw copy ErrorMsg::fatal(loc, end-> tok, SyntaxErrorMessage::BLOCK_NEVER_CLOSED);
+                        }
+
+                        // Or a declaration a protected declaration
+                        // We pass the list of allowed keywords in that context
+                        // (`extern` is the only the keyword that is not a
+                        // declaration, allowed here)
+
+                        decls ~= [GlobalVisitor::readDeclaration(alias context,
+                                                                 tok,
+                                                                 comm-> attrComm ~ tokComm,
+                                                                 attrs-> (attrLoc, attrs),
+                                                                 expected-> __SPECIAL_GLOBAL__.listKeysExtern)];
+                    }
+                }
+            }
+        } catch {
+            err => {
+                throw copy ErrorMsg::note(loc, SyntaxErrorMessage::IN_DECL_BLOCK, notes-> copy [err]);
+            }
+        }
+
+        // We don't return a block, but a list of declarations, the protected
+        // block that called this function will create it with the proper
+        // protection
+        //
+        decls
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * =====================================          EXTERN          =====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Reads an `extern` declaration.
+     *
+     * @params:
+     *   - context:  the current syntax-visitor context
+     *   - loc:      the location of the `extern` keyword
+     *   - comm:     leading comments attached to the `extern` keyword
+     *   - attrs:  attributes applied to this extern declaration(if any)
+     *
+     * @grammar:
+     * ```
+     *   ExternBlockDecl:=
+     *         AttributesOpt 'extern' LangOpt Declaration
+     *       | 'extern' LangOpt '{' DeclBlockExternal '}'
+     *
+     *   LangOpt:=
+     *        '(' LangName ')'
+     *        | <empty>
+     *
+     *   LangName:= 'Y' | 'C'
+     * ```
+     *
+     */
+    pub fn readExternBlock(dmut context: &SyntaxVisitor,
+                           loc: &Word,
+                           comm: [c8],
+                           attrs: (&Word, [AttributeWord], [c8]))-> &ExternBlockDecl
+        throws ErrorMsg
+    {
+        // We enforce the '(C)' declaration, (future version might include more extern languages)
+        let (p, _) = context:.readIf(Tokens::LPAR);
+        let lang = if !p.isEof {
+            let (lang, _) = context:.readTokens(Keys::CLANG, Keys::YLANG);
+            context:.readTokens(Tokens::RPAR);
+            lang
+        } else {
+            loc.locate(Keys::YLANG)
+        };
+
+        context:.setInExtern(loc, lang);
+        {
+            let (tok, _) = context:.readToken();
+            let decls = match tok.str {
+                Tokens::LACC => {
+                    context.checkNoAttributes(tok, attrs._0, attrs._1); // no attributes allowed '@attrib extern (C) { ... }' is forbidden
+                    GlobalVisitor::readBlockExternal(alias context, tok)
+                }
+                _ => {
+
+                    // Only one declaration '@attrib extern decl'
+                    // We pass the list of keyword allowed in that context only
+                    copy [GlobalVisitor::readDeclaration(alias context,
+                                                         tok,
+                                                         comm-> comm ~ attrs._2,
+                                                         attrs-> (attrs._0, attrs._1),
+                                                         expected-> __SPECIAL_GLOBAL__.listKeys)]
+                }
+            }
+
+            copy ExternBlockDecl(loc, comm, lang, decls)
+        } exit {
+            context:.setInExtern(EOF_WORD, EOF_WORD);
+        }
+    }
+
+    /**
+     * Reads a declaration block inside a `extern (C) { ... }`.
+     *
+     * @params:
+     *   - context: the current syntax-visitor context
+     *   - loc:     the location of the opening '{' of the protected block
+     *
+     * @grammar:
+     * ```
+     *   DeclBlockExternal:=
+     *      (AttributesOpt? Declaration)*
+     *
+     * ```
+     *
+     * @returns: a list of declaration, the block is created by `readExternBlock`
+     *
+     * */
+    fn readBlockExternal(dmut context: &SyntaxVisitor, loc: &Word)-> [&Declaration]
+        throws ErrorMsg
+    {
+        let mut decls: [mut &Declaration] = [];
+        {
+            loop {
+                // Read attributes for the next declaration
+                let (attrLoc, attrs, attrComm) = context:.readAttributes();
+
+                let (tok, tokComm) = context:.readToken();
+                match tok.str {
+                    Tokens::RACC => { // a protected block always start with '{'
+                        context.checkNoAttributes(tok, attrLoc, attrs); // dangling attributes are not allowed
+                        break;
+                    }
+                    _ => {
+                        // We read nothing, because there's nothing to read, but protection block are always opened
+                        if tok.isEof {
+                            throw copy ErrorMsg::fatal(loc, end-> tok, SyntaxErrorMessage::BLOCK_NEVER_CLOSED);
+                        }
+
+                        // Or a declaration a protected declaration
+                        // We pass the list of allowed keywords in that context
+                        // Only declarations are allowed here
+
+                        decls ~= [GlobalVisitor::readDeclaration(alias context,
+                                                                 tok,
+                                                                 comm-> attrComm ~ tokComm,
+                                                                 attrs-> (attrLoc, attrs),
+                                                                 expected-> __SPECIAL_GLOBAL__.listKeys)];
+                    }
+                }
+            }
+        } catch {
+            err => {
+                if (!loc.isEof) {
+                    throw copy ErrorMsg::note(loc, SyntaxErrorMessage::IN_DECL_BLOCK, notes-> copy [err]);
+                } else {
+                    throw err;
+                }
+            }
+        }
+
+        decls
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ==================================          LOCAL MODULE          ==================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Reads a local module declaration introduced by `mod`.
+     *
+     * @params:
+     *   - context:  the current syntax-visitor context
+     *   - loc:      the location of the `mod` keyword
+     *   - comm:     leading comments attached to the `mod` keyword
+     *
+     * @grammar:
+     *
+     * ```
+     *   LocalModuleDecl ::=
+     *       'mod' TemplateTest? Identifier TemplateLocalModule
+     *     | 'mod' Identifier LocalModuleBody
+     *     | 'mod' SubmoduleOpt Identifier ';'
+     *
+     *   SubmoduleOpt       ::= ('::' | '.')?
+     *   LocalModuleBody    ::= '{' DeclBlock '}'
+     * ```
+     *
+     */
+    fn readLocalModule(dmut context: &SyntaxVisitor, loc: &Word, comm: [c8])-> &Declaration
+        throws ErrorMsg
+    {
+        let (hasTest, test) = context:.readTemplateTest();
+        if !hasTest.isEof { // a template local module
+            let (ident, _) = context:.readIdentifier();
+            return GlobalVisitor::readTemplateLocalModule(alias context, comm, loc, ident, ifLoc-> hasTest, test);
+        }
+
+        let (isSub, _) = context:.readIf(Tokens::DCOLON, Tokens::DOT);
+        let (ident, _) = context:.readIdentifier();
+
+        let (isEnd, _) = context:.readIf(Tokens::SEMI_COLON);
+
+        if isEnd.isEof { // mod Ident '{' decl_block '}'
+            if !isSub.isEof { // mod ::Ident '{' '}' is not allowed
+                throw copy ErrorMsg::fatal(isEnd, format(SyntaxErrorMessage::UNEXPECTED, isEnd.str),
+                                           notes-> copy [copy ErrorMsg::note(isSub, "")]);
+            }
+
+            return GlobalVisitor::readLocalModule(alias context, comm, loc, ident);
+        }
+
+        // 'mod' ('.' | '::')? Ident
+        copy ImportDecl(loc, comm, ident, root-> isSub)
+    }
+
+    /**
+     * Reads the body of a local module introduced by `mod Name { ... }`.
+     *
+     * This function is called after the module name has already been parsed.
+     * It handles optional template parameters and then reads the module body.
+     *
+     * @params:
+     *   - context:  the current syntax-visitor context
+     *   - comm:     leading comments attached to the `mod` declaration
+     *   - ident:    the identifier of the module being defined
+     *
+     * @grammar:
+     * ```
+     *   LocalModuleBody ::=
+     *       TemplateParams? '{' DeclBlock '}'
+     *
+     * ```
+     *
+     */
+    pub fn readLocalModule(dmut context: &SyntaxVisitor, comm: [c8], loc: &Word, ident: &Word)-> &Declaration
+        throws ErrorMsg
+    {
+        let tryTemplateLoc = context.getSeek();
+        let mut templateError: (&ErrorMsg)? = none;
+        let mut normalError: (&ErrorMsg)? = none;
+
+        // Try a normal reading
+        { // mod Ident { ... }
+
+            // Only a block declaration
+            let (start, tokComm) = context:.readTokens(Tokens::LACC);
+            let content = GlobalVisitor::readBlockTop(alias context, start, tokComm, closing-> true);
+
+            // return the module declared
+            return copy ModuleDecl(loc-> loc,
+                                   name-> ident,
+                                   comm-> comm,
+                                   block-> content,
+                                   isGlobal-> false);
+        } catch {
+            err => {
+                normalError = (err)?;
+            }
+        }
+
+        // Failed, try reading a template module
+        context:.rewindToSeek(tryTemplateLoc); // go back to the start of the reading
+        { // mod Ident { params } { ... }
+            return GlobalVisitor::readTemplateLocalModule(alias context, comm, loc, ident, EOF_WORD, EMPTY_EXPR);
+        } catch {
+            err => {
+                templateError = (err.withNote(copy [copy ErrorMsg::note(EOF_WORD, format(SyntaxErrorMessage::TEMPLATE_SYMBOL),
+                                                                        oneLine-> true)]))?;
+            }
+        }
+
+        // both failed
+        if let (Ok(te), Ok(ne)) = (templateError, normalError) {
+            throw copy ErrorMsg::list(copy [ne, te]);
+        }
+
+        eprintln("internal syntax error: empty errors");
+        panic;
+    }
+
+
+    /**
+     * Reads a template local module of the form:
+     *
+     * This function is called after the `mod` keyword, the template test,
+     * and the module identifier have already been parsed. It forcibly reads
+     * the template parameter list, then reads the module body, and finally
+     * wraps the result inside a `TemplateDecl`.
+     *
+     * @params:
+     *   - context:  the current syntax-visitor context
+     *   - comm:     leading comments attached to the `mod` declaration
+     *   - loc:      the location of the `mod` keyword
+     *   - ident:    the identifier of the module being defined
+     *   - ifLoc:    the location of the template test(e.g., the 'if' of `mod if TEST Ident`)
+     *   - test:     the parsed template test expression
+     *
+     * @grammar:
+     * ```
+     *   TemplateLocalModule ::=
+     *       TemplateParams '{' DeclBlock '}'
+     * ```
+     *
+     */
+    pub fn readTemplateLocalModule(dmut context: &SyntaxVisitor, comm: [c8], loc: &Word, ident: &Word, ifLoc: &Word, test: &Expression)-> &Declaration
+        throws ErrorMsg
+    {
+        // Force the reading of the template parameters
+        let templates = context:.readTemplateParameters(ifLoc-> ifLoc);
+
+        // Read the module block(similar as top level reading)
+        let (start, tokComm) = context:.readTokens(Tokens::LACC);
+        let content = GlobalVisitor::readBlockTop(alias context, start, tokComm, closing-> true);
+
+
+        let module = copy ModuleDecl(loc-> loc,
+                                     name-> ident,
+                                     comm-> comm,
+                                     block-> content,
+                                     isGlobal-> false);
+
+        // Return the result wrapped inside a template declaration
+        copy TemplateDecl(loc-> ident, comm-> comm, params-> templates, guard-> test, decl-> module)
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ======================================          USE          =======================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Reads a `use` declaration of the form:
+     *
+     *     use Path;
+     *     use ::Path;
+     *
+     * A `use` declaration introduces one or more imported paths. The parser
+     * first checks for a leading `::` to determine whether the import is
+     * rooted at the module root. It then reads the first identifier and
+     * continues parsing the remainder of the path using `readComplexPath`,
+     * which may expand into multiple resolved expressions.
+     *
+     * Each resolved path expression is wrapped into a separate `UseDecl`.
+     *
+     * @params:
+     *   - context:  the current syntax-visitor context
+     *   - loc:      the location of the `use` keyword
+     *   - comm:     leading comments attached to the `use` declaration
+     *
+     * @grammar:
+     * ```
+     *   UseDecl ::=
+     *       'use' RootOpt Path ';'
+     *
+     *   RootOpt ::= '::'?
+     *   Path    ::= Identifier ComplexPathTail
+     *
+     *   ComplexPathTail ::= ...                 // parsed by readComplexPath
+     * ```
+     *
+     * The result is a list of `UseDecl` nodes, one for each expanded path.
+     */
+    pub fn readUse(dmut context: &SyntaxVisitor, loc: &Word, comm: [c8])-> [&Declaration]
+        throws ErrorMsg
+    {
+        let mut res: [mut &Expression] = [];
+
+        let (isRoot, _) = context:.readIf(Tokens::DCOLON); // root importation starts with '::'
+
+        // at least one identifier has to be read to the start the reading of readComplexPath
+        let (fst, _) = context:.readIdentifier();
+
+        // Read the complex paths, and fill the res array with the read paths
+        GlobalVisitor::readComplexPath(alias context, copy VarExpr(fst, isQuoted-> false), ref res);
+
+        // Ending with a ';'
+        context:.readTokens(Tokens::SEMI_COLON);
+
+        copy [copy UseDecl(loc, comm, i, isRoot-> !isRoot.isEof) for i in res]
+    }
+
+    /**
+     * Reads a complex path following an initial root expression.
+     *
+     * This function parses the continuation of a path after the first
+     * identifier, handling nested segments introduced by `::`, wildcard
+     * segments(`_`), and sub-paths enclosed in `{ ... }`. The resulting
+     * expanded path expressions are appended to `result`.
+     *
+     * @params:
+     *   - context:  the current syntax-visitor context
+     *   - root:     the initial path expression(already parsed)
+     *   - result:   an output list collecting all resolved path expressions(passed as ref because filled recursively)
+     *
+     * @grammar:
+     * ```
+     * ComplexPath:=
+     *    ('::' Identifier)* ('::' FinalSegment)?
+     *
+     * FinalSegment:=
+     *    '{' SubComplexPath(',' SubComplexPath)* '}'
+     *  | '_'
+     *
+     * SubComplexPath:=
+     *     '_'
+     *   | Identifier(ComplexPath)?
+     *
+     * ```
+     *
+     */
+    fn readComplexPath(dmut context: &SyntaxVisitor, root: &Expression, ref mut result: [&Expression])
+        throws ErrorMsg
+    {
+        let mut res = root;
+        let mut readColon = EOF_WORD;
+
+        // (:: Ident)*
+        while let (colon, _) = context:.readIf(Tokens::DCOLON) && !colon.isEof {
+            readColon = colon;
+            let (ident, _) = context:.readIfIdentifier();
+            if ident.isEof // dangling '::'
+                break;
+
+            res = copy PathExpr(colon, res, copy VarExpr(ident, isQuoted-> false));
+            readColon = EOF_WORD;
+        }
+
+        // no final segment
+        if readColon.isEof {
+            result ~= [res];
+            return;
+        }
+
+        // (:: FinalSegment)
+        let (next, _) = context:.readTokens(Tokens::LACC, Keys::UNDER);
+        if next == Keys::UNDER { // Path '::_'
+            result ~= [copy PathExpr(readColon, res, copy VarExpr(next, isQuoted-> false))];
+            return;
+        }
+
+
+        // Complex '{ ... }'
+        let mut hadUnder = EOF_WORD;
+        loop {
+            let (under, _) = context:.readIf(Keys::UNDER);
+            if !under.isEof { // multiple '_' are not allowed
+                if !hadUnder.isEof {
+                    throw copy ErrorMsg::fatal(hadUnder, format(SyntaxErrorMessage::UNEXPECTED, hadUnder.str),
+                                               notes-> copy [copy ErrorMsg::note(under, "")]);
+                }
+
+                hadUnder = next;
+                result ~= [copy PathExpr(readColon, res, copy VarExpr(under, isQuoted-> false))];
+            }
+
+            else {
+                let (ident, _) = context:.readIdentifier();
+                let current = copy PathExpr(readColon, root, copy VarExpr(ident, isQuoted-> false));
+                GlobalVisitor::readComplexPath(alias context, current, ref result);
+            }
+
+            let (end, _) = context:.readTokens(Tokens::RACC, Tokens::COMA);
+            if (end == Tokens::RACC) break;
+        }
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ==================================          DECLARATIONS          ==================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Reads a single local declaration expression block - e.g. nested
+     * declaration inside functions.
+     *
+     * @params:
+     *    - context: the syntax-visitor context of the reading
+     *
+     * @grammar:
+     * ```
+     *   LocalDeclaration ::=
+     *       UseDeclBlock
+     *     | Attributes? ExternBlock
+     *     | Attributes? Declaration
+     *
+     * ```
+     */
+    pub fn readLocalDeclaration(dmut context: &SyntaxVisitor)-> &Declaration
+        throws ErrorMsg
+    {
+        // Read attributes for the next declaration
+        let (attrLoc, attrs, attrComm) = context:.readAttributes();
+        let (tok, tokComm) = context:.readToken();
+        {
+            match tok.str {
+                Keys::USE => { // use are allowed within local blocks
+                    context.checkNoAttributes(tok, attrLoc, attrs);
+                    let decls = GlobalVisitor::readUse(alias context,
+                                                       loc-> tok,
+                                                       comm-> tokComm);
+                    copy BlockDecl(tok, "", decls, protection-> Protection::PRIVATE, isSet-> true)
+                }
+                Keys::EXTERN => { // As for externs
+                    context.checkNoAttributes(tok, attrLoc, attrs);
+                    GlobalVisitor::readExternBlock(alias context,
+                                                   loc-> tok,
+                                                   comm-> tokComm,
+                                                   attrs-> (EOF_WORD, [], ""))
+                }
+                _ => {
+
+                    // We pass the list of allowed tokens(i.e. declarations ~ [USE, EXTERN])
+                    GlobalVisitor::readDeclaration(alias context,
+                                                   tok,
+                                                   attrComm ~ tokComm,
+                                                   attrs-> (attrLoc, attrs),
+                                                   expected-> __SPECIAL_GLOBAL__.listKeysExternUse)
+                }
+            }
+        } catch {
+            err => {
+                let prevNotes = err.notes;
+                let nNote = copy ErrorMsg::note(EOF_WORD, format(SyntaxErrorMessage::READING_LOCAL_DECLARATION));
+                throw err.withNote(copy [nNote] ~ prevNotes);
+            }
+        }
+    }
+
+    /**
+     * @returns: true if the next token starts a local declaration
+     *
+     * */
+    pub fn isLocalDeclaration(context: &SyntaxVisitor)-> bool {
+        let n = context.peekToken();
+        for z in __SPECIAL_GLOBAL__.listKeysExternUse if z == n.str {
+            return true;
+        }
+
+        false
+    }
+
+    /**
+     * Read a declaration, that can be found inside a module, or a local expression block.
+     * @params:
+     *    - context:  the context of the syntax-visitor reading
+     *    - tok:      the token describing the declaration to read
+     *    - comm:     the comment on top of the declaration
+     *    - attrs:  the list of attributes on top of the declaration
+     *    - expected: the list of declarations that are expected(only used to throw an explicit error message)
+     *
+     * @grammars:
+     *
+     * ```
+     * declaration:=   class_decl
+     *                | function_decl
+     *                | lazy_decl
+     *                | record_decl
+     *                | static_decl
+     *                | entity_decl
+     *                | union_decl
+     *                | mod_decl
+     *                | def_decl
+     *                | enum_decl
+     *                | macro_decl
+     *                | trait_decl
+     *                | unittest_decl
+     *                | use_decl
+     * ```
+     *
+     */
+    fn readDeclaration(dmut context: &SyntaxVisitor,
+                       tok: &Word,
+                       comm: [c8],
+                       attrs: (&Word, [AttributeWord]),
+                       expected: [[c8]])-> &Declaration
+
+        throws ErrorMsg
+    {
+        // Globals with attributes
+        match tok.str {
+            Keys::STATIC | Keys::LAZY =>
+                return GlobalVisitor::readGlobalVar(alias context, tok, comm, attrs-> attrs._1);
+
+            Keys::CLASS | Keys::RECORD | Keys::ENTITY =>
+                return context:.readClass(tok, comm, attrs-> attrs._1);
+            Keys::FUNCTION =>
+                return context:.readFunction(tok, comm, attrs-> attrs._1);
+        }
+
+        // Global without attributes
+        context.checkNoAttributes(tok, attrs._0, attrs._1);
+        match tok.str {
+            Keys::MOD => { return GlobalVisitor::readLocalModule(alias context, tok, comm); }
+
+            Keys::DEF => { return context:.readDef(tok, comm); }
+            Keys::ENUM => { return context:.readEnum(tok, comm); }
+            Keys::UNION => { return context:.readUnion(tok, comm); }
+            Keys::MACRO => { return context:.readMacro(tok, comm); }
+            Keys::TRAIT => { return context:.readTrait(tok, comm); }
+            Keys::UNITTEST => { return context:.readUnitTest(tok, comm); }
+        }
+
+        throw copy ErrorMsg::fatal(tok, format(SyntaxErrorMessage::UNEXPECTED_BUT_LST, tok.str, expected));
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * =====================================          GLOBAL          =====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Read a global var declaration
+     *
+     * @params:
+     *    - loc:   the location of the introducing keyword
+     *    - comm:  the comment above the global declaration
+     *    - attrs: the attributes above the global declaration
+     *
+     * @grammar
+     * ```
+     * GlobalVarDecl:=
+     *      GlobalWithType
+     *    | GlobalWithValue
+     *
+     * GlobalWithType:=
+     *    GlobalKw MutOrDmut? Identifier ':' OperandSimple(0) ('=' ExpressionSimple(BOOL_LOGIC))? ';'
+     *
+     * GlobalWithValue:=
+     *    GlobalKw MutOrDmut? Identifier '=' ExpressionSimple(BOOL_LOGIC) ';'
+     *
+     * GlobalKw:= 'static' | 'lazy'
+     * MutOrDmut:= 'mut' | 'dmut'
+     * ```
+     */
+    pub fn readGlobalVar(dmut context: &SyntaxVisitor, loc: &Word, comm: [c8], attrs: [AttributeWord])-> &GlobalVarDecl
+        throws ErrorMsg
+    {
+        // let 'mut' | 'dmut', lazy and ref are undefined in this context
+        let (isMutOrDmut, _) = context:.readIf(Keys::MUTABLE, Keys::DMUTABLE);
+        let (name, _) = context:.readIdentifier();
+
+        // Type is optional, ':' ExpressionSimple(0)
+        let (hasType, _) = context:.readIf(Tokens::COLON);
+        let mut type: &Expression = EMPTY_EXPR;
+        if !hasType.isEof {
+            type = ExpressionVisitor::readOperandSimple0(alias context);
+        }
+
+        // Value is optional if type was defined, '=' ExpressionSimple(0)
+        let (hasValue, _) = if hasType.isEof {
+            context:.readTokens(Tokens::EQUAL)
+        } else {
+            context:.readIf(Tokens::EQUAL)
+        };
+
+        let mut value: &Expression = EMPTY_EXPR;
+        if !hasValue.isEof {
+            // But is simple if defined
+            value = ExpressionVisitor::readExpressionSimple(alias context, BinaryOperatorsLevelNames::BOOL_LOGIC);
+        }
+
+        // Always end with a ';'
+        context:.readTokens(Tokens::SEMI_COLON);
+
+        let var = copy VarDeclExpr(loc-> loc,
+                                   name-> name,
+                                   isMutOrDmut-> isMutOrDmut,
+                                   isLazyOrRef-> EOF_WORD,
+                                   value-> value,
+                                   type-> type);
+
+        return copy GlobalVarDecl(loc-> loc,
+                                  comm-> comm,
+                                  var-> var,
+                                  isField-> false,
+                                  isStatic-> (loc == Keys::STATIC),
+                                  attrs-> attrs);
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * =====================================          PATHS          ======================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Read a namepath expression
+     * @verbatim:
+     * ```
+     * namepath_expr:= Identifier('::' Identifier)*
+     * ```
+     */
+    pub fn readPath(dmut context: &SyntaxVisitor)-> &Expression
+        throws ErrorMsg
+    {
+        let (fst, _) = context:.readIdentifier();
+        let mut res: &Expression = copy VarExpr(fst, isQuoted-> false);
+        while let (colon, _) = context:.readIf(Tokens::DCOLON) && !colon.isEof {
+            let (next, _) = context:.readIf(Keys::UNDER);
+            match next.str {
+                Keys::UNDER => {
+                    return copy PathExpr(colon, res, copy VarExpr(next, isQuoted-> false));
+                }
+                _ => {
+                    let (ident, _) = context:.readIdentifier();
+                    res = copy PathExpr(colon, res, copy VarExpr(ident, isQuoted-> false));
+                }
+            }
+        }
+
+        res
+    }
+
+
+
+}

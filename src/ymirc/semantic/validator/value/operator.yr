@@ -1,0 +1,270 @@
+/*
+ * Implements validation for all operator-level expressions in Ymir.
+ *
+ * This module provides the central dispatch for operator expressions
+ * (`OperatorExpr`) and delegates validation to specialized submodules:
+ *
+ *   - binary operators
+ *   - unary operators
+ *   - casts
+ *   - calls
+ *   - paths
+ *   - templates
+ *   - macros
+ *   - field access
+ *   - multiplication operator chains
+ *
+ * OperatorValidation is responsible for:
+ *
+ *   - selecting the correct operator subsystem based on the AST node
+ *   - performing compile-time evaluation for `cte(...)` expressions
+ *   - validating named expressions(`name: expr`)
+ *   - enforcing reference/lazy constraints when required
+ *
+ * This module acts as the root of the operator-validation tree and is the
+ * single entry point for all operator-related semantic checks.
+ *
+ * <hr>
+ *
+ * @Package: ymirc
+ * @Module: ymirc::semantic::validator::value::operator
+ * @File: ymirc/semantic/validator/value/operator.yr
+ * @Author(s):
+ *   - Emile Cadorel <ecadorel@gmail.com>
+ *
+ * @Created(YYYY-MM-DD): 2026-03-25
+ * @Copyright(C) 2021–2026 GNU-Ymir
+ * @License
+ *   ```text
+ *   This file is part of the Ymir language project.
+ *
+ *   Ymir is free software: you can redistribute it and/or modify it
+ *   under the terms of the GNU General Public License as published by
+ *   the Free Software Foundation, either version 3 of the License, or
+ *   (at your option) any later version.
+ *
+ *   Ymir is distributed in the hope that it will be useful,
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *   GNU General Public License for more details.
+ *
+ *   You should have received a copy of the GNU General Public License
+ *   along with Ymir.  If not, see <https://www.gnu.org/licenses/>.
+ *   ```
+ */
+
+in operator;
+
+
+use ymirc::syntax::expression::{operator, control, instruction};
+use ymirc::semantic::validator;
+use ymirc::semantic::generator::{value, value::operator};
+
+use ymirc::errors;
+
+use ymirc::utils::format;
+use std::io;
+
+/*!
+ * ====================================================================================================
+ * ====================================================================================================
+ * ====================================          SUBMODS          =====================================
+ * ====================================================================================================
+ * ====================================================================================================
+ */
+
+pub mod ::binary;
+pub mod ::call;
+pub mod ::cast_;
+pub mod ::fields;
+pub mod ::macro_;
+pub mod ::path;
+pub mod ::template_;
+pub mod ::unary;
+pub mod ::index;
+
+/*!
+ * ====================================================================================================
+ * ====================================================================================================
+ * =====================================          ROOTS          ======================================
+ * ====================================================================================================
+ * ====================================================================================================
+ */
+
+/**
+ * OperatorValidation module
+ *
+ * Provides the main entry point for validating operator expressions. Operator
+ * expressions include binary operators, unary operators, casts, template calls,
+ * macro calls, path expressions, multiplication chains, and compile-time
+ * expressions.
+ *
+ * The module delegates validation to the appropriate subsystem based on
+ * the concrete operator expression:
+ *
+ *   - BinaryValidation
+ *   - UnaryValidation
+ *   - CastValidation
+ *   - MultValidation
+ *   - PathValidation
+ *   - MacroValidation
+ *   - PragmaValidation
+ *   - TemplateValidation
+ *
+ * Additionally, OperatorValidation handles:
+ *
+ *   - compile-time operator evaluation(`cte(...)`)
+ *   - named expressions(`name-> expr`)
+ *
+ * All operator expressions in the language must pass through this module before
+ * type inference, memory verification, or code generation.
+ *
+ */
+pub mod OperatorValidation {
+
+    /**
+     * Validate an operator expression.
+     *
+     * Dispatches based on the concrete operator AST node and forwards validation
+     * to the appropriate subsystem:
+     *
+     *   - BinaryExpr => BinaryValidation
+     *   - CastExpr => CastValidation
+     *   - UnaryExpr => UnaryValidation
+     *   - MultOperatorExpr => MultValidation
+     *   - PathExpr => PathValidation
+     *   - MacroCallExpr => MacroValidation
+     *   - PragmaExpr => PragmaValidation::validateValue
+     *   - TemplateCallExpr => TemplateValidation::validateCall
+     *   - TemplateCheckerExpr => TemplateValidation::validateCheck
+     *   - CteExpr => validateCte
+     *   - NamedExpr => validateNamed
+     *
+     * If an unexpected operator type is encountered, an internal compiler error
+     * is raised.
+     *
+     * @params:
+     *   - context:   validation context
+     *   - op:        operator expression to validate
+     *   - canBeRef:  whether the operator may produce a reference value
+     *   - canBeLazy: whether the operator may produce a lazy value
+     *
+     * @returns:
+     *   - the validated Value
+     *
+     * @throws:
+     *   - ErrorMsg if validation fails
+     */
+    pub fn validate(dmut context: &ValidationContext, op: &OperatorExpr, canBeRef: bool, canBeLazy: bool)-> &Value
+        throws ErrorMsg
+    {
+        match op {
+            b: &BinaryExpr => return BinaryValidation::validate(alias context, b);
+            c: &CastExpr => return CastValidation::validate(alias context, c);
+            u: &UnaryExpr => return UnaryValidation::validate(alias context, u);
+            m: &MultOperatorExpr if m.isCall => return CallValidation::validate(alias context, m);
+            m: &MultOperatorExpr if m.isIndex => return IndexValidation::validate(alias context, m);
+            p: &PathExpr => return PathValidation::validate(alias context, p);
+
+            m: &MacroCallExpr => return MacroValidation::validate(alias context, m);
+            p: &PragmaExpr => return PragmaValidation::validateValue(alias context, p);
+
+            t: &TemplateCallExpr => return TemplateValidation::validateCall(alias context, t);
+            t: &TemplateCheckerExpr => return TemplateValidation::validateCheck(alias context, t);
+
+            c: &CteExpr => return OperatorValidation::validateCte(alias context, c);
+            n: &NamedExpr => return OperatorValidation::validateNamed(alias context, n, canBeRef, canBeLazy);
+
+            _ => {
+                eprintln("internal opertor validation error; ", op.__typeinfo.name);
+                panic;
+            }
+        }
+    }
+
+    /**
+     * Validate an expression and ensure it is known at compile time.
+     *
+     * Special-cases:
+     *   - ConditionalExpr => delegated to ConditionalValidation
+     *   - ForLoopExpr => delegated to ForLoopValidation
+     *   - AssertExpr => delegated to AssertValidation
+     *
+     * After validation, the result must satisfy `isCte`; otherwise a
+     * UNKNOWN_AT_COMPILE_TIME error is thrown.
+     *
+     * @params:
+     *   - context: validation context
+     *   - expr:    expression to validate
+     *
+     * @returns:
+     *   - the compile-time value
+     *
+     * @throws:
+     *   - ErrorMsg if the expression is not compile-time evaluable
+     */
+    pub fn validateCte(dmut context: &ValidationContext, c: &CteExpr)-> &Value
+        throws ErrorMsg
+    {
+        if let cd: &ConditionalExpr = c.value {
+            return ConditionalValidation::validateCte(alias context, cd);
+        }
+
+        if let f: &ForLoopExpr = c.value {
+            return ForLoopValidation::validateCte(alias context, f);
+        }
+
+        if let a: &AssertExpr = c.value {
+            return AssertValidation::validateCte(alias context, a);
+        }
+
+        let res = context.cteInterpret:.reduce(
+            ValueValidation::validate(alias context, c.value));
+        if !context.cteInterpret.isCte(res) {
+            throw copy ErrorMsg::fatal(res.loc,
+                                       end-> c.loc,
+                                       format(ValidateErrorMessage::UNKNOWN_AT_COMPILE_TIME, res.type));
+        }
+
+        return res;
+    }
+
+    /**
+     * Validate a named expression(`name-> expr`).
+     *
+     * Steps:
+     *   1. Validate the inner expression with reference/lazy constraints.
+     *   2. If the expression cannot be lazy or a reference, reduce it through
+     *      the compile-time interpreter.
+     *   3. Wrap the result in a NamedValue.
+     *
+     *
+     * @params:
+     *   - context:   validation context
+     *   - n:         named expression
+     *   - canBeRef:  whether the expression may produce a reference
+     *   - canBeLazy: whether the expression may produce a lazy value
+     *
+     * @returns:
+     *   - a NamedValue containing the validated content
+     *
+     * @throws:
+     *   - ErrorMsg if validation fails
+     */
+    fn validateNamed(dmut context: &ValidationContext, n: &NamedExpr, canBeRef: bool, canBeLazy: bool)-> &Value
+        throws ErrorMsg
+    {
+        let content = ValueValidation::validate(alias context,
+                                                n.value,
+                                                canBeRef-> canBeRef,
+                                                canBeLazy-> canBeLazy);
+
+        let rContent = if (!canBeLazy && !canBeRef) {
+            context.cteInterpret:.reduce(content)
+        } else {
+            content
+        };
+
+        return copy NamedValue(n.loc, n.name.str, rContent);
+    }
+}

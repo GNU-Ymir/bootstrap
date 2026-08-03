@@ -1,444 +1,1796 @@
-in lexer;
-    
-use ymirc::lexing::{word, tokens};
-use ymirc::utils::list;
+/*
+ * Module in charge of the definition of the class SrcLexer. The lexer cuts
+ * the string containing Ymir source into a list of tokens. It also defines a
+ * list of tools to traverse the list of tokens once cut down.
+ *
+ * <hr>
+ *
+ * @Package: ymirc
+ * @Module: ymirc::lexing::lexer
+ * @File: ymirc/lexing/lexer.yr
+ * @Author(s):
+ *   - Emile Cadorel <ecadorel@gmail.com>
+ *
+ * @Created(YYYY-MM-DD): 2021-11-12
+ * @Copyright(C) 2021–2026 GNU-Ymir
+ * @License
+ *   ```text
+ *   This file is part of the Ymir language project.
+ *
+ *   Ymir is free software: you can redistribute it and/or modify it
+ *   under the terms of the GNU General Public License as published by
+ *   the Free Software Foundation, either version 3 of the License, or
+ *   (at your option) any later version.
+ *
+ *   Ymir is distributed in the hope that it will be useful,
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *   GNU General Public License for more details.
+ *
+ *   You should have received a copy of the GNU General Public License
+ *   along with Ymir.  If not, see <https://www.gnu.org/licenses/>.
+ *   ```
+ */
 
-use std::syntax::tokenizer;
+in lexer;
+
+pub mod ::scope;
+
+use ymirc::lexing::{_, lexer::scope};
+use ymirc::errors;
+use ymirc::utils::format;
+
 use std::{stream, io};
+use std::algorithm::comparison;
 
 /**
- * The lexer is the class responsible of cutting a source code string into a list of tokens
- * Unlike simple tokenizer, the lexer has context information, and switch (allowing to ignore parts of the source code, or not depending of the context)
+ * The lexer is responsible for cutting a source string into a sequence of tokens.
+ * Unlike a simple tokenizer, it maintains contextual state and can switch modes,
+ * allowing it to ignore or include parts of the input depending on the current
+ * lexical context.
+ *
+ * The Lexer also provides navigation utilities(forward, backtrack, lookahead)
+ * to support the syntax visitor and other compiler stages.
+ *
+ * @info:
+ *   The lexer does not open files itself. It is constructed from a string, but
+ *   stores a filename so that the Words it produces can be annotated with proper
+ *   source locations.
+ *
+ * @example:
+ * ```
+ * let content = {
+ *     let dmut file = File::open(path);
+ *     file:.readAll()
+ * }; // File is an entity, therefore closed here
+ *
+ * let dmut lex = copy SrcLexer("file.yr", content);
+ *
+ * // All words are already cut; now we can traverse them
+ * while let (tok, comm) = lex:.next() && !tok of EofWord {
+ *     println("Token: ", tok);
+ *     println("Comment above the token: ", comm);
+ * }
+ * ```
  */
+
 @final
-pub class Lexer {
-    
-    // The name of the file that the lexer is reading
-    let _filename : [c8];
+pub class SrcLexer {
 
-    // The content of the file, that is tokenized
-    let _content : [c8];
+    /*! Immutable fields **/
+    prv {
+        // The name of the file that the lexer is reading
+        let _filename: [c8];
 
-    // Does the lexer has to skip comments
-    let mut _doComments : bool = true;
+        // The content of the file, that is tokenized
+        let _content: [c8];
 
-    // The position of the cursor
-    let mut _cursor : usize = 0us;
-
-    // The current word that is being read
-    let mut _wordCursor : usize = 0us;
-
-    // The list of words infos
-    let mut _wordInfos : [(usize, bool, [c8])] = [];
-
-    // The end comments that are found
-    let dmut _commentEnds : [usize => (usize, usize)] = copy [];
-
-    // The list of allocated words found in the files (the tokens basically)
-    let mut _words : [&Word] = [] ;
-    
-    // The position of the (cursors, line, col, lineSeek) of the previous read words
-    let dmut _rewinders : &List!{(usize, usize)} = copy List!{(usize, usize)} ();
-
-    // Set to true, when nothing is left to read (iif _cursor >= _content.len)
-    let mut _eof : bool = false;
-
-    // The word returns when the lexer is eof
-    let _eofWord : &Word;
-
-    let _initLine : u64;
-    let _initCol : u64;
-    let _initLineSeek : usize;
-
-    /**
-     * Create a new lexer, ready to split content
-     * @params: 
-     *    - content: the content to split
-     *    - tokens: the list of tokens that split the string, (cf. Tokenizer)
-     *    - comments: the list of tokens that start a comment line (by default [])
-     *    - skips: the list of tokens that will be omitted by the lexer when reading (by default [" ", "\n", "\t", "\r"])
-     * @warning: if the skips and comments token are not in tokens, they are added, so they split the content 
-     */
-    pub self (filename : [c8], content : [c8], tokens: [[c8]], comments : [([c8], [c8])], skips: [[c8]], addLine : u64 = 1u64, addCol : u64 = 1u64, lineSeek : usize = 0us)
-        with _filename = filename
-        , _content = content
-        , _eofWord = copy Word::eof (filename-> filename)
-        , _initLine = addLine
-        , _initCol = addCol
-        , _initLineSeek = lineSeek
-    {
-        self._rewinders:.push ((self._cursor, self._wordCursor));
-
-        let mut tzer = Tokenizer!{c8} (tokens-> tokens);
-        for i in comments {
-            tzer:.insert (i._0, isComment-> i._1);
-        }
-
-        for i in skips {
-            tzer:.insert (i, isSkip-> true);
-        }
-
-        self:.readAll (tzer);
-    }        
-
-    /**
-     * Read the next word in the lexer, and returns it, with the documentation read before it
-     * @returns:
-     *   - .0: the next word in the lexer
-     *   - .1: the associated comments
-     */
-    pub fn next (mut self)-> (&Word, [c8]) {
-        if (self._eof) return (self._eofWord, "");
-
-        self._rewinders:.push ((self._cursor, self._wordCursor));
-        let mut start_com = 0us;
-        let mut end_com = 0us;
-
-        while (self._wordCursor < self._wordInfos.len) {
-            let (wd, isSkip, isComment) = self._wordInfos [self._wordCursor];
-            self._wordCursor += 1us;
-            self._cursor += wd;
-            if (!isSkip) {
-                if (isComment != "") {
-                    let begin_com = self._wordCursor - 1;
-                    start_com = self._cursor;
-                    self:.gotoNextToken (isComment, self._words [self._wordCursor - 1].str);
-                    end_com = self._cursor - isComment.len;
-                    if (self._words [begin_com] == (CommentTokens::MULTILINE_NO_DOC)._0) { start_com = end_com; }
-                } else {
-                    return (self._words [self._wordCursor - 1us], self._content [start_com .. end_com]);
-                }
-            }
-        }
-
-        self._eof = true;
-        return (self._eofWord, "");
     }
 
-    /**
-     * Read the next word in the lexer, and returns it, with the documentation read before it
-     * @returns:
-     *   - .0: the next word in the lexer
-     *   - .1: the associated comments
-     */
-    pub fn nextNoConsume (self)-> (&Word, [c8]) {
-        if (self._eof) return (self._eofWord, "");
-        let mut start_com = 0us;
-        let mut end_com = 0us;
+    /*! Mutable fields */
+    prv {
+        // The current word that is being read
+        let mut _cursor: usize = 0us;
 
-        let mut saveWC = self._wordCursor, mut saveC = self._cursor;
-        while (saveWC < self._wordInfos.len) {
-            let (wd, isSkip, isComment) = self._wordInfos [saveWC];
+        // The comments about a word
+        let mut _wordComms: [[c8]] = [];
 
-            saveWC += 1us;
-            saveC += wd;
-            if (!isSkip) {
-                if (isComment != "") {
-                    let begin_com = saveWC - 1;
-                    start_com = saveC;
-                    let (postWC, postC) = self.gotoNextTokenNoConsume (isComment, self._words [saveWC - 1].str, saveWC, saveC);
-                    saveWC = postWC;
-                    saveC = postC;
-                    end_com = saveC - isComment.len;
-                    if (self._words [begin_com] == (CommentTokens::MULTILINE_NO_DOC)._0) { start_com = end_com; }
-                } else {
-                    return (self._words [saveWC - 1us], self._content [start_com .. end_com]);
-                }
-            }
-        }
+        // The list of allocated words found in the files(the tokens basically)
+        let mut _words: [&Word] = [] ;
 
-        return (self._eofWord, "");
-    }
-
-    /**
-     * @returns: the next word, without taking into account skips, and comments
-     */
-    pub fn directNext (mut self)-> &Word {
-        if (self._eof) return self._eofWord;
-        
-        self._rewinders:.push ((self._cursor, self._wordCursor));
-        if (self._wordCursor < self._wordInfos.len) {
-            self._wordCursor += 1us;
-            self._cursor += self._wordInfos [self._wordCursor - 1us]._0;
-            self._words [self._wordCursor - 1us]
-        } else {
-            self._eof = true;
-            self._eofWord
-        }
-    }
-    
-    /**
-     * Got to the end of a string disabling skip tokens
-     * @params: 
-     *    - closing: the token closing the string
-     * @returns: 
-     *   - .0 : the content of the string literal
-     *   - .1 : the closing word
-     */
-    pub fn getString (mut self, closing : [c8], opening : [[c8]] = [], escaping : bool = false)-> ([c8], &Word) {
-        let start = self._cursor;
-        let mut nb = 1us;
-        let mut currentEscape = false;
-        while (self._wordCursor < self._wordInfos.len) {
-            let (wd, _, _) = self._wordInfos [self._wordCursor];
-
-            let ret = self._content [self._cursor .. self._cursor + wd];
-            self._wordCursor += 1us;
-            self._cursor += wd;
-                
-            if (ret == closing && !currentEscape) {
-                nb -= 1us;
-                if (nb == 0us) {
-                    return (self._content [start .. self._cursor - wd], self._words [self._wordCursor - 1us]);
-                }
-            } else if (!currentEscape) {
-                for j in opening {
-                    if ret == j {
-                        nb += 1us;
-                        break;
-                    }
-                }
-            }
-
-            currentEscape = escaping && !currentEscape && (ret == Tokens::ANTI);
-        }
-
-        self._eof = true;
-        return (self._content [start .. $], self._eofWord);
-    }
-
-
-    /**
-     * @returns:
-     *    - .0: the string that was read so far as the location of the current word cursor
-     *    - .1: the rest of the string that was not yet read
-     * */
-    pub fn getCutContent (self)-> ([c8], [c8]) {
-        let beg = self._content [0us .. self._cursor];
-        let end = self._content [self._cursor .. $];
-
-        (beg, end)
+        // The word returns when the lexer is eof
+        let mut _eofWord: &Word;
     }
 
     /*!
-     * ================================================================================
-     * ================================================================================
-     * =========================            REWIND            =========================
-     * ================================================================================
-     * ================================================================================
+     * ====================================================================================================
+     * ====================================================================================================
+     * =====================================          CTORS          ======================================
+     * ====================================================================================================
+     * ====================================================================================================
      */
-    
+
     /**
-     * Rewind to a previous location in the file
-     * Each time the function next is called, the lexer saves the cursor position
-     * This function rewind go to that cursor position, so if we rewind 10 times, we will get the last 10 next calls
-     * @warning: 
-     * ===============
-     * when toggeling skips, and doComment, the rewind does not garantee, that the lexer will return at least nb tokens
-     * ===============
+     * Creates a new lexer ready to split the given content.
+     *
+     * @params:
+     *   - content:   the string to cut into lexical words
+     *
+     * @warning:
+     *   If skip or comment tokens are not present in `tokens`, they are automatically
+     *   added so that they correctly participate in splitting the content.
+     *
+     * @info:
+     *   The constructor immediately cuts the entire string into a list of `Word`
+     *   instances. Pre-cutting the full sequence has proven significantly more
+     *   efficient than tokenizing on demand. All traversal methods operate solely
+     *   on this precomputed collection, no further tokenization occurs after
+     *   construction.
      */
-    pub fn rewind (mut self) {
-        if (self._eof) {
-            self._rewinders:.pop ();
-            self._eof = false;
+    pub self (filename: [c8], content: [c8])
+        with _filename = filename
+        , _content = content
+        , _eofWord = copy EofWord(filename-> filename)
+
+        throws ErrorMsg
+    {
+        self:.tokenizeAll(__SRC_TOKENIZER__);
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * =====================================          USAGE          ======================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Returns the word being pointed by cursor and make the cursor move forward
+     *
+     * @info
+     *   EOF word is returned if we reached the end of the collection
+     *
+     * @returns:
+     *    - .0: the word
+     *    - .1: the comment attached to the word
+     * */
+    pub fn next(mut self)-> (&Word, [c8]) {
+        if (self._cursor >= self._words.len) {
+            self._cursor += 1;
+            return (self._eofWord, "");
         }
 
-        let (x, h) = self._rewinders.back ();
-        self._cursor = x;
-        self._wordCursor = h;
+        let toRet = (self._words[self._cursor], self._wordComms[self._cursor]);
+        self._cursor += 1;
 
-        self._rewinders:.pop ();
-        if (self._rewinders.isEmpty ()) {
-            self._rewinders:.push ((self._cursor, self._wordCursor));
-        }
+        return toRet;
     }
 
     /**
-     * Rewind to a previous location in the file, moving the c8 cursor
-     * @params: 
-     *   - cursor: the c8 seek cursor to go to 
-     */
-    pub fn rewindToSeek (mut self, cursor : usize) {
-        if (self._eof) {
-            self._rewinders:.pop ();
-            self._eof = false;
+     * Returns the word pointed by the cursor without making the cursor move forward
+     *
+     * @info
+     *    EOF is returned if we reached the end of the collection
+     *
+     * @returns: the word pointed by the cursor
+     * */
+    pub fn peek(self)-> &Word {
+        if (self._cursor >= self._words.len) {
+            return self._eofWord;
         }
 
-        while self._rewinders.len > 0 {
-            let (x, h) = self._rewinders.back ();
-            self._cursor = x;
-            self._wordCursor = h;
-            self._rewinders:.pop ();
-            if (x <= cursor) break;
-        }
-
-        if (self._rewinders.len == 0us) {
-            self._rewinders:.push ((self._cursor, self._wordCursor));
-        }
+        return self._words[self._cursor];
     }
 
-    /***
-     * ============================================================================
-     * ============================================================================
-     * =========================          GETTERS        ==========================
-     * ============================================================================
-     * ============================================================================
-     */
-    
     /**
-     * @returns: the counter of previous "self:.next" calls
-     * @info: this information can be usefull to go back rapidely
-     * @example: 
-     * =================
-     * let dmut lex : &Lexer = ...
-     * let read_Nb : u64 = ...
-     * let cursor = lex.getSeek ();
-     * for i in 0 .. read_Nb {
-     *     println (lex:.next ()._0);
-     * }
-     * lex:.rewindToSeek (cursor); // go back of number of valid read done
-     * // so the lexer will be reset, as if the for loop never executed
-     * =================
-     */
-    pub fn getSeek (self)-> usize {
-        self._cursor
+     * Move the cursor back by one
+     *
+     * @info
+     *   Do nothing if we are already at the start of the collection
+     * */
+    pub fn rewind(mut self) {
+        if self._cursor == 0
+            return;
+
+        self._cursor -= 1;
     }
 
-    /***
-     * ============================================================================
-     * ============================================================================
-     * =========================          PRIVATE        ==========================
-     * ============================================================================
-     * ============================================================================
-     */
-    
     /**
-     * Move the cursor (and counters) to the next token == end
-     */
-    prv fn gotoNextToken (mut self, end : [c8], opening : [c8])-> void {
-        let start = self._wordCursor;
-        if let Ok (x) = self._commentEnds [self._wordCursor] {
-            self._wordCursor = x._0;
-            self._cursor = x._1;
+     * Move the cursor back to the seek of a given word
+     *
+     * @panic
+     *    Panic if we try to make the cursor move forward(i.e. self.getSeek() < seek)
+     *
+     * @info
+     *   if the seek is not an exact word, move to the word whose .seek < seek
+     *
+     * @params:
+     *    - seek: the seek of the word to rewind to
+     *
+     * */
+    pub fn rewindToSeek(mut self, seek: usize) {
+
+        // rewindToSeek must not be used to go forward
+        if self.getSeek() < seek {
+            eprintln("internal lexer error: rewinding forward");
+            panic;
+        }
+
+        // rewind to end, and already at end
+        if seek == self._content.len {
+            self._cursor = self._words.len;
             return;
         }
 
-        if tokens::isMultipleLineComment (opening) {
-            let mut finish = 0us;
-            while (self._wordCursor < self._wordInfos.len) {
-                let (wd, _, _) = self._wordInfos [self._wordCursor];
-                let ret = self._content [self._cursor .. self._cursor + wd];
-                self._wordCursor += 1us;
-                self._cursor += wd;
-
-                if (ret == end) {
-                    if (finish == 0us) {
-                        self._commentEnds [start] = (self._wordCursor, self._cursor);
-                        return;
-                    } else finish -= 1us;
-                } else if ret == opening {
-                    finish += 1us;
-                }
-            }
-        } else {
-            while (self._wordCursor < self._wordInfos.len) {
-                let (wd, _, _) = self._wordInfos [self._wordCursor];
-                let ret = self._content [self._cursor .. self._cursor + wd];
-                self._wordCursor += 1us;
-                self._cursor += wd;
-
-                if (ret == end) {
-                    self._commentEnds [start] = (self._wordCursor, self._cursor);
-                    return;
-                }
-            }
-        }
-
-        self._commentEnds [start] =  (self._wordCursor, self._cursor);
-    }
-
-    /**
-     * Move the cursor (and counters) to the next token == end
-     */
-    prv fn gotoNextTokenNoConsume (self, end : [c8], opening : [c8], wordCursor : usize, cursor : usize)-> (usize, usize) {
-        if let Ok (x) = self._commentEnds [wordCursor] {
-            return (x._0, x._1);
-        }
-
-        let mut saveWC = wordCursor, mut saveC = cursor;
-        if tokens::isMultipleLineComment (opening) {
-            let mut finish = 0us;
-            while (saveWC < self._wordInfos.len) {
-                let (wd, _, _) = self._wordInfos [saveWC];
-                let ret = self._content [saveC .. saveC + wd];
-                saveWC += 1us;
-                saveC += wd;
-
-                if (ret == end) {
-                    if (finish == 0us) {
-                        return (saveWC, saveC);
-                    } else finish -= 1us;
-                } else if ret == opening && isMultipleLineComment (opening) {
-                    finish += 1us;
-                }
-            }
-        } else {
-            while (saveWC < self._wordInfos.len) {
-                let (wd, _, _) = self._wordInfos [saveWC];
-                let ret = self._content [saveC .. saveC + wd];
-                saveWC += 1us;
-                saveC += wd;
-
-                if (ret == end) {
-                    return (saveWC, saveC);
-                }
-            }
-        }
-
-        return (saveWC, saveC);
-    }
-
-    /**
-     * Read the content to lex, and store the words
-     */
-    prv fn readAll (mut self, tzer : Tokenizer!{c8}) {
-        let mut tzerCursor = 0us;
-        let mut lineSeek = self._initLineSeek;
-        let mut line = self._initLine;
-        let mut col = self._initCol;
-
-        let dmut wordInfos = copy List!{(usize, bool, [c8])} ();
-        let dmut words = copy List!{dmut &Word} ();
-
         loop {
-            let (len, isSkip, isComment) = tzer.next (self._content [tzerCursor .. $]);
-            if (len == 0us) break;
+            // First word break
+            if self._cursor == 0
+                return;
 
-            let ret = self._content [tzerCursor  .. tzerCursor + len];
-            wordInfos:.push ((len, isSkip, isComment));
-            words:.push (copy Word (ret, filename-> self._filename, fileContent-> self._content, line, col, tzerCursor, lineSeek));
-            tzerCursor += len;
+            // Current word is seek are before it
+            if self._cursor < self._words.len && self._words[self._cursor].seek <= seek
+                return;
 
-            if (ret [0us] == '\n'c8) {
-                lineSeek = lineSeek + cast!usize (col);
-                line += 1u64;
-                col = 1u64;
-            } else { col += cast!u64 (len); }
+            // Rewind by one
+            self._cursor -= 1;
         }
-
-        self._wordInfos = wordInfos:[];
-        self._words = words:[];
     }
 
-    /***
-     * ==================================================================================
-     * ==================================================================================
-     * =========================          MISCELLANEOUS        ==========================
-     * ==================================================================================
-     * ==================================================================================
+    /**
+     * @returns: the seek of the word pointed by the cursor of the collection
+     *
+     * @info
+     *   if EOF returns the seek of the EOF word
+     * */
+    pub fn getSeek(self)-> usize {
+        if self._cursor >= self._words.len // End of file returns the seek past last word
+            return self._content.len;
+
+        // returns the seek of the current word
+        self._words[self._cursor].seek
+    }
+
+    /**
+     * @returns: true iif we reached the end of the collection
+     * */
+    @field
+    pub fn isEof(self)-> bool {
+        self._cursor >= self._words.len
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ==================================          TOKENIZATION          ==================================
+     * ====================================================================================================
+     * ====================================================================================================
      */
-    
+
+    /**
+     * Tokenize the content of the lexer into a list of words
+     * @params:
+     *    - tzer: the word tokenizer used to split the words
+     *
+     * @info
+     *   Fill self._words collection
+     *
+     * @returns: the list of #if directive found in the tokens
+     * */
+    prv fn tokenizeAll(mut self, tzer: SrcTokenizer)
+        throws ErrorMsg
+    {
+        let mut cursor      = SrcCursor(self._filename, self._content);
+        let mut currentComm = "";
+
+        let dmut scope = copy scope::SrcScopeList();
+
+        while cursor.seek < self._content.len {
+            let slc = tzer.next(self._content[cursor.seek .. $]);
+            if slc.tok.len == 0us // EOF
+                break;
+
+            if slc.isSkip {
+                if slc.tok == "\n" {
+                    cursor:.newLine(); // only skip contain line returns
+                } else {
+                    cursor:.forward(slc.tok.len);
+                }
+            }
+
+            else if slc.isString {
+                let (close, mult, suff, ident) = tzer.stringInfo(slc.tok);
+                let lst = tzer.openList(close);
+
+                let word = self.tokenizeString(tzer, slc.tok, close, lst, suff, mult, ident, ref cursor);
+                scope:.push(word, currentComm);
+                currentComm = [];
+            }
+
+            else if slc.isComment {
+                let (close, mult, doc) = tzer.commentInfo(slc.tok);
+                let lst = tzer.openList(close);
+
+                currentComm ~= self.tokenizeComment(tzer, slc.tok, close, lst, mult, doc, ref cursor)
+            }
+
+            else if slc.isKeyword {
+                scope:.push(cursor.instantiateKey(slc.tok), currentComm);
+                cursor:.forward(slc.tok.len);
+                currentComm = [];
+            }
+
+            else if slc.isToken {
+                if slc.tok == Tokens::SHARP { // a single '#' must be followed by if, else, or end
+                    self.manageVersion(tzer, alias scope, ref cursor);
+                }
+                else if slc.tok == Tokens::NOT { // might be !in, !of, !is, but we don't create a token, since !inside is not to be splitted by[!in, side]
+                    let word = self.tokenizeNotToken(tzer, ref cursor);
+                    scope:.push(word, currentComm);
+                    currentComm = [];
+                }
+                else {
+                    scope:.push(cursor.instantiateTok(slc.tok), currentComm);
+                    cursor:.forward(slc.tok.len);
+                    currentComm = [];
+                }
+            }
+
+            else {
+                let word = self.tokenizeWord(tzer, slc.tok, ref cursor);
+                scope:.push(word, currentComm);
+                currentComm = [];
+            }
+        }
+
+        self._eofWord = cursor.instantiateEof();
+
+        let lst = scope[];
+        if lst.len != 1 {
+            throw copy ErrorMsg::fatal(lst[$ - 1].open, format(LexingErrorMessage::UNTERMINATED_VERSION_BLOCK));
+        }
+
+        self._words = lst[0].words;
+        self._wordComms = lst[0].comms;
+    }
+
+    /**
+     * Tokenize a string
+     * @params:
+     *   - tzer: the string tokenizer
+     *   - tok: the opening token
+     *   - close: the expected closing token of the string
+     *   - opens: the nested strings(with the same closing)
+     *   - mult: true iif the string can be written on multiple lines
+     *   - cursor: the cursor of the lexer to make forward
+     *
+     * */
+    prv fn tokenizeString(self, tzer: SrcTokenizer, tok: [c8], close: [c8], opens: [[c8] => ()], suffixes: [[c8]], mult: bool, ident: bool, ref mut cursor: SrcCursor)-> &Word
+        throws ErrorMsg
+    {
+        let mut startCursor   = cursor;
+        cursor:.forward(tok.len);
+
+        let mut depth = 1;
+        while cursor.seek < self._content.len {
+            let ret = tzer.next(self._content[cursor.seek .. $]).tok;
+            if ret.len == 0us
+                break;
+
+            if ret == close { // reaching a close
+                cursor:.forward(ret.len);
+                depth -= 1;
+                if depth == 0 { // it's not a nested, it's the real close
+                    return self.finalizeString(tzer, tok, close, suffixes, mult, ident, ref startCursor, ref cursor);
+                }
+            }
+
+            else if ret == Tokens::ANTI { // escaping the next char
+                self.checkEscapeNothing(tok, startCursor, cursor, true);
+                self.checkEscapeReturn(tok, startCursor, cursor, true);
+                cursor:.forward(ret.len + 1);
+            }
+
+            else if ret == Tokens::RETURN { // New line
+                self.checkReturnMult(tok, startCursor, cursor, mult, true);
+                cursor:.newLine();
+            }
+
+            else if ret in opens { // Nested string
+                depth += 1;
+                cursor:.forward(ret.len);
+            }
+
+            else { // just a token
+                cursor:.forward(ret.len);
+            }
+        }
+
+        // If here, means depth never was equal to 0
+        // Create a location token for the error message
+        let loc = startCursor.instantiateTok(tok);
+        throw copy ErrorMsg::fatal(loc, format(LexingErrorMessage::UNTERMINATED_STRING, close));
+    }
+
+
+    /**
+     * Finalize the string token
+     * @params:
+     *    - open:        the opening token
+     *    - close:       the closing token
+     *    - startCursor: the cursor at the opening location
+     *    - endCursor:   the cursor at the closing location
+     *    - mult:        true iif it's a multiline string(and therefore will be trimmed)
+     * */
+    fn finalizeString(self, tzer: SrcTokenizer, open: [c8], close: [c8], suffixes: [[c8]], mult: bool, ident: bool, ref mut startCursor: SrcCursor, ref mut endCursor: SrcCursor)-> &Word {
+        let s = startCursor.seek + open.len;
+        let e = endCursor.seek - close.len;
+
+        if ident { // Not a string but an identifier `ident`
+            startCursor:.forward(open.len);
+            return startCursor.instantiateName(self._content[s .. e]);
+        }
+
+        let mut suffix = EOF_WORD;
+        if suffixes.len != 0 { // read the suffix if the string can have a suffix
+            let slice = tzer.next(self._content[endCursor.seek .. $]);
+            let mut isSuff = false;
+            for f in suffixes if slice.tok == f {
+                isSuff = true;
+                break;
+            }
+
+            if isSuff {
+                suffix = endCursor.instantiateTok(slice.tok);
+                endCursor:.forward(slice.tok.len);
+            }
+        }
+
+        let (finalStr, trimmed, skip) = if mult { // trim if multiline string
+            self.trimString(self._content[s .. e])
+        } else { // or as is
+            (self._content[s .. e], 0, false)
+        };
+
+        let startWord = startCursor.instantiateTok(open);
+        let endWord   = endCursor.instantiateTok(close);
+
+        // skip means the first line of the trim was empty
+        if skip {
+            startCursor:.newLine();
+        }
+        else { // it wasn't so the string is on the same line but past the opening word
+            startCursor:.forward(open.len);
+        }
+
+        return startCursor.instantiateStr(finalStr, startWord, endWord, trimmed, suffix);
+    }
+
+    /**
+     * Tokenize a comment block
+     * @params:
+     *   - tzer:   the string tokenizer
+     *   - tok:    the opening token
+     *   - close:  the expected closing token of the string
+     *   - opens:  the nested strings(with the same closing)
+     *   - mult:   true iif the string can be written on multiple lines
+     *   - doc:    true iif we are reading a documentation comment
+     *   - cursor: the cursor of the lexer to make forward
+     *
+     * */
+    fn tokenizeComment(self, tzer: SrcTokenizer, tok: [c8], close: [c8], opens: [[c8] => ()], mult: bool, doc: bool, ref mut cursor: SrcCursor)-> [c8]
+        throws ErrorMsg
+    {
+        let mut startCursor   = cursor;
+        cursor:.forward(tok.len);
+
+        let mut depth = 1;
+        while cursor.seek < self._content.len {
+            let ret = tzer.next(self._content[cursor.seek .. $]).tok;
+            if ret.len == 0us // EOF
+                break;
+
+            if ret == close { // closing token found
+                if close == Tokens::RETURN {
+                    cursor:.newLine();
+                } else {
+                    cursor:.forward(ret.len);
+                }
+
+                depth -= 1;
+                if depth == 0 { // not in nested
+                    return self.finalizeComment(tok, ret, mult, doc, startCursor, cursor);
+                }
+            }
+
+            else if ret == Tokens::ANTI { // Escaping
+                self.checkEscapeNothing(tok, startCursor, cursor, false);
+                self.checkEscapeReturn(tok, startCursor, cursor, false);
+                cursor:.forward(ret.len + 1);
+            }
+
+            else if ret == Tokens::RETURN { // New line
+                self.checkReturnMult(tok, startCursor, cursor, mult, false);
+                cursor:.newLine();
+            }
+
+            else if ret in opens { // Nested comment
+                depth += 1;
+                cursor:.forward(ret.len);
+            }
+
+            else { // move the cursor foward, just a part of the comment
+                cursor:.forward(ret.len);
+            }
+        }
+
+        // We reached EOF but the comment is not closed
+        // Create a location token for the error message
+        let loc = startCursor.instantiateTok(tok);
+        throw copy ErrorMsg::fatal(loc, format(LexingErrorMessage::UNTERMINATED_COMMENT, close));
+    }
+
+    /**
+     * Finalize a comment
+     * @params:
+     *    - open:        the opening token
+     *    - close:       the closing token
+     *    - startCursor: the cursor at the opening location
+     *    - endCursor:   the cursor at the closing location
+     *    - mult:        true iif it's a multiline comment(and therefore will be trimmed)
+     *
+     * */
+    fn finalizeComment(self, open: [c8], close: [c8], mult: bool, doc: bool, startCursor: SrcCursor, endCursor: SrcCursor)-> [c8] {
+        if !doc return ""; // not documentation, simply ignoring the comment
+
+        let s = startCursor.seek + open.len;
+        let e = endCursor.seek - close.len;
+
+        if mult { // multiline comments are trimmed
+            return self.trimComment(self._content[s .. e]);
+        } else {
+            // Skipping the first space in comment if there is one
+            if s < self._content.len && self._content[s] == ' ' {
+                return self._content[s + 1 .. e];
+            }
+
+            return self._content[s .. e];
+        }
+    }
+
+    /**
+     * Tokenize a word that is neither a token, neither a string, nor a comment.
+     * It can be an int/float or an identifier
+     *
+     * @params:
+     *    - tzer:   the tokenizer
+     *    - tok:    the token being tokenized
+     *    - cursor: the cursor to move
+     *
+     * */
+    fn tokenizeWord(self, tzer: SrcTokenizer, tok: [c8], ref mut cursor: SrcCursor)-> &Word
+        throws ErrorMsg
+    {
+        let mut number = tok;
+        let startCursor = cursor;
+        while number.len > 0 && number[0] == '_' {
+            cursor:.forward(1);
+            number = number[1 .. $];
+        }
+
+        if number.len > 2 && number[0 .. 2] == "0x" {
+            return self.tokenizeHexWord(tzer, number, ref cursor);
+        }
+
+        if number.len > 2 && number[0 .. 2] == "0b" {
+            return self.tokenizeBinWord(number, ref cursor);
+        }
+
+        if number.len > 2 && number[0 .. 2] == "0o" {
+            return self.tokenizeOctWord(number, ref cursor);
+        }
+
+        if number.len >= 1 && number[0] >= '0' && number[0] <= '9' {
+            return self.tokenizeDecWord(tzer, number, ref cursor);
+        }
+
+        cursor = startCursor;
+        return self.tokenizeName(tok, ref cursor);
+    }
+
+    /**
+     * Tokenize a token start starts with '!', check if the following token is a
+     * keyword and a special not one
+     *
+     * @params:
+     *    - tzer:   the tokenizer to read the following token
+     *    - cursor: the cursor pointing to not to move forward
+     *
+     * */
+    fn tokenizeNotToken(self, tzer: SrcTokenizer, ref mut cursor: SrcCursor)-> &Word {
+        let next = tzer.next(self._content[cursor.seek + Tokens::NOT.len .. $]);
+
+        // Found in|of|is, so the real token is !in, !of or !is
+        if next.isKeyword && (next.tok == Keys::IN || next.tok == Keys::IS || next.tok == Keys::OF) {
+            let ret = cursor.instantiateTok(Tokens::NOT ~ next.tok);
+            cursor:.forward(Tokens::NOT.len + next.tok.len);
+            return ret;
+        }
+
+        // Anything else, a simple '!' token
+        let ret = cursor.instantiateTok(Tokens::NOT);
+        cursor:.forward(Tokens::NOT.len);
+        return ret;
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ===============================          NAME TOKENIZATION          ================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Tokenize a word that contains a name
+     *
+     * @params:
+     *   - tok: the token to check
+     *   - cursor: the cursor pointing to the name
+     *
+     * @returns: the name word generated
+     *
+     * */
+    fn tokenizeName(self, tok: [c8], ref mut cursor: SrcCursor)-> &NameWord
+        throws ErrorMsg
+    {
+        // '_' is a valid identifier
+        if tok == Keys::UNDER {
+            let name = cursor.instantiateName(tok);
+            cursor:.forward(tok.len);
+            return name;
+        }
+
+        let mut i = 0us, mut found = false;
+
+        // must start by a letter, but can be preceded by as many _ as wanted
+        for j, c in tok {
+            if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') {
+                i = j;
+                found = true;
+                break;
+            }
+
+            else if (c != '_') { // a letter or underscore in the first part only
+                let mut errCursor = cursor;
+                errCursor:.forward(j);
+
+                let loc = cursor.instantiateLoc(tok);
+                let err = errCursor.instantiateLoc(tok[j .. j + 1]);
+                throw copy ErrorMsg::fatal(loc, format(LexingErrorMessage::INVALID_IDENTIFIER, tok, tok),
+                                            notes-> copy [copy ErrorMsg::note(err, "")]);
+            }
+        }
+
+        // only underscores, only '_' is allowed, '__' isn't
+        if !found {
+            let loc = cursor.instantiateLoc(tok);
+            throw copy ErrorMsg::fatal(loc, format(LexingErrorMessage::INVALID_IDENTIFIER, tok));
+        }
+
+        // the rest of the identifier must be composed of letters, numbers, or _
+        for j in i .. tok.len {
+            let c = tok[j];
+            if (c < 'a' || c > 'z') && (c < 'A' || c > 'Z') && (c != '_') && (c < '0' || c > '9') {
+                let mut errCursor = cursor;
+                errCursor:.forward(j);
+
+                let loc = cursor.instantiateLoc(tok);
+                let err = errCursor.instantiateLoc(tok[j .. j + 1]);
+                throw copy ErrorMsg::fatal(loc, format(LexingErrorMessage::INVALID_IDENTIFIER, tok, tok),
+                                            notes-> copy [copy ErrorMsg::note(err, "")]);
+            }
+        }
+
+        // A valid identifier
+        let name = cursor.instantiateName(tok);
+        cursor:.forward(tok.len);
+        return name;
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * =============================          INTEGRAL TOKENIZATIONS          =============================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Tokenize a word starting with `0b`. It is necessarily a integral number in binary format.
+     * Int can be followed by suffixes from FixedSuffixes enumerations.
+     *
+     * * @params:
+     *    - tok:    the number that was read
+     *    - cursor: the current cursor location(moved by the function to the end of the word after read)
+     *
+     * @returns: the Numericword that was read
+     *
+     * */
+    fn tokenizeBinWord(self, tok: [c8], ref mut cursor: SrcCursor)-> &NumericWord
+        throws ErrorMsg
+    {
+        // Keep info on where the cursor started for errors, and final word composition
+        let startCursor = cursor;
+
+        // Search for a suffix at the end of the token
+        let mut foundNumSuff = "";
+        for suff in FixedSuffixes::__members__ {
+            if tok.len > suff.len && tok[$ - suff.len .. $] == suff {
+                foundNumSuff = suff;
+                break;
+            }
+        }
+
+        // Extract the number part
+        let numValue = tok[0 .. $ - foundNumSuff.len];
+        // Verify everything in the number is in binary format(ignoring the leading 0b)
+        let mut one = false;
+        for i, c in numValue[2 .. $] {
+            if c != '_' && c != '0' && c != '1' {
+                let mut errCursor = startCursor; // snapshot to move a cursor to the error location
+                errCursor:.forward(2 + i);
+
+                let loc = startCursor.instantiateLoc(tok); // start of the word
+                let err = errCursor.instantiateLoc(numValue[i + 2 .. i + 3]); // error location
+                throw copy ErrorMsg::fatal(loc, format(LexingErrorMessage::INVALID_BIN_NUMBER),
+                                            notes-> copy [copy ErrorMsg::note(err, "")]);
+            }
+
+            if c != '_' { one = true; }
+        }
+
+        // only underscores
+        if !one {
+            let loc = startCursor.instantiateLoc(tok); // start of the word
+            throw copy ErrorMsg::fatal(loc, format(LexingErrorMessage::EMPTY_BIN_NUMBER));
+        }
+
+        // Move the cursor to the end of the number(at suffix position)
+        cursor:.forward(numValue.len);
+
+        let suffWord = if foundNumSuff.len != 0 {
+            let suff = cursor.instantiateTok(foundNumSuff);
+            cursor:.forward(foundNumSuff.len);
+            suff
+        } else {
+            EOF_WORD
+        };
+
+        // Use startCursor that stored the position of the number before we made the cursor progress
+        return startCursor.instantiateNum(numValue,
+                                           notation-> NumericNotation::BIN,
+                                           suffix-> suffWord);
+    }
+
+    /**
+     * Tokenize a word starting with `0o`. It is necessarily a integral number in octal format.
+     * Int can be followed by suffixes from FixedSuffixes enumerations.
+     *
+     * * @params:
+     *    - tok:    the number that was read
+     *    - cursor: the current cursor location(moved by the function to the end of the word after read)
+     *
+     * @returns: the Numericword that was read
+     *
+     * */
+    fn tokenizeOctWord(self, tok: [c8], ref mut cursor: SrcCursor)-> &NumericWord
+        throws ErrorMsg
+    {
+        // Keep info on where the cursor started for errors, and final word composition
+        let startCursor = cursor;
+
+        // Search for a suffix at the end of the token
+        let mut foundNumSuff = "";
+        for suff in FixedSuffixes::__members__ {
+            if tok.len > suff.len && tok[$ - suff.len .. $] == suff {
+                foundNumSuff = suff;
+                break;
+            }
+        }
+
+        // Extract the number part
+        let numValue = tok[0 .. $ - foundNumSuff.len];
+        let mut one = false;
+
+        // Verify everything in the number is in octal format(ignoring the leading 0o)
+        for i, c in numValue[2 .. $] {
+            if c != '_' && (c < '0' || c > '7') {
+                let mut errCursor = startCursor; // snapshot to move a cursor to the error location
+                errCursor:.forward(2 + i);
+
+                let loc = startCursor.instantiateLoc(tok); // start of the word
+                let err = errCursor.instantiateLoc(numValue[i + 2 .. i + 3]); // error location
+                throw copy ErrorMsg::fatal(loc, format(LexingErrorMessage::INVALID_OCT_NUMBER),
+                                            notes-> copy [copy ErrorMsg::note(err, "")]);
+            }
+            if c != '_' { one = true; }
+        }
+
+        // only underscores
+        if !one {
+            let loc = startCursor.instantiateLoc(tok); // start of the word
+            throw copy ErrorMsg::fatal(loc, format(LexingErrorMessage::EMPTY_OCT_NUMBER));
+        }
+
+        // Move the cursor to the end of the number(at suffix position)
+        cursor:.forward(numValue.len);
+
+        let suffWord = if foundNumSuff.len != 0 {
+            let suff = cursor.instantiateTok(foundNumSuff);
+            cursor:.forward(foundNumSuff.len);
+            suff
+        } else {
+            EOF_WORD
+        };
+
+        // Use startCursor that stored the position of the number before we made the cursor progress
+        return startCursor.instantiateNum(numValue,
+                                           notation-> NumericNotation::OCT,
+                                           suffix-> suffWord);
+    }
+
+
+    /**
+     * Tokenize a word starting with `0x`. It can be either a float in hex format, or an int in hex format
+     * Int can be followed by suffixes from FixedSuffixes enumerations, float by FloatSuffixes enumeration.
+     *
+     * @params:
+     *    - tzer:   the tokenizer to split the content if needed
+     *    - tok:    the number that was read
+     *    - cursor: the current cursor location(moved by the function to the end of the word after read)
+     *
+     * @returns: the word that was read
+     * */
+    fn tokenizeHexWord(self, tzer: SrcTokenizer, tok: [c8], ref mut cursor: SrcCursor)-> &Word
+        throws ErrorMsg
+    {
+        // Keep info on where the cursor started for errors, and final word composition
+        let startCursor = cursor;
+
+        // Search for a suffix at the end of the token
+        let mut foundNumSuff = "";
+        for suff in FixedSuffixes::__members__ {
+            if tok.len > suff.len && tok[$ - suff.len .. $] == suff {
+                foundNumSuff = suff;
+                break;
+            }
+        }
+
+        // Extract the number part
+        let numValue = tok[0 .. $ - foundNumSuff.len];
+        let mut one = false;
+
+        // Verify everything in the number is in Hex format(ignoring the leading 0x)
+        for i, c in numValue[2 .. $] {
+            if c != '_' && (c < '0' || c > '9') && (c < 'A' || c > 'F') && (c < 'a' || c > 'f') {
+                let mut errCursor = startCursor; // snapshot to move a cursor to the error location
+                errCursor:.forward(2 + i);
+
+                let loc = startCursor.instantiateLoc(tok); // start of the word
+                let err = errCursor.instantiateLoc(numValue[i + 2 .. i + 3]); // error location
+                throw copy ErrorMsg::fatal(loc, format(LexingErrorMessage::INVALID_HEX_NUMBER),
+                                            notes-> copy [copy ErrorMsg::note(err, "")]);
+            }
+            if c != '_' { one = true; }
+        }
+
+        if !one {
+            let loc = startCursor.instantiateLoc(tok); // start of the word
+            throw copy ErrorMsg::fatal(loc, format(LexingErrorMessage::EMPTY_HEX_NUMBER));
+        }
+
+
+        // Move the cursor to the end of the number(at suffix position)
+        cursor:.forward(numValue.len);
+
+        // No suffix, if it follows with a dot without space, then it's a floating hex
+        if foundNumSuff == "" {
+            let slc = tzer.next(self._content[cursor.seek .. $]);
+            if (slc.isToken && slc.tok == Tokens::DOT) {
+                // tokenizeHexFloat takes charge of making the cursor progress for the DOT
+                // We give it startCursor to instantiate the final word at the correct cursor position
+                return self.tokenizeHexFloat(tzer, numValue, startCursor, ref cursor);
+            }
+        }
+
+        let suffWord = if foundNumSuff.len != 0 {
+            let suff = cursor.instantiateTok(foundNumSuff);
+            cursor:.forward(foundNumSuff.len);
+            suff
+        } else {
+            EOF_WORD
+        };
+
+        // Use startCursor that stored the position of the number before we made the cursor progress
+        return startCursor.instantiateNum(numValue,
+                                           notation-> NumericNotation::HEX,
+                                           suffix-> suffWord);
+    }
+
+    /**
+     * Tokenize a word in decimal format. It can be either an int or a float.
+     * Int can be followed by suffixes from FixedSuffixes enumerations, float by FloatSuffixes enumeration.
+     *
+     * @params:
+     *    - tzer:   the tokenizer to split the content if needed
+     *    - tok:    the number that was read
+     *    - cursor: the current cursor location(moved by the function to the end of the word after read)
+     *
+     * @returns: the word that was read
+     *
+     * @assume
+     *   The first char of `tok` is [0-9]
+     * */
+    fn tokenizeDecWord(self, tzer: SrcTokenizer, tok: [c8], ref mut cursor: SrcCursor)-> &Word
+        throws ErrorMsg
+    {
+        // Keep info on where the cursor started for errors, and final word composition
+        let startCursor = cursor;
+
+        // Search for a suffix at the end of the token
+        let mut foundNumSuff = "";
+        for suff in FixedSuffixes::__members__ {
+            if tok.len > suff.len && tok[$ - suff.len .. $] == suff {
+                foundNumSuff = suff;
+                break;
+            }
+        }
+
+        // Extract the number part
+        let numValue = tok[0 .. $ - foundNumSuff.len];
+
+        // Verify everything in the number is in decimal format
+        for i, c in numValue {
+            if c != '_' && (c < '0' || c > '9') {
+                let mut errCursor = startCursor; // snapshot to move a cursor to the error location
+                errCursor:.forward(i);
+
+                let loc = startCursor.instantiateLoc(tok); // start of the word
+                let err = errCursor.instantiateLoc(numValue[i .. i + 1]); // error location
+                throw copy ErrorMsg::fatal(loc, format(LexingErrorMessage::INVALID_DEC_NUMBER),
+                                            notes-> copy [copy ErrorMsg::note(err, "")]);
+            }
+        }
+
+        // Unlike other numeric functions, we don't check for one, since it
+        // cannot start with a underscore, this function would have not be
+        // called
+
+        // Move the cursor to the end of the number(at suffix position)
+        cursor:.forward(numValue.len);
+
+        // No suffix: if followed immediately by a dot, it's a decimal float
+        if foundNumSuff == "" {
+            let slc = tzer.next(self._content[cursor.seek .. $]);
+            if (slc.isToken && slc.tok == Tokens::DOT) {
+                // tokenizeDecFloat takes charge of making the cursor progress for the DOT
+                // We give it startCursor to instantiate the final word at the correct cursor position
+                return self.tokenizeDecFloat(tzer, numValue, startCursor, ref cursor);
+            }
+        }
+
+        let suffWord = if foundNumSuff.len != 0 {
+            let suff = cursor.instantiateTok(foundNumSuff);
+            cursor:.forward(foundNumSuff.len);
+            suff
+        } else {
+            EOF_WORD
+        };
+
+        // Use startCursor that stored the position of the number before we made the cursor progress
+        return startCursor.instantiateNum(numValue,
+                                           notation-> NumericNotation::DEC,
+                                           suffix-> suffWord);
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * =============================          FLOATING TOKENIZATIONS          =============================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Tokenize a decimal float value, in pure decimal or scientific notation
+     *
+     * @params:
+     *    - tzer: the tokenizer to tokenize the decimal, exponant parts
+     *    - num: the integral part of the float
+     *    - startCursor: the cursor pointing to the start of the integral part
+     *    - cursor: the cursor pointing to the dot
+     *
+     * @returns: a float word
+     *
+     * @assume
+     *   The cursor points to the dot
+     * */
+    fn tokenizeDecFloat(self, tzer: SrcTokenizer, num: [c8], startCursor: SrcCursor, ref mut cursor: SrcCursor)-> &FloatWord
+        throws ErrorMsg
+    {
+        // Moving past '.'
+        let dotLoc = cursor.instantiateTok(Tokens::DOT);
+        cursor:.forward(Tokens::DOT.len);
+
+        // read the decimal part after the dot
+        let decSlc = tzer.next(self._content[cursor.seek .. $]);
+
+        // A scientific float that must be followed by a + or a -
+        if decSlc.tok.len != 0 && (decSlc.tok[$ - 1] == 'e' || decSlc.tok[$ - 1] == 'E') {
+            return self.tokenizeSciFloatSign(tzer, num, dotLoc, decSlc.tok[0 .. $ - 1], startCursor, ref cursor);
+        }
+
+        // Search for a suffix at the end of the token
+        let mut foundFloatSuff = "";
+        for suff in FloatSuffixes::__members__ {
+            if decSlc.tok.len > suff.len && decSlc.tok[$ - suff.len .. $] == suff {
+                foundFloatSuff = suff;
+                break;
+            }
+        }
+
+        let mut one = false;
+        // Verify everything in the decimal part is in decimal format(without suffix)
+        let decValue = decSlc.tok[0 .. $ - foundFloatSuff.len]; // remove the suffix
+
+        for i, c in decValue {
+            if c != '_' && (c < '0' || c > '9') && c != 'e' && c != 'E' { // decimal is in dec
+                let mut errCursor = cursor; // snapshot to move a cursor to the error location
+                errCursor:.forward(i);
+
+                let loc = startCursor.instantiateLoc(num); // start of the integral part
+                let err = errCursor.instantiateLoc(decValue[i .. i + 1]); // error location
+                throw copy ErrorMsg::fatal(loc, format(LexingErrorMessage::INVALID_DEC_NUMBER),
+                                            notes-> copy [copy ErrorMsg::note(err, "")]);
+            }
+            if c != '_' { one = true; }
+            if c == 'e' || c == 'E' {
+                let decWord = cursor.instantiateNum(decValue[0 .. i], notation-> NumericNotation::DEC, suffix-> EOF_WORD);
+                cursor:.forward(i + 1); // move past the 'e'
+
+                let exp = decValue[i + 1 .. $];
+                return self.tokenizeExpFloatCuttedOut(num,
+                                                       dotLoc,
+                                                       decWord,
+                                                       sign-> EOF_WORD,
+                                                       exp,
+                                                       foundFloatSuff,
+                                                       FloatNotation::SCI,
+                                                       startCursor,
+                                                       ref cursor);
+            }
+        }
+
+        // Normal decimal value
+        if !one && foundFloatSuff.len == 0 { // empty decimal part, or only underscores  1.__ is not allowed, but 1.f, or 1.l is
+            let loc = startCursor.instantiateLoc(num); // start of the integral part
+            let err = cursor.instantiateLoc(decValue); // error location
+            throw copy ErrorMsg::fatal(loc, format(LexingErrorMessage::EMPTY_DEC_FLOAT_NUMBER),
+                                        notes-> copy [copy ErrorMsg::note(err, "")]);
+        }
+
+        // Move past the decimal part
+        let decWord = cursor.instantiateNum(decValue, notation-> NumericNotation::DEC, suffix-> EOF_WORD);
+        cursor:.forward(decValue.len);
+
+        // Move past the suffix part
+        let suffWord = if foundFloatSuff.len != 0 {
+            let suff = cursor.instantiateTok(foundFloatSuff);
+            cursor:.forward(foundFloatSuff.len);
+            suff
+        } else {
+            EOF_WORD
+        };
+
+        // Create the final word
+        return startCursor.instantiateFloat(num,
+                                             dot-> dotLoc,
+                                             dec-> decWord,
+                                             suffix-> suffWord,
+                                             exp-> EOF_WORD, // no exponant and no sign in decimal
+                                             sign-> EOF_WORD,
+                                             notation-> FloatNotation::DEC)
+    }
+
+    /**
+     * Tokenize a scientific float where the dec part ended with an 'e' (so assuming it must be followed by a + or a -)
+     *
+     * @params:
+     *    - num:         the integral part
+     *    - dotLoc:      the location of the dot
+     *    - dec:         the decimal part(with final 'e' cutted out)
+     *    - startCursor: the cursor pointing to the integral part
+     *    - cursor:      the cursor pointing to the decimal part
+     *
+     * @assume
+     *    The cursor points to the decimal part
+     * */
+    fn tokenizeSciFloatSign(self, tzer: SrcTokenizer, num: [c8], dotLoc: &Word, dec: [c8], startCursor: SrcCursor, ref mut cursor: SrcCursor)-> &FloatWord
+        throws ErrorMsg
+    {
+        // Verify everything in the decimal part is in decimal format
+        for i, c in dec {
+            if c != '_' && (c < '0' || c > '9') {
+                let mut errCursor = cursor; // snapshot to move a cursor to the error location
+                errCursor:.forward(i);
+
+                let loc = startCursor.instantiateLoc(num); // start of the integral part
+                let err = errCursor.instantiateLoc(dec[i .. i + 1]); // error location
+                throw copy ErrorMsg::fatal(loc, format(LexingErrorMessage::INVALID_DEC_NUMBER),
+                                            notes-> copy [copy ErrorMsg::note(err, "")]);
+            }
+        }
+
+        // We don't check for one, 1.e+10 is allowed
+        let decWord = cursor.instantiateNum(dec, notation-> NumericNotation::DEC, suffix-> EOF_WORD);
+        cursor:.forward(dec.len + 1); // move past the e
+
+        // Read the mandatory sign
+        let signSlc = tzer.next(self._content[cursor.seek .. $]);
+        if signSlc.tok != Tokens::PLUS && signSlc.tok != Tokens::MINUS {
+            let loc = startCursor.instantiateLoc(num);
+            throw copy ErrorMsg::fatal(loc, format(LexingErrorMessage::MISSING_SCI_FLOAT_SIGN));
+        }
+
+        // Move past the sign
+        let signWord = cursor.instantiateTok(signSlc.tok);
+        cursor:.forward(signSlc.tok.len);
+
+
+        let (mut expValue, mut suffValue) = ("", "");
+
+        // Reading the exponant part
+        let expSlc = tzer.next(self._content[cursor.seek .. $]);
+        if expSlc.isWord {
+            // Search for a suffix at the end of the token
+            for suff in FloatSuffixes::__members__ {
+                if expSlc.tok.len > suff.len && expSlc.tok[$ - suff.len .. $] == suff {
+                    suffValue = suff;
+                    break;
+                }
+            }
+
+            expValue = expSlc.tok[0 .. $ - suffValue.len];
+        }
+
+        return self.tokenizeExpFloatCuttedOut(num,
+                                               dotLoc,
+                                               decWord,
+                                               signWord,
+                                               expValue,
+                                               suffValue,
+                                               FloatNotation::SCI,
+                                               startCursor,
+                                               ref cursor);
+    }
+
+
+    /**
+     * Tokenize a float in hexadecimal notation
+     *
+     * @params:
+     *    - tzer: the tokenizer to tokenize the decimal, exponant parts
+     *    - num: the integral part of the float
+     *    - startCursor: the cursor pointing to the start of the integral part
+     *    - cursor: the cursor pointing to the dot
+     *
+     * @returns: a float word
+     *
+     * @assume
+     *   The cursor points to the dot
+     * */
+    fn tokenizeHexFloat(self, tzer: SrcTokenizer, num: [c8], startCursor: SrcCursor, ref mut cursor: SrcCursor)-> &FloatWord
+        throws ErrorMsg
+    {
+        // Moving past '.'
+        let dotLoc = cursor.instantiateTok(Tokens::DOT);
+        cursor:.forward(Tokens::DOT.len);
+
+        // Find the decimal part(2AFp)
+        let pSlc = tzer.next(self._content[cursor.seek .. $]);
+
+        // if is ends with a p, then the sign is mandatory
+        if pSlc.tok.len == 0 || (pSlc.tok[$ - 1] == 'P' || pSlc.tok[$ - 1] == 'p') {
+            return self.tokenizeHexFloatSign(tzer, num, dotLoc, pSlc.tok[0 .. $ - 1], startCursor, ref cursor);
+        }
+
+        // Search for a suffix at the end of the token
+        let mut foundFloatSuff = "";
+        for suff in FloatSuffixes::__members__ {
+            if pSlc.tok.len > suff.len && pSlc.tok[$ - suff.len .. $] == suff {
+                foundFloatSuff = suff;
+                break;
+            }
+        }
+
+        // Verify everything in the decimal part is in hex form until 'p' is reached
+        let mut decValue = pSlc.tok[0 .. $ - foundFloatSuff.len];
+
+        // Verify everything in the decimal part is in Hex format
+        for i, c in decValue {
+            if c != '_' && (c < '0' || c > '9') && (c < 'A' || c > 'F') && (c < 'a' || c > 'f') && c != 'p' && c != 'P' {
+                let mut errCursor = cursor; // snapshot to move a cursor to the error location
+                errCursor:.forward(i);
+
+                let loc = startCursor.instantiateLoc(num); // start of the integral part
+                let err = errCursor.instantiateLoc(decValue[i .. i + 1]); // error location
+                throw copy ErrorMsg::fatal(loc, format(LexingErrorMessage::INVALID_HEX_NUMBER),
+                                            notes-> copy [copy ErrorMsg::note(err, "")]);
+            }
+            if c == 'p' || c == 'P' {
+                let decWord = cursor.instantiateNum(decValue[0 .. i], notation-> NumericNotation::HEX, suffix-> EOF_WORD);
+                cursor:.forward(i + 1);
+
+                let exp = decValue[i + 1 .. $];
+                return self.tokenizeExpFloatCuttedOut(num,
+                                                       dotLoc-> dotLoc,
+                                                       sign-> EOF_WORD,
+                                                       dec-> decWord,
+                                                       exp-> exp,
+                                                       foundFloatSuff,
+                                                       notation-> FloatNotation::HEX,
+                                                       startCursor,
+                                                       ref cursor);
+            }
+        }
+
+        // We didn't find 'P' in the decimal part
+        let loc = startCursor.instantiateLoc(num);
+        throw copy ErrorMsg::fatal(loc, format(LexingErrorMessage::MISSING_P_IN_HEX_FLOAT),
+                                    notes-> copy [copy ErrorMsg::note(dotLoc, "")]);
+    }
+
+    /**
+     * Tokenize an hex float where the sign is mandatory(the decimal part ended with an hanging 'P')
+     *
+     * @params:
+     *    - tzer:        the tokenizer the tokenize the rest of the float parts
+     *    - num:         the integral part of the float value
+     *    - dotLoc:      the location of the dot in the float literal
+     *    - dec:         the decimal part
+     *    - startCursor: the cursor pointing to the integral part
+     *    - cursor:      the cursor pointing to the decimal part(right after the dot)
+     *
+     * @returns: a float word
+     *
+     * @assume
+     *   The cursor points right after the dot
+     *
+     * */
+    fn tokenizeHexFloatSign(self, tzer: SrcTokenizer, num: [c8], dotLoc: &Word, dec: [c8], startCursor: SrcCursor, ref mut cursor: SrcCursor)-> &FloatWord
+        throws ErrorMsg
+    {
+        // Verify everything in the decimal part is in hex format
+        for i, c in dec {
+            if c != '_' && (c < '0' || c > '9') && (c < 'A' || c > 'F') && (c < 'a' || c > 'f') && c != 'p' && c != 'P' {
+                let mut errCursor = cursor; // snapshot to move a cursor to the error location
+                errCursor:.forward(i);
+
+                let loc = startCursor.instantiateLoc(num); // start of the integral part
+                let err = errCursor.instantiateLoc(dec[i .. i + 1]); // error location
+                throw copy ErrorMsg::fatal(loc, format(LexingErrorMessage::INVALID_HEX_NUMBER),
+                                            notes-> copy [copy ErrorMsg::note(err, "")]);
+            }
+        }
+
+        let decWord = cursor.instantiateNum(dec, notation-> NumericNotation::HEX, suffix-> EOF_WORD);
+        cursor:.forward(dec.len + 1); // move past the 'p'
+
+        // Read the mandatory sign
+        let signSlc = tzer.next(self._content[cursor.seek .. $]);
+        if signSlc.tok != Tokens::PLUS && signSlc.tok != Tokens::MINUS {
+            let loc = startCursor.instantiateLoc(num);
+            throw copy ErrorMsg::fatal(loc, format(LexingErrorMessage::MISSING_HEX_FLOAT_SIGN));
+        }
+
+        // Move past the sign
+        let signWord = cursor.instantiateTok(signSlc.tok);
+        cursor:.forward(signSlc.tok.len);
+
+
+        let (mut expValue, mut suffValue) = ("", "");
+
+        // Reading the exponant part
+        let expSlc = tzer.next(self._content[cursor.seek .. $]);
+        if expSlc.isWord {
+            // Search for a suffix at the end of the token
+            for suff in FloatSuffixes::__members__ {
+                if expSlc.tok.len > suff.len && expSlc.tok[$ - suff.len .. $] == suff {
+                    suffValue = suff;
+                    break;
+                }
+            }
+
+            expValue = expSlc.tok[0 .. $ - suffValue.len];
+        }
+
+        return self.tokenizeExpFloatCuttedOut(num,
+                                               dotLoc,
+                                               decWord,
+                                               signWord,
+                                               expValue,
+                                               suffValue,
+                                               FloatNotation::HEX,
+                                               startCursor,
+                                               ref cursor);
+    }
+
+    /**
+     * Tokenize a float in hex or sci format, where the integral, decimal and sign part have already been read
+     *
+     * @params:
+     *   - num:         the integral part of the float
+     *   - dotLoc:      the location of the dot
+     *   - dec:         the decimal part
+     *   - sign:        the sign part
+     *   - exp:         the exponent to check
+     *   - suffix:      the suffix of the float(or empty)
+     *   - startCursor: the cursor pointing to the integral part
+     *   - cursor:      the cursor pointing to the exponent part
+     *   - notation:    the format of the float to return (HEX or SCI)
+     *
+     * @returns: a float word
+     *
+     * @assume
+     *   The cursor points right after the sign
+     *
+     * */
+    fn tokenizeExpFloatCuttedOut(self, num: [c8], dotLoc: &Word, dec: &Word, sign: &Word, exp: [c8], suffix: [c8], notation: FloatNotation, startCursor: SrcCursor, ref mut cursor: SrcCursor)-> &FloatWord
+        throws ErrorMsg
+    {
+        let mut one = false;
+        // Verify everything in the exp part is in decimal format(without suffix)
+        for i, c in exp {
+            if c != '_' && (c < '0' || c > '9') { // decimal is in dec
+                let mut errCursor = cursor; // snapshot to move a cursor to the error location
+                errCursor:.forward(i);
+
+                let loc = startCursor.instantiateLoc(num); // start of the integral part
+                let err = errCursor.instantiateLoc(exp[i .. i + 1]); // error location
+                throw copy ErrorMsg::fatal(loc, format(LexingErrorMessage::INVALID_DEC_NUMBER),
+                                            notes-> copy [copy ErrorMsg::note(err, "")]);
+            }
+            if c != '_' { one = true; }
+        }
+
+        // Normal decimal value
+        if !one { // empty decimal part, or only underscores  1.p+ is not allowed, neither is 1.e+f
+            let loc = startCursor.instantiateLoc(num); // start of the integral part
+            throw copy ErrorMsg::fatal(loc, format(LexingErrorMessage::EMPTY_EXP_FLOAT_NUMBER));
+        }
+
+        let expWord = cursor.instantiateNum(exp, notation-> NumericNotation::DEC, suffix-> EOF_WORD);
+        cursor:.forward(exp.len);
+
+        // Move past the suffix part
+        let suffWord = if suffix.len != 0 {
+            let suff = cursor.instantiateTok(suffix);
+            cursor:.forward(suffix.len);
+            suff
+        } else {
+            EOF_WORD
+        };
+
+        // Create the final word
+        return startCursor.instantiateFloat(num,
+                                             dot-> dotLoc,
+                                             dec-> dec,
+                                             suffix-> suffWord,
+                                             exp-> expWord,
+                                             sign-> sign,
+                                             notation-> notation)
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          VERSIONS          ====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Manage a version '#' token
+     *
+     * @params:
+     *   - tzer:      the tokenizer to read the next word(for 'if' and 'else' directives)
+     *   - scope:     the scope list holding words informations
+     *   - cursor:    the cursor pointing to the '#'
+     *
+     * @returns: the version opened by the directive if any
+     *
+     * */
+    fn manageVersion(self, tzer: SrcTokenizer, dmut scope: &SrcScopeList, ref mut cursor: SrcCursor)
+        throws ErrorMsg
+    {
+        let startCursor = cursor;
+
+        cursor:.forward(Tokens::SHARP.len);
+        let directive = tzer.next(self._content[cursor.seek .. $]);
+        if directive.tok != Keys::IF && directive.tok != Keys::ELSE && directive.tok != Keys::END {
+            let loc = startCursor.instantiateLoc(Tokens::SHARP);
+            let err = cursor.instantiateLoc(directive.tok);
+
+            throw copy ErrorMsg::fatal(loc, format(LexingErrorMessage::UNDEFINED_VERSION_DIRECTIVE),
+                                        notes-> copy [copy ErrorMsg::note(err, "")]);
+        }
+
+        self.executeVersionDirective(tzer, directive.tok, alias scope, ref cursor);
+    }
+
+
+    /**
+     * Execute a version directive, open, close version scope
+     *
+     * @params:
+     *   - tzer:      the tokenizer to read the next word(for 'if' and 'else' directives)
+     *   - directive: the version directive('if', 'else', 'end').
+     *   - scope:     the scope list holding words informations
+     *   - cursor:    the cursor pointing to the directive
+     *
+     * @returns: the version opened by the directive if any
+     * */
+    fn executeVersionDirective(self, tzer: SrcTokenizer, directive: [c8], dmut scope: &SrcScopeList, ref mut cursor: SrcCursor)
+        throws ErrorMsg
+    {
+        let pastPass = if directive == Keys::END || directive == Keys::ELSE {
+            if scope[].len == 1 {
+                let loc = cursor.instantiateLoc(directive);
+                throw copy ErrorMsg::fatal(loc, format(LexingErrorMessage::UNMATCHED_VERSION_END, directive));
+            }
+
+            // Exit the scope that was opened by a past #if
+            scope:.exit()
+        } else {
+            false
+        };
+
+        // Nothing more to do, just closing the scope
+        if directive == Keys::END {
+            cursor:.forward(directive.len);
+            return;
+        }
+
+        // Open an scope after closing the previous one
+        if directive == Keys::ELSE {
+            cursor:.forward(directive.len);
+
+            let mut testCursor = cursor;
+            let loc = cursor.instantiateLoc(directive);
+
+            // We try to read ' if version'
+            self.skipSpaces(ref testCursor); // skipping all spaces before the name(but note \n)
+
+            let mut hasIf = tzer.next(self._content[testCursor.seek .. $]);
+            if hasIf.tok != Keys::IF { // no if, a fallback scope
+                scope:.enter(loc, EOF_WORD, pastPass);
+                return;
+            }
+
+            // Move the cursor past the read if (skipping all spaces and if keyword)
+            cursor = testCursor;
+        }
+
+        // directive == IF or ELSE IF
+
+        let ifLoc = cursor.instantiateLoc(Keys::IF); // keeping location before the reading of spaces
+        cursor:.forward(Keys::IF.len);
+
+        self.skipSpaces(ref cursor); // there can spaces between 'if' and 'version'
+
+        // Reading the version, it can be either an identifier or a backquote string
+        let next = tzer.next(self._content[cursor.seek .. $]);
+        let v = if next.isString && next.tok == Tokens::BACK_QUOTE {
+            self.tokenizeString(tzer, next.tok, Tokens::BACK_QUOTE, copy [], [], false, true, ref cursor)
+        } else if next.isWord {
+            self.tokenizeWord(tzer, next.tok, ref cursor)
+        } else {
+            EOF_WORD
+        };
+
+        if !v.isName { // backquote string are identifiers, but not EOF, or numbers
+            throw copy ErrorMsg::fatal(ifLoc, format(LexingErrorMessage::MISSING_VERSION_CONDITION));
+        }
+
+        // Enter the new scope
+        scope:.enter(ifLoc, v, pastPass);
+    }
+
+    /**
+     * Skip the spaces at the cursor position
+     *
+     * @params:
+     *    - cursor: the cursor to move forward until it touches something that is not a space or a tab
+     *
+     * */
+    fn skipSpaces(self, ref mut cursor: SrcCursor) {
+        while self._content[cursor.seek] == ' ' || self._content[cursor.seek] == '\t' {
+            cursor:.forward(1);
+        }
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ===================================          CHECKINGS          ====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Check if the escape escaped something in a string or comment, throw an
+     * error if nothing is escaped
+     *
+     * @params:
+     *    - tok:    the token that started the string/comment
+     *    - start:  the location of the start of the string/comment
+     *    - cursor: the location of the escape char
+     *    - str:    true iif escaping in a string
+     *
+     * */
+    fn checkEscapeNothing(self, tok: [c8], start: SrcCursor, cursor: SrcCursor, str: bool)
+        throws ErrorMsg
+    {
+        if cursor.seek + 2 >= self._content.len { // escaping nothing
+            let loc = start.instantiateTok(tok);
+            let anti = cursor.instantiateTok(Tokens::ANTI);
+
+            let msg = if str {
+                LexingErrorMessage::ESCAPE_AT_END_OF_STRING
+            } else {
+                LexingErrorMessage::ESCAPE_AT_END_OF_COMMENT
+            };
+
+            throw copy ErrorMsg::fatal(loc, end-> anti, format(msg));
+        }
+    }
+
+    /**
+     * Check if the escape escaped a line return in a string or comment, throw
+     * an error if it did
+     *
+     * @params:
+     *    - tok:    the token that started the string/comment
+     *    - start:  the location of the start of the string/comment
+     *    - cursor: the location of the escape char
+     *    - str:    true iif escaping in a string
+     *
+     * */
+    fn checkEscapeReturn(self, tok: [c8], start: SrcCursor, cursor: SrcCursor, str: bool)
+        throws ErrorMsg
+    {
+        // escaping line return
+        if cursor.seek + 2 < self._content.len && self._content[cursor.seek + 1] == '\n' {
+            let loc = start.instantiateTok(tok);
+            let anti = cursor.instantiateTok(Tokens::ANTI);
+
+            let msg = if str {
+                LexingErrorMessage::ESCAPE_RETURN_PROHIBITED_STRING
+            } else {
+                LexingErrorMessage::ESCAPE_RETURN_PROHIBITED_COMMENT
+            };
+
+            throw copy ErrorMsg::fatal(loc, end-> anti, format(msg));
+        }
+    }
+
+    /**
+     * Check if the escape escaped a line return in a string or comment, throw
+     * an error if it did
+     *
+     * @params:
+     *    - tok:    the token that started the string/comment
+     *    - start:  the location of the start of the string/comment
+     *    - cursor: the location of the escape char
+     *    - str:    true iif escaping in a string
+     *
+     * */
+    fn checkReturnMult(self, tok: [c8], start: SrcCursor, cursor: SrcCursor, mult: bool, str: bool)
+        throws ErrorMsg
+    {
+        if !mult {
+            let loc = start.instantiateTok(tok);
+            let ret = cursor.instantiateTok("\\n");
+
+            let msg = if str {
+                LexingErrorMessage::RETURN_IN_SINGLE_LINE_STRING
+            } else {
+                LexingErrorMessage::RETURN_IN_SINGLE_LINE_COMMENT
+            };
+
+            throw copy ErrorMsg::fatal(loc, end-> ret, format(msg));
+        }
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          TRIMMING          ====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Trim the paragraph string by removing the leading line-return and
+     * trimming indentation to the line that is indented the least(i.e., the
+     * leftmost indentation).
+     *
+     * @params
+     *    - str: the string to trim left
+     *    - removeStar: (for comments remove the star at the beginning of line comment)
+     * @returns:
+     *    - .0: the trimmed function
+     *    - .1: the amount of left trim
+     *    - .2: true if the first line was removed
+     * */
+    fn trimString(self, str: [c8])-> ([c8], usize, bool) {
+        // Split into lines
+        let mut lines = self.splitLines(str);
+
+        // Remove the first line if empty
+        let mut skipFst = true;
+        if lines.len > 0 && self.isBlankLine(lines[0]) { // empty line with spaces only a line return
+            lines = lines[1 .. $];
+            skipFst = true;
+        }
+
+        // We removed the only line?
+        if lines.len == 0
+            return ("", 0, skipFst);
+
+        // ending with a line return means closing token is at the start of a new line
+        if lines[$ - 1][$ - 1] == '\n' {
+            lines ~= [""]; // so we add an empty line to compute the correct minIndent length
+        }
+        else if lines.len == 1 { // one line, with no line returns
+            return (lines[0], 0, skipFst); // we return it as it is
+        }
+
+        // Compute the left trimming of the last line(aligning to it by default)
+        // Unlike other lines, a blank trimming is considered = 0
+        let mut minIndent = lines[$ - 1].len;
+        for i in 0 .. lines[$ - 1].len {
+            if lines[$ - 1][i] != ' ' {
+                break;
+            }
+            else minIndent = i + 1;
+        }
+
+        // compute the left trimming of every lines
+        // A blank line trimming doesn't count(even if = 0, doesn't change the min)
+        for line in lines[0 .. $ - 1] {
+            for i in 0 .. min(line.len, minIndent) {
+                if (line[i] != ' ' || line[i] == '\n') {
+                    break;
+                } else {
+                    minIndent = i + 1;
+                }
+            }
+        }
+
+        // Join all lines
+        let mut result = "";
+        for _, line in lines[0 .. $] {
+            if line.len > minIndent {
+                result ~= line[minIndent .. $]; // no need to add \n, already in the line
+            }
+        }
+
+        (result, minIndent, skipFst)
+    }
+
+    /**
+     * Trim a comment by removing all entabing of every lines
+     * unlike trimString we don't care who has the minIndent
+     *
+     * @params:
+     *    - str:        the string to trim
+     *    - removeStar: true for multiline comments, we remove the stars
+     *                  at the begin of each line
+     * */
+    fn trimComment(self, str: [c8])-> [c8] {
+        let mut lines = self.splitLines(str);
+        let mut result = "", mut lastCut = "";
+        for line in lines {
+            for i, c in line match c {
+                ' ' => {} // continue
+                '*' => { // A line starting by a star, remove it
+                    result ~= line[i + 1 .. $];
+                    lastCut = line[i + 1 .. $];
+                    break;
+                }
+                _ => { // A line starting by something else
+                    result ~= line[i .. $];
+                    lastCut = line[i .. $];
+                    break;
+                }
+            }
+        }
+
+        let mut blank = true;
+        if result.len > 0 && result[$ - 1] != '\n' {
+            for z in lastCut if z != ' ' && z != '\n' {
+                blank = false;
+                break;
+            }
+        }
+
+
+        // Add a line return at the end of comment if not empty
+        if !blank
+            return result ~ "\n";
+
+        result
+    }
+
+
+    /**
+     * returns: true if the line ends with a line return and contains only
+     *          spaces(or nothing)
+     *
+     * */
+    fn isBlankLine(self, txt: [c8])-> bool {
+
+        // Remove the ending \r\n
+        let inner = if txt.len >= 2 && txt[$ - 2 .. $] == Tokens::RRETURN_CMP {
+            txt[0 .. $ - 2]
+        } else if txt.len >= 1 && txt[$ - 1] == '\n' { // or just \n
+            txt[0 .. $ - 1]
+        } else {
+            return false; // a line that does not have a \n is not a line, so we return false
+        };
+
+        for c in inner if c != ' ' {
+            return false;
+        }
+
+        return true;
+    }
+
+
+    /**
+     * Split a string by lines
+     *
+     * @params:
+     *    - str: the string to split
+     *
+     * @returns: the splitted lines(each line contains the '\n')
+     * */
+    fn splitLines(self, str: [c8])-> [[c8]] {
+        let mut result: [[c8]] = [];
+        let mut start = 0us;
+        for i, c in str if c == '\n' {
+            result ~= [str[start .. i + 1]]; // keep the '\n' in the line
+            start = i + 1;
+        }
+
+        // Add remaning if the last line doesn't end with a \n
+        if start != str.len {
+            result ~= [str[start .. $]];
+        }
+
+        result
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * =================================          MISCELLANEOUS          ==================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
     impl Streamable;
-    
-    
+
 }

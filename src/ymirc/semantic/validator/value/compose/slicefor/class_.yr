@@ -1,0 +1,203 @@
+/*
+ * Implements semantic validation for class-based list comprehensions.
+ *
+ * This module handles:
+ *   - validating class iterator methods(BEGIN / END / NEXT),
+ *   - enforcing copy-mode for class list comprehensions,
+ *   - rejecting tuple-mode comprehensions on class objects,
+ *   - constructing LoopValue structures using class iterator semantics,
+ *   - appending values dynamically using SliceAppendValue,
+ *   - producing ListComprValue results wrapped in CopierValue.
+ *
+ * Class list comprehensions iterate over user-defined class iterators and
+ * accumulate results into a dynamically growing slice.
+ *
+ * <hr>
+ *
+ * @Package: ymirc
+ * @Module: ymirc::semantic::validator::value::compose::slicefor::class_
+ * @File: ymirc/semantic/validator/value/compose/slicefor/class_.yr
+ * @Author(s):
+ *   - Emile Cadorel <ecadorel@gmail.com>
+ *
+ * @Created(YYYY-MM-DD): 2026-05-18
+ * @Copyright(C) 2021–2026 GNU-Ymir
+ * @License
+ *   ```text
+ *   This file is part of the Ymir language project.
+ *
+ *   Ymir is free software: you can redistribute it and/or modify it
+ *   under the terms of the GNU General Public License as published by
+ *   the Free Software Foundation, either version 3 of the License, or
+ *   (at your option) any later version.
+ *
+ *   Ymir is distributed in the hope that it will be useful,
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *   GNU General Public License for more details.
+ *
+ *   You should have received a copy of the GNU General Public License
+ *   along with Ymir.  If not, see <https://www.gnu.org/licenses/>.
+ *   ```
+ */
+
+in class_;
+
+use ymirc::lexing::{keys, word};
+
+use ymirc::syntax::expression::_;
+use ymirc::semantic::{validator, interpret};
+
+use ymirc::errors;
+use ymirc::semantic::generator::{value::_, type::_};
+
+use ymirc::utils::format;
+
+/**
+ * ClassListComprValidation module
+ *
+ * Provides semantic validation for list comprehensions applied to class
+ * objects that implement the class-based for-loop protocol. Class list
+ * comprehensions:
+ *
+ *   - must run in copy-mode,
+ *   - do not support tuple-mode,
+ *   - iterate using BEGIN / END / NEXT methods,
+ *   - accumulate results dynamically using SliceAppendValue.
+ *
+ */
+pub mod ClassListComprValidation {
+
+    /**
+     * Validate a list comprehension applied to a class object.
+     *
+     * Class list comprehensions:
+     *   - do not support tuple-mode,
+     *   - must always run in copy-mode,
+     *   - rely on class iterator methods validated by ClassForLoopValidation.
+     *
+     * @params:
+     *   - context:    validation context
+     *   - object:     the class instance being iterated
+     *   - cptr:       the ClassPtrType of the object
+     *   - floop:      the SliceForAllocatorExpr describing the comprehension
+     *   - inCopy:     whether the comprehension is evaluated in copy-mode
+     *   - byAlias:    whether aliasing is permitted
+     *   - aliasLoc:   location used for alias-related diagnostics
+     *
+     * @returns:
+     *   - the resulting list comprehension value
+     *
+     * @throws:
+     *   - ErrorMsg if tuple-mode is used
+     *   - ErrorMsg if not in copy-mode
+     *   - ErrorMsg if iterator method validation fails
+     */
+    pub fn validate(dmut context: &ValidationContext,
+                    object:       &Value,
+                    cptr:         &ClassPtrType,
+                    floop:        &SliceForAllocatorExpr,
+                    inCopy:       bool,
+                    byAlias:      bool,
+                    aliasLoc:     &Word)-> &Value
+        throws ErrorMsg
+    {
+        if floop.isTuple {
+            throw copy ErrorMsg::fatal(floop.iter.loc, format(ValidateErrorMessage::LIST_COMPR_SIZE_CTE, cptr));
+        } else if !inCopy {
+            throw copy ErrorMsg::fatal(floop.iter.loc, format(ValidateErrorMessage::LIST_COMPR_SIZE_CTE, cptr),
+                                       notes-> copy [copy ErrorMsg::note(floop.loc, format(ValidateErrorMessage::ENCLOSE_COPY_LST))]);
+        }
+
+        let loc = floop.loc;
+        let mut errors: (&ErrorMsg)? = none;
+
+        let (beginMeth, endMeth) = ClassForLoopValidation::validateBegEndMethods(alias context, loc, object, cptr, byAlias, aliasLoc);
+
+        context:.enterBlock();
+        let result = {
+            ClassListComprValidation::validateInnerLoop(alias context, loc, cptr, floop, beginMeth, endMeth)
+        } catch {
+            err => {
+                errors = (copy ErrorMsg::fatal(loc, format(ValidateErrorMessage::FOR_LOOP_CPTR, cptr),
+                                               notes-> copy [err]))?;
+                UNIT_VALUE
+            }
+        }
+
+        {
+            context:.quitBlock(warnUnused-> (!errors.hasValue));
+        } catch {
+            err => {
+                errors = (err)?;
+            }
+        }
+
+        if let Ok(err) = errors {
+            throw err;
+        }
+
+
+        return result;
+    }
+
+    /**
+     * Build the loop structure for a class-based list comprehension.
+     *
+     * Uses ClassForLoopValidation to:
+     *   - validate iterator variables,
+     *   - generate the loop test and increment expressions,
+     *   - populate inner and outer loop blocks.
+     *
+     * @params:
+     *   - context:    validation context
+     *   - loc:        source location
+     *   - cptr:       class pointer type
+     *   - floop:      comprehension expression
+     *   - beginMeth:  BEGIN method value
+     *   - endMeth:    END method value
+     *
+     * @returns:
+     *   - the resulting list comprehension value wrapped in CopierValue
+     *
+     * @throws:
+     *   - ErrorMsg if iterator validation or loop construction fails
+     */
+    fn validateInnerLoop(dmut context: &ValidationContext,
+                         loc:          &Word,
+                         cptr:         &ClassPtrType,
+                         floop:        &SliceForAllocatorExpr,
+                         beginMeth:    &Value,
+                         endMeth:      &Value)-> &Value
+        throws ErrorMsg
+    {
+        let mut outerLoop: [&Value] = [];
+        let mut innerLoop: [&Value] = [];
+        let (test, increment) = ClassForLoopValidation::validateLoopVar(alias context, loc, cptr, beginMeth, endMeth, floop.vars,
+                                                                        ref innerLoop,
+                                                                        ref outerLoop);
+
+        let resInnerValue = ValueValidation::validate(alias context, floop.value);
+        let resInnerType = TypeInference::inferImplicitMutability(resInnerValue.type, resInnerValue);
+        let (resultDecl, resultVref, resultType) = SliceForComposeValidation::validateResultValueDeclNoLen(loc, resInnerType);
+
+        let sliceVal = ValueCreation::createSliceFromSingleValue(loc, resInnerValue,
+                                                                 mutable-> resInnerType.isMutable);
+
+        innerLoop ~= [copy SliceAppendValue(loc, resultType, resultVref, sliceVal)]; // res ~= [innerVal];
+        innerLoop ~= [increment];
+
+        let blk = copy BlockValue(loc, VOID_TYPE, innerLoop);
+        let lp = copy LoopValue(loc, VOID_TYPE, test, blk);
+
+
+        outerLoop ~= [resultDecl, lp, resultVref];
+
+
+        let outBlk = copy BlockValue(loc, resultType, outerLoop);
+        let lstBlk = copy ListComprValue(loc, resultType, outBlk);
+
+        return copy CopierValue(loc, resultType, lstBlk,
+                                isDone-> true);
+    }
+}

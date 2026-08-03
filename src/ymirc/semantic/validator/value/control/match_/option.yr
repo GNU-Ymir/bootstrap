@@ -1,0 +1,247 @@
+/*
+ * Implements validation for option-pattern matching in Ymir.
+ *
+ * Option patterns allow destructuring of values of type Option[T] in match
+ * expressions. They support two forms:
+ *
+ *     Ok(x)   — match the presence of a value
+ *     Err(e)   — match the absence of a value, optionally binding an error
+ *
+ * Responsibilities:
+ *   - ensure the matched value is an Option type
+ *   - validate the `some` and `none` branches
+ *   - generate boolean test expressions for pattern success
+ *   - extract and reduce the `.set`, `.value`, and `.error` fields
+ *   - recursively validate inner patterns
+ *   - propagate memory-information for the matched value
+ *
+ * <hr>
+ *
+ * @Package: ymirc
+ * @Module: ymirc::semantic::validator::value::control::match_::option
+ * @File: ymirc/semantic/validator/value/control/match_/option.yr
+ * @Author(s):
+ *   - Emile Cadorel <ecadorel@gmail.com>
+ *
+ * @Created(YYYY-MM-DD): 2026-04-09
+ * @Copyright(C) 2021–2026 GNU-Ymir
+ * @License
+ *   ```text
+ *   This file is part of the Ymir language project.
+ *
+ *   Ymir is free software: you can redistribute it and/or modify it
+ *   under the terms of the GNU General Public License as published by
+ *   the Free Software Foundation, either version 3 of the License, or
+ *   (at your option) any later version.
+ *
+ *   Ymir is distributed in the hope that it will be useful,
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *   GNU General Public License for more details.
+ *
+ *   You should have received a copy of the GNU General Public License
+ *   along with Ymir.  If not, see <https://www.gnu.org/licenses/>.
+ *   ```
+ */
+
+in option;
+
+use ymirc::lexing::{word, tokens, keys};
+
+use ymirc::syntax::expression::_;
+use ymirc::semantic::validator;
+use ymirc::semantic::generator::{value::_, type::_};
+
+use ymirc::errors;
+use ymirc::utils::format;
+
+use ymirc::semantic::validator::value::control::match_::_;
+
+
+/**
+ * MatchOptionValidation module
+ *
+ * Provides validation for option-matching patterns inside match
+ * expressions. These patterns destructure Option[T] values using:
+ *
+ *   - MATCH_SOME — match the presence of a wrapped value
+ *   - MATCH_NONE — match the absence of a value, optionally binding an error
+ *
+ * Semantics:
+ *   - The matched value must be of Option type; otherwise OPTION_MATCHER error.
+ *   - For MATCH_SOME:
+ *        - test the `.set` flag
+ *        - optionally validate a sub-pattern on `.value`
+ *
+ *   - For MATCH_NONE:
+ *        - test the negation of `.set`
+ *        - optionally validate a sub-pattern on `.error`
+ *        - ensure `.error` is non-null when matching a pattern
+ *
+ *   - All boolean tests are reduced through the constant-expression
+ *     interpreter to simplify expressions at compile time.
+ *
+ * The module enforces:
+ *   - correct Option type usage
+ *   - correct field access for `.set`, `.value`, and `.error`
+ *   - correct propagation of memory information
+ *   - correct recursive pattern validation
+ */
+pub mod MatchOptionValidation {
+
+    /**
+     * Validate an option-pattern and dispatch to either validateSome or
+     * validateNone depending on the pattern kind.
+     *
+     * Steps:
+     *   1. Ensure the matched value is an Option type; otherwise OPTION_MATCHER.
+     *   2. If the pattern is MATCH_SOME => validateSome.
+     *   3. Otherwise => validateNone.
+     *
+     * @returns:
+     *   (testExpression, memoryInfo)
+     *
+     * @throws:
+     *   ErrorMsg if the matched value is not an Option or if validation fails.
+     */
+    pub fn validate(dmut context: &ValidationContext,
+                     value:        &Value,
+                     opt:          &MatchOptionFilterExpr,
+                     mem:          MemoryInfo,
+                     ref mut vars: [&VarDeclValue])-> (&Value, MemoryInfo)
+        throws ErrorMsg
+    {
+        let optType: &OptionType = if let o: &OptionType = value.type {
+            o
+        } else {
+            throw copy ErrorMsg::fatal(opt.loc, format(ValidateErrorMessage::OPTION_MATCHER, opt.loc, value.type));
+        };
+
+        if (opt.kind == OptionKeys::MATCH_SOME) {
+            return MatchOptionValidation::validateSome(alias context, value, optType, opt, mem, ref vars);
+        }
+
+        return MatchOptionValidation::validateNone(alias context, value, opt, mem, ref vars);
+    }
+
+    /**
+     * Validate a MATCH_SOME pattern:
+     *
+     *     Ok(x) = value
+     *
+     * Semantics:
+     *   - Extract and reduce the `.set` flag.
+     *   - If the inner pattern is empty:
+     *        - return `.set` as the test
+     *        - no memory information
+     *
+     *   - Otherwise:
+     *        - extract and reduce `.value`
+     *        - recursively validate the inner pattern
+     *        - final test = `.set` AND innerTest
+     *
+     * All boolean expressions are reduced through the constant-expression
+     * interpreter.
+     *
+     * @returns:
+     *   (testExpression, memoryInfo)
+     *
+     * @throws:
+     *   ErrorMsg if the inner pattern is invalid.
+     */
+    fn validateSome(dmut context: &ValidationContext,
+                     value:        &Value,
+                     type:         &OptionType,
+                     opt:          &MatchOptionFilterExpr,
+                     memInfo:      MemoryInfo,
+                     ref mut vars: [&VarDeclValue])-> (&Value, MemoryInfo)
+        throws ErrorMsg
+    {
+        let mut isSet: &Value = copy StructFieldAccessValue(opt.loc, BOOL_TYPE, value, OptionKeys::SET);
+        isSet = context.cteInterpret:.reduce(isSet);
+
+        if opt.inner of EmptyExpr { // if let Ok() = value
+            return (isSet, MemoryInfo());
+        }
+
+        // Retreive the wrapped .value field
+        let mut innerVal: &Value = copy OptionFieldAccessValue(opt.loc, type.wrapped, value, OptionKeys::VALUE);
+        innerVal = context.cteInterpret:.reduce(innerVal);
+
+        // if let Ok(x) = value
+        let (innerTest, innerMemInfo) = MatchValidation::validatePattern(alias context, innerVal, opt.inner, memInfo, ref vars);
+
+        // value.isSet && value.wrapped == x
+        let mut finTest: &Value = copy LogicalBoolOperatorValue(opt.loc, BinaryOperators::DAND, isSet, innerTest);
+        finTest = context.cteInterpret:.reduce(finTest);
+
+        return (finTest, innerMemInfo);
+    }
+
+    /**
+     * Validate a MATCH_NONE pattern:
+     *
+     *     Err(x) = value
+     *
+     * Semantics:
+     *   - Extract and reduce the `.set` flag.
+     *
+     *   - If the inner pattern is empty:
+     *        - test = NOT `.set`
+     *        - no memory information
+     *
+     *   - Otherwise:
+     *        - none-patterns may carry an error value; ensure `.error` is non-null
+     *        - test1 = NOT `.set`
+     *        - test2 = `.error` != null
+     *        - extract `.error` as an exception type
+     *        - recursively validate the inner pattern
+     *        - final test = test1 AND test2 AND innerTest
+     *
+     * All boolean expressions are reduced through the constant-expression
+     * interpreter.
+     *
+     * @returns:
+     *   (testExpression, memoryInfo)
+     *
+     * @throws:
+     *   ErrorMsg if the inner pattern is invalid or if the Option structure
+     *   is inconsistent.
+     */
+
+    fn validateNone(dmut context: &ValidationContext,
+                     value:        &Value,
+                     opt:          &MatchOptionFilterExpr,
+                     memInfo:      MemoryInfo,
+                     ref mut vars: [&VarDeclValue])-> (&Value, MemoryInfo)
+        throws ErrorMsg
+    {
+        let mut isSet: &Value = copy StructFieldAccessValue(opt.loc, BOOL_TYPE, value, OptionKeys::SET);
+        isSet = context.cteInterpret:.reduce(isSet);
+
+        if opt.inner of EmptyExpr { // if let Err() = value
+            return (copy UnaryOperatorValue(opt.loc, BOOL_TYPE, UnaryOperators::NOT, isSet), MemoryInfo());
+        }
+
+
+        // all none option don't have an error, they may be completely empty, so we need to check that
+        let hasError = copy CmpPointerOperatorValue(opt.loc, BinaryOperators::NOT_EQUAL,
+                                                     copy OptionFieldAccessValue(opt.loc, PTR_VOID_TYPE, value, OptionKeys::ERROR),
+                                                     copy NullValue(opt.loc, PTR_VOID_TYPE));
+
+        let notSet = copy UnaryOperatorValue(opt.loc, BOOL_TYPE, UnaryOperators::NOT, isSet);
+        let mut finTest: &Value = copy LogicalBoolOperatorValue(opt.loc, BinaryOperators::DAND, notSet, hasError); // !isSet && error != null
+
+        let innerType = TypeCreation::createExceptionType(alias context, loc-> opt.loc);
+        let err = copy OptionFieldAccessValue(opt.loc, innerType, value, OptionKeys::ERROR);
+
+        // Validate the pattern on the error of the option
+        let (innerTest, innerMemInfo) = MatchValidation::validatePattern(alias context, err, opt.inner, memInfo, ref vars);
+
+        finTest = copy LogicalBoolOperatorValue(opt.loc, BinaryOperators::DAND, finTest, innerTest);
+        finTest = context.cteInterpret:.reduce(finTest);
+
+        return (finTest, innerMemInfo);
+    }
+
+}

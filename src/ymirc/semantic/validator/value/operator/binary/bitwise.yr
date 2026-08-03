@@ -1,0 +1,220 @@
+/*
+ * Implements semantic validation for bitwise binary operators in Ymir.
+ *
+ * Supported operators include:
+ *   - bitwise AND, OR, XOR
+ *   - bit shifts(<<, >>)
+ *   - class-overloaded bitwise operators
+ *
+ * This module is invoked by BinaryValidation when the operator kind is
+ * OperatorType::BITWISE.
+ *
+ * <hr>
+ *
+ * @Package: ymirc
+ * @Module: ymirc::semantic::validator::value::operator::binary::bitwise
+ * @File: ymirc/semantic/validator/value/operator/binary/bitwise.yr
+ * @Author(s):
+ *   - Emile Cadorel <ecadorel@gmail.com>
+ *
+ * @Created(YYYY-MM-DD): 2026-04-10
+ * @Copyright(C) 2021–2026 GNU-Ymir
+ * @License
+ *   ```text
+ *   This file is part of the Ymir language project.
+ *
+ *   Ymir is free software: you can redistribute it and/or modify it
+ *   under the terms of the GNU General Public License as published by
+ *   the Free Software Foundation, either version 3 of the License, or
+ *   (at your option) any later version.
+ *
+ *   Ymir is distributed in the hope that it will be useful,
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *   GNU General Public License for more details.
+ *
+ *   You should have received a copy of the GNU General Public License
+ *   along with Ymir.  If not, see <https://www.gnu.org/licenses/>.
+ *   ```
+ */
+
+in bitwise;
+
+use ymirc::lexing::{word, tokens, keys};
+
+use ymirc::syntax::expression::_;
+use ymirc::semantic::validator;
+use ymirc::semantic::generator::{value::_, type::_};
+
+use ymirc::errors;
+use ymirc::utils::format;
+
+
+/**
+ * BinaryBitwiseValidation
+ *
+ * Provides semantic validation for bitwise operators. Bitwise operators are
+ * defined for:
+ *
+ *   - integer types(primary implementation)
+ *   - class types(via operator overloading)
+ *
+ * The validator:
+ *   - unwraps enum values
+ *   - checks operand types
+ *   - attempts left-biased and right-biased type inference
+ *   - dispatches to class operator overloads when applicable
+ *   - aggregates errors when multiple validation paths fail
+ *
+ * This ensures bitwise operations behave consistently across primitive and
+ * user-defined types.
+ *
+ */
+pub mod BinaryBitwiseValidation {
+
+    /**
+     * Validate a bitwise binary expression.
+     *
+     *
+     * @params:
+     *   - context: validation context
+     *   - bin:     binary expression
+     *   - op:      bitwise operator
+     *
+     * @returns:
+     *   A &Value representing the validated bitwise operation.
+     */
+    pub fn validate(dmut context: &ValidationContext, bin: &BinaryExpr, op: BinaryOperators)-> &Value
+        throws ErrorMsg
+    {
+        return BinaryBitwiseValidation::validate(alias context, bin.loc, op,
+                                                  left-> ValueValidation::validate(alias context, bin.left),
+                                                  right-> ValueValidation::validate(alias context, bin.right));
+    }
+
+    /**
+     * Validate a bitwise operation after both operands have been validated.
+     *
+     * Enum values are unwrapped before validation so that bitwise operators
+     * operate on the underlying integer type.
+     *
+     * @returns:
+     *   A &Value representing the validated bitwise operation.
+     */
+    pub fn validate(dmut context: &ValidationContext,
+                     loc:          &Word,
+                     op:           BinaryOperators,
+                     left:         &Value,
+                     right:        &Value)-> &Value
+        throws ErrorMsg
+    {
+        return BinaryBitwiseValidation::validateImpl(alias context, loc, op,
+                                                      left-> ValueCreation::createEnumUnwrap(left),
+                                                      right-> ValueCreation::createEnumUnwrap(right));
+    }
+
+    /**
+     * Core implementation of bitwise validation.
+     *
+     * Dispatch order:
+     *
+     *   1. Try validating with left operand as primary:
+     *        - if left is IntType => validateIntLeft()
+     *        - if left is ClassPtrType => class operator overload
+     *
+     *   2. If left-side validation fails, try right-side class overload.
+     *
+     *   3. If both fail, produce a fatal error with aggregated notes.
+     *
+     * This two-phase strategy ensures:
+     *   - integer operations are preferred
+     *   - class overloads are attempted symmetrically
+     *   - error messages include all failed attempts
+     *
+     * @throws:
+     *   ErrorMsg if no valid bitwise operator implementation exists.
+     */
+    fn validateImpl(dmut context: &ValidationContext,
+                     loc:          &Word,
+                     op:           BinaryOperators,
+                     left:         &Value,
+                     right:        &Value)-> &Value
+        throws ErrorMsg
+    {
+        let mut errors: [&ErrorMsg] = [];
+        {
+            match left.type {
+                li: &IntType => {
+                    return BinaryBitwiseValidation::validateIntLeft(alias context, loc, op, left, li, right);
+                }
+                c: &ClassPtrType => {
+                    return BinaryValidation::validateClassLeft(alias context, loc, op, left, c, right);
+                }
+            }
+        } catch {
+            err: &ErrorMsg => {
+                errors ~= [err];
+            }
+        }
+
+        {
+            match right.type {
+                c: &ClassPtrType => {
+                    return BinaryValidation::validateClassRight(alias context, loc, op, left, right, c);
+                }
+            }
+        } catch {
+            err: &ErrorMsg => {
+                errors ~= [err];
+            }
+        }
+
+        throw copy ErrorMsg::fatal(loc,
+                                    format(ValidateErrorMessage::UNDEFINED_BIN_OP, op, left.type, right.type),
+                                    notes-> errors);
+    }
+
+
+    /**
+     * Validate bitwise operations where the left operand is an integer.
+     *
+     * This function handles all bitwise operators for integer types, including
+     * mixed-type cases where the two operands differ in size or signedness.
+     *
+     * @params:
+     *   - context:   validation context
+     *   - loc:       operator location
+     *   - op:        bitwise operator
+     *   - left:      validated left operand
+     *   - leftType:  integer type of the left operand
+     *   - right:     validated right operand
+     *
+     * @returns:
+     *   A BitwiseIntOperatorValue representing the validated operation.
+     *
+     * @throws:
+     *   ErrorMsg if the right operand is not an integer or if type
+     *   inference fails to produce compatible integer operands.
+     */
+    fn validateIntLeft(dmut context: &ValidationContext,
+                        loc:          &Word,
+                        op:           BinaryOperators,
+                        left:         &Value,
+                        leftType:     &IntType,
+                        right:        &Value)-> &Value
+
+        throws ErrorMsg
+    {
+
+        if let rightType: &IntType = right.type {
+            if (leftType.isSigned == rightType.isSigned && leftType.size == rightType.size) {
+                return copy BitwiseIntOperatorValue(loc, leftType, op, left, right);
+            }
+
+            let (resType, lvalue, rvalue) = TypeInference::inferValuesForBranch(alias context, loc, left, right);
+            return copy BitwiseIntOperatorValue(loc, resType, op, lvalue, rvalue);
+        }
+
+        throw copy ErrorMsg::list([]);
+    }
+}
