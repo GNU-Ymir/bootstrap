@@ -13,22 +13,45 @@ validation, and lowers the result to an intermediate language (YIL) for a backen
 
 Build system is `gyllir` (config in `gyllir.toml`, compiler path points at a local `gyc` build).
 
-- Build the compiler: `gyllir build` → produces `./ymirc` in the repo root.
-- Run the compiler on a file: `./ymirc <path/to/file.yr>` (prints the syntax dump, then the
-  semantic generators, then the expanded YIL nodes, separated by `====...====` lines — see
-  `src/main.yr` for the exact driver).
-- Run the full self-test suite: `gyllir test` → builds `./ymirc.test` and runs it. Test source
-  lives in `test/*.yr`; results are cached in `.ymir_test_success`.
-- Run a subset of tests directly against the built test binary:
-  `./ymirc.test --filter <substring>` (also supports `-sf/--stop-first`, `--resume` to re-run
-  only previously-failed tests, `-cov/--coverage`, `-ct/--call-tree`).
+- `gyllir build` → `libymirc.a`. **This project is `type = "library"`** (see `gyllir.toml`), so
+  it does *not* link a runnable compiler. Any `./ymirc` binary sitting in the repo root is a
+  leftover from an older layout and is almost certainly stale — do not use it to check
+  behavior. To run the compiler over a `.yr` snippet, write a test (see below).
+- `gyllir test` → builds `./ymirc.test` and runs it. `gyllir test --dry` builds the binary
+  without running it, which is what you want before invoking `./ymirc.test` yourself.
+  Results are cached in `.ymir_test_success`.
 - `gyllir build --release` / `gyllir test --release` for release-mode builds.
+
+### Running tests
+
+```
+./ymirc.test -f "integration::<module>*"
+```
+
+- The filter matches the **test module path**, not the resource directory, and the trailing
+  `*` is required. `integration::class_ops*` works; `integration::class_ops` matches nothing.
+- **A filter that matches nothing prints nothing and exits 0.** Empty output means "no test
+  ran", never "everything passed". Always confirm you see `[SUCCESS] : integration::<module>…`.
+- The module name often differs from the resource directory — e.g. `test_resources/lit_class/operators`
+  is registered by `test/integration/class_ops.yr`. Find the owner with
+  `grep -rn "<resource-dir>" test/`.
+- Golden diffs are written to **stderr** while the test log goes to stdout, so capture them
+  separately (`2>err.txt`) and strip ANSI codes (`sed -e 's/\x1b\[[0-9;]*m//g'`) before reading.
+- Other flags: `-sf/--stop-first`, `--resume` (re-run only previously-failed tests),
+  `-j/--jobs`, `-cov/--coverage`, `-ct/--call-tree`.
 
 ### Test layout
 
-Each test category is a module in `test/__test__.yr` (e.g. `mod .scope_guards;`) backed by a
-file `test/<category>.yr` containing a `__test { ... }` block. These call
-`utils::registerTest("test_resources/<category>/testN.yr")` (see `test/utils.yr`), which:
+Test categories live under `test/integration/`: `test/integration.yr` lists them as
+`mod ::<category>;`, each backed by `test/integration/<category>.yr` containing a
+`__test { ... }` block. (`test/__test__.yr` only pulls in `integration` and `ymirc_test`.)
+Those blocks call, from `test/integration/utils.yr`, either:
+
+- `utils::registerTest("test_resources/<dir>/testN.yr")` — a single case, or
+- `utils::registerTests("test_resources/<dir>", lo, hi)` — cases `test<lo>.yr` … `test<hi>.yr`,
+  contiguous; each case runs even if an earlier one fails, and all failures are reported together.
+
+Either way, each case:
 
 1. Compiles the given `.yr` file through the real `Parser` pipeline.
 2. Compares the result against golden files with the same basename:
@@ -38,10 +61,60 @@ file `test/<category>.yr` containing a `__test { ... }` block. These call
    - `testN.yil` — expected formatted dump of the expanded YIL nodes/types (only compared if
      this file exists, since not every test needs to check lowering).
 
+If a case has *no* golden file at all, the only assertion is "compilation raised no error" —
+and when it does raise one, the full formatted error is printed to stderr. That makes a
+golden-less case the way to see what the compiler currently does with a snippet.
+
 When you change validator/semantic behavior, the golden `.sem`/`.err`/`.yil` files are the
 source of truth for expected behavior — treat a diff against them as a real regression/fix
 signal, not just noise to silence. When behavior intentionally changes, regenerate/update the
 corresponding golden file rather than special-casing the test.
+
+### Regenerating a golden file
+
+Truncate the golden to empty, re-run the test, and the whole produced output comes back as
+added lines in the diff:
+
+```sh
+: > test_resources/<dir>/testN.err
+./ymirc.test -f "integration::<module>*" 2>err.txt >/dev/null
+sed -e 's/\x1b\[[0-9;]*m//g' err.txt        # every produced line is now "+      | <content>"
+```
+
+Strip the `+`/`| ` gutter to rebuild the file, then re-run to confirm `[SUCCESS]`. Truncating
+first matters: against a non-empty golden the diff elides unchanged regions as `...`, so you
+cannot reconstruct the full file from it. Read the resulting diff before committing it — the
+point is to check the new behavior is what you intended, not to make the test go green.
+
+### Creating a temporary throwaway test
+
+To exercise the compiler on an ad-hoc snippet (there is no runnable binary to do it directly):
+
+1. `mkdir test_resources/tmpcheck` and write `test1.yr` … `testN.yr` there, contiguous, one
+   case per behavior you want to probe. Write **no** golden files — then a case passes iff it
+   compiles, and prints its error to stderr if it doesn't.
+2. Create `test/integration/tmpcheck.yr`:
+   ```
+   in tmpcheck;
+
+   use ymirc::utils::_;
+   use utils;
+
+   __test {
+       utils::registerTests ("test_resources/tmpcheck", 1, N);
+   }
+   ```
+3. Add `mod ::tmpcheck;` to `test/integration.yr`.
+4. `gyllir test --dry` then `./ymirc.test -f "integration::tmpcheck*" 2>err.txt`.
+
+Probe *both* directions of whatever you are testing (the accepted form and the rejected one),
+and prefer cases whose outcome is observable in the type system — e.g. give two overloads
+different return types and assign the result to a typed variable — so a "compiles" result tells
+you which one was selected.
+
+Afterwards, delete `test_resources/tmpcheck/` and `test/integration/tmpcheck.yr`, revert the
+`mod ::tmpcheck;` line, and re-run `gyllir test --dry` so the built binary no longer references
+the removed module. Verify with `git status` that nothing temporary is left behind.
 
 ## Architecture: the pipeline
 
