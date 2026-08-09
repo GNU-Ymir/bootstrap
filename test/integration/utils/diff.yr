@@ -1,0 +1,407 @@
+/*
+ * Defines this module.
+ *
+ * <hr>
+ *
+ * @Package: ymirc
+ * @Module: integration::utils::diff
+ * @File: integration/utils/diff.yr
+ * @Author(s):
+ *   - Emile Cadorel <ecadorel@gmail.com>
+ *
+ * @Created(YYYY-MM-DD): 2026-08-07
+ * @Copyright(C) 2021–2026 GNU-Ymir
+ * @License
+ *   ```text
+ *   This file is part of the Ymir language project.
+ *
+ *   Ymir is free software: you can redistribute it and/or modify it
+ *   under the terms of the GNU General Public License as published by
+ *   the Free Software Foundation, either version 3 of the License, or
+ *   (at your option) any later version.
+ *
+ *   Ymir is distributed in the hope that it will be useful,
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *   GNU General Public License for more details.
+ *
+ *   You should have received a copy of the GNU General Public License
+ *   along with Ymir.  If not, see <https://www.gnu.org/licenses/>.
+ *   ```
+ */
+in diff;
+
+use ymirc::utils::_;
+use std::{io, conv};
+
+/**
+ * The share of a line, in percent, that a word by word comparison must recognize before
+ * the changed words are worth highlighting
+ * Below that the two lines have nothing to do with each other, and highlighting the few
+ * blanks and separators they happen to share would only shred the output
+ * */
+def MIN_COMMON_PERCENT = 30us;
+
+
+/**
+ * An operation of a diff between two sequences
+ * @params:
+ *    - op: '=' the element is common, '-' it is only in the left sequence, '+' only in the right one
+ *    - left: index in the left sequence(meaningless for '+')
+ *    - right: index in the right sequence(meaningless for '-')
+ * */
+pub record SeqOp {
+    pub let op: c8;
+    pub let left: usize;
+    pub let right: usize;
+
+    pub self (op: c8, left: usize, right: usize)
+        with op = op, left = left, right = right
+    {}
+}
+
+/**
+ * A single line of a diff
+ * @params:
+ *    - op: '=' the line is common, '-' it is only expected, '+' it was only produced
+ *    - expLine: the 1 based line number in the expected text(0 iif the line is not there)
+ *    - actLine: the 1 based line number in the produced text(0 iif the line is not there)
+ *    - text: the content of the line
+ * */
+pub record DiffLine {
+    pub let op: c8;
+    pub let expLine: usize;
+    pub let actLine: usize;
+    pub let text: [c8];
+
+    pub self (op: c8, expLine: usize, actLine: usize, text: [c8])
+        with op = op
+        , expLine = expLine
+        , actLine = actLine
+        , text = text
+    {}
+}
+
+/**
+ * Diff of two sequences of strings, based on their longest common subsequence
+ * The common prefix and suffix are stripped first, so the quadratic part only ever runs
+ * on the elements that actually changed
+ * On a tie the left element is emitted first, so a replacement reads as '-' then '+',
+ * the way a unified diff does
+ * */
+pub fn diffSeq(left: [[c8]], right: [[c8]])-> [SeqOp] {
+    let mut pre = 0us;
+    while pre < left.len && pre < right.len && left[pre] == right[pre] {
+        pre += 1us;
+    }
+
+    let mut suf = 0us;
+    while suf < (left.len - pre) && suf < (right.len - pre)
+        && left[left.len - 1us - suf] == right[right.len - 1us - suf] {
+            suf += 1us;
+        }
+
+    let n = left.len - pre - suf, m = right.len - pre - suf;
+    let mut res: [SeqOp] = [];
+
+    for k in 0us .. pre {
+        res ~= [SeqOp('='c8, k, k)];
+    }
+
+    if (n != 0us || m != 0us) {
+        // lcs[i * w + j] = length of the lcs of left[pre + i .. ] and right[pre + j .. ]
+        let w = m + 1us;
+        let dmut lcs = copy [0us ; (n + 1us) * w];
+        let mut i = n;
+        while i != 0us {
+            i -= 1us;
+            let mut j = m;
+            while j != 0us {
+                j -= 1us;
+                if (left[pre + i] == right[pre + j]) {
+                    lcs[i * w + j] = lcs[(i + 1us) * w + (j + 1us)] + 1us;
+                } else {
+                    let a = lcs[(i + 1us) * w + j], b = lcs[i * w + (j + 1us)];
+                    lcs[i * w + j] = if a > b { a } else { b };
+                }
+            }
+        }
+
+        let mut x = 0us, mut y = 0us;
+        while x < n || y < m {
+            if (x < n && y < m && left[pre + x] == right[pre + y]) {
+                res ~= [SeqOp('='c8, pre + x, pre + y)];
+                x += 1us;
+                y += 1us;
+            } else if (y < m && (x == n || lcs[x * w + (y + 1us)] > lcs[(x + 1us) * w + y])) {
+                res ~= [SeqOp('+'c8, 0us, pre + y)];
+                y += 1us;
+            } else {
+                res ~= [SeqOp('-'c8, pre + x, 0us)];
+                x += 1us;
+            }
+        }
+    }
+
+    for k in 0us .. suf {
+        res ~= [SeqOp('='c8, left.len - suf + k, right.len - suf + k)];
+    }
+
+    res
+}
+
+/**
+ * Split a text into its lines, the line terminators are not kept
+ * */
+pub fn splitLines(txt: [c8])-> [[c8]] {
+    let mut res: [[c8]] = [];
+    let mut start = 0us;
+    for i in 0us .. txt.len {
+        if (txt[i] == '\n') {
+            res ~= [txt[start .. i]];
+            start = i + 1us;
+        }
+    }
+
+    if (start < txt.len) {
+        res ~= [txt[start .. $]];
+    }
+
+    res
+}
+
+/**
+ * @returns: true iif 'c' can be part of a word
+ * Bytes above ascii are words, so a multi byte character is never cut in half
+ * */
+fn isWordChar(c: c8)-> bool {
+    (c >= 'a'c8 && c <= 'z'c8)
+    || (c >= 'A'c8 && c <= 'Z'c8)
+    || (c >= '0'c8 && c <= '9'c8)
+    || c == '_'c8
+    || cast!{u8}(c) >= 128u8
+}
+
+/**
+ * Split a line into words, so that two lines can be compared word by word
+ * Every character is kept, concatenating the result gives the line back
+ * A word is a run of word characters, or a run of blanks, or any other single character
+ * */
+pub fn splitWords(line: [c8])-> [[c8]] {
+    let mut res: [[c8]] = [];
+    let mut i = 0us;
+    while i < line.len {
+        let start = i;
+        if (isWordChar(line[i])) {
+            while i < line.len && isWordChar(line[i]) { i += 1us; }
+        } else if (line[i] == ' 'c8 || line[i] == '\t'c8) {
+            while i < line.len && (line[i] == ' 'c8 || line[i] == '\t'c8) { i += 1us; }
+        } else {
+            i += 1us;
+        }
+
+        res ~= [line[start .. i]];
+    }
+
+    res
+}
+
+/**
+ * Line diff of two texts
+ * @params:
+ *    - expected: the lines read from the golden file
+ *    - actual: the lines produced by the compiler
+ * @returns: the diff, in expected/actual line order
+ * */
+pub fn diffLines(expected: [[c8]], actual: [[c8]])-> [DiffLine] {
+    let mut res: [DiffLine] = [];
+    for o in diffSeq(expected, actual) {
+        if (o.op == '+'c8) {
+            res ~= [DiffLine('+'c8, 0us, o.right + 1us, actual[o.right])];
+        } else if (o.op == '-'c8) {
+            res ~= [DiffLine('-'c8, o.left + 1us, 0us, expected[o.left])];
+        } else {
+            res ~= [DiffLine('='c8, o.left + 1us, o.right + 1us, expected[o.left])];
+        }
+    }
+
+    res
+}
+
+/**
+ * @returns: the 1 based line number of the first change of a diff, 0 iif there is none
+ * */
+pub fn firstDiffLine(diff: [DiffLine])-> usize {
+    for d in diff {
+        if (d.op != '='c8) {
+            return if d.expLine != 0us { d.expLine } else { d.actLine };
+        }
+    }
+
+    0us
+}
+
+/**
+ * @returns: the number of changed lines of a diff
+ * */
+pub fn countChanges(diff: [DiffLine])-> usize {
+    let mut nb = 0us;
+    for d in diff {
+        if (d.op != '='c8) { nb += 1us; }
+    }
+
+    nb
+}
+
+/**
+ * Pair the removed lines of each hunk with the added ones, so that a line that was
+ * merely edited can be compared word by word with the line that replaced it
+ * @returns: for each line of the diff, 1 + the index of its counterpart, 0 iif it has none
+ * */
+fn pairChanges(diff: [DiffLine])-> [usize] {
+    let dmut res = copy [0us ; diff.len];
+    let mut k = 0us;
+    while k < diff.len {
+        if (diff[k].op == '='c8) {
+            k += 1us;
+        } else {
+            let mut end = k;
+            while end < diff.len && diff[end].op != '='c8 { end += 1us; }
+
+            let mut minus: [usize] = [], mut plus: [usize] = [];
+            for x in k .. end {
+                if (diff[x].op == '-'c8) { minus ~= [x]; } else { plus ~= [x]; }
+            }
+
+            let nb = if minus.len < plus.len { minus.len } else { plus.len };
+            for x in 0us .. nb {
+                res[minus[x]] = plus[x] + 1us;
+                res[plus[x]] = minus[x] + 1us;
+            }
+
+            k = end;
+        }
+    }
+
+    res
+}
+
+/**
+ * @returns: true iif 'word' is only made of blanks
+ * */
+fn isBlank(word: [c8])-> bool {
+    for c in word {
+        if (c != ' 'c8 && c != '\t'c8) return false;
+    }
+
+    true
+}
+
+
+/**
+ * Write a line, putting the words that do not appear in 'other' on a colored background
+ * Consecutive changed words are highlighted as a single run
+ * @params:
+ *    - line: the line to render
+ *    - other: the line it is compared against
+ *    - base: the color of the line
+ *    - back: the background of the words that changed
+ * */
+fn highlightWords(line: [c8], other: [c8], base: Colors, back: Colors)-> [c8] {
+    let words = splitWords(line);
+    let ops = diffSeq(words, splitWords(other));
+
+    // blanks are ignored, two unrelated lines almost always share some indentation
+    let mut common = 0us;
+    for o in ops {
+        if (o.op == '='c8 && !isBlank(words[o.left])) {
+            common += words[o.left].len;
+        }
+    }
+
+    if (common * 100us < line.len * MIN_COMMON_PERCENT) return line;
+
+    let mut res: [c8] = "", mut run: [c8] = "";
+    for o in ops {
+        if (o.op == '='c8) {
+            if (run.len != 0us) {
+                res ~= format("%%%%%", back, Colors::WHITE, run, Colors::RESET, base);
+                run = "";
+            }
+
+            res ~= words[o.left];
+        } else if (o.op == '-'c8) {
+            run ~= words[o.left];
+        }
+    }
+
+    if (run.len != 0us) {
+        res ~= format("%%%%%", back, Colors::WHITE, run, Colors::RESET, base);
+    }
+
+    res
+}
+
+/**
+ * Render a diff the way a unified diff would, keeping 'ctx' common lines around each
+ * change and collapsing the runs of common lines in between
+ * '-' lines are the ones the golden file expects, '+' the ones that were produced, and
+ * within a line that was edited the words that differ are highlighted
+ * */
+pub fn formatDiff(diff: [DiffLine], ctx: usize = 3us)-> [c8] {
+    let dmut shown = copy [false ; diff.len];
+    for k in 0us .. diff.len {
+        if (diff[k].op != '='c8) {
+            let lo = if k > ctx { k - ctx } else { 0us };
+            let hi = if k + ctx + 1us < diff.len { k + ctx + 1us } else { diff.len };
+            for x in lo .. hi {
+                shown[x] = true;
+            }
+        }
+    }
+
+    let pairs = pairChanges(diff);
+    let mut res: [c8] = "";
+    let mut collapsed = false;
+    for k in 0us .. diff.len {
+        if (shown[k]) {
+            collapsed = false;
+            let d = diff[k];
+            // the numbers are those of the expected file, the one to fix or regenerate
+            // a produced line has none, precisely because it is missing from that file
+            if (d.op == '='c8) {
+                res ~= format("  % | %\n", pad(d.expLine, 4us), d.text);
+            } else {
+                let base = if d.op == '-'c8 { Colors::RED } else { Colors::GREEN };
+                let back = if d.op == '-'c8 { Colors::RED_BACK } else { Colors::GREEN_BACK };
+                let txt = if pairs[k] != 0us {
+                    highlightWords(d.text, diff[pairs[k] - 1us].text, base, back)
+                } else { d.text };
+
+                if (d.op == '-'c8) {
+                    res ~= format("%- % | %%\n", base, pad(d.expLine, 4us), txt, Colors::RESET);
+                } else {
+                    res ~= format("%+      | %%\n", base, txt, Colors::RESET);
+                }
+            }
+        } else if (!collapsed) {
+            collapsed = true;
+            res ~= "  ...\n";
+        }
+    }
+
+    res
+}
+
+/**
+ * @returns: 'nb' written in a cell of 'width' characters, right aligned
+ * */
+fn pad(nb: usize, width: usize)-> [c8] {
+    let str = conv::to!{[c8]}(nb);
+    let mut res: [c8] = "";
+    for _ in str.len .. width {
+        res ~= " ";
+    }
+
+    res ~ str
+}

@@ -1,0 +1,219 @@
+use ymirc::errors;
+use ymirc::lexing::word;
+use ymirc::utils::_;
+
+use std::io;
+
+/**
+ * Tests of the note flattening of 'ymirc::errors::utils'. The function itself
+ * is internal to the errors module, so it is driven here through the two
+ * constructors that call it, which is also how the rest of the compiler
+ * reaches it:
+ *   - a plain error flattens its notes and keeps their order,
+ *   - a list flattens its content and sorts it.
+ * */
+
+lazy CONTENT = "let x = 12;\nlet y = 13;\n";
+
+/**
+ * @returns: a location word in "a.yr", flattening only ever looks at the location
+ * */
+fn loc(line: u64, col: u64 = 0u64, filename: [c8] = "a.yr")-> &Word {
+    copy LocWord(str-> "x", filename-> filename, fileContent-> CONTENT,
+                 line-> line, col-> col, seek-> cast!{usize}(col), lineSeek-> 0us)
+}
+
+/**
+ * @returns: a fatal error at line 'line', with the given notes
+ * */
+fn err(msg: [c8], line: u64 = 1u64, notes: [&ErrorMsg] = [], end: &Word = EOF_WORD)-> &ErrorMsg {
+    copy ErrorMsg::fatal(loc(line), end-> end, notes-> notes, msg-> msg)
+}
+
+/**
+ * @returns: 'notes' flattened, keeping the order they were given in
+ * */
+fn unsorted(notes: [&ErrorMsg])-> [&ErrorMsg] {
+    (copy ErrorMsg::fatal(loc(1u64), notes-> notes, msg-> "root")).notes
+}
+
+/**
+ * @returns: 'notes' flattened and sorted by location
+ * */
+fn sorted(notes: [&ErrorMsg])-> [&ErrorMsg] {
+    (copy ErrorMsg::list(notes)).notes
+}
+
+/**
+ * @returns: the message of each error of the list, to compare the shape of a
+ *           flattening without depending on the rest of the node
+ * */
+fn msgs(lst: [&ErrorMsg])-> [[c8]] {
+    let mut res: [[c8]] = [];
+    for i in lst {
+        res ~= [i.msg];
+    }
+
+    res
+}
+
+/**
+ * ======================================================================
+ * ==========================    FLATTEN     ============================
+ * ======================================================================
+ */
+
+__test {
+    // nothing to flatten
+    assert(unsorted([]).len == 0us);
+    assert(sorted([]).len == 0us);
+}
+
+__test {
+    // errors that are not lists are kept as they are, in order
+    let a = err("a"), b = err("b"), c = err("c");
+    assert(msgs(unsorted(copy [a, b, c])) == ["a", "b", "c"]);
+}
+
+__test {
+    // a list node is replaced by its content, the node itself disappears
+    let inner = copy ErrorMsg::list(copy [err("b"), err("c")]);
+    assert(msgs(unsorted(copy [err("a"), inner, err("d")])) == ["a", "b", "c", "d"]);
+}
+
+__test {
+    // and the expansion goes all the way down
+    let deep = copy ErrorMsg::list(copy [copy ErrorMsg::list(copy [copy ErrorMsg::list(copy [err("b")])])]);
+    assert(msgs(unsorted(copy [err("a"), deep])) == ["a", "b"]);
+}
+
+__test {
+    // the notes of a non-list error are left untouched, only the level being
+    // flattened is expanded
+    let e = err("a", notes-> copy [err("b")]);
+    let f = unsorted(copy [e]);
+
+    assert(f.len == 1us);
+    assert(f[0].msg == "a");
+    assert(f[0].notes.len == 1us);
+    assert(f[0].notes[0].msg == "b");
+}
+
+__test {
+    // the same error reaching the list twice is emitted once, whatever the
+    // depth it appears at
+    let a = err("a");
+    assert(msgs(unsorted(copy [a, a])) == ["a"]);
+    assert(msgs(unsorted(copy [a, copy ErrorMsg::list(copy [a])])) == ["a"]);
+    assert(msgs(unsorted(copy [copy ErrorMsg::list(copy [a]), a])) == ["a"]);
+}
+
+__test {
+    // deduplication is on identity, not on the message: two errors that read
+    // the same are still two diagnostics
+    assert(msgs(unsorted(copy [err("a"), err("a")])) == ["a", "a"]);
+}
+
+__test {
+    // an empty one-line error carries nothing to print, and is dropped
+    let empty = copy ErrorMsg::fatal(loc(1u64), oneLine-> true, msg-> "");
+    assert(empty.isEmpty);
+    assert(msgs(unsorted(copy [err("a"), empty, err("b")])) == ["a", "b"]);
+    assert(unsorted(copy [empty]).len == 0us);
+}
+
+__test {
+    // an error with an empty message is not empty if it is not one-line, it
+    // still prints its source excerpt
+    let e = copy ErrorMsg::fatal(loc(1u64), msg-> "");
+    assert(!e.isEmpty);
+    assert(unsorted(copy [e]).len == 1us);
+}
+
+/**
+ * ======================================================================
+ * ===========================    SORT      =============================
+ * ======================================================================
+ */
+
+__test {
+    // without sorting the original order is kept, even when out of order
+    assert(msgs(unsorted(copy [err("c", line-> 3u64), err("a", line-> 1u64)])) == ["c", "a"]);
+}
+
+__test {
+    // sorting orders by the line the error begins at
+    let f = sorted(copy [err("c", line-> 3u64), err("a", line-> 1u64), err("b", line-> 2u64)]);
+    assert(msgs(f) == ["a", "b", "c"]);
+}
+
+__test {
+    // on the same begin line, the shorter span comes first
+    let a = err("a", line-> 1u64, end-> loc(2u64));
+    let b = err("b", line-> 1u64, end-> loc(5u64));
+    assert(msgs(sorted(copy [b, a])) == ["a", "b"]);
+}
+
+__test {
+    // an error whose span reaches the end of the file comes last on its line,
+    // since it encloses the others
+    let unbounded = err("eof", line-> 1u64);
+    let bounded = err("bounded", line-> 1u64, end-> loc(4u64));
+
+    assert(unbounded.endLoc.isEof);
+    assert(msgs(sorted(copy [unbounded, bounded])) == ["bounded", "eof"]);
+    assert(msgs(sorted(copy [bounded, unbounded])) == ["bounded", "eof"]);
+}
+
+__test {
+    // sorting reaches the errors pulled out of a nested list too
+    let inner = copy ErrorMsg::list(copy [err("d", line-> 4u64), err("b", line-> 2u64)]);
+    let f = sorted(copy [err("c", line-> 3u64), inner, err("a", line-> 1u64)]);
+    assert(msgs(f) == ["a", "b", "c", "d"]);
+}
+
+__test {
+    // sorting keeps every error, it only reorders them
+    let lst: [&ErrorMsg] = copy [err("a", line-> 5u64), err("b", line-> 1u64), err("c", line-> 3u64),
+                                 err("d", line-> 1u64), err("e", line-> 9u64)];
+
+    let flat = unsorted(lst);
+    let s = sorted(lst);
+    assert(s.len == flat.len);
+
+    // and the result is really sorted
+    for i in 1us .. s.len {
+        assert(s[i - 1us].loc.line <= s[i].loc.line,
+               format("line % came before line %", s[i - 1us].loc.line, s[i].loc.line));
+    }
+}
+
+/**
+ * ======================================================================
+ * ======================    THROUGH THE CTORS     ======================
+ * ======================================================================
+ */
+
+__test {
+    // a list note never survives in a built error, it is always expanded
+    let e = err("a", notes-> copy [copy ErrorMsg::list(copy [err("b"), err("c")])]);
+    assert(msgs(e.notes) == ["b", "c"]);
+
+    for n in e.notes {
+        assert(!n.isList, "a list note survived the construction");
+    }
+}
+
+__test {
+    // a list sorts its content on construction, a plain error does not
+    let notes: [&ErrorMsg] = copy [err("c", line-> 3u64), err("a", line-> 1u64)];
+    assert(msgs((copy ErrorMsg::list(notes)).notes) == ["a", "c"]);
+    assert(msgs(err("root", notes-> notes).notes) == ["c", "a"]);
+}
+
+__test {
+    // notes and warnings flatten their notes the same way
+    let inner = copy ErrorMsg::list(copy [err("b"), err("c")]);
+    assert(msgs((copy ErrorMsg::note(loc(1u64), notes-> copy [inner], msg-> "n")).notes) == ["b", "c"]);
+    assert(msgs((copy ErrorMsg::warn(loc(1u64), notes-> copy [inner], msg-> "w")).notes) == ["b", "c"]);
+}

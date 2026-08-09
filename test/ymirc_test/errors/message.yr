@@ -1,0 +1,293 @@
+use ymirc::errors;
+use ymirc::lexing::word;
+use ymirc::utils::_;
+
+use std::io;
+
+lazy CONTENT = "let x = 12;\nlet y = 13;\n";
+
+/**
+ * @returns: a location word in "a.yr"
+ * */
+fn loc(line: u64, col: u64 = 0u64, filename: [c8] = "a.yr")-> &Word {
+    copy LocWord(str-> "x", filename-> filename, fileContent-> CONTENT,
+                 line-> line, col-> col, seek-> cast!{usize}(col), lineSeek-> 0us)
+}
+
+/**
+ * @returns: the message of each error of the list
+ * */
+fn msgs(lst: [&ErrorMsg])-> [[c8]] {
+    let mut res: [[c8]] = [];
+    for i in lst {
+        res ~= [i.msg];
+    }
+
+    res
+}
+
+/**
+ * ======================================================================
+ * ==========================    SEVERITY    ============================
+ * ======================================================================
+ */
+
+__test {
+    // a diagnostic has exactly one severity, fatal being the one with no flag
+    let all = [copy ErrorMsg::fatal(loc(1u64), msg-> "e"),
+               copy ErrorMsg::note(loc(1u64), msg-> "n"),
+               copy ErrorMsg::warn(loc(1u64), msg-> "w"),
+               copy ErrorMsg::list(copy [])];
+
+    for e in all {
+        let mut n = 0;
+        if e.isFatal { n += 1; }
+        if e.isNote { n += 1; }
+        if e.isWarning { n += 1; }
+        if e.isList { n += 1; }
+
+        assert(n == 1, format("% severities matched for '%'", n, e.msg));
+    }
+}
+
+__test {
+    let e = copy ErrorMsg::fatal(loc(1u64), msg-> "boom");
+    assert(e.isFatal);
+    assert(e.msg == "boom");
+
+    let n = copy ErrorMsg::note(loc(1u64), msg-> "hint");
+    assert(n.isNote);
+    assert(n.msg == "hint");
+
+    let w = copy ErrorMsg::warn(loc(1u64), msg-> "careful");
+    assert(w.isWarning);
+    assert(w.msg == "careful");
+}
+
+__test {
+    // a list has no message of its own, it only groups
+    let l = copy ErrorMsg::list(copy [copy ErrorMsg::fatal(loc(1u64), msg-> "a")]);
+    assert(l.isList);
+    assert(l.msg == "");
+    assert(l.notes.len == 1us);
+}
+
+/**
+ * ======================================================================
+ * ============================    IDS      =============================
+ * ======================================================================
+ */
+
+__test {
+    // every diagnostic gets its own id, which is what deduplication relies on
+    let mut seen: [usize => mut()] = copy [];
+    for _ in 0us .. 50us {
+        let e = copy ErrorMsg::fatal(loc(1u64), msg-> "e");
+        assert(e.id !in seen, format("the id % was handed out twice", e.id));
+        seen[e.id] = ();
+    }
+}
+
+__test {
+    // the transformations build new nodes, so they get new ids
+    let e = copy ErrorMsg::fatal(loc(1u64), msg-> "e");
+    assert(e.asFatal().id != e.id);
+    assert(e.withNote(copy []).id != e.id);
+}
+
+/**
+ * ======================================================================
+ * ==========================    LOCATION    ============================
+ * ======================================================================
+ */
+
+__test {
+    // a span is stored begin first, whichever way round it was given
+    let a = loc(2u64), b = loc(7u64);
+
+    let straight = copy ErrorMsg::fatal(a, end-> b, msg-> "e");
+    assert(straight.loc.line == 2u64);
+    assert(straight.endLoc.line == 7u64);
+
+    // passing the end first gives the same span, not a reversed one
+    let reversed = copy ErrorMsg::fatal(b, end-> a, msg-> "e");
+    assert(reversed.loc.line == 2u64);
+    assert(reversed.endLoc.line == 7u64);
+}
+
+__test {
+    // the same normalization applies to notes and warnings
+    let a = loc(2u64), b = loc(7u64);
+
+    let n = copy ErrorMsg::note(b, end-> a, msg-> "n");
+    assert(n.loc.line == 2u64 && n.endLoc.line == 7u64);
+
+    let w = copy ErrorMsg::warn(b, end-> a, msg-> "w");
+    assert(w.loc.line == 2u64 && w.endLoc.line == 7u64);
+}
+
+__test {
+    // without an end the error is a point, and its span runs to the end of file
+    let e = copy ErrorMsg::fatal(loc(3u64), msg-> "e");
+    assert(e.loc.line == 3u64);
+    assert(e.endLoc.isEof);
+}
+
+__test {
+    // a list is not attached to any location
+    let l = copy ErrorMsg::list(copy [copy ErrorMsg::fatal(loc(3u64), msg-> "a")]);
+    assert(l.loc.isEof);
+    assert(l.endLoc.isEof);
+}
+
+/**
+ * ======================================================================
+ * ===========================    EMPTY     =============================
+ * ======================================================================
+ */
+
+__test {
+    // an error is empty when it has nothing left to print: no message, no
+    // source excerpt, no location
+    assert((copy ErrorMsg::fatal(loc(1u64), oneLine-> true, msg-> "")).isEmpty);
+
+    // a message is something to print
+    assert(!(copy ErrorMsg::fatal(loc(1u64), oneLine-> true, msg-> "x")).isEmpty);
+
+    // and so is the source excerpt of a multi-line error
+    assert(!(copy ErrorMsg::fatal(loc(1u64), msg-> "")).isEmpty);
+}
+
+__test {
+    // a one-line note asked to show its location is not empty either
+    assert((copy ErrorMsg::note(loc(1u64), oneLine-> true, withLoc-> false, msg-> "")).isEmpty);
+    assert(!(copy ErrorMsg::note(loc(1u64), oneLine-> true, withLoc-> true, msg-> "")).isEmpty);
+}
+
+__test {
+    // isOneLine reports how the error was built
+    assert((copy ErrorMsg::fatal(loc(1u64), oneLine-> true, msg-> "x")).isOneLine);
+    assert(!(copy ErrorMsg::fatal(loc(1u64), msg-> "x")).isOneLine);
+}
+
+/**
+ * ======================================================================
+ * =========================    AS FATAL     ============================
+ * ======================================================================
+ */
+
+__test {
+    // a note can be promoted to an error, keeping everything but its severity
+    let n = copy ErrorMsg::note(loc(2u64), end-> loc(4u64), notes-> copy [copy ErrorMsg::note(loc(3u64), msg-> "sub")],
+                                oneLine-> true, msg-> "hint");
+    let f = n.asFatal();
+
+    assert(f.isFatal);
+    assert(!f.isNote);
+    assert(f.msg == "hint");
+    assert(f.loc.line == 2u64);
+    assert(f.endLoc.line == 4u64);
+    assert(f.isOneLine);
+    assert(msgs(f.notes) == ["sub"]);
+}
+
+__test {
+    // promoting an error that is already fatal changes nothing but its identity
+    let e = copy ErrorMsg::fatal(loc(1u64), msg-> "e");
+    let f = e.asFatal();
+    assert(f.isFatal && f.msg == e.msg && f.loc.line == e.loc.line);
+}
+
+/**
+ * ======================================================================
+ * =========================    SUB NOTES    ============================
+ * ======================================================================
+ */
+
+__test {
+    // withNote appends to the notes already there
+    let e = copy ErrorMsg::fatal(loc(1u64), notes-> copy [copy ErrorMsg::note(loc(1u64), msg-> "a")], msg-> "root");
+    let w = e.withNote(copy [copy ErrorMsg::note(loc(1u64), msg-> "b")]);
+
+    assert(msgs(w.notes) == ["a", "b"]);
+
+    // the original is untouched, the tree is persistent
+    assert(msgs(e.notes) == ["a"]);
+}
+
+__test {
+    // alone replaces them instead
+    let e = copy ErrorMsg::fatal(loc(1u64), notes-> copy [copy ErrorMsg::note(loc(1u64), msg-> "a")], msg-> "root");
+    let w = e.withNote(copy [copy ErrorMsg::note(loc(1u64), msg-> "b")], alone-> true);
+
+    assert(msgs(w.notes) == ["b"]);
+}
+
+__test {
+    // and nothing else about the error moves
+    let e = copy ErrorMsg::warn(loc(2u64), end-> loc(5u64), oneLine-> true, msg-> "w");
+    let w = e.withNote(copy [copy ErrorMsg::note(loc(1u64), msg-> "n")]);
+
+    assert(w.isWarning);
+    assert(w.msg == "w");
+    assert(w.loc.line == 2u64 && w.endLoc.line == 5u64);
+    assert(w.isOneLine);
+}
+
+__test {
+    // subbingNote slips a note in between the error and its own notes
+    let e = copy ErrorMsg::fatal(loc(1u64),
+                                 notes-> copy [copy ErrorMsg::note(loc(1u64), msg-> "b"),
+                                          copy ErrorMsg::note(loc(1u64), msg-> "c")],
+                                 msg-> "a");
+
+    let s = e.subbingNote(copy ErrorMsg::note(loc(1u64), msg-> "d"));
+
+    // a -> [d -> [b, c]]
+    assert(s.msg == "a");
+    assert(msgs(s.notes) == ["d"]);
+    assert(msgs(s.notes[0].notes) == ["b", "c"]);
+}
+
+__test {
+    // the inserted note loses whatever notes it came with, it is only a level
+    let e = copy ErrorMsg::fatal(loc(1u64), notes-> copy [copy ErrorMsg::note(loc(1u64), msg-> "b")], msg-> "a");
+    let d = copy ErrorMsg::note(loc(1u64), notes-> copy [copy ErrorMsg::note(loc(1u64), msg-> "own")], msg-> "d");
+
+    assert(msgs(e.subbingNote(d).notes[0].notes) == ["b"]);
+}
+
+__test {
+    // appendNotes puts the notes at the bottom of the leftmost branch
+    let leaf = copy ErrorMsg::note(loc(1u64), msg-> "leaf");
+    let mid = copy ErrorMsg::note(loc(1u64), notes-> copy [leaf], msg-> "mid");
+    let root = copy ErrorMsg::fatal(loc(1u64), notes-> copy [mid], msg-> "root");
+
+    let a = root.appendNotes(copy [copy ErrorMsg::note(loc(1u64), msg-> "new")]);
+
+    // root -> mid -> leaf -> new
+    assert(a.msg == "root");
+    assert(msgs(a.notes) == ["mid"]);
+    assert(msgs(a.notes[0].notes) == ["leaf"]);
+    assert(msgs(a.notes[0].notes[0].notes) == ["new"]);
+}
+
+__test {
+    // on an error with no notes it is just an assignment
+    let e = copy ErrorMsg::fatal(loc(1u64), msg-> "root");
+    assert(msgs(e.appendNotes(copy [copy ErrorMsg::note(loc(1u64), msg-> "new")]).notes) == ["new"]);
+}
+
+__test {
+    // only the first branch is descended, the siblings stay where they are
+    let root = copy ErrorMsg::fatal(loc(1u64),
+                                    notes-> copy [copy ErrorMsg::note(loc(1u64), msg-> "first"),
+                                             copy ErrorMsg::note(loc(1u64), msg-> "second")],
+                                    msg-> "root");
+
+    let a = root.appendNotes(copy [copy ErrorMsg::note(loc(1u64), msg-> "new")]);
+
+    assert(msgs(a.notes) == ["first", "second"]);
+    assert(msgs(a.notes[0].notes) == ["new"]);
+    assert(a.notes[1].notes.len == 0us);
+}

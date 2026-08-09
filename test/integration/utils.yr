@@ -1,0 +1,360 @@
+in utils;
+
+pub mod ::diff;
+
+use integration::utils::diff;
+use ymirc::parser;
+use ymirc::semantic::generator::_;
+use ymirc::syntax::{_, declaration::_};
+
+use ymirc::lint::node::{_, global::_};
+use ymirc::{errors, global::_, args, utils::_};
+use ymirc::lexing::word;
+
+use std::{io, conv, config::_, time::_, fs::_};
+
+lazy EMPTY_MODULE = copy ModuleDecl(EOF_WORD, "", EOF_WORD,
+                                    copy BlockDecl(EOF_WORD, "", [], Protection::PRIVATE, false),
+                                    true);
+
+pub record CompileResult {
+    pub let synt: &Declaration = EMPTY_MODULE;
+    pub let sem: [&Generator] = [];
+    pub let exp: [&YILNode] = [];
+    pub let types: [&YILType] = [];
+    pub let withLint: bool = true;
+    pub let err: (&ErrorMsg)? = none;
+
+    pub self (synt: &Declaration = EMPTY_MODULE,
+              sem: [&Generator] = [],
+              exp: [&YILNode] = [],
+              types: [&YILType] = [],
+              withLint: bool = true,
+              err: (&ErrorMsg)? = none)
+        with synt = synt
+        , sem = sem
+        , exp = exp
+        , types = types
+        , err = err
+        , withLint = withLint
+    {}
+}
+
+/**
+ * Register a test
+ * @params:
+ *    - package: the root file of the compilation
+ *    - results: the name of the output files(where adding extension .err, .sem and .yil will point to those files)
+ *    - withYIL: generate yil, or stop at semantic
+ *    - withImports: list of external package to import
+ *    - removeWeak: true iif not comparing weak symbols in yil
+ * */
+pub fn registerTest(package: [c8], results: [c8] = "", withImports: [[c8]] = [], removeWeak: bool = false)
+    throws AssertError
+{
+    let rpath = if results == "" {
+        Path(package).stripExtension()
+    } else { Path(results).stripExtension() };
+
+    let withYIL = fs::sys::isFile(rpath.addExtension("yil"));
+    let compileRes = compileFile(Path(package).stripExtension().addExtension("yr"), withLint-> withYIL, withImports-> withImports);
+
+    compareResultWithFiles(compileRes, rpath, removeWeak-> removeWeak);
+}
+
+/**
+ * Register a numbered serie of tests, 'dir/test<lo>.yr' up to 'dir/test<hi>.yr'
+ * Contrarily to a hand written loop, a failing case does not prevent the next ones
+ * from running, every error is kept and they are all reported at once at the end
+ * @params:
+ *    - dir: the directory containing the test files
+ *    - lo: index of the first test
+ *    - hi: index of the last test (included)
+ *    - suffix: what follows the index, e.g. "/foo.yr" when each case has its own directory
+ *    - name: the name displayed in the logs (the basename of 'dir' by default)
+ *    - removeWeak: true iif not comparing weak symbols in yil
+ * */
+pub fn registerTests(dir: [c8], lo: i32, hi: i32, suffix: [c8] = ".yr", name: [c8] = "", removeWeak: bool = false)
+    throws AssertError
+{
+    let disp = if name == "" { Path(dir).file() } else { name };
+    let mut failures: [([c8], &AssertError)] = [];
+
+    for i in lo ... hi {
+        let index = conv::to!{[c8]}(i);
+        logging::setRelativeTime();
+        logging::info(" Test % % start", disp, index);
+        {
+            registerTest(dir ~ "/test" ~ index ~ suffix, removeWeak-> removeWeak);
+            logging::success(" Test % % finished", disp, index);
+        } catch {
+            err: &AssertError => {
+                logging::failure(" Test % % failed", disp, index);
+                failures ~= [(index, err)];
+            }
+        }
+    }
+
+    if (failures.len != 0us) {
+        let mut report = format("% : %/% cases failed", disp, failures.len, hi - lo + 1);
+        for f in failures {
+            report = report ~ format("\n  - test%% : %", f.0, suffix, f.1.msg);
+        }
+
+        throw copy AssertError(report);
+    }
+}
+
+/**
+ * Compile a package
+ * */
+fn compileFile(filename: Path, withLint: bool = false, withImports: [[c8]] = [])-> CompileResult {
+    ymirc::global::state::resetToDefault(); // reset all global informations
+
+    let args = YmirArguments(file-> filename.toStr(),
+                              noLint-> !withLint,
+                              includes-> withImports);
+
+    let dmut parser = copy Parser(args);
+
+    parser:.parseAll();
+
+    return CompileResult(synt-> parser.getSyntaxModule(),
+                          sem-> parser.getSemGenerators(),
+                          exp-> parser.getExpYILNodes(),
+                          types-> parser.getExpYILTypes(),
+                          withLint-> withLint);
+
+} catch {
+    err: &ErrorMsg => {
+        return CompileResult(err-> err?);
+    }
+}
+
+/**
+ * Compare result of compilation with output files
+ * */
+fn compareResultWithFiles(result: CompileResult, loc: Path, removeWeak: bool = false)
+    throws AssertError
+{
+    if fs::sys::isFile(loc.addExtension("err")) {
+        compareErrorWithFile(result.err, loc.addExtension("err"));
+    } else {
+        ensureErrorEmpty(result.err);
+        if fs::sys::isFile(loc.addExtension("sem")) {
+            compareResultWithFile(result.sem, loc.addExtension("sem"), removeWeak-> removeWeak);
+        }
+
+        if result.withLint && fs::sys::isFile(loc.addExtension("yil")) {
+            compareResultWithFile(result.types, result.exp, loc.addExtension("yil"), removeWeak-> removeWeak);
+        }
+    }
+} catch {
+    f: &FsError => {
+        throw copy AssertError(format("%", f));
+    }
+    err: &AssertError => throw err;
+}
+
+
+fn compareResultWithFile(gens: [&Generator], filename: Path, removeWeak: bool = false)
+    throws AssertError, FsError
+{
+    let output = {
+        let dmut f = File::open(filename);
+        f:.readAll()
+    };
+
+    let dmut stream = copy Formatter(tags-> FormatTags(forDebug-> true, withVarIds-> false));
+    let mut valids: [mut([c8], &FrameGenerator)] = [];
+    for i in gens if let f: &FrameGenerator = i {
+        valids ~= [(Mangler::mangle(f), f)];
+    }
+
+    valids = std::algorithm::sorting::sort(alias valids, |a, b| => { a.0 < b.0 });
+    for v in valids {
+        if (!removeWeak || !v.1.isWeak) {
+            stream:.write(format("%\n", v.1, tags-> FormatTags(withParams-> false, forDebug-> true)));
+        }
+    }
+
+    compareResultWithString(stream, output, origin-> filename.toStr());
+}
+
+fn compareResultWithFile(types: [&YILType], yil: [&YILNode], filename: Path, removeWeak: bool = false, onlyFrames: bool = false)
+    throws AssertError, FsError
+{
+    let output = {
+        let dmut f = File::open(filename);
+        f:.readAll()
+    };
+
+    let dmut stream = copy Formatter(tags-> FormatTags(forDebug-> true, withVarIds-> false));
+    for t in std::algorithm::sorting::sort(copy types, |a, b| => { a.uid < b.uid }) {
+        stream:.write(format("%;\n", t, tags-> FormatTags(withParams-> true, forDebug-> true)));
+    }
+
+    for i in yil {
+        let remove = if (removeWeak || onlyFrames) {
+            match i {
+                f: &YILFrame => { f.isWeak && removeWeak }
+                g: &YILGlobalVar => { g.isWeak || onlyFrames }
+                c: &YILConstant => { c.isWeak || onlyFrames }
+                _ => { false }
+            }
+        } else { false };
+
+        if (!remove) {
+            // use a new stream for each node, to reset counters
+            stream:.write(format("%", i, tags-> FormatTags(forDebug-> true)), '\n'c8);
+        }
+    }
+
+    compareResultWithString(stream, output, origin-> filename.toStr());
+}
+
+/**
+ * Compare a produced result with the expected text, printing a line diff and throwing
+ * when they differ
+ * @params:
+ *    - stream: the produced result
+ *    - output: the expected text
+ *    - origin: what to name in the error message(the golden file, usually)
+ * */
+pub fn compareResultWithString(stream: &Formatter, output: [c8], origin: [c8] = "")
+    throws AssertError
+{
+    let res = removeColors(stream[]);
+    if (res != output) {
+        let d = diff::diffLines(diff::splitLines(output), diff::splitLines(res));
+        let name = if origin == "" { "result" } else { origin };
+
+        eprintln(Colors::YELLOW, "--- ", name, " (expected)", Colors::RESET);
+        eprintln(Colors::YELLOW, "+++ produced", Colors::RESET);
+        eprint(diff::formatDiff(d));
+
+        assert(false, format("% differs at line % (% lines)", name,
+                             diff::firstDiffLine(d), diff::countChanges(d)));
+    }
+}
+
+
+pub fn compareErrorWithFile(error: (&ErrorMsg)?, filename: Path)
+    throws AssertError
+{
+    let output = {
+        let dmut f = File::open(filename);
+        f:.readAll().trimLineEnds()
+    };
+
+    match error {
+        Ok(err: &ErrorMsg) => {
+            let dmut stream = copy Formatter(tags-> FormatTags(verbose-> true));
+            stream:.write(err, "\n");
+
+            let dmut trimmed = copy Formatter();
+            trimmed:.write(removeColors(stream[]).trimLineEnds());
+
+            compareResultWithString(trimmed, output, origin-> filename.toStr());
+        }
+        _ => {
+            assert(output.len == 0us,
+                   format("% expects an error, but the compilation succeeded", filename.toStr()));
+        }
+    }
+
+} catch {
+    f: &FsError => {
+        assert(false, format("could not read % : %", filename.toStr(), f));
+    }
+    err: &AssertError => throw err;
+}
+
+
+fn ensureResultEmpty(gens: [&Generator])
+    throws AssertError
+{
+    if (gens.len != 0us) {
+        let dmut stream = copy Formatter();
+        for i in gens {
+            stream:.write(i, '\n');
+        }
+
+        eprintln("Result not empty: ", stream[]);
+        assert(false, "result not empty");
+    }
+}
+
+fn ensureErrorEmpty(error: (&ErrorMsg)?)
+    throws AssertError
+{
+    match error {
+        Ok(err: &ErrorMsg) => {
+            let dmut stream = copy Formatter();
+            stream:.write(err, "\n");
+
+            let res = removeColors(stream[]).trimLineEnds();
+
+            eprintln("Error not empty: \n", res);
+            assert(false, "compilation failed, but no .err file was expected");
+        }
+    }
+}
+
+pub fn removeColors(txt: [c8])-> [c8] {
+    let mut res: [c8] = [];
+    let mut i = 0us;
+    while i < txt.len {
+        let col = isColor(txt[i..$]);
+        if (col.len != 0) {
+            i += col.len;
+        } else if (txt[i] != '\u{0}') {
+            res ~= [txt[i]];
+            i += 1us;
+        } else i += 1us;
+    }
+
+    res
+}
+
+pub fn isColor(current: [c8])-> [c8] {
+    for i in Colors::__members__ {
+        if (current.len >= i.len) {
+            if (current[0us .. i.len] == i) return i;
+        }
+    }
+
+    []
+}
+
+pub fn trimLineEnds(txt: [c8])-> [c8] {
+    let mut res: [c8] = [];
+    let mut nb = 0us;
+    for i in 0us .. txt.len {
+        if (txt[i] == ' ') {
+            nb += 1us;
+        } else if (txt[i] == '\t') {
+            nb += 4us;
+        } else {
+            if (txt[i] != '\n') {
+                for _ in 0us .. nb {
+                    res ~= [' '];
+                }
+            }
+            nb = 0us;
+            res ~= [txt[i]];
+        }
+    }
+
+    res
+}
+
+pub fn getUntilLineEnd(txt: [c8])-> [c8] {
+    let mut e = 0us;
+    while (e < txt.len) {
+        if (txt[e] == '\n') return txt[0us .. e];
+        e += 1us;
+    }
+
+    txt
+}
