@@ -40,9 +40,10 @@ RUN test -n "$GYC_RELEASE_TAG" && test -n "$GYC_ASSET" \
     (echo "GYC_RELEASE_TAG, GYC_ASSET, GYLLIR_RELEASE_TAG, GYLLIR_ASSET, MIDGARD_RELEASE_TAG and MIDGARD_ASSET build-args are required - see YMIR_VERSION" >&2 && exit 1)
 
 # gmp/mpfr are the compile-time arbitrary-precision arithmetic libraries ymirc links against
-# (`libraries = ["gmp", "mpfr"]` in gyllir.toml).
+# (`libraries = ["gmp", "mpfr"]` in gyllir.toml). zip is only needed by the `package` stage
+# (bundling the golden .yil files below), but installed here since this layer is shared/cached.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        ca-certificates curl git unzip libgmp-dev libmpfr-dev \
+        ca-certificates curl git unzip zip libgmp-dev libmpfr-dev \
     && rm -rf /var/lib/apt/lists/*
 
 # The gyc .deb depends on g++-<N>/gcc-<N>/libgc-dev/libdwarf-dev; `apt-get install ./file.deb`
@@ -92,7 +93,12 @@ RUN ./ymirc.test -sf
 # Depends on `test` (not `build`) so a release artifact can never be produced from a tree whose
 # tests fail. `gyllir build --release` rewrites ./libymirc.a in place, hence the debug copy
 # being stashed first.
+#
+# Also bundles the golden .yil files under test_resources/ (the expanded-YIL reference dumps
+# checked into this repo - see CLAUDE.md's golden-file section) into a zip. These are source,
+# not build output, so the zip just packages what's already in the checkout as-is.
 FROM test AS package
 RUN cp libymirc.a /libymirc_debug.a \
     && gyllir build --release \
-    && cp libymirc.a /libymirc_release.a
+    && cp libymirc.a /libymirc_release.a \
+    && find test_resources -name '*.yil' -print | zip -q /ymirc_yil.zip -@
