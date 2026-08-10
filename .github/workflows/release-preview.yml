@@ -1,0 +1,90 @@
+name: Preview Release
+
+# Rolling pre-release, manually triggered (pick the branch/ref from the "Run workflow" button).
+# The tag/release name is the constant `preview`, independent of gyllir.toml's `version`: every
+# run replaces the previous preview, so there is only ever one preview tag and one preview
+# release. The asset names are constant too (libymirc_preview.a, ymirc_preview_yil.zip), which
+# keeps the download URLs stable across runs. The name cannot collide with release.yml's bare
+# <version> tags.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  preview-release:
+    runs-on: [self-hosted, linux, x64]
+    steps:
+      - uses: actions/checkout@v7
+
+      # The self-hosted runners have no gh CLI of their own; the release steps below need one.
+      - uses: ./.github/actions/setup-gh
+
+      - name: Compute toolchain build-args
+        id: version
+        run: |
+          . ./YMIR_VERSION
+          GCC_MAJOR_VERSION="$(echo "$GCC_VERSION" | cut -d. -f1)"
+          echo "gyc_release_tag=${YMIR_BOOTSTRAP_VERSION}" >> "$GITHUB_OUTPUT"
+          echo "gyc_asset=gyc-${GCC_MAJOR_VERSION}_${YMIR_BOOTSTRAP_VERSION}_amd64.deb" >> "$GITHUB_OUTPUT"
+          echo "gyllir_release_tag=${GYLLIR_VERSION}" >> "$GITHUB_OUTPUT"
+          echo "gyllir_asset=gyllir_${GYLLIR_VERSION}_amd64.deb" >> "$GITHUB_OUTPUT"
+          echo "midgard_release_tag=${MIDGARD_VERSION}" >> "$GITHUB_OUTPUT"
+          echo "midgard_asset=midgard-${MIDGARD_VERSION}-src.zip" >> "$GITHUB_OUTPUT"
+          echo "tag_name=preview" >> "$GITHUB_OUTPUT"
+          echo "lib_asset=libymirc_preview.a" >> "$GITHUB_OUTPUT"
+          echo "yil_asset=ymirc_preview_yil.zip" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-buildx-action@v4
+
+      # Same `package` stage the CI workflow's `build`/`test` stages sit under: compiles
+      # ymirc, runs ./ymirc.test -sf (failing the job if anything regressed), rebuilds
+      # libymirc.a in release mode, and zips the golden .yil files. See ./Dockerfile.
+      - name: Build, test, and package
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          target: package
+          push: false
+          load: true
+          tags: ymirc-preview-build:latest
+          build-args: |
+            GYC_RELEASE_TAG=${{ steps.version.outputs.gyc_release_tag }}
+            GYC_ASSET=${{ steps.version.outputs.gyc_asset }}
+            GYLLIR_RELEASE_TAG=${{ steps.version.outputs.gyllir_release_tag }}
+            GYLLIR_ASSET=${{ steps.version.outputs.gyllir_asset }}
+            MIDGARD_RELEASE_TAG=${{ steps.version.outputs.midgard_release_tag }}
+            MIDGARD_ASSET=${{ steps.version.outputs.midgard_asset }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Extract release assets
+        env:
+          LIB_ASSET: ${{ steps.version.outputs.lib_asset }}
+          YIL_ASSET: ${{ steps.version.outputs.yil_asset }}
+        run: |
+          CID="$(docker create ymirc-preview-build:latest)"
+          docker cp "${CID}:/libymirc_release.a" "./${LIB_ASSET}"
+          docker cp "${CID}:/ymirc_yil.zip" "./${YIL_ASSET}"
+          docker rm "${CID}"
+
+      - name: Replace existing preview tag/release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.version.outputs.tag_name }}
+        run: gh release delete "$TAG" --yes --cleanup-tag || true
+
+      - name: Publish preview release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.version.outputs.tag_name }}
+          LIB_ASSET: ${{ steps.version.outputs.lib_asset }}
+          YIL_ASSET: ${{ steps.version.outputs.yil_asset }}
+        run: |
+          gh release create "$TAG" \
+            --target "${{ github.sha }}" \
+            --title "Preview" \
+            --notes "Automated preview build of ymirc @ ${{ github.sha }}: libymirc.a (release build) plus ${YIL_ASSET}, the golden .yil reference dumps from test_resources/. This tag is rolling - it always points at the most recent preview build." \
+            --prerelease \
+            "${LIB_ASSET}" "${YIL_ASSET}"

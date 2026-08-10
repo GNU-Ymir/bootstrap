@@ -1,0 +1,100 @@
+name: Release
+
+# Manual: builds and publishes libymirc_<version>.a (release build) and
+# ymirc_<version>_yil.zip (the golden .yil reference dumps under test_resources/) as GitHub
+# release assets. The tag is the bare <version> (no leading v), read from gyllir.toml's
+# `version` key - bump it before dispatching this again for a new release. This repo is
+# type = "library" (no runnable compiler binary is produced), so unlike gymir/Gyllir there is
+# no .deb here. Fails instead of overwriting if the target version has already been released;
+# see release-preview.yml for a replaceable rolling build.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: [self-hosted, linux, x64]
+    steps:
+      - uses: actions/checkout@v7
+
+      # The self-hosted runners have no gh CLI of their own; the release steps below need one.
+      - uses: ./.github/actions/setup-gh
+
+      - name: Compute toolchain build-args and version
+        id: version
+        run: |
+          . ./YMIR_VERSION
+          GCC_MAJOR_VERSION="$(echo "$GCC_VERSION" | cut -d. -f1)"
+          YMIRC_VERSION="$(bash .github/scripts/ymirc-version.sh)"
+          echo "ymirc_version=${YMIRC_VERSION}" >> "$GITHUB_OUTPUT"
+          echo "gyc_release_tag=${YMIR_BOOTSTRAP_VERSION}" >> "$GITHUB_OUTPUT"
+          echo "gyc_asset=gyc-${GCC_MAJOR_VERSION}_${YMIR_BOOTSTRAP_VERSION}_amd64.deb" >> "$GITHUB_OUTPUT"
+          echo "gyllir_release_tag=${GYLLIR_VERSION}" >> "$GITHUB_OUTPUT"
+          echo "gyllir_asset=gyllir_${GYLLIR_VERSION}_amd64.deb" >> "$GITHUB_OUTPUT"
+          echo "midgard_release_tag=${MIDGARD_VERSION}" >> "$GITHUB_OUTPUT"
+          echo "midgard_asset=midgard-${MIDGARD_VERSION}-src.zip" >> "$GITHUB_OUTPUT"
+          echo "tag_name=${YMIRC_VERSION}" >> "$GITHUB_OUTPUT"
+          echo "lib_asset=libymirc_${YMIRC_VERSION}.a" >> "$GITHUB_OUTPUT"
+          echo "yil_asset=ymirc_${YMIRC_VERSION}_yil.zip" >> "$GITHUB_OUTPUT"
+
+      - name: Ensure this version has not already been released
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.version.outputs.tag_name }}
+        run: |
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "::error::Release $TAG already exists - bump the version in gyllir.toml before releasing again."
+            exit 1
+          fi
+          if git ls-remote --exit-code --tags origin "refs/tags/$TAG" >/dev/null 2>&1; then
+            echo "::error::Tag $TAG already exists on origin (with no matching release) - bump the version in gyllir.toml before releasing again."
+            exit 1
+          fi
+
+      - uses: docker/setup-buildx-action@v4
+
+      # Same `package` stage the CI workflow's `build`/`test` stages sit under: compiles
+      # ymirc, runs ./ymirc.test -sf (failing the job if anything regressed), rebuilds
+      # libymirc.a in release mode, and zips the golden .yil files. See ./Dockerfile.
+      - name: Build, test, and package
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          target: package
+          push: false
+          load: true
+          tags: ymirc-release-build:latest
+          build-args: |
+            GYC_RELEASE_TAG=${{ steps.version.outputs.gyc_release_tag }}
+            GYC_ASSET=${{ steps.version.outputs.gyc_asset }}
+            GYLLIR_RELEASE_TAG=${{ steps.version.outputs.gyllir_release_tag }}
+            GYLLIR_ASSET=${{ steps.version.outputs.gyllir_asset }}
+            MIDGARD_RELEASE_TAG=${{ steps.version.outputs.midgard_release_tag }}
+            MIDGARD_ASSET=${{ steps.version.outputs.midgard_asset }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Extract release assets
+        env:
+          LIB_ASSET: ${{ steps.version.outputs.lib_asset }}
+          YIL_ASSET: ${{ steps.version.outputs.yil_asset }}
+        run: |
+          CID="$(docker create ymirc-release-build:latest)"
+          docker cp "${CID}:/libymirc_release.a" "./${LIB_ASSET}"
+          docker cp "${CID}:/ymirc_yil.zip" "./${YIL_ASSET}"
+          docker rm "${CID}"
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.version.outputs.tag_name }}
+          LIB_ASSET: ${{ steps.version.outputs.lib_asset }}
+          YIL_ASSET: ${{ steps.version.outputs.yil_asset }}
+        run: |
+          gh release create "$TAG" \
+            --target "${{ github.sha }}" \
+            --title "Release $TAG" \
+            --notes "ymirc ${TAG} @ ${{ github.sha }}: libymirc.a (release build) plus ${YIL_ASSET}, the golden .yil reference dumps from test_resources/." \
+            "${LIB_ASSET}" "${YIL_ASSET}"
