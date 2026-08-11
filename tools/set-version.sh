@@ -18,7 +18,21 @@ MIDGARD_VERSION_SHORT=$(sed -nE 's/^MIDGARD_VERSION=([0-9]+\.[0-9]+).*/\1/p' YMI
 test -n "$YMIR_VERSION_SHORT" || { echo "set-version: could not read 'version' from gyllir.toml" >&2; exit 1; }
 test -n "$MIDGARD_VERSION_SHORT" || { echo "set-version: could not read MIDGARD_VERSION from YMIR_VERSION" >&2; exit 1; }
 
-sed -i -E "s/^pub lazy __YMIR_VERSION__ = \"[^\"]*\";/pub lazy __YMIR_VERSION__ = \"$YMIR_VERSION_SHORT\";/" src/ymirc/global/common.yr
-sed -i -E "s/^pub lazy MIDGARD_VERSION = \"[^\"]*\";/pub lazy MIDGARD_VERSION = \"$MIDGARD_VERSION_SHORT\";/" src/ymirc/global/common.yr
+# Written through a temporary file and moved back only when the content really
+# changed: 'sed -i' rewrites the file unconditionally, and since this runs as a
+# pre-build command that would bump common.yr's mtime at every build, making
+# gyllir recompile it (and everything importing it) even on an untouched tree.
+COMMON=src/ymirc/global/common.yr
+TMP=$(mktemp "${COMMON}.XXXXXX")
+trap 'rm -f "$TMP"' EXIT
 
-echo "set-version: __YMIR_VERSION__=$YMIR_VERSION_SHORT MIDGARD_VERSION=$MIDGARD_VERSION_SHORT"
+sed -E \
+    -e "s/^pub lazy __YMIR_VERSION__ = \"[^\"]*\";/pub lazy __YMIR_VERSION__ = \"$YMIR_VERSION_SHORT\";/" \
+    -e "s/^pub lazy MIDGARD_VERSION = \"[^\"]*\";/pub lazy MIDGARD_VERSION = \"$MIDGARD_VERSION_SHORT\";/" \
+    "$COMMON" > "$TMP"
+
+if ! cmp -s "$TMP" "$COMMON"; then
+    cat "$TMP" > "$COMMON"
+fi
+
+# echo "set-version: __YMIR_VERSION__=$YMIR_VERSION_SHORT MIDGARD_VERSION=$MIDGARD_VERSION_SHORT"
