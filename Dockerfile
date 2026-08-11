@@ -94,11 +94,10 @@ RUN ./ymirc.test -sf
 # tests fail. `gyllir build --release` rewrites ./libymirc.a in place, hence the debug copy
 # being stashed first.
 #
-# Also bundles the golden .yil files under test_resources/ (the expanded-YIL reference dumps
-# checked into this repo - see CLAUDE.md's golden-file section) into a zip. These are source,
-# not build output, so the zip just packages what's already in the checkout as-is.
+# Also bundles the .yil files produced by the release build under .target/release/yils/ into a
+# zip. These are build output (the expanded-YIL dumps for every module of the compiler itself),
+# and let downstream consumers build ymirc without needing the Ymir source.
 FROM test AS package
-RUN cp libymirc.a /libymirc_debug.a \
-    && gyllir build --release \
+RUN gyllir build --release \
     && cp libymirc.a /libymirc_release.a \
-    && find test_resources -name '*.yil' -print | zip -q /ymirc_yil.zip -@
+    && find .target/release/yils -name '*.yil' -print | zip -q -j /ymirc_yil.zip -@
