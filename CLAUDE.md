@@ -9,6 +9,16 @@ and compiled by the `gyc` GCC-based Ymir compiler. It parses Ymir source, perfor
 validation, and lowers the result to an intermediate language (YIL) for a backend compiler
 (GCC). This repo is the bootstrap frontend only — no backend/codegen lives here.
 
+## Pull request titles
+
+PR titles must read `[YMI-XXX][kind] Log` — `YMI-XXX` is the Linear issue, and `[kind]` is
+optional and defaults to a feature. Known kinds: `feat`/`feature`, `fix`, `perf`, `refactor`,
+`doc(s)`, `test(s)`, `chore`/`ci`/`build`/`style`, `breaking`. This is not cosmetic: the release
+notes are generated from these titles by `.github/scripts/changelog.sh`, one entry per merged PR
+(the commits inside a PR are never listed), grouped by kind. **A PR whose title does not follow
+the format — no issue key, or a kind outside that list — is left out of the release notes
+entirely**; the skip is logged on stderr by the release job, but the change goes unannounced.
+
 ## Build / run / test
 
 Build system is `gyllir` (config in `gyllir.toml`, compiler path points at a local `gyc` build).
