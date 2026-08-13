@@ -50,7 +50,7 @@ use ymirc::semantic::{symbol, generator::_};
 use ymirc::semantic::generator::{type::_, value::_};
 
 use ymirc::global::{core_, state};
-use ymirc::lexing::word;
+use ymirc::lexing::{keys, word};
 
 use ymirc::lint::expander::value::_;
 use std::io;
@@ -146,16 +146,18 @@ pub mod ControlExpander {
      *   - an optional "else" block,
      *   - a final join label.
      *
-     * Optionally inserts coverage instrumentation.
+     * Optionally inserts coverage instrumentation, on both outcomes. When instrumenting, the
+     * "else" side is materialized even for a conditional that has no else branch, so that the
+     * not-taken path of an `if` gets a probe of its own - without it, "were both outcomes
+     * exercised" cannot be answered. Both probes carry `loc`(the location of the conditional),
+     * not the location of the branch bodies.
      *
      * @params:
      *   - loc:       source location of the conditional
      *   - context:   the expansion context
      *   - list:      the statement list to append instructions to
      *   - test:      the YILValue representing the test condition
-     *   - thenLoc:   source location of the "then" branch
      *   - thenList:  list of statements for the "then" branch
-     *   - elseLoc:   source location of the "else" branch
      *   - elseList:  list of statements for the "else" branch
      *   - cover:     whether to emit coverage calls(default: true)
      *
@@ -166,15 +168,17 @@ pub mod ControlExpander {
                         dmut context: &Expander,
                         ref mut list: StmtList,
                         test:         &YILValue,
-                        thenLoc:      &Word,
                         thenList:     StmtList,
-                        elseLoc:      &Word,
                         elseList:     StmtList,
                         cover:        bool = true) {
 
+        // only alter the shape of the generated code when a probe is actually emitted
+        let doCover = cover && context.isCoverageEnabled();
+        let hasElseBlock = elseList.len != 0us || doCover;
+
         let thenLabel = copy YILLabel(loc, "then"s8, context:.generateLblId());
         let endLabel = copy YILLabel(loc, "end"s8, context:.generateLblId());
-        let elseLabel = if (elseList.len != 0us) {
+        let elseLabel = if (hasElseBlock) {
             copy YILLabel(loc, "else"s8, context:.generateLblId())
         } else {
             endLabel
@@ -182,16 +186,16 @@ pub mod ControlExpander {
 
         list:.append(copy YILCondJmp(loc, test, thenLabel, elseLabel));
         list:.append(thenLabel);
-        if cover {
-            ValueExpander::generateCoverageCall(alias context, thenLoc, ref list);
+        if doCover {
+            ValueExpander::generateBranchCoverageCall(alias context, loc, CoverageLocKinds::BRANCH_TRUE, ref list);
         }
         list:.append(thenList);
 
-        if (elseList.len != 0us) {
+        if (hasElseBlock) {
             list:.append(copy YILGoto(loc, endLabel));
             list:.append(elseLabel);
-            if cover {
-                ValueExpander::generateCoverageCall(alias context, elseLoc, ref list);
+            if doCover {
+                ValueExpander::generateBranchCoverageCall(alias context, loc, CoverageLocKinds::BRANCH_FALSE, ref list);
             }
             list:.append(elseList);
         }
@@ -491,8 +495,23 @@ pub mod ControlExpander {
      */
     pub fn finalizeSet(dmut context: &Expander, s: &BlockValue, ref mut list: StmtList)-> &YILValue {
         let mut finVal: &YILValue = YIL_UNIT_VALUE;
+        let mut lastLine = 0u64;
         for i in 0us .. s.values.len {
             let inner = s.values[i];
+            // this is the only place block statements are iterated, so this is where line
+            // coverage is anchored (finalizeInline is left out on purpose: an inlined body comes
+            // from the callee's file, while a coverage frame records a single file)
+            //
+            // consecutive statements sharing a line need a single probe: a statement of a block
+            // is only ever reached by falling through the previous one, so the first probe of
+            // the line already proves the line was reached. Desugarings(a 'for' loop, a match
+            // line, ...) expand into many statements all pointing at the same source line, and
+            // would otherwise emit a runtime call for each of them.
+            if (inner.loc.line != lastLine) {
+                ValueExpander::generateLineCoverageCall(alias context, inner.loc, ref list);
+                lastLine = inner.loc.line;
+            }
+
             finVal = ValueExpander::finalize(alias context, inner, ref list, asLeft-> false);
         }
 
@@ -556,10 +575,9 @@ pub mod ControlExpander {
 
         ControlExpander::finalizeCond(c.loc, alias context,  ref list,
                                       testVar,
-                                      c.thenv.loc,
                                       ifList,
-                                      c.elsev.loc,
-                                      elseList);
+                                      elseList,
+                                      cover-> c.isCoverable);
 
         if (var !of YILUnit) {
             context:.registerVariable(c.uniqId, var);
@@ -714,8 +732,12 @@ pub mod ControlExpander {
             list:.append(copy YILGoto(l.loc, testLabel));
         }
 
+        // a loop is a branch too: entering the body is the taken outcome, falling out of the
+        // loop is the not-taken one. The exit probe needs a label of its own, `endLabel` is also
+        // the target of every `break`.
+        let doCover = context.isCoverageEnabled();
         list:.append(begLabel);
-        ValueExpander::generateCoverageCall(alias context, l.value.loc, ref list);
+        ValueExpander::generateBranchCoverageCall(alias context, l.loc, CoverageLocKinds::BRANCH_TRUE, ref list);
         list:.append(loopList);
 
         if (hasStep) {
@@ -724,9 +746,20 @@ pub mod ControlExpander {
         }
 
         if (test !of YILUnit) {
+            let exitLabel = if (doCover) {
+                copy YILLabel(l.loc, "loop_exit"s8, context:.generateLblId())
+            } else {
+                endLabel
+            };
+
             list:.append(testLabel);
             list:.append(testList);
-            list:.append(copy YILCondJmp(l.loc, test, begLabel, endLabel));
+            list:.append(copy YILCondJmp(l.loc, test, begLabel, exitLabel));
+
+            if (doCover) {
+                list:.append(exitLabel);
+                ValueExpander::generateBranchCoverageCall(alias context, l.loc, CoverageLocKinds::BRANCH_FALSE, ref list);
+            }
         } else {
             list:.append(copy YILGoto(l.loc, begLabel));
         }
