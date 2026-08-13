@@ -79,7 +79,7 @@ COPY . .
 
 # __YMIR_VERSION__ is read from the source instead of being hardcoded, so a bump there can
 # never silently leave the tests compiling against a stdlib installed under the old version.
-RUN YMIR_STDLIB_VERSION="$(sed -nE 's/^pub lazy __YMIR_VERSION__[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p' src/ymirc/global/common.yr)" \
+RUN YMIR_STDLIB_VERSION="$(sed -nE 's/^pub lazy MIDGARD_VERSION[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p' src/ymirc/global/common.yr)" \
     && test -n "$YMIR_STDLIB_VERSION" || \
        (echo "could not read __YMIR_VERSION__ from src/ymirc/global/common.yr" >&2 && exit 1) \
     && mkdir -p /usr/include/ymir \
