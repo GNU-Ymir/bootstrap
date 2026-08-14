@@ -1,0 +1,183 @@
+in yil_serialize;
+
+use ymirc::lint::serialize;
+use ymirc::lint::node::{_, global::_};
+use ymirc::utils::_;
+use ymirc::errors;
+
+use std::{io, conv, fs::_};
+
+use utils;
+
+/**
+ * @returns: the debug rendering of `node`, what a golden .yil file holds for it
+ *
+ * Renderings are what the round trip compares, rather than the nodes themselves: a YILTuple
+ * read back from bytecode is `prepared`, and a prepared tuple is by construction equal to
+ * nothing but itself, so every symbol carrying one would differ whatever the bytecode says.
+ * */
+fn render(node: &YILSymbol)-> [c8] {
+    return normalizeTypeIds(format("%", node, tags-> FormatTags(forDebug-> true)));
+}
+
+/**
+ * @returns: `text`, with the uid of every compound type(`T_12`, `P_4`, `A_7`) replaced by its
+ *           rank of first appearance
+ *
+ * The importer numbers the types it reads from scratch, so the two sides of a round trip never
+ * agree on uids. What must agree is the shape: the same kind of type in the same places, and
+ * the same type shared between exactly the same places, which ranking preserves.
+ * */
+fn normalizeTypeIds(text: [c8])-> [c8] {
+    let dmut ranks: [[c8] => usize] = copy [];
+    let dmut result = copy Formatter();
+
+    let mut i = 0us;
+    while i < text.len {
+        let mut consumed = 1us;
+        let c = text[i];
+        if (c == 'T'c8 || c == 'P'c8 || c == 'A'c8) && i + 2us < text.len && text[i + 1us] == '_'c8 {
+            let mut j = i + 2us;
+            while j < text.len && text[j] >= '0'c8 && text[j] <= '9'c8 { j += 1us; }
+
+            if j != i + 2us {
+                let name = text[i .. j];
+                let rank = if let Ok(r) = ranks[name] { r } else {
+                    ranks[name] = ranks.len;
+                    ranks.len - 1us
+                };
+
+                result:.write(c, '_', rank);
+                consumed = j - i;
+            }
+        }
+
+        if consumed == 1us { result:.write(c); }
+        i += consumed;
+    }
+
+    return result[];
+}
+
+/**
+ * @returns: the index of every symbol of `nodes`, by mangled name
+ * */
+fn indexByName(nodes: [&YILNode])-> [[c8] => usize] {
+    let dmut result: [[c8] => usize] = copy [];
+    for i, n in nodes {
+        if let s: &YILSymbol = n {
+            result[s.name] = i;
+        }
+    }
+
+    return result;
+}
+
+/**
+ * @returns: the symbol of `nodes` named `name`, none if there is no such symbol
+ * */
+fn symbolNamed(nodes: [&YILNode], index: [[c8] => usize], name: [c8])-> (&YILSymbol)? {
+    if let Ok(i) = index[name] {
+        if let s: &YILSymbol = nodes[i] {
+            return s?;
+        }
+    }
+
+    return none;
+}
+
+/**
+ * Compile `package`, let the expansion step serialize the produced YIL into a temporary
+ * directory, read that bytecode back, and check every symbol survived the round trip.
+ *
+ * The importer is the only consumer of what the exporter writes, so the pair is correct only
+ * insofar as import(export(x)) == x. Nothing else in the compiler checks that, and a symbol
+ * that comes back wrong is a miscompilation of every module reading it from bytecode.
+ * */
+fn roundTrip(package: [c8])
+    throws AssertError
+{
+    let outDir = fs::sys::tempDirectory(prefix-> "ymirc_yil_");
+    let mut failure = "";
+    {
+        checkRoundTrip(package, outDir);
+    } catch {
+        e: &AssertError => { failure = e.msg; }
+    }
+
+    { fs::sys::removeDir(outDir, recursive-> true); } catch { _ => {} }
+
+    if (failure != "") {
+        throw copy AssertError(failure);
+    }
+} catch {
+    a: &AssertError => throw a;
+    f: &FsError => {
+        throw copy AssertError(format("% : %", package, f));
+    }
+}
+
+/**
+ * The round trip itself, everything but the creation and the removal of the directory the
+ * bytecode is written to
+ * */
+fn checkRoundTrip(package: [c8], outDir: Path)
+    throws AssertError
+{
+    {
+        let res = utils::compilePackage(package, withYILExport-> outDir);
+        if let Ok(err) = res.err {
+            throw copy AssertError(format("% : %", package, err));
+        }
+
+        let mut imp = YILImporter();
+        let dir = fs::sys::readDir(outDir);
+        for entry in dir {
+            if entry.path.extension() == "yil" {
+                imp:.import(entry.path);
+            }
+        }
+
+        let imported = imp.getNodes();
+        assert(imported.len != 0us, format("% : nothing was imported back", package));
+
+        let expIndex = indexByName(res.exp);
+        for n in imported {
+            if let s: &YILSymbol = n {
+                if let Ok(origin) = symbolNamed(res.exp, expIndex, s.name) {
+                    let expected = render(origin), got = render(s);
+                    if expected != got {
+                        eprintln("--- ", package, " ", s.name, " (expanded)");
+                        eprintln(expected);
+                        eprintln("+++ imported");
+                        eprintln(got);
+                        assert(false, format("% : % did not survive serialization", package, s.name));
+                    }
+                } else {
+                    assert(false, format("% : imported % is not a symbol of the package", package, s.name));
+                }
+            }
+        }
+
+        // Every symbol the package defines must be readable back: a backend reading the
+        // bytecode gets nothing else, so a symbol missing from it is missing from the build
+        let impIndex = indexByName(imported);
+        for n in res.exp {
+            if let s: &YILSymbol = n {
+                assert(s.name in impIndex, format("% : % was not exported", package, s.name));
+            }
+        }
+    }
+} catch {
+    a: &AssertError => throw a;
+    err: &ErrorMsg => {
+        throw copy AssertError(format("% : %", package, err));
+    }
+    f: &FsError => {
+        throw copy AssertError(format("% : %", package, f));
+    }
+}
+
+__test {
+    roundTrip("test_resources/yil_serialize/test1.yr");
+}
