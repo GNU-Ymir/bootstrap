@@ -120,6 +120,12 @@ pub mod CallExpander {
         } else if (c.type.isMovable) {
             if let v: &YILVar = result {
                 ValueExpander::registerDestroy(alias context, v, c.type, ref list, implicit-> true);
+
+                // a ctor call constructs in place, everything else returns by value: the
+                // callee released the result before returning it, the caller owns it now
+                if (c !of CtorCallValue) {
+                    ValueExpander::acquireDestroy(v, ref list);
+                }
             } else panic;
         }
 
@@ -146,16 +152,16 @@ pub mod CallExpander {
 
         let mut params: [&YILValue] = [];
         for i in c.params {
-            let p = ValueExpander::finalize(alias context, i, ref list, asLeft-> false);
-            ValueExpander::removeDestroy(p, ref list);
-            params ~= [p];
+            params ~= [ValueExpander::finalize(alias context, i, ref list, asLeft-> false)];
         }
 
         for i in c.addParams {
-            let p = ValueExpander::finalize(alias context, i, ref list, asLeft-> false);
-            ValueExpander::removeDestroy(p, ref list);
-            params ~= [p];
+            params ~= [ValueExpander::finalize(alias context, i, ref list, asLeft-> false)];
         }
+
+        // the arguments are transferred when the call is entered, not when they are
+        // expanded, until then they are still owned by this frame
+        ValueExpander::transferDestroy(params, ref list);
 
         let name = Mangler::mangle(c.proto);
         context:.registerTouchSym(name, c.proto.implLoc);
@@ -183,17 +189,16 @@ pub mod CallExpander {
         let (inst, value) = CallExpander::finalizeCtorSelf(alias context, c.loc, retType, c.type, c.delegate.instance, ref list);
 
         let mut params: [&YILValue] = [];
+        let mut args: [&YILValue] = [];
         params ~= [inst];
         for pi in c.params {
-            let p = ValueExpander::finalize(alias context, pi, ref list, asLeft-> false);
-            ValueExpander::removeDestroy(p, ref list);
-            params ~= [p];
+            args ~= [ValueExpander::finalize(alias context, pi, ref list, asLeft-> false)];
         }
         for pi in c.addParams {
-            let p = ValueExpander::finalize(alias context, pi, ref list, asLeft-> false);
-            ValueExpander::removeDestroy(p, ref list);
-            params ~= [p];
+            args ~= [ValueExpander::finalize(alias context, pi, ref list, asLeft-> false)];
         }
+
+        params ~= args;
 
         // Class takes a last parameter in ctor calls
         if !c.delegate.proto.classRef.sym.isStruct {
@@ -213,7 +218,17 @@ pub mod CallExpander {
 
         let name = Mangler::mangle(c.delegate.proto);
         context:.registerTouchSym(name, c.delegate.proto.loc);
+
+        // the arguments are transferred when the ctor is entered, not when they are
+        // expanded, until then they are still owned by this frame
+        ValueExpander::transferDestroy(args, ref list);
         list:.append(copy YILCall(c.loc, copy YILNameCallValue(c.loc, YIL_VOID, name, params)));
+
+        // the instance we created is now built, cf. CallExpander::finalizeCtorSelf
+        if (c.delegate.instance of UnitValue) {
+            CallExpander::finalizeCtorSetting(c.loc, c.type, value, alive-> true, ref list);
+        }
+
         return value;
     }
 
@@ -257,10 +272,9 @@ pub mod CallExpander {
         let (varref, _) = ValueExpander::createVarForBlock(alias context, loc, NONE_TYPE, retType, ref list, name-> "__self_%"s8);
         if let cptr: &ClassPtrType = clType {
             if (cptr.isStruct) {
-                if (cptr.sym.isEntity) {
-                    let field = copy YILFieldValue(loc, YIL_UINT_8, varref, name-> ClassKeys::SET);
-                    list:.append(copy YILAffect(loc, field, copy YILIntValue(loc, YIL_UINT_8, 1us)));
-                }
+                // the instance is dead until the ctor built it, a ctor that escapes must
+                // leave a dead location, not a half built one presented as live
+                CallExpander::finalizeCtorSetting(loc, clType, varref, alive-> false, ref list);
 
                 return (copy YILAddrValue(varref.loc, context.typeExpander:.finalizePointer(retType), varref), varref);
             } else {
@@ -285,6 +299,29 @@ pub mod CallExpander {
     }
 
     /**
+     * Emit the SET store of an entity instance being constructed.
+     *
+     * Does nothing when the constructed type is not an entity, those have no SET field.
+     *
+     * @params:
+     *   - loc:    source location of the constructor call
+     *   - clType: the semantic class type being constructed
+     *   - value:  the instance being constructed
+     *   - alive:  whether the instance holds a constructed object at this point
+     *   - list:   the statement list to append the store to
+     *
+     * @returns:
+     *   - void
+     */
+    pub fn finalizeCtorSetting(loc: &Word, clType: &Type, value: &YILValue, alive: bool, ref mut list: StmtList) {
+        if let cptr: &ClassPtrType = clType && (cptr.isStruct && cptr.sym.isEntity) {
+            let field = copy YILFieldValue(loc, YIL_UINT_8, value, name-> ClassKeys::SET);
+            let set = if (alive) { 1us } else { 0us };
+            list:.append(copy YILAffect(loc, field, copy YILIntValue(loc, YIL_UINT_8, set)));
+        }
+    }
+
+    /**
      * Finalize a function-pointer call.
      *
      * Expands parameters, removes destructor scheduling, and dispatches to:
@@ -304,19 +341,22 @@ pub mod CallExpander {
 
         let mut params: [&YILValue] = [];
         for pi in f.params {
-            let p = ValueExpander::finalize(alias context, pi, ref list, asLeft-> false);
-            ValueExpander::removeDestroy(p, ref list);
-            params ~= [p];
+            params ~= [ValueExpander::finalize(alias context, pi, ref list, asLeft-> false)];
         }
 
         if let n: &ProtoFuncPtrValue = f.fptr {
             let proto = Mangler::mangle(n.proto);
             context:.registerTouchSym(proto, n.proto.implLoc);
 
+            ValueExpander::transferDestroy(params, ref list);
             return copy YILNameCallValue(f.loc, retType, proto, params);
         }
 
         let fptr = ValueExpander::finalize(alias context, f.fptr, ref list, asLeft-> false);
+
+        // the arguments are transferred when the call is entered, not when they are
+        // expanded, until then they are still owned by this frame
+        ValueExpander::transferDestroy(params, ref list);
         return copy YILPtrCallValue(f.loc, retType, fptr, params);
     }
 
@@ -361,27 +401,27 @@ pub mod CallExpander {
         };
 
         params ~= [inst];
-        ValueExpander::removeDestroy(inst, ref list);
         for pi in f.params {
-            let p = ValueExpander::finalize(alias context, pi, ref list, asLeft-> false);
-            ValueExpander::removeDestroy(p, ref list);
-            params ~= [p];
+            params ~= [ValueExpander::finalize(alias context, pi, ref list, asLeft-> false)];
         }
 
         for pi in f.addParams {
-            let p = ValueExpander::finalize(alias context, pi, ref list, asLeft-> false);
-            ValueExpander::removeDestroy(p, ref list);
-            params ~= [p];
+            params ~= [ValueExpander::finalize(alias context, pi, ref list, asLeft-> false)];
         }
 
         if (isDirect) {
             let name = Mangler::mangle(methProto.proto);
             context:.registerTouchSym(name, methProto.proto.implLoc);
 
+            ValueExpander::transferDestroy(params, ref list);
             return copy YILNameCallValue(f.loc, retType, name, params);
         }
 
         let fptr = CallExpander::createVtableAccess(alias context, f.loc, inst, methProto.vtableIndex, ref list);
+
+        // the arguments are transferred when the call is entered, not when they are
+        // expanded, until then they are still owned by this frame
+        ValueExpander::transferDestroy(params, ref list);
         return copy YILPtrCallValue(f.loc, retType, fptr, params);
     }
 
