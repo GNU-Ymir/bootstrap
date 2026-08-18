@@ -100,4 +100,4 @@ RUN ./ymirc.test -sf
 FROM test AS package
 RUN gyllir build --release \
     && cp libymirc.a /libymirc_release.a \
-    && find .target/release/yils -name '*.yil' -print | zip -q -j /ymirc_yil.zip -@
+    && find .target/ymirc/release/yils -name '*.yil' -print | zip -q -j /ymirc_yil.zip -@
