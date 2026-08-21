@@ -85,7 +85,7 @@ RUN YMIR_STDLIB_VERSION="$(sed -nE 's/^pub lazy MIDGARD_VERSION[[:space:]]*=[[:s
     && mkdir -p /usr/include/ymir \
     && ln -sfn /opt/ymir-stdlib "/usr/include/ymir/${YMIR_STDLIB_VERSION}"
 
-RUN gyllir test --dry
+RUN gyllir test --dry -j 12
 
 FROM build AS test
 RUN ./ymirc.test -sf
@@ -98,6 +98,6 @@ RUN ./ymirc.test -sf
 # zip. These are build output (the expanded-YIL dumps for every module of the compiler itself),
 # and let downstream consumers build ymirc without needing the Ymir source.
 FROM test AS package
-RUN gyllir build --release \
+RUN gyllir build --release -j 12 \
     && cp libymirc.a /libymirc_release.a \
     && find .target/ymirc/release/yils -name '*.yil' -print | zip -q -j /ymirc_yil.zip -@
