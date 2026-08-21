@@ -257,7 +257,41 @@ fn compareResultWithFile(types: [&YILType], yil: [&YILNode], filename: Path, rem
         }
     }
 
-    compareResultWithString(stream, output, origin-> filename.toStr());
+    compareResultWithString(stream, output, origin-> filename.toStr(), canonicalizeIds-> true);
+}
+
+// Golden dumps use this in place of the absolute path to the installed standard library
+// (see expandRuntimePathPlaceholder), since that path isn't portable across machines/toolchains.
+def RUNTIME_PATH_PLACEHOLDER = "{{RUNTIME_PATH}}";
+
+/**
+ * A panic embeds the source location it was raised from as a literal string — for a check
+ * that lives inside a generic/template defined by the standard library itself(e.g. an array
+ * bounds check embeds the location of the runtime's own `core::types::array.yr`), that is
+ * the absolute install path of the runtime, not a path relative to the compiled package(see
+ * `state::relativePath`, which only relativizes paths under the current working directory).
+ * That install path isn't portable(`/usr/include/ymir/<version>` by default, but
+ * configurable, and the version component changes with the runtime), so golden dumps spell
+ * it as `{{RUNTIME_PATH}}` instead. Expand it back to whatever path this run's toolchain
+ * actually used before comparing against the produced dump.
+ * */
+fn expandRuntimePathPlaceholder(txt: [c8])-> [c8] {
+    let placeholder = RUNTIME_PATH_PLACEHOLDER;
+    let actual = ymirc::global::state::corePath().toStr();
+
+    let mut res: [c8] = [];
+    let mut i = 0us;
+    while i < txt.len {
+        if (i + placeholder.len <= txt.len && txt[i .. i + placeholder.len] == placeholder) {
+            res ~= actual;
+            i += placeholder.len;
+        } else {
+            res ~= [txt[i]];
+            i += 1us;
+        }
+    }
+
+    res
 }
 
 /**
@@ -267,13 +301,22 @@ fn compareResultWithFile(types: [&YILType], yil: [&YILNode], filename: Path, rem
  *    - stream: the produced result
  *    - output: the expected text
  *    - origin: what to name in the error message(the golden file, usually)
+ *    - canonicalizeIds: renumber the T_/P_/A_ global type ids of both texts before comparing,
+ *      so a harmless renumbering (nondeterministic type-discovery order during expansion)
+ *      does not fail the test — see canonicalizeTypeIds
  * */
-pub fn compareResultWithString(stream: &Formatter, output: [c8], origin: [c8] = "")
+pub fn compareResultWithString(stream: &Formatter, output: [c8], origin: [c8] = "", canonicalizeIds: bool = false)
     throws AssertError
 {
-    let res = removeColors(stream[]);
-    if (res != output) {
-        let d = diff::diffLines(diff::splitLines(output), diff::splitLines(res));
+    let mut res = removeColors(stream[]);
+    let mut exp = expandRuntimePathPlaceholder(output);
+    if (canonicalizeIds) {
+        res = canonicalizeTypeIds(res);
+        exp = canonicalizeTypeIds(exp);
+    }
+
+    if (res != exp) {
+        let d = diff::diffLines(diff::splitLines(exp), diff::splitLines(res));
         let name = if origin == "" { "result" } else { origin };
 
         eprintln(Colors::YELLOW, "--- ", name, " (expected)", Colors::RESET);
@@ -285,6 +328,231 @@ pub fn compareResultWithString(stream: &Formatter, output: [c8], origin: [c8] = 
     }
 }
 
+/**
+ * Find every occurrence of a global YIL type id(T_<n>, P_<n>, A_<n>) in a line
+ * @returns: the list of(offset, full token), in left to right order
+ * */
+fn findTypeIds(line: [c8])-> [(usize, [c8])] {
+    let mut res: [(usize, [c8])] = [];
+    let mut i = 0us;
+    while i < line.len {
+        let c = line[i];
+        let isBoundary = i == 0us || !isIdentChar(line[i - 1us]);
+        if (c == 'T' || c == 'P' || c == 'A') && isBoundary
+            && i + 2us < line.len && line[i + 1us] == '_'
+            && line[i + 2us] >= '0' && line[i + 2us] <= '9'
+        {
+            let mut j = i + 2us;
+            while j < line.len && line[j] >= '0' && line[j] <= '9' {
+                j += 1us;
+            }
+
+            res ~= [(i, line[i .. j])];
+            i = j;
+        } else {
+            i += 1us;
+        }
+    }
+
+    res
+}
+
+fn isIdentChar(c: c8)-> bool {
+    (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_'
+}
+
+/**
+ * @returns: true iif line is a top level type declaration("tuple T_.. ;", "pointer P_.. ;",
+ *           "array A_.. ;"), as opposed to a const/frame body line
+ * */
+fn isTypeDecl(line: [c8])-> bool {
+    (line.len >= 6us && line[0us .. 6us] == "tuple ")
+        || (line.len >= 8us && line[0us .. 8us] == "pointer ")
+        || (line.len >= 6us && line[0us .. 6us] == "array ")
+}
+
+/**
+ * Renumber the global type ids(T_<n>, P_<n>, A_<n>) referenced in a line, following the
+ * mapping built by canonicalizeTypeIds
+ * */
+fn renumberTypeIds(line: [c8], canon: [[c8] => usize])-> [c8] {
+    let mut res: [c8] = [];
+    let mut pos = 0us;
+    for m in findTypeIds(line) {
+        res ~= line[pos .. m.0];
+        res ~= [m.1[0us]];
+        res ~= "_";
+        if let Ok(cid: usize) = canon[m.1] {
+            res ~= conv::to!{[c8]}(cid);
+        }
+        pos = m.0 + (m.1).len;
+    }
+
+    res ~= line[pos .. $];
+
+    res
+}
+
+/**
+ * The `.yil` dump lists every generated YIL type(tuple/pointer/array) with a global id,
+ * assigned in the order the TypeExpander first discovers each distinct type while walking
+ * the semantic tree(see TypeExpander._uid, ymirc::lint::expander::type). That discovery
+ * order is not guaranteed stable across runs(hash-map/set iteration order somewhere
+ * upstream), so the exact ids — and sometimes the order the type declarations are printed
+ * in — can shift between two otherwise-identical compilations(see YMI-146).
+ *
+ * So instead of comparing raw ids, renumber every type in two passes.
+ *
+ * Pass 1 walks the frame/const bodies — printed in a fixed, source-derived order, so
+ * already deterministic — in that fixed order, and every time a not yet-numbered type is
+ * referenced, numbers it and recurses into whatever types *it* references. This is what
+ * correctly tells apart types that are structurally identical but conceptually distinct,
+ * e.g. three classes with the same empty vtable+monitor layout: nothing in their own
+ * declaration text differs, only *which frame uses which one* does.
+ *
+ * Pass 2 orders whatever pass 1 never reached(a type only ever referenced from other
+ * types' declarations, never named directly in a body — e.g. a class name string's own
+ * length/pointer/block-info tuple, which const dumps print inlined rather than by id) by a
+ * structural fixpoint instead: repeatedly canonicalize whichever remaining types have every
+ * type they reference already numbered(their declaration, with those references
+ * substituted, is then a pure function of structure), ordering same-round types by that
+ * text. A reference cycle confined entirely to this leftover set(nothing analogous has
+ * been seen in practice, but two mutually-recursive types with no direct body user aren't
+ * impossible) is broken by sorting on declaration text with unresolved references left
+ * blank — still never a raw numeric id, so still run-independent.
+ *
+ * Two structurally equivalent dumps always end up with the same canonical ids this way,
+ * regardless of which raw ids the two runs happened to assign, so only a genuine structural
+ * difference(a real extra/missing/mismatched type) still shows up as a diff.
+ * */
+fn canonicalizeTypeIds(txt: [c8])-> [c8] {
+    let lines = diff::splitLines(txt);
+
+    let dmut headerMap: [[c8] => [c8]] = copy [];
+    let mut headerOrder: [[c8]] = [];
+    let mut bodyLines: [[c8]] = [];
+
+    for line in lines {
+        let mut isHeader = false;
+        if (isTypeDecl(line)) {
+            let ids = findTypeIds(line);
+            if (ids.len != 0us) {
+                headerMap[ids[0us].1] = copy line;
+                headerOrder ~= [ids[0us].1];
+                isHeader = true;
+            }
+        }
+
+        if (!isHeader) {
+            bodyLines ~= [line];
+        }
+    }
+
+    let dmut canon: [[c8] => usize] = copy [];
+    let mut nextId = 1us;
+
+    // Pass 1: forward walk from the bodies.
+    let mut queue: [[c8]] = [];
+    for line in bodyLines {
+        for m in findTypeIds(line) {
+            if (m.1 !in canon) {
+                canon[m.1] = nextId;
+                nextId += 1us;
+                queue ~= [m.1];
+            }
+        }
+    }
+
+    let mut qi = 0us;
+    while qi < queue.len {
+        let id = queue[qi];
+        qi += 1us;
+
+        if let Ok(declLine: [c8]) = headerMap[id] {
+            let refs = findTypeIds(declLine);
+            for i in 1us .. refs.len {
+                let m = refs[i];
+                if (m.1 !in canon) {
+                    canon[m.1] = nextId;
+                    nextId += 1us;
+                    queue ~= [m.1];
+                }
+            }
+        }
+    }
+
+    // Pass 2: structural fixpoint over whatever pass 1 left unreached.
+    let mut remaining = 0us;
+    for id in headerOrder {
+        if (id !in canon) { remaining += 1us; }
+    }
+
+    while remaining != 0us {
+        let mut ready: [mut([c8], [c8])] = [];
+
+        for id in headerOrder {
+            if (id !in canon) {
+                if let Ok(declLine: [c8]) = headerMap[id] {
+                    let refs = findTypeIds(declLine);
+                    let mut allKnown = true;
+                    for i in 1us .. refs.len {
+                        if ((refs[i]).1 !in canon) { allKnown = false; }
+                    }
+
+                    if (allKnown) {
+                        ready ~= [(id, renumberTypeIds(declLine, canon))];
+                    }
+                }
+            }
+        }
+
+        if (ready.len == 0us) {
+            // A reference cycle confined to the leftover set: sort by declaration text with
+            // unresolved references left blank(renumberTypeIds already does this), so the
+            // key is still never a raw numeric id.
+            for id in headerOrder {
+                if (id !in canon) {
+                    if let Ok(declLine: [c8]) = headerMap[id] {
+                        ready ~= [(id, renumberTypeIds(declLine, canon))];
+                    }
+                }
+            }
+        }
+
+        ready = std::algorithm::sorting::sort(alias ready, |a, b| => { a.1 < b.1 });
+        for r in ready {
+            if (r.0 !in canon) {
+                canon[r.0] = nextId;
+                nextId += 1us;
+                remaining -= 1us;
+            }
+        }
+    }
+
+    let mut headerPairs: [mut(usize, [c8])] = [];
+    for id in headerOrder {
+        if let Ok(cid: usize) = canon[id] {
+            if let Ok(declLine: [c8]) = headerMap[id] {
+                headerPairs ~= [(cid, renumberTypeIds(declLine, canon))];
+            }
+        }
+    }
+
+    headerPairs = std::algorithm::sorting::sort(alias headerPairs, |a, b| => { a.0 < b.0 });
+
+    let mut res: [c8] = [];
+    for p in headerPairs {
+        res ~= p.1;
+        res ~= "\n";
+    }
+
+    for line in bodyLines {
+        res ~= renumberTypeIds(line, canon);
+        res ~= "\n";
+    }
+
+    res
+}
 
 pub fn compareErrorWithFile(error: (&ErrorMsg)?, filename: Path)
     throws AssertError
