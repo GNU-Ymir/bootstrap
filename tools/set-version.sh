@@ -12,7 +12,7 @@
 # job. Run automatically as a pre-build command, see gyllir.toml.
 set -e
 
-YMIR_VERSION_SHORT=$(sed -nE 's/^version = "([0-9]+\.[0-9]+).*/\1/p' gyllir.toml)
+YMIR_VERSION_SHORT=$(sed -nE '/^\[/q; s/^version = "([0-9]+\.[0-9]+).*/\1/p' gyllir.toml)
 MIDGARD_VERSION_SHORT=$(sed -nE 's/^MIDGARD_VERSION=([0-9]+\.[0-9]+).*/\1/p' YMIR_VERSION)
 
 test -n "$YMIR_VERSION_SHORT" || { echo "set-version: could not read 'version' from gyllir.toml" >&2; exit 1; }
@@ -35,4 +35,3 @@ if ! cmp -s "$TMP" "$COMMON"; then
     cat "$TMP" > "$COMMON"
 fi
 
-# echo "set-version: __YMIR_VERSION__=$YMIR_VERSION_SHORT MIDGARD_VERSION=$MIDGARD_VERSION_SHORT"
