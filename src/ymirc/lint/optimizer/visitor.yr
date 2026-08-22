@@ -1,10 +1,59 @@
+/*
+ * Declares the Optimizer, the pass manager of the YIL optimization stage.
+ *
+ * The Optimizer runs between the Expander and the YIL dump/export, so that what
+ * is dumped, exported and handed to the backend is the optimized YIL. It owns
+ * an ordered list of OptimizerPass, and applies them one after the other over
+ * every frame of the module.
+ *
+ * The pipeline is data, not control flow: the order of the list is the order of
+ * the passes, and the same pass may appear twice(copy propagation, then dead
+ * code elimination, then copy propagation again). Each pass is gated by a
+ * minimum `-O` level, and can be forced on or off individually with
+ * `-fenable-pass=` / `-fdisable-pass=` to bisect a miscompilation down to a
+ * single transformation.
+ *
+ * At `-O0` the Optimizer runs nothing at all and returns the expander output
+ * untouched, so the YIL is byte identical to what the compiler produced before
+ * this stage existed.
+ *
+ * <hr>
+ *
+ * @Package: ymirc
+ * @Module: ymirc::lint::optimizer::visitor
+ * @File: ymirc/lint/optimizer/visitor.yr
+ * @Author(s):
+ *   - Emile Cadorel <ecadorel@gmail.com>
+ *
+ * @Created(YYYY-MM-DD): 2025-01-04
+ * @Copyright(C) 2021–2026 GNU-Ymir
+ * @License
+ *   ```text
+ *   This file is part of the Ymir language project.
+ *
+ *   Ymir is free software: you can redistribute it and/or modify it
+ *   under the terms of the GNU General Public License as published by
+ *   the Free Software Foundation, either version 3 of the License, or
+ *   (at your option) any later version.
+ *
+ *   Ymir is distributed in the hope that it will be useful,
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *   GNU General Public License for more details.
+ *
+ *   You should have received a copy of the GNU General Public License
+ *   along with Ymir.  If not, see <https://www.gnu.org/licenses/>.
+ *   ```
+ */
+
 in visitor;
 
-use std::io;
+use std::{io, fs::{_, path}};
 
+use ymirc::global;
 use ymirc::utils::format;
 use ymirc::lint::{node::{_, global::_, instr::_, type::_, value::_},
-                  optimizer::bblock};
+                  optimizer::{bblock, pass_}};
 
 use ymirc::lexing::word;
 use ymirc::lexing::keys;
@@ -14,75 +63,169 @@ use ymirc::lexing::keys;
  */
 pub class Optimizer {
 
-    // The list of generators provided by the previous pass(validation)
-    let mut _nodes: [&YILNode] = [];
+    // The optimization level of the current compilation(0 means no pass is run)
+    let _level: u32;
 
-    // The list of optimized generators
-    let mut _optimized: [mut &YILNode] = [];
+    // The passes to apply, in application order
+    let mut _passes: [dmut &OptimizerPass] = [];
 
-    /**
-     * Create a new empty optimizer
-     * */
-    pub self () {}
+    // The path of the module being optimized, used as the base name of the dumps
+    let mut _dumpPath: Path = Path("");
 
     /**
-     * Optimize a list of generators
-     * */
-    pub fn optimize(mut self, generators: [&YILNode])-> [&YILNode] {
-        self._nodes = generators;
-        for gen in self._nodes {
-            self:.optimize(gen);
-        }
-
-        self._optimized
-    }
-
-    /**
-     * Optimize a generator
-     * */
-    pub fn optimize(mut self, gen: &YILNode) {
-        match gen {
-            frame: &YILFrame => {
-                self:.optimizeFrame(frame);
-            }
-            _ => {
-                self._optimized ~= [gen];
-            }
-        }
-    }
-
-    /**
-     * Optimize a frame generator
+     * Create a new optimizer.
+     *
      * @params:
-     *    - frame: the frame to optimize
+     *    - level: the optimization level(`-O`), 0 disabling every pass
      * */
-    pub fn optimizeFrame(mut self, frame: &YILFrame) {
-        // let dmut entryBB = copy BasicBlock();
-        // let dmut  exitBB = copy BasicBlock();
+    pub self (level: u32 = 0u32)
+        with _level = level
+    {}
 
-        // match frame.getBody() {
-        //     b: &YILBlock => {
-        //         let dmut bb = self.createBasicBlockFromBlock(b, parent-> alias entryBB, exit-> alias exitBB);
-        //         if (bb.isFalling()) {
-        //             exitBB:.insertFrom(alias bb, copy YILIntValue(EOF_WORD, YIL_UINT_8, 1));
-        //         }
-        //     }
-        //     x: _ => {
-        //         eprintln(x.__typeinfo__.name);
-        //         panic;
-        //     }
-        // }
+    /*!
+     * ================================================================================
+     * ================================================================================
+     * ============================          PASSES          ==========================
+     * ================================================================================
+     * ================================================================================
+     */
 
-        // let dmut fr = copy Formatter();
-        // fr:.write("digraph {");
-        // fr:.entabing();
-        // entryBB.format(alias fr);
-        // fr:.detabing();
-        // fr:.write("}");
+    /**
+     * Append a pass at the end of the pipeline.
+     *
+     * The same pass instance must not be registered twice: register two
+     * instances instead, so that their statistics stay distinguishable.
+     *
+     * @params:
+     *    - pass: the pass to append
+     * */
+    pub fn addPass(mut self, dmut pass: &OptimizerPass) {
+        self._passes ~= [alias pass];
+    }
 
-        // println(fr[]);
+    /**
+     * @returns: the passes of the pipeline, in application order
+     * */
+    pub fn getPasses(self)-> [&OptimizerPass] {
+        self._passes
+    }
 
-        self._optimized ~= [frame];
+    /*!
+     * ================================================================================
+     * ================================================================================
+     * ===========================          OPTIMIZE          =========================
+     * ================================================================================
+     * ================================================================================
+     */
+
+    /**
+     * Optimize a list of generators.
+     *
+     * @params:
+     *    - generators: the YIL nodes produced by the expander
+     *    - dumpPath:   the path of the module, used as the base name of the dumps
+     * @returns: the optimized nodes, or `generators` untouched at `-O0`
+     * */
+    pub fn optimize(mut self, generators: [&YILSymbol], dumpPath: Path = Path(""))-> [&YILSymbol] {
+        self._dumpPath = dumpPath;
+
+        if (self._level == 0u32) return generators;
+
+        let mut current = generators;
+        let mut nb = 0us;
+
+        for i in 0us .. self._passes.len {
+            let dmut pass = alias self._passes[i];
+            if (!pass.isEnabledAt(self._level)) continue;
+
+            current = self.applyPass(alias pass, current);
+            nb += 1us;
+
+            if (global::state::isYilOptDumpingEachActive()) {
+                self.dumpNodes(current, format("ydump-yil.%.%", nb, pass.name));
+            }
+        }
+
+        if (global::state::isYilOptDumpingActive()) {
+            self.dumpNodes(current, "ydump-yil-opt");
+        }
+
+        if (global::state::isOptStatsActive()) {
+            self.printStats();
+        }
+
+        current
+    }
+
+    /**
+     * Apply a single pass over every frame of the module.
+     *
+     * @params:
+     *    - pass:  the pass to apply
+     *    - nodes: the nodes to transform
+     * @returns: the transformed nodes
+     * */
+    fn applyPass(self, dmut pass: &OptimizerPass, nodes: [&YILSymbol])-> [&YILSymbol] {
+        let mut res: [mut &YILSymbol] = [];
+        for gen in nodes {
+            match gen {
+                frame: &YILFrame => {
+                    res ~= [pass:.apply(frame)];
+                }
+                _ => {
+                    res ~= [gen];
+                }
+            }
+        }
+
+        res
+    }
+
+    /*!
+     * ================================================================================
+     * ================================================================================
+     * ==========================          DUMPING          ===========================
+     * ================================================================================
+     * ================================================================================
+     */
+
+    /**
+     * Write the YIL nodes to `<module>.<ext>`.
+     *
+     * Failing to write a dump is never fatal: dumps are a debugging aid, and a
+     * read only build directory must not break the compilation.
+     *
+     * @params:
+     *    - nodes: the nodes to write
+     *    - ext:   the extension of the dump file
+     * */
+    fn dumpNodes(self, nodes: [&YILSymbol], ext: [c8]) {
+        if (self._dumpPath.toStr() == "") return;
+
+        {
+            let dmut f = File::create(self._dumpPath.addExtension(ext), write-> true);
+            for n in nodes {
+                f:.write(format("%\n", n, tags-> FormatTags(withVarIds-> true)));
+            }
+        } catch {
+            err: &FsError => println(err);
+        }
+    }
+
+    /**
+     * Print the per pass statistics table on the standard output(`--fopt-stats`).
+     * */
+    fn printStats(self) {
+        println("YIL optimizer statistics (-O", self._level, ") : ", self._dumpPath.toStr());
+        for i in 0us .. self._passes.len {
+            let pass = self._passes[i];
+            if (!pass.isEnabledAt(self._level)) continue;
+
+            println("  ", pass.name, " :", if (pass.isNoop()) { " nothing" } else { "" });
+            for k, v in pass.getStats() {
+                if (v != 0us) println("    ", k, " : ", v);
+            }
+        }
     }
 
     /*!
@@ -150,11 +293,5 @@ pub class Optimizer {
 
         alias current
     }
-
-
-
-
-
-
 
 }
