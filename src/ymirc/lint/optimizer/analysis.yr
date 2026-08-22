@@ -1,0 +1,811 @@
+/*
+ * Declares FrameDataflow, the three analyses the optimizer runs over a frame.
+ *
+ * It is what a pass asks for: given a frame, it builds the control flow graph,
+ * extracts the def/use of every instruction, fills the gen and kill sets of
+ * every block, and solves liveness, reaching definitions and available
+ * expressions over them.
+ *
+ * The three of them share the solver of `optimizer::dataflow` and differ only by
+ * what a fact is:
+ *
+ *   - liveness numbers the variables of the frame. `gen` is the variables a
+ *     block reads before writing them, `kill` the ones it entirely overwrites,
+ *   - reaching definitions numbers the writes the frame makes, one fact per
+ *     variable written per instruction. A write that overwrites the whole
+ *     variable kills every other write to it, a partial one(a field, a store
+ *     through a pointer, an in/out parameter) kills nothing,
+ *   - available expressions numbers the expressions the frame computes, a
+ *     side effect free operation over variables and literals. A write to a
+ *     variable kills every expression reading it.
+ *
+ * The dump of `--fdump-dataflow=` prints the three of them per block, which is
+ * the only readable way of checking a fixpoint by hand.
+ *
+ * <hr>
+ *
+ * @Package: ymirc
+ * @Module: ymirc::lint::optimizer::analysis
+ * @File: ymirc/lint/optimizer/analysis.yr
+ * @Author(s):
+ *   - Emile Cadorel <ecadorel@gmail.com>
+ *
+ * @Created(YYYY-MM-DD): 2026-08-22
+ * @Copyright(C) 2021–2026 GNU-Ymir
+ * @License
+ *   ```text
+ *   This file is part of the Ymir language project.
+ *
+ *   Ymir is free software: you can redistribute it and/or modify it
+ *   under the terms of the GNU General Public License as published by
+ *   the Free Software Foundation, either version 3 of the License, or
+ *   (at your option) any later version.
+ *
+ *   Ymir is distributed in the hope that it will be useful,
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *   GNU General Public License for more details.
+ *
+ *   You should have received a copy of the GNU General Public License
+ *   along with Ymir.  If not, see <https://www.gnu.org/licenses/>.
+ *   ```
+ */
+
+in analysis;
+
+use std::{io, stream, conv};
+
+use ymirc::utils::format;
+use ymirc::lint::node::{_, global::_, instr::_, type::_, value::_};
+use ymirc::lint::optimizer::{bblock, cfg, dataflow, defuse};
+
+/**
+ * The index of the liveness solution in the solutions of a FrameDataflow.
+ * */
+def LIVENESS = 0us;
+
+/**
+ * The index of the reaching definitions solution.
+ * */
+def REACHING = 1us;
+
+/**
+ * The index of the available expressions solution.
+ * */
+def AVAILABLE = 2us;
+
+/**
+ * The dataflow of a single frame: its graph, its def/use, and the fixpoint of
+ * the three analyses over them.
+ * */
+pub class FrameDataflow {
+
+    // The mangled name of the frame the dataflow was computed of
+    let _name: [c8];
+
+    // The control flow graph the analyses were solved over
+    let dmut _cfg: &CFG;
+
+    // What every instruction of the frame reads and writes
+    let _defuse: &DefUse;
+
+    // The name of every variable of the frame, in universe order
+    let mut _names: [[c8]] = [];
+
+    // The solved analyses, in the LIVENESS, REACHING, AVAILABLE order
+    let mut _solutions: [&Solution] = [];
+
+    /**
+     * Compute the dataflow of a frame.
+     *
+     * @params:
+     *    - frame: the frame to analyse
+     * */
+    pub self (frame: &YILFrame)
+        with _name = frame.name
+        , _cfg = copy CFG(frame)
+        , _defuse = copy DefUse(frame)
+    {
+        self._names = varNames(frame, self._defuse);
+        self:.fillSummaries();
+
+        let live = dataflow::solve(self._cfg, self.buildLiveness());
+        let reach = dataflow::solve(self._cfg, self.buildReaching());
+        let avail = dataflow::solve(self._cfg, self.buildAvailable());
+
+        self._solutions = copy [live, reach, avail];
+    }
+
+    /*!
+     * ================================================================================
+     * ================================================================================
+     * ============================          GETTERS          =========================
+     * ================================================================================
+     * ================================================================================
+     */
+
+    /**
+     * @returns: the mangled name of the frame
+     * */
+    pub fn getName(self)-> [c8] {
+        self._name
+    }
+
+    /**
+     * @returns: the control flow graph the analyses were solved over
+     * */
+    pub fn getCfg(self)-> &CFG {
+        self._cfg
+    }
+
+    /**
+     * @returns: what every instruction of the frame reads and writes
+     * */
+    pub fn getDefUse(self)-> &DefUse {
+        self._defuse
+    }
+
+    /**
+     * @returns: the name of every variable of the frame, in universe order
+     * */
+    pub fn getVarNames(self)-> [[c8]] {
+        self._names
+    }
+
+    /**
+     * @returns: the liveness of the variables of the frame
+     * */
+    pub fn getLiveness(self)-> &Solution {
+        self._solutions[LIVENESS]
+    }
+
+    /**
+     * @returns: the definitions reaching every block of the frame
+     * */
+    pub fn getReachingDefs(self)-> &Solution {
+        self._solutions[REACHING]
+    }
+
+    /**
+     * @returns: the expressions available at every block of the frame
+     * */
+    pub fn getAvailableExprs(self)-> &Solution {
+        self._solutions[AVAILABLE]
+    }
+
+    /*!
+     * ================================================================================
+     * ================================================================================
+     * ===========================          LIVENESS          =========================
+     * ================================================================================
+     * ================================================================================
+     */
+
+    /**
+     * @params:
+     *    - bb: a block of the frame
+     *    - id: the identifier of a variable of the frame
+     * @returns: true iif the variable holds, at the top of the block, a value
+     * that some path reads before overwriting it
+     * */
+    pub fn isLiveIn(self, bb: &BasicBlock, id: usize)-> bool {
+        self.getLiveness().holdsIn(bb, self._defuse.indexOf(id))
+    }
+
+    /**
+     * @params:
+     *    - bb: a block of the frame
+     *    - id: the identifier of a variable of the frame
+     * @returns: true iif the variable holds, at the bottom of the block, a value
+     * that some path reads before overwriting it
+     * */
+    pub fn isLiveOut(self, bb: &BasicBlock, id: usize)-> bool {
+        self.getLiveness().holdsOut(bb, self._defuse.indexOf(id))
+    }
+
+    /**
+     * @params:
+     *    - name: the name a variable is declared under in the source
+     * @returns: the identifier of that variable, none iif the frame declares no
+     * variable of that name
+     *
+     * Two variables of a frame may share a name, the innermost one is returned.
+     * This is a convenience for the tests and for whoever debugs a pass by hand,
+     * a pass itself always knows the identifier of the variable it works on.
+     * */
+    pub fn varNamed(self, name: [c8])-> (usize)? {
+        let mut res: (usize)? = none;
+        for v in self._defuse.getVars() {
+            if (v.name == name) res = v.id?;
+        }
+
+        res
+    }
+
+    /*!
+     * ================================================================================
+     * ================================================================================
+     * ===========================          BUILDING          =========================
+     * ================================================================================
+     * ================================================================================
+     */
+
+    /**
+     * Fill the gen and kill sets of every block of the graph.
+     *
+     * They are the ones of the liveness: the variables the block reads before
+     * writing them, and the ones it entirely overwrites. Every other analysis
+     * derives its own sets from the def/use of the instructions, those two are
+     * the ones a pass reads often enough to be worth keeping on the block.
+     * */
+    fn fillSummaries(mut self) {
+        let dmut blocks = alias self._cfg:.blocksMut();
+        for i in 0us .. blocks.len {
+            let dmut b = alias blocks[i];
+            let sum = blockDefUse(self._defuse, b);
+
+            b:.setSummary(sum.0, sum.1);
+        }
+    }
+
+    /**
+     * @returns: the liveness analysis of the frame, its gen and kill sets being
+     * the summary the blocks carry
+     * */
+    fn buildLiveness(self)-> &Analysis {
+        let nb = self._names.len;
+        let dmut res = copy Analysis("liveness", Direction::BACKWARD, MeetKind::UNION, self._names);
+
+        for b in self._cfg.getBlocks() {
+            let mut gen = dataflow::setEmpty(nb);
+            let mut kill = dataflow::setEmpty(nb);
+
+            for g in b.getGens() { gen = dataflow::setWith(gen, self._defuse.indexOf(g)); }
+            for k in b.getKills() { kill = dataflow::setWith(kill, self._defuse.indexOf(k)); }
+
+            res:.setBlock(b.getUid(), gen, kill);
+        }
+
+        res
+    }
+
+    /**
+     * @returns: the reaching definitions analysis of the frame
+     *
+     * A fact is one write made by one instruction. A write that overwrites the
+     * whole variable kills every other write to that variable, a partial one
+     * kills nothing: what the variable held may still be there.
+     * */
+    fn buildReaching(self)-> &Analysis {
+        let mut names: [[c8]] = [];
+        let mut byVar: [usize => mut [usize]] = copy [];
+        let mut byBlock: [usize => mut [(usize, usize, bool, usize)]] = copy [];
+
+        for b in self._cfg.getBlocks() {
+            let mut inBlock: [(usize, usize, bool, usize)] = [];
+            for z, instr in b.getInstrs() {
+                let du = self._defuse.ofInstr(instr);
+                for d in du.getDefs() {
+                    let fact = names.len;
+                    names ~= [format("%:BB%#%", self.nameOf(d), b.getUid(), z)];
+                    inBlock ~= [(fact, d, true, z)];
+                    byVar[d] = self.factsOf(byVar, d) ~ [fact];
+                }
+
+                for d in du.getMayDefs() {
+                    let fact = names.len;
+                    names ~= [format("%?:BB%#%", self.nameOf(d), b.getUid(), z)];
+                    inBlock ~= [(fact, d, false, z)];
+                    byVar[d] = self.factsOf(byVar, d) ~ [fact];
+                }
+            }
+
+            byBlock[b.getUid()] = inBlock;
+        }
+
+        let nb = names.len;
+        let dmut res = copy Analysis("reaching definitions", Direction::FORWARD, MeetKind::UNION, names);
+
+        for b in self._cfg.getBlocks() {
+            let mut gen = dataflow::setEmpty(nb);
+            let mut kill = dataflow::setEmpty(nb);
+            let mut preGen = dataflow::setEmpty(nb);
+            let mut preKill = dataflow::setEmpty(nb);
+
+            // the block's closing instruction is the one an exception edge
+            // leaves from, so what it contributes on that edge stops at the
+            // instruction before it
+            let nbInstrs = b.getInstrs().len;
+            let lastZ = if (nbInstrs == 0us) { 0us } else { nbInstrs - 1us };
+
+            for f in self.blockFacts(byBlock, b.getUid()) {
+                if (f.2) {
+                    for other in self.factsOf(byVar, f.1) {
+                        if (other != f.0) {
+                            gen = dataflow::setWithout(gen, other);
+                            kill = dataflow::setWith(kill, other);
+                        }
+                    }
+                }
+
+                gen = dataflow::setWith(gen, f.0);
+
+                if (f.3 < lastZ) {
+                    preGen = gen;
+                    preKill = kill;
+                }
+            }
+
+            res:.setBlock(b.getUid(), gen, kill);
+            res:.setBlockPre(b.getUid(), preGen, preKill);
+        }
+
+        res
+    }
+
+    /**
+     * @returns: the available expressions analysis of the frame
+     *
+     * A fact is an expression the frame computes somewhere: a side effect free
+     * operation over variables and literals. Anything reading memory or calling
+     * is left out, it is not the same value twice. A write to a variable, be it
+     * partial, kills every expression reading that variable.
+     * */
+    fn buildAvailable(self)-> &Analysis {
+        let dmut table = copy ExprTable();
+        for b in self._cfg.getBlocks() {
+            for instr in b.getInstrs() {
+                self.walkInstr(instr, alias table, register-> true);
+            }
+        }
+
+        let nb = table.getKeys().len;
+        let dmut res = copy Analysis("available expressions", Direction::FORWARD, MeetKind::INTERSECTION, table.getKeys());
+
+        for b in self._cfg.getBlocks() {
+            let mut gen = dataflow::setEmpty(nb);
+            let mut kill = dataflow::setEmpty(nb);
+            let mut preGen = dataflow::setEmpty(nb);
+            let mut preKill = dataflow::setEmpty(nb);
+
+            let instrs = b.getInstrs();
+            for z, instr in instrs {
+                for e in self.walkInstr(instr, alias table, register-> false) {
+                    gen = dataflow::setWith(gen, e);
+                }
+
+                let du = self._defuse.ofInstr(instr);
+                for d in du.getAllDefs() {
+                    for e in table.reading(d) {
+                        gen = dataflow::setWithout(gen, e);
+                        kill = dataflow::setWith(kill, e);
+                    }
+                }
+
+                // the block's closing instruction is the one an exception edge
+                // leaves from, so what it contributes on that edge stops here
+                if (z + 1us < instrs.len) {
+                    preGen = gen;
+                    preKill = kill;
+                }
+            }
+
+            res:.setBlock(b.getUid(), gen, kill);
+            res:.setBlockPre(b.getUid(), preGen, preKill);
+        }
+
+        res
+    }
+
+    /*!
+     * ================================================================================
+     * ================================================================================
+     * ==========================          EXPRESSIONS          =======================
+     * ================================================================================
+     * ================================================================================
+     */
+
+    /**
+     * Walk the expressions an instruction computes.
+     *
+     * @params:
+     *    - instr:    the instruction to walk
+     *    - table:    the expressions of the frame
+     *    - register: true iif the expressions found are added to the table
+     * @returns: the facts of the expressions found
+     * */
+    fn walkInstr(self, instr: &YILInstr, dmut table: &ExprTable, register: bool)-> [usize] {
+        match instr {
+            a: &YILAffect => {
+                let mut res = self.walkValue(a.right, alias table, register-> register);
+                res ~= self.walkValue(a.left, alias table, register-> register);
+                return res;
+            }
+            c: &YILCall => { return self.walkValue(c.content, alias table, register-> register); }
+            r: &YILReturn => { return self.walkValue(r.value, alias table, register-> register); }
+            c: &YILCondJmp => { return self.walkValue(c.cond, alias table, register-> register); }
+        }
+
+        []
+    }
+
+    /**
+     * Walk the expressions a value computes, itself and the ones it is built from.
+     * */
+    fn walkValue(self, value: &YILValue, dmut table: &ExprTable, register: bool)-> [usize] {
+        let mut res: [usize] = [];
+        if (self.isExpr(value)) {
+            let key = self.exprKey(value);
+            let mut fact = table.indexOf(key);
+            if (register) { fact = table:.add(key, self.varsOf(value)); }
+            if (fact < table.getKeys().len) { res ~= [fact]; }
+        }
+
+        match value {
+            b: &YILBinaryValue => {
+                res ~= self.walkValue(b.left, alias table, register-> register);
+                res ~= self.walkValue(b.right, alias table, register-> register);
+            }
+            u: &YILUnaryValue => { res ~= self.walkValue(u.left, alias table, register-> register); }
+            c: &YILCastValue => { res ~= self.walkValue(c.value, alias table, register-> register); }
+            f: &YILFieldValue => { res ~= self.walkValue(f.tuple, alias table, register-> register); }
+            a: &YILArrayAccessValue => {
+                res ~= self.walkValue(a.value, alias table, register-> register);
+                res ~= self.walkValue(a.index, alias table, register-> register);
+            }
+            a: &YILAddrValue => { res ~= self.walkValue(a.value, alias table, register-> register); }
+            u: &YILUnrefValue => { res ~= self.walkValue(u.value, alias table, register-> register); }
+            t: &YILTupleValue => { for v in t.values { res ~= self.walkValue(v, alias table, register-> register); } }
+            a: &YILArrayValue => { for v in a.value { res ~= self.walkValue(v, alias table, register-> register); } }
+            n: &YILNameCallValue => { for v in n.params { res ~= self.walkValue(v, alias table, register-> register); } }
+            p: &YILPtrCallValue => {
+                res ~= self.walkValue(p.funcPtr, alias table, register-> register);
+                for v in p.params { res ~= self.walkValue(v, alias table, register-> register); }
+            }
+        }
+
+        res
+    }
+
+    /**
+     * @returns: true iif the value is an expression the analysis tracks: an
+     * operation, and one whose operands are variables and literals only
+     * */
+    fn isExpr(self, value: &YILValue)-> bool {
+        match value {
+            b: &YILBinaryValue => { return self.isPure(b.left) && self.isPure(b.right); }
+            u: &YILUnaryValue => { return self.isPure(u.left); }
+            c: &YILCastValue => { return self.isPure(c.value); }
+        }
+
+        false
+    }
+
+    /**
+     * @returns: true iif evaluating the value twice gives the same result as
+     * long as the variables it reads are not written
+     *
+     * A read through a pointer is not: a call in between may have changed what
+     * is pointed at. A global is not either: its identifier is `0`, so nothing
+     * in the frame is known to write it or not.
+     * */
+    fn isPure(self, value: &YILValue)-> bool {
+        match value {
+            v: &YILVar => { return self._defuse.isTracked(v.id); }
+            _: &YILIntValue => { return true; }
+            _: &YILFloatValue => { return true; }
+            _: &YILStringValue => { return true; }
+            _: &YILUnit => { return true; }
+            b: &YILBinaryValue => { return self.isPure(b.left) && self.isPure(b.right); }
+            u: &YILUnaryValue => { return self.isPure(u.left); }
+            c: &YILCastValue => { return self.isPure(c.value); }
+        }
+
+        false
+    }
+
+    /**
+     * @returns: the text identifying an expression, two expressions computing
+     * the same thing having the same one
+     * */
+    fn exprKey(self, value: &YILValue)-> [c8] {
+        match value {
+            v: &YILVar => { return self.nameOf(v.id); }
+            b: &YILBinaryValue => {
+                return "(" ~ self.exprKey(b.left) ~ " " ~ format("%", b.op) ~ " " ~ self.exprKey(b.right) ~ ")";
+            }
+            u: &YILUnaryValue => { return "(" ~ format("%", u.op) ~ " " ~ self.exprKey(u.left) ~ ")"; }
+            c: &YILCastValue => { return "cast<" ~ format("%", c.type) ~ ">(" ~ self.exprKey(c.value) ~ ")"; }
+        }
+
+        format("%", value)
+    }
+
+    /**
+     * @returns: the variables of the frame an expression reads
+     * */
+    fn varsOf(self, value: &YILValue)-> [usize] {
+        match value {
+            v: &YILVar => { if (self._defuse.isTracked(v.id)) return copy [v.id]; }
+            b: &YILBinaryValue => { return self.varsOf(b.left) ~ self.varsOf(b.right); }
+            u: &YILUnaryValue => { return self.varsOf(u.left); }
+            c: &YILCastValue => { return self.varsOf(c.value); }
+        }
+
+        []
+    }
+
+    /*!
+     * ================================================================================
+     * ================================================================================
+     * =============================          NAMES          ==========================
+     * ================================================================================
+     * ================================================================================
+     */
+
+    /**
+     * @params:
+     *    - id: the identifier of a variable of the frame
+     * @returns: the name the dump gives it
+     * */
+    fn nameOf(self, id: usize)-> [c8] {
+        let i = self._defuse.indexOf(id);
+        if (i < self._names.len) return self._names[i];
+
+        "?"
+    }
+
+    /**
+     * @returns: the facts of the writes made to a variable, none when it is never written
+     * */
+    fn factsOf(self, byVar: [usize => [usize]], id: usize)-> [usize] {
+        if let Ok(f) = byVar[id] { return f; }
+
+        []
+    }
+
+    /**
+     * @returns: the writes a block makes, in execution order
+     * */
+    fn blockFacts(self, byBlock: [usize => [(usize, usize, bool, usize)]], uid: usize)-> [(usize, usize, bool, usize)] {
+        if let Ok(f) = byBlock[uid] { return f; }
+
+        []
+    }
+
+    /*!
+     * ================================================================================
+     * ================================================================================
+     * ============================          DUMPING          =========================
+     * ================================================================================
+     * ================================================================================
+     */
+
+    /**
+     * @returns: the textual representation of the three analyses(`--fdump-dataflow=`)
+     * */
+    pub fn toDump(self)-> [c8] {
+        let dmut stream = copy Formatter(tags-> FormatTags(short-> true));
+        stream:.write("dataflow \"", self._name, "\" {\n");
+
+        stream:.write("  variables : ", joinNames(self._names), "\n");
+
+        let mut escaped: [[c8]] = [];
+        for e in self._defuse.getEscaped() { escaped ~= [self.nameOf(e)]; }
+        stream:.write("  address escaped : ", joinNames(escaped), "\n");
+
+        for s in self._solutions {
+            let a = s.getAnalysis();
+            stream:.write("  ", a.name, " (", directionName(a.direction), ", ", meetName(a.meet), ") :\n");
+
+            for b in s.getBlocks() {
+                let uid = b.getUid();
+                stream:.write("    BB", uid, " :\n");
+                stream:.write("      gen  = ", joinNames(a.factNames(a.genOf(uid))), "\n");
+                stream:.write("      kill = ", joinNames(a.factNames(a.killOf(uid))), "\n");
+                stream:.write("      in   = ", joinNames(a.factNames(s.inOf(b))), "\n");
+                stream:.write("      out  = ", joinNames(a.factNames(s.outOf(b))), "\n");
+            }
+        }
+
+        stream:.write("}\n");
+
+        stream[]
+    }
+
+    impl Streamable {
+        pub over toStream(self, dmut stream: &StringStream) {
+            stream:.write(self.toDump());
+        }
+    }
+
+}
+
+/*!
+ * ================================================================================
+ * ================================================================================
+ * =========================          EXPRESSIONS          ========================
+ * ================================================================================
+ * ================================================================================
+ */
+
+/**
+ * The expressions a frame computes, numbered in the order they are found.
+ * */
+pub class ExprTable {
+
+    // The text identifying every expression, its index being the fact
+    let mut _keys: [[c8]] = [];
+
+    // The fact of every expression, indexed by its text
+    let mut _index: [[c8] => mut usize] = copy [];
+
+    // The variables every expression reads, indexed by fact
+    let mut _vars: [[usize]] = [];
+
+    pub self () {}
+
+    /**
+     * Register an expression, or return the fact it already has.
+     *
+     * @params:
+     *    - key:  the text identifying the expression
+     *    - vars: the variables it reads
+     * @returns: the fact of the expression
+     * */
+    pub fn add(mut self, key: [c8], vars: [usize])-> usize {
+        if let Ok(i) = self._index[key] { return i; }
+
+        let res = self._keys.len;
+        self._index[key] = res;
+        self._keys ~= [key];
+        self._vars ~= [vars];
+
+        res
+    }
+
+    /**
+     * @returns: the fact of an expression, the size of the table when it has none
+     * */
+    pub fn indexOf(self, key: [c8])-> usize {
+        if let Ok(i) = self._index[key] { return i; }
+
+        self._keys.len
+    }
+
+    /**
+     * @returns: the text identifying every expression, its index being the fact
+     * */
+    pub fn getKeys(self)-> [[c8]] {
+        self._keys
+    }
+
+    /**
+     * @params:
+     *    - id: the identifier of a variable of the frame
+     * @returns: the facts of the expressions reading that variable
+     * */
+    pub fn reading(self, id: usize)-> [usize] {
+        let mut res: [usize] = [];
+        for i in 0us .. self._vars.len {
+            if (containsId(self._vars[i], id)) res ~= [i];
+        }
+
+        res
+    }
+
+}
+
+/*!
+ * ================================================================================
+ * ================================================================================
+ * ==========================          UTILITIES          =========================
+ * ================================================================================
+ * ================================================================================
+ */
+
+/**
+ * Compute the def/use summary of a block.
+ *
+ * @params:
+ *    - du: the def/use of the frame the block belongs to
+ *    - bb: the block to summarize
+ * @returns: the variables the block reads before writing them, and the ones it
+ * entirely overwrites
+ * */
+pub fn blockDefUse(du: &DefUse, bb: &BasicBlock)-> ([usize], [usize]) {
+    let mut gens: [usize] = [];
+    let mut kills: [usize] = [];
+
+    for instr in bb.getInstrs() {
+        let set = du.ofInstr(instr);
+
+        // the reads of an instruction happen before its writes, `a = a + 1`
+        // reads the `a` it overwrites
+        for u in set.getUses() {
+            if (!containsId(kills, u) && !containsId(gens, u)) gens ~= [u];
+        }
+
+        for d in set.getDefs() {
+            if (!containsId(kills, d)) kills ~= [d];
+        }
+    }
+
+    (gens, kills)
+}
+
+/**
+ * Name the variables of a frame for the dump.
+ *
+ * A temporary the expander created has no name in the source, and its identifier
+ * is a counter that says nothing: the YIL dump numbers them `YI_1`, `YI_2`, ...
+ * in the order they appear in the frame, and reading a dataflow dump means
+ * putting it side by side with the YIL dump of the same frame. The two
+ * consequently number them the same way, which is done by handing the frame to a
+ * formatter and asking it what number it gave each of them.
+ *
+ * Two variables of a frame may share a source name(two blocks declaring their
+ * own `i`), the second one is suffixed so that a name identifies a variable in
+ * the dump.
+ *
+ * @params:
+ *    - frame: the frame the variables belong to
+ *    - du:    its def/use, holding the variables in universe order
+ * @returns: the name of every variable of the frame, in universe order
+ * */
+pub fn varNames(frame: &YILFrame, du: &DefUse)-> [[c8]] {
+    let dmut stream = copy Formatter(tags-> FormatTags(forDebug-> true));
+    frame.format(alias stream);
+
+    let mut res: [[c8]] = [];
+    let mut taken: [[c8] => mut usize] = copy [];
+
+    for v in du.getVars() {
+        let mut name = v.name;
+        if (v.isTemp || name == "") {
+            name = "YI_" ~ conv::to!{[c8]}(stream:.getYilId(v.id));
+        }
+
+        if let Ok(nb) = taken[name] {
+            taken[name] = nb + 1us;
+            name = name ~ "'" ~ conv::to!{[c8]}(nb + 1us);
+        } else {
+            taken[name] = 1us;
+        }
+
+        res ~= [name];
+    }
+
+    res
+}
+
+/**
+ * @returns: the names of a set of facts, as the dump writes them
+ * */
+pub fn joinNames(names: [[c8]])-> [c8] {
+    let mut res = "{";
+    for i, n in names {
+        if (i != 0us) res = res ~ ", ";
+        res = res ~ n;
+    }
+
+    res ~ "}"
+}
+
+/**
+ * @returns: the name of a direction, as the dump writes it
+ * */
+pub fn directionName(dir: Direction)-> [c8] {
+    if (dir == Direction::FORWARD) return "forward";
+
+    "backward"
+}
+
+/**
+ * @returns: the name of a meet, as the dump writes it
+ * */
+pub fn meetName(meet: MeetKind)-> [c8] {
+    if (meet == MeetKind::UNION) return "union";
+
+    "intersection"
+}

@@ -1,0 +1,650 @@
+/*
+ * Declares the dataflow framework of the YIL optimizer: the sets a block
+ * generates and kills, and the fixpoint solver run over them.
+ *
+ * A dataflow analysis is entirely described by four things: the facts it
+ * computes, the direction it walks the control flow graph in, the way two paths
+ * meeting are combined, and what a block does to the facts entering it. The
+ * three analyses of this module differ only by those four:
+ *
+ *   - liveness(backward, union): which variables hold a value that is read
+ *     before it is overwritten. It is what tells a dead store from a useful one,
+ *     and a temporary read once from one read twice,
+ *   - reaching definitions(forward, union): which assignments may be the one a
+ *     read sees. It is what copy propagation and constant propagation need,
+ *   - available expressions(forward, intersection): which expressions have
+ *     already been computed on every path, and not invalidated since. It is what
+ *     common subexpression elimination and the elision of a redundant runtime
+ *     call need.
+ *
+ * The transfer function is the same for the three of them, `out = gen | (in -
+ * kill)`, which is why they share one solver: what changes is what a fact is,
+ * and what a block puts in `gen` and in `kill`.
+ *
+ * The iteration goes over the blocks in reverse post order(forward) or in the
+ * reverse of it(backward), and only re-visits a block when something entering it
+ * changed. Unreachable blocks are left out: no path reaches them, so no analysis
+ * has anything to say about them.
+ *
+ * Exception edges are edges like any other, and forgetting them is not a missed
+ * optimization but a miscompilation: a variable read by a catch handler is live
+ * across every throwing instruction of the region the handler protects, and a
+ * liveness that ignores the edge reports it dead. They do carry one subtlety: an
+ * exception edge leaves from the middle of the instruction closing its block,
+ * not after it. What that block computes has therefore not necessarily happened
+ * when the handler is entered, so a forward analysis — reaching definitions and
+ * available expressions alike, regardless of whether its meet is a union or an
+ * intersection — propagates what the block produced before its closing
+ * instruction, not what it produced once that instruction (which may not have
+ * run to completion) is accounted for.
+ *
+ * <hr>
+ *
+ * @Package: ymirc
+ * @Module: ymirc::lint::optimizer::dataflow
+ * @File: ymirc/lint/optimizer/dataflow.yr
+ * @Author(s):
+ *   - Emile Cadorel <ecadorel@gmail.com>
+ *
+ * @Created(YYYY-MM-DD): 2026-08-22
+ * @Copyright(C) 2021–2026 GNU-Ymir
+ * @License
+ *   ```text
+ *   This file is part of the Ymir language project.
+ *
+ *   Ymir is free software: you can redistribute it and/or modify it
+ *   under the terms of the GNU General Public License as published by
+ *   the Free Software Foundation, either version 3 of the License, or
+ *   (at your option) any later version.
+ *
+ *   Ymir is distributed in the hope that it will be useful,
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *   GNU General Public License for more details.
+ *
+ *   You should have received a copy of the GNU General Public License
+ *   along with Ymir.  If not, see <https://www.gnu.org/licenses/>.
+ *   ```
+ */
+
+in dataflow;
+
+use std::{io, stream};
+
+use ymirc::utils::format;
+use ymirc::lint::node::{_, global::_, instr::_, type::_, value::_};
+use ymirc::lint::optimizer::{bblock, cfg, defuse};
+
+/**
+ * The direction a dataflow analysis walks the graph in.
+ * */
+pub enum Direction: u8
+| FORWARD  = 0
+| BACKWARD = 1;
+
+/**
+ * The way two paths meeting are combined.
+ * */
+pub enum MeetKind: u8
+| UNION        = 0
+| INTERSECTION = 1;
+
+/*!
+ * ================================================================================
+ * ================================================================================
+ * =============================          SETS          ===========================
+ * ================================================================================
+ * ================================================================================
+ */
+
+/**
+ * The sets of facts are dense: an analysis numbers its facts from `0` to
+ * `nbFacts`, and a set is that many booleans. Frames have tens of variables, not
+ * thousands, so the density costs nothing and makes the meet a loop over an
+ * array rather than a hash lookup per element.
+ * */
+
+/**
+ * @returns: a set containing none of the `nb` facts
+ * */
+pub fn setEmpty(nb: usize)-> [bool] {
+    copy [false ; nb]
+}
+
+/**
+ * @returns: a set containing all of the `nb` facts
+ * */
+pub fn setFull(nb: usize)-> [bool] {
+    copy [true ; nb]
+}
+
+/**
+ * @returns: true iif the set contains the fact
+ * */
+pub fn setHas(set: [bool], i: usize)-> bool {
+    i < set.len && set[i]
+}
+
+/**
+ * @returns: the set, with the fact added to it
+ * */
+pub fn setWith(set: [bool], i: usize)-> [bool] {
+    if (i >= set.len) return set;
+
+    let dmut res = copy set;
+    res[i] = true;
+
+    res
+}
+
+/**
+ * @returns: the set, with the fact removed from it
+ * */
+pub fn setWithout(set: [bool], i: usize)-> [bool] {
+    if (i >= set.len) return set;
+
+    let dmut res = copy set;
+    res[i] = false;
+
+    res
+}
+
+/**
+ * @returns: the facts that are in either set
+ * */
+pub fn setUnion(a: [bool], b: [bool])-> [bool] {
+    let dmut res = copy a;
+    for i in 0us .. res.len {
+        if (setHas(b, i)) { res[i] = true; }
+    }
+
+    res
+}
+
+/**
+ * @returns: the facts that are in both sets
+ * */
+pub fn setInter(a: [bool], b: [bool])-> [bool] {
+    let dmut res = copy a;
+    for i in 0us .. res.len {
+        if (!setHas(b, i)) { res[i] = false; }
+    }
+
+    res
+}
+
+/**
+ * @returns: the facts of the first set that are not in the second one
+ * */
+pub fn setDiff(a: [bool], b: [bool])-> [bool] {
+    let dmut res = copy a;
+    for i in 0us .. res.len {
+        if (setHas(b, i)) { res[i] = false; }
+    }
+
+    res
+}
+
+/**
+ * @returns: the indices of the facts the set contains, in increasing order
+ * */
+pub fn setElems(set: [bool])-> [usize] {
+    let mut res: [usize] = [];
+    for i in 0us .. set.len {
+        if (set[i]) res ~= [i];
+    }
+
+    res
+}
+
+/*!
+ * ================================================================================
+ * ================================================================================
+ * ===========================          ANALYSIS          =========================
+ * ================================================================================
+ * ================================================================================
+ */
+
+/**
+ * A dataflow analysis: its facts, its direction, its meet, and the gen and kill
+ * sets of every block of a frame.
+ *
+ * It is what the solver consumes, and the only thing that differs between
+ * liveness, reaching definitions and available expressions.
+ * */
+pub class Analysis {
+
+    pub {
+        // The name of the analysis, as printed by `--fdump-dataflow=`
+        let name: [c8];
+
+        // The direction the facts flow in
+        let direction: Direction;
+
+        // The way two paths meeting are combined
+        let meet: MeetKind;
+
+        // The number of facts the analysis computes
+        let nbFacts: usize;
+    }
+
+    // The name of every fact, indexed by fact, used by the dump
+    let mut _factNames: [[c8]] = [];
+
+    // The facts a block produces, indexed by block identifier
+    let mut _gens: [usize => mut [bool]] = copy [];
+
+    // The facts a block invalidates, indexed by block identifier
+    let mut _kills: [usize => mut [bool]] = copy [];
+
+    // The facts produced by a block up to, but excluding, its closing
+    // instruction, indexed by block identifier — what a forward analysis sees
+    // on an exception edge, since that edge leaves before the closing
+    // instruction completes
+    let mut _preGens: [usize => mut [bool]] = copy [];
+
+    // The facts invalidated by a block up to, but excluding, its closing
+    // instruction, indexed by block identifier
+    let mut _preKills: [usize => mut [bool]] = copy [];
+
+    /**
+     * Create an analysis whose blocks generate and kill nothing yet.
+     *
+     * @params:
+     *    - name:      the name of the analysis
+     *    - direction: the direction the facts flow in
+     *    - meet:      the way two paths meeting are combined
+     *    - factNames: the name of every fact, its index being the fact itself
+     * */
+    pub self (name: [c8], direction: Direction, meet: MeetKind, factNames: [[c8]])
+        with name = name
+        , direction = direction
+        , meet = meet
+        , nbFacts = factNames.len
+        , _factNames = factNames
+    {}
+
+    /**
+     * Set the gen and kill sets of a block.
+     *
+     * @params:
+     *    - uid:  the identifier of the block
+     *    - gen:  the facts it produces
+     *    - kill: the facts it invalidates
+     * */
+    pub fn setBlock(mut self, uid: usize, gen: [bool], kill: [bool]) {
+        self._gens[uid] = gen;
+        self._kills[uid] = kill;
+    }
+
+    /**
+     * Set the gen and kill sets of a block, up to but excluding its closing
+     * instruction.
+     *
+     * A block whose closing instruction throws is entered by an exception edge
+     * that leaves before that instruction completes, so what it contributes on
+     * that edge is this, not the whole-block `setBlock`. Only forward analyses
+     * consume it.
+     *
+     * @params:
+     *    - uid:  the identifier of the block
+     *    - gen:  the facts produced before the closing instruction
+     *    - kill: the facts invalidated before the closing instruction
+     * */
+    pub fn setBlockPre(mut self, uid: usize, gen: [bool], kill: [bool]) {
+        self._preGens[uid] = gen;
+        self._preKills[uid] = kill;
+    }
+
+    /**
+     * @returns: the facts the block produces, none when it produces nothing
+     * */
+    pub fn genOf(self, uid: usize)-> [bool] {
+        if let Ok(g) = self._gens[uid] { return g; }
+
+        setEmpty(self.nbFacts)
+    }
+
+    /**
+     * @returns: the facts the block invalidates, none when it invalidates nothing
+     * */
+    pub fn killOf(self, uid: usize)-> [bool] {
+        if let Ok(k) = self._kills[uid] { return k; }
+
+        setEmpty(self.nbFacts)
+    }
+
+    /**
+     * @returns: the facts the block produces before its closing instruction
+     * */
+    pub fn preGenOf(self, uid: usize)-> [bool] {
+        if let Ok(g) = self._preGens[uid] { return g; }
+
+        setEmpty(self.nbFacts)
+    }
+
+    /**
+     * @returns: the facts the block invalidates before its closing instruction
+     * */
+    pub fn preKillOf(self, uid: usize)-> [bool] {
+        if let Ok(k) = self._preKills[uid] { return k; }
+
+        setEmpty(self.nbFacts)
+    }
+
+    /**
+     * @returns: the name of a fact, as printed by the dump
+     * */
+    pub fn factName(self, i: usize)-> [c8] {
+        if (i < self._factNames.len) return self._factNames[i];
+
+        "?"
+    }
+
+    /**
+     * @returns: the names of the facts a set contains, in fact order
+     * */
+    pub fn factNames(self, set: [bool])-> [[c8]] {
+        let mut res: [[c8]] = [];
+        for i in setElems(set) {
+            res ~= [self.factName(i)];
+        }
+
+        res
+    }
+
+}
+
+/*!
+ * ================================================================================
+ * ================================================================================
+ * ===========================          SOLUTION          =========================
+ * ================================================================================
+ * ================================================================================
+ */
+
+/**
+ * The fixpoint an analysis reached over a frame: the facts entering and leaving
+ * every reachable block.
+ *
+ * `in` and `out` are named after the execution of the block, not after the
+ * direction of the analysis: the `in` set of a backward analysis is the one at
+ * the top of the block, which is the result of applying its transfer function.
+ * */
+pub class Solution {
+
+    // The analysis that was solved
+    let _analysis: &Analysis;
+
+    // The facts holding at the top of every block, indexed by block identifier
+    let mut _ins: [usize => mut [bool]] = copy [];
+
+    // The facts holding at the bottom of every block, indexed by block identifier
+    let mut _outs: [usize => mut [bool]] = copy [];
+
+    // The blocks the analysis was solved over, in the order it iterated on them
+    let mut _blocks: [&BasicBlock] = [];
+
+    /**
+     * @params:
+     *    - analysis: the analysis that was solved
+     * */
+    pub self (analysis: &Analysis)
+        with _analysis = analysis
+    {}
+
+    /**
+     * Set the facts holding around a block.
+     * */
+    pub fn set(mut self, uid: usize, in_: [bool], out: [bool]) {
+        self._ins[uid] = in_;
+        self._outs[uid] = out;
+    }
+
+    /**
+     * Register the blocks the analysis was solved over.
+     * */
+    pub fn setBlocks(mut self, blocks: [&BasicBlock]) {
+        self._blocks = blocks;
+    }
+
+    /**
+     * @returns: the analysis that was solved
+     * */
+    pub fn getAnalysis(self)-> &Analysis {
+        self._analysis
+    }
+
+    /**
+     * @returns: the blocks the analysis was solved over
+     * */
+    pub fn getBlocks(self)-> [&BasicBlock] {
+        self._blocks
+    }
+
+    /**
+     * @returns: the facts holding at the top of the block
+     * */
+    pub fn inOf(self, bb: &BasicBlock)-> [bool] {
+        if let Ok(i) = self._ins[bb.getUid()] { return i; }
+
+        setEmpty(self._analysis.nbFacts)
+    }
+
+    /**
+     * @returns: the facts holding at the bottom of the block
+     * */
+    pub fn outOf(self, bb: &BasicBlock)-> [bool] {
+        if let Ok(o) = self._outs[bb.getUid()] { return o; }
+
+        setEmpty(self._analysis.nbFacts)
+    }
+
+    /**
+     * @returns: true iif the fact holds at the top of the block
+     * */
+    pub fn holdsIn(self, bb: &BasicBlock, fact: usize)-> bool {
+        setHas(self.inOf(bb), fact)
+    }
+
+    /**
+     * @returns: true iif the fact holds at the bottom of the block
+     * */
+    pub fn holdsOut(self, bb: &BasicBlock, fact: usize)-> bool {
+        setHas(self.outOf(bb), fact)
+    }
+
+}
+
+/*!
+ * ================================================================================
+ * ================================================================================
+ * ============================          SOLVER          ==========================
+ * ================================================================================
+ * ================================================================================
+ */
+
+/**
+ * Run an analysis over a graph until it reaches its fixpoint.
+ *
+ * The blocks are visited in reverse post order for a forward analysis, and in
+ * the reverse of it for a backward one, which is the order that propagates a
+ * change the furthest per visit. A block is put back in the worklist when a
+ * block flowing into it changed, and the analysis is done when the worklist is
+ * empty: every set is then a solution of the equations, since nothing is left to
+ * update.
+ *
+ * @params:
+ *    - graph:    the control flow graph of a frame
+ *    - analysis: the analysis to solve
+ * @returns: the facts entering and leaving every reachable block
+ * */
+pub fn solve(graph: &CFG, analysis: &Analysis)-> &Solution {
+    let rpo = graph.reversePostOrder();
+    let order = if (analysis.direction == Direction::FORWARD) { rpo } else { reversed(rpo) };
+
+    let nb = analysis.nbFacts;
+    let boundary = setEmpty(nb);
+    let start = if (analysis.meet == MeetKind::UNION) { setEmpty(nb) } else { setFull(nb) };
+
+    let mut entering: [usize => mut [bool]] = copy [];
+    let mut leaving: [usize => mut [bool]] = copy [];
+    let mut rank: [usize => mut usize] = copy [];
+    for i, b in order {
+        rank[b.getUid()] = i;
+        entering[b.getUid()] = boundary;
+        leaving[b.getUid()] = start;
+    }
+
+    let dmut pending = copy [true ; order.len];
+    let mut nbPending = order.len;
+
+    while (nbPending != 0us) {
+        let mut cur = order.len;
+        for i in 0us .. order.len {
+            if (pending[i]) { cur = i; break; }
+        }
+
+        if (cur == order.len) break;
+        pending[cur] = false;
+        nbPending -= 1us;
+
+        let b = order[cur];
+        let uid = b.getUid();
+        let before = meetOf(b, analysis, entering, leaving, boundary);
+        let after = setUnion(analysis.genOf(uid), setDiff(before, analysis.killOf(uid)));
+
+        entering[uid] = before;
+        let mut changed = true;
+        if let Ok(old) = leaving[uid] { changed = (old != after); }
+        leaving[uid] = after;
+
+        if (changed) {
+            for n in flowNext(b, analysis.direction) {
+                if let Ok(r) = rank[n.getUid()] {
+                    if (!pending[r]) {
+                        pending[r] = true;
+                        nbPending += 1us;
+                    }
+                }
+            }
+        }
+    }
+
+    let dmut res = copy Solution(analysis);
+    res:.setBlocks(rpo);
+    for b in order {
+        let uid = b.getUid();
+        let mut en = boundary;
+        let mut le = start;
+        if let Ok(e) = entering[uid] { en = e; }
+        if let Ok(l) = leaving[uid] { le = l; }
+
+        if (analysis.direction == Direction::FORWARD) {
+            res:.set(uid, en, le);
+        } else {
+            res:.set(uid, le, en);
+        }
+    }
+
+    res
+}
+
+/**
+ * The facts a block contributes on an exception edge: what it produced before
+ * its closing instruction, applied to whatever entered the block.
+ *
+ * A block's closing instruction is the one an exception edge leaves from, and
+ * it leaves before that instruction completes — so a definition or an
+ * invalidation the instruction itself would make has not necessarily happened.
+ * `preGenOf`/`preKillOf` already exclude it; this just applies them the same
+ * way the normal transfer function applies the whole-block sets.
+ * */
+pub fn preTransferOf(analysis: &Analysis, uid: usize, entering: [bool])-> [bool] {
+    setUnion(analysis.preGenOf(uid), setDiff(entering, analysis.preKillOf(uid)))
+}
+
+/**
+ * Combine the facts leaving every block flowing into a block.
+ *
+ * A block that nothing flows into starts from the boundary value: at the entry
+ * of a forward analysis nothing has been computed yet, and at the exit of a
+ * backward one nothing is live anymore.
+ *
+ * An exception edge leaves from the middle of the instruction closing its
+ * source, so a forward analysis — union or intersection alike — propagates
+ * what that block contributes up to its closing instruction rather than what
+ * it produces once that instruction has run: what the block's last instruction
+ * computes has not necessarily happened when the handler is entered.
+ * */
+fn meetOf(bb: &BasicBlock, analysis: &Analysis, entering: [usize => [bool]], leaving: [usize => [bool]], boundary: [bool])-> [bool] {
+    let mut res = boundary;
+    let mut first = true;
+
+    for p in flowPrevious(bb, analysis.direction) {
+        let uid = (p.0).getUid();
+        let midEdge = (p.1 == EdgeKind::EXCEPTION
+                       && analysis.direction == Direction::FORWARD);
+
+        let mut fact: [bool] = [];
+        let mut known = false;
+        if (midEdge) {
+            if let Ok(e) = entering[uid] { fact = preTransferOf(analysis, uid, e); known = true; }
+        } else {
+            if let Ok(l) = leaving[uid] { fact = l; known = true; }
+        }
+
+        if (!known) continue; // an unreachable block, no path goes through it
+
+        if (first) {
+            res = fact;
+            first = false;
+        } else if (analysis.meet == MeetKind::UNION) {
+            res = setUnion(res, fact);
+        } else {
+            res = setInter(res, fact);
+        }
+    }
+
+    res
+}
+
+/**
+ * @returns: the blocks flowing into a block, and the nature of the edge
+ * */
+fn flowPrevious(bb: &BasicBlock, dir: Direction)-> [(&BasicBlock, EdgeKind)] {
+    let mut res: [(&BasicBlock, EdgeKind)] = [];
+    if (dir == Direction::FORWARD) {
+        for p in bb.getPrevious() { res ~= [(p.0, p.2)]; }
+    } else {
+        for n in bb.getNext() { res ~= [(n.0, n.2)]; }
+    }
+
+    res
+}
+
+/**
+ * @returns: the blocks a block flows into
+ * */
+fn flowNext(bb: &BasicBlock, dir: Direction)-> [&BasicBlock] {
+    let mut res: [&BasicBlock] = [];
+    if (dir == Direction::FORWARD) {
+        for n in bb.getNext() { res ~= [n.0]; }
+    } else {
+        for p in bb.getPrevious() { res ~= [p.0]; }
+    }
+
+    res
+}
+
+/**
+ * @returns: the blocks in the reverse of the order they are given in
+ * */
+fn reversed(blocks: [&BasicBlock])-> [&BasicBlock] {
+    let mut res: [&BasicBlock] = [];
+    for i in 0us .. blocks.len {
+        res ~= [blocks[blocks.len - 1us - i]];
+    }
+
+    res
+}
