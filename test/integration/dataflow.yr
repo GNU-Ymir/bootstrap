@@ -1,0 +1,665 @@
+in dataflow;
+
+use ymirc::utils::_;
+use ymirc::lexing::word;
+use ymirc::lint::node::{_, global::_, instr::_, type::_, value::_};
+use ymirc::lint::optimizer;
+use ymirc::lint::optimizer::dataflow;
+
+use std::{io, fs::_};
+
+use utils;
+
+/**
+ * The packages the dataflow is solved over to check that no frame breaks the
+ * analyses. They are the ones of the control flow graph, plus the scope guards
+ * and the try/catch cases: an exception edge that liveness gets wrong is what
+ * makes a dead store elimination miscompile every catching frame of the
+ * codebase, so they are part of this test rather than of the one of the pass
+ * consuming it.
+ * */
+def SWEEP = ["test_resources/control_flow/test11.yr",
+             "test_resources/control_flow/test13.yr",
+             "test_resources/control_flow/test19.yr",
+             "test_resources/control_flow/test23.yr",
+             "test_resources/control_flow/test24.yr",
+             "test_resources/control_flow/test4.yr",
+             "test_resources/entities/test1.yr",
+             "test_resources/entities/test4.yr",
+             "test_resources/entities/test7.yr",
+             "test_resources/scope_guards/test1.yr",
+             "test_resources/scope_guards/test2.yr",
+             "test_resources/scope_guards/test5.yr",
+             "test_resources/scope_guards/test8.yr",
+             "test_resources/for_loops/arrays/test1.yr",
+             "test_resources/pattern_match/test1.yr"];
+
+/**
+ * Solve the dataflow of every frame of a compiled package.
+ *
+ * @params:
+ *    - res: the result of the compilation of the package
+ *    - withWeak: true iif the weak frames are analysed as well
+ * @returns: the dataflows, in the order the frames were produced by the expander
+ * */
+fn buildDataflows(res: utils::CompileResult, withWeak: bool = true)-> [&FrameDataflow]
+    throws AssertError
+{
+    if let Ok(err) = res.err {
+        throw copy AssertError(format("%", err));
+    }
+
+    let mut dfs: [&FrameDataflow] = [];
+    for node in res.exp {
+        if let f: &YILFrame = node {
+            if (withWeak || !f.isWeak) {
+                dfs ~= [copy FrameDataflow(f)];
+            }
+        }
+    }
+
+    dfs
+}
+
+/**
+ * @params:
+ *    - package: the root file of the compilation
+ *    - name:    a fragment of the mangled name of the frame to analyse
+ * @returns: the dataflow of that frame
+ * */
+fn dataflowOf(package: [c8], name: [c8])-> &FrameDataflow
+    throws AssertError
+{
+    for df in buildDataflows(utils::compilePackage(package), withWeak-> false) {
+        if (string::contains(df.getName(), name)) return df;
+    }
+
+    throw copy AssertError(format("% : no frame named %", package, name));
+}
+
+/**
+ * Assert that a solution is a solution: every block satisfies the transfer
+ * function of the analysis, and nothing entering a block is missing from what
+ * leaves the blocks flowing into it.
+ *
+ * That is what a fixpoint is, and checking it is what makes a sweep over a
+ * package worth more than checking that nothing crashed.
+ * */
+fn checkFixpoint(df: &FrameDataflow, sol: &Solution)
+    throws AssertError
+{
+    let a = sol.getAnalysis();
+    for b in sol.getBlocks() {
+        let uid = b.getUid();
+        let before = dataflow::setUnion(a.genOf(uid), dataflow::setDiff(sol.inOf(b), a.killOf(uid)));
+
+        if (a.direction == Direction::BACKWARD) {
+            // an exception edge leaves from the middle of the instruction
+            // closing its source, so what flows back along it is transferred
+            // through the block minus that instruction, and the meet happens
+            // after the transfer rather than before it -- same as `transferOf`
+            let mut after = dataflow::setUnion(a.genOf(uid), dataflow::setDiff(sol.outOf(b), a.killOf(uid)));
+            let mut first = true;
+
+            for n in b.getNext() {
+                let through = if (n.2 == EdgeKind::EXCEPTION) {
+                    dataflow::preTransferOf(a, uid, sol.inOf(n.0))
+                } else {
+                    dataflow::transferOfSet(a, uid, sol.inOf(n.0))
+                };
+
+                if (first) {
+                    after = through;
+                    first = false;
+                } else if (a.meet == MeetKind::UNION) {
+                    after = dataflow::setUnion(after, through);
+                } else {
+                    after = dataflow::setInter(after, through);
+                }
+            }
+
+            assert (sol.inOf(b) == after,
+                    format("% : % : BB% : the transfer function is not applied", df.getName(), a.name, uid));
+
+            for n in b.getNext() {
+                let out = sol.outOf(b);
+                assert (dataflow::setUnion(out, sol.inOf(n.0)) == out,
+                        format("% : % : BB% does not carry everything BB% needs", df.getName(), a.name, uid, (n.0).getUid()));
+            }
+        } else {
+            assert (sol.outOf(b) == before,
+                    format("% : % : BB% : the transfer function is not applied", df.getName(), a.name, uid));
+
+            for p in b.getPrevious() {
+                // what a predecessor contributes on an exception edge stops at
+                // its closing instruction, same as `meetOf` — not its full out
+                let contribution = if (p.2 == EdgeKind::EXCEPTION) {
+                    dataflow::preTransferOf(a, (p.0).getUid(), sol.inOf(p.0))
+                } else {
+                    sol.outOf(p.0)
+                };
+
+                if (a.meet == MeetKind::UNION) {
+                    assert (dataflow::setUnion(contribution, sol.inOf(b)) == sol.inOf(b),
+                            format("% : % : BB% does not carry everything BB% needs", df.getName(), a.name, (p.0).getUid(), uid));
+                } else {
+                    assert (dataflow::setUnion(sol.inOf(b), contribution) == contribution,
+                            format("% : % : BB% does not carry everything BB% needs", df.getName(), a.name, (p.0).getUid(), uid));
+                }
+            }
+        }
+    }
+}
+
+/**
+ * Assert a property `checkFixpoint` cannot see: for every block `B` with an
+ * exception successor `H`, every variable live at the top of `H` that `B`
+ * does not fully write before its closing instruction must be live at the
+ * top of `B` too.
+ *
+ * Unlike `checkFixpoint`, this is not stated in terms of the solver's own
+ * gen/kill/meet/transfer -- "does not write" is read straight off
+ * `DefUse::ofInstr` for each instruction of `B` but its last, independently
+ * of the block summaries `FrameDataflow` derives from the same def/use for
+ * the solver to consume. A backward analysis that applies the whole block's
+ * kill to an exception edge instead of the pre-close one fails this even
+ * though it still reaches a fixpoint of its own (wrong) equations.
+ * */
+fn checkExceptionLiveness(df: &FrameDataflow)
+    throws AssertError
+{
+    let du = df.getDefUse();
+
+    for b in df.getCfg().getBlocks() {
+        for n in b.getNext() {
+            if (n.2 != EdgeKind::EXCEPTION) continue;
+            let h = n.0;
+
+            let instrs = b.getInstrs();
+            let mut writtenBeforeClose: [usize] = [];
+            for z in 0us .. instrs.len {
+                if (z + 1us == instrs.len) continue; // the closing instruction itself
+                for d in du.ofInstr(instrs[z]).getDefs() {
+                    if (!contains(writtenBeforeClose, d)) writtenBeforeClose ~= [d];
+                }
+            }
+
+            for v in du.getVars() {
+                if (!df.isLiveIn(h, v.id)) continue;
+                if (contains(writtenBeforeClose, v.id)) continue;
+
+                assert (df.isLiveIn(b, v.id),
+                        format("% : % is live at the top of handler BB% but neither written before BB%'s closing instruction nor live at the top of BB%",
+                               df.getName(), v.name, h.getUid(), b.getUid(), b.getUid()));
+            }
+        }
+    }
+}
+
+/**
+ * Assert that the three analyses of a frame reached their fixpoint.
+ * */
+fn checkFixpoints(df: &FrameDataflow)
+    throws AssertError
+{
+    checkFixpoint(df, df.getLiveness());
+    checkFixpoint(df, df.getReachingDefs());
+    checkFixpoint(df, df.getAvailableExprs());
+    checkExceptionLiveness(df);
+}
+
+/**
+ * Compare the dataflow of a package with a golden `.df` file.
+ * */
+fn compareDump(package: [c8])
+    throws AssertError
+{
+    let expected = {
+        let dmut f = File::open(Path(package).stripExtension().addExtension("df"));
+        f:.readAll()
+    } catch {
+        err: &FsError => throw copy AssertError(format("%", err));
+    };
+
+    let dfs = buildDataflows(utils::compilePackage(package), withWeak-> false);
+    let dmut stream = copy Formatter();
+    for df in dfs {
+        checkFixpoints(df);
+        stream:.write(df.toDump());
+    }
+
+    utils::compareResultWithString(stream, expected,
+                                   origin-> Path(package).stripExtension().addExtension("df").toStr(),
+                                   canonicalizeIds-> true);
+}
+
+/**
+ * @returns: true iif the list contains the identifier
+ * */
+fn contains(ids: [usize], id: usize)-> bool {
+    for i in ids {
+        if (i == id) return true;
+    }
+
+    false
+}
+
+/**
+ * @params:
+ *    - instr: an instruction of a frame
+ * @returns: the variables the two first parameters of a `_yrt_dup_slice` call
+ * name, none iif the instruction is not such a call
+ * */
+fn dupSliceArgs(instr: &YILInstr)-> ((usize, usize))? {
+    let mut params: [&YILValue] = [];
+    match instr {
+        c: &YILCall => {
+            match c.content {
+                n: &YILNameCallValue => {
+                    if (n.funcName != "_yrt_dup_slice") return none;
+                    params = n.params;
+                }
+            }
+        }
+    }
+
+    if (params.len < 2us) return none;
+
+    let mut ids: [usize] = [];
+    for i in 0us .. 2us {
+        match params[i] {
+            a: &YILAddrValue => {
+                match a.value {
+                    v: &YILVar => { ids ~= [v.id]; }
+                }
+            }
+        }
+    }
+
+    if (ids.len != 2us) return none;
+
+    (ids[0us], ids[1us])?
+}
+
+__test {
+    // a branch and a loop, the liveness of the locals across them
+    compareDump("test_resources/dataflow/test1.yr");
+}
+
+__test {
+    // a try/catch, a variable read by the handler only
+    compareDump("test_resources/dataflow/test2.yr");
+}
+
+__test {
+    // a local whose address escapes, and a store through the pointer
+    compareDump("test_resources/dataflow/test3.yr");
+}
+
+__test {
+    // a slice copy, the out parameter of the runtime call
+    compareDump("test_resources/dataflow/test4.yr");
+}
+
+__test {
+    // the address passed to a runtime function that writes it is a definition,
+    // the one passed to a parameter it reads is a use. Reading the first one as
+    // a use is what makes the framework useless for the temporaries the expander
+    // produces, and reading the second one as a definition is unsound
+    let df = dataflowOf("test_resources/dataflow/test4.yr", "foo");
+    let du = df.getDefUse();
+    let mut nb = 0us;
+
+    for b in df.getCfg().getBlocks() {
+        for i in b.getInstrs() {
+            if let Ok(args) = dupSliceArgs(i) {
+                nb += 1us;
+                let set = du.ofInstr(i);
+
+                assert (contains(set.getDefs(), args.0),
+                        format("the out parameter #% is not defined by the call", args.0));
+                assert (!contains(set.getUses(), args.0),
+                        format("the out parameter #% is read by the call", args.0));
+                assert (contains(set.getUses(), args.1),
+                        format("the in parameter #% is not read by the call", args.1));
+                assert (!contains(set.getDefs(), args.1),
+                        format("the in parameter #% is written by the call", args.1));
+                assert (!contains(du.getEscaped(), args.0),
+                        format("the out parameter #% escaped, though the callee is known", args.0));
+            }
+        }
+    }
+
+    assert (nb != 0us, "test4 : no call to _yrt_dup_slice in the frame");
+}
+
+__test {
+    // the address of a local taken by the frame escapes, and a store through a
+    // pointer may write it: nothing but a direct assignment kills it
+    let df = dataflowOf("test_resources/dataflow/test3.yr", "foo");
+    let mut a = 0us;
+    if let Ok(id) = df.varNamed("a") { a = id; }
+
+    assert (a != 0us, "test3 : the frame declares no variable named a");
+    assert (contains(df.getDefUse().getEscaped(), a), "test3 : the address of a did not escape");
+
+    let mut nbStores = 0us;
+    let du = df.getDefUse();
+    for b in df.getCfg().getBlocks() {
+        for i in b.getInstrs() {
+            match i {
+                af: &YILAffect => {
+                    match af.left {
+                        _: &YILUnrefValue => {
+                            nbStores += 1us;
+                            let set = du.ofInstr(i);
+
+                            assert (contains(set.getMayDefs(), a),
+                                    "the store through a pointer does not write a, though its address escaped");
+                            assert (!contains(set.getDefs(), a),
+                                    "the store through a pointer kills a, though nothing says the pointer points at it");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    assert (nbStores != 0us, "test3 : no store through a pointer in the frame");
+}
+
+__test {
+    // a variable a catch handler reads is live on the exception edges entering
+    // it: it is live across every throwing instruction of the region the handler
+    // protects, though nothing there mentions it
+    let df = dataflowOf("test_resources/dataflow/test2.yr", "foo");
+    let mut msg = 0us;
+    if let Ok(id) = df.varNamed("msg") { msg = id; }
+
+    assert (msg != 0us, "test2 : the frame declares no variable named msg");
+
+    let mut nbHandlers = 0us;
+    for b in df.getCfg().getBlocks() {
+        let mut isHandler = false;
+        for p in b.getPrevious() {
+            if (p.2 == EdgeKind::EXCEPTION) isHandler = true;
+        }
+
+        if (!isHandler) continue;
+        nbHandlers += 1us;
+
+        for u in b.getGens() {
+            for p in b.getPrevious() {
+                if (p.2 != EdgeKind::EXCEPTION) continue;
+
+                assert (df.isLiveOut(p.0, u),
+                        format("the variable #% the handler BB% reads is dead on the exception edge leaving BB%",
+                               u, b.getUid(), (p.0).getUid()));
+            }
+        }
+    }
+
+    assert (nbHandlers != 0us, "test2 : no handler entered by an exception edge");
+
+    let mut liveInHandler = false;
+    for b in df.getCfg().getBlocks() {
+        for p in b.getPrevious() {
+            if (p.2 == EdgeKind::EXCEPTION && df.isLiveOut(p.0, msg)) liveInHandler = true;
+        }
+    }
+
+    assert (liveInHandler, "test2 : msg is dead on every exception edge, though the handler reads it");
+}
+
+/**
+ * A frame built by hand, the way the verifier's are: a variable read by the
+ * handler, written by the instruction closing the protected block and by
+ * nothing else in that block.
+ *
+ * No source program produces the shape today, because the expander declares
+ * every temporary it introduces: the variable a throwing call writes is almost
+ * always killed, earlier in its own block, by that declaration too, which hides
+ * what the block contributes on the exception edge. Nothing in the intermediate
+ * language forbids it, though — an out parameter of a runtime function writing
+ * a variable of the source directly is enough — and a liveness applying the
+ * whole-block kill to the exception edge reports `x` dead at the top of a block
+ * the handler reads it across.
+ * */
+fn throwingWriteFrame()-> &YILFrame {
+    let decl = copy YILVarDecl(EOF_WORD, "x", YIL_SINT_32, 12us);
+    let x = copy YILVar(EOF_WORD, "x", YIL_SINT_32, 12us);
+
+    // the label is what puts the write in a block of its own, the way a
+    // preceding throwing instruction would
+    let tryPart: [&YILInstr] = copy [copy YILLabel(EOF_WORD, "try", 1us),
+                                     copy YILAffect(EOF_WORD, x,
+                                                    copy YILNameCallValue(EOF_WORD, YIL_SINT_32, "_Y3barFZi32", []))];
+
+    let catchPart: [&YILInstr] = copy [copy YILCall(EOF_WORD,
+                                                    copy YILNameCallValue(EOF_WORD, YIL_VOID, "_Y3useFi32Zv", copy [x]))];
+
+    let body: [&YILInstr] = copy [decl,
+                                  copy YILAffect(EOF_WORD, x, copy YILIntValue(EOF_WORD, YIL_SINT_32, 1)),
+                                  copy YILTryCatch(EOF_WORD, YIL_SINT_32, tryPart, catchPart)];
+
+    copy YILFrame(EOF_WORD, EOF_WORD, "_YtestFZv", [], YIL_VOID,
+                  body-> copy YILBlock(EOF_WORD, body),
+                  refs-> copy [])
+}
+
+__test {
+    // an exception edge leaves from the middle of the instruction closing its
+    // block: what that instruction writes may not have been written, so it does
+    // not kill, on that edge, a variable the handler reads
+    let df = copy FrameDataflow(throwingWriteFrame());
+    checkFixpoints(df);
+
+    let mut x = 0us;
+    if let Ok(id) = df.varNamed("x") { x = id; }
+
+    assert (x != 0us, "the frame declares no variable named x");
+
+    let mut nb = 0us;
+    for b in df.getCfg().getBlocks() {
+        for n in b.getNext() {
+            if (n.2 != EdgeKind::EXCEPTION) continue;
+            nb += 1us;
+
+            assert (df.isLiveIn(n.0, x),
+                    format("x is dead at the top of the handler BB%, though it reads it", (n.0).getUid()));
+            assert (df.isLiveIn(b, x),
+                    format("x is dead at the top of BB%, though the handler its closing instruction may throw to reads the value it holds",
+                           b.getUid()));
+        }
+    }
+
+    assert (nb == 1us, format("expected one exception edge, found %", nb));
+}
+
+/**
+ * A frame built by hand, whose protected block holds nothing but the call the
+ * handler is entered from, and is the head of a loop that writes the same
+ * variable after it.
+ *
+ * A definition made after the call flows back around the loop into the top of
+ * that block, and the call kills it: what enters the block moves, what leaves
+ * it does not. Since the handler is entered from the *top* of the block, its
+ * own facts move with the first of the two, and a solver that requeues on the
+ * second alone reports a solution the exception edge does not satisfy.
+ * */
+fn loopingThrowFrame()-> &YILFrame {
+    let decl = copy YILVarDecl(EOF_WORD, "x", YIL_SINT_32, 12us);
+    let x = copy YILVar(EOF_WORD, "x", YIL_SINT_32, 12us);
+    let head = copy YILLabel(EOF_WORD, "head", 1us);
+
+    let tryPart: [&YILInstr] = copy [head,
+                                     copy YILAffect(EOF_WORD, x,
+                                                    copy YILNameCallValue(EOF_WORD, YIL_SINT_32, "_Y3barFZi32", [])),
+                                     copy YILAffect(EOF_WORD, x, copy YILIntValue(EOF_WORD, YIL_SINT_32, 2)),
+                                     copy YILGoto(EOF_WORD, head)];
+
+    let catchPart: [&YILInstr] = copy [copy YILCall(EOF_WORD,
+                                                    copy YILNameCallValue(EOF_WORD, YIL_VOID, "_Y3useFi32Zv", copy [x]))];
+
+    let body: [&YILInstr] = copy [decl,
+                                  copy YILAffect(EOF_WORD, x, copy YILIntValue(EOF_WORD, YIL_SINT_32, 1)),
+                                  copy YILTryCatch(EOF_WORD, YIL_SINT_32, tryPart, catchPart)];
+
+    copy YILFrame(EOF_WORD, EOF_WORD, "_YtestFZv", [], YIL_VOID,
+                  body-> copy YILBlock(EOF_WORD, body),
+                  refs-> copy [])
+}
+
+__test {
+    // a handler is entered from the top of the block that throws to it, so the
+    // definitions reaching it are the ones reaching that top: a block whose
+    // facts move there and nowhere else still has to hand them on
+    let df = copy FrameDataflow(loopingThrowFrame());
+    checkFixpoints(df);
+
+    let sol = df.getReachingDefs();
+    let mut nb = 0us;
+
+    for b in df.getCfg().getBlocks() {
+        for n in b.getNext() {
+            if (n.2 != EdgeKind::EXCEPTION) continue;
+            nb += 1us;
+
+            // the block holds nothing but that call, so it neither defines nor
+            // kills anything before it: the handler sees exactly what entered
+            assert (b.getInstrs().len == 1us,
+                    format("BB% holds % instructions, the frame is not the one this checks", b.getUid(), b.getInstrs().len));
+            assert (sol.inOf(n.0) == sol.inOf(b),
+                    format("the handler BB% does not see the definitions reaching the top of BB% it is entered from",
+                           (n.0).getUid(), b.getUid()));
+        }
+    }
+
+    assert (nb == 1us, format("expected one exception edge, found %", nb));
+}
+
+__test {
+    // a golden dump of a return escaping through two nested finally parts
+    compareDump("test_resources/dataflow/test5.yr");
+}
+
+__test {
+    // a golden dump of success/failure/exit, a single finally branching on
+    // how its try was left rather than nesting -- the branch itself must be
+    // built twice too, once per unwind copy, without the two copies' labels
+    // colliding
+    compareDump("test_resources/dataflow/test6.yr");
+}
+
+/**
+ * @returns: true iif `to` is reachable from `from` by following the edges of
+ * the graph they belong to, `from` included
+ * */
+fn reaches(from: &BasicBlock, to: &BasicBlock)-> bool {
+    let mut seen: [usize] = [];
+    let mut stack: [&BasicBlock] = [];
+    seen ~= [from.getUid()];
+    stack ~= [from];
+
+    while (stack.len != 0us) {
+        let cur = stack[$ - 1us];
+        stack = stack[0us .. $ - 1us];
+
+        if (cur.getUid() == to.getUid()) return true;
+
+        for n in cur.getNext() {
+            if (!contains(seen, (n.0).getUid())) {
+                seen ~= [(n.0).getUid()];
+                stack ~= [n.0];
+            }
+        }
+    }
+
+    false
+}
+
+/**
+ * @returns: the number of edges of the shortest path from `from` to `to`,
+ * the size of the graph iif none exists
+ * */
+fn hopsTo(from: &BasicBlock, to: &BasicBlock)-> usize {
+    let mut dist: [usize => mut usize] = copy [];
+    dist[from.getUid()] = 0us;
+
+    let mut queue: [&BasicBlock] = [];
+    queue ~= [from];
+
+    let mut head = 0us;
+    while (head < queue.len) {
+        let cur = queue[head];
+        head += 1us;
+
+        if (cur.getUid() == to.getUid()) {
+            if let Ok(d) = dist[cur.getUid()] { return d; }
+        }
+
+        let mut d = 0us;
+        if let Ok(cd) = dist[cur.getUid()] { d = cd; }
+
+        for n in cur.getNext() {
+            if ((n.0).getUid() !in dist) {
+                dist[(n.0).getUid()] = d + 1us;
+                queue ~= [n.0];
+            }
+        }
+    }
+
+    if let Ok(d) = dist[to.getUid()] { return d; }
+
+    dist.len + 1us
+}
+
+__test {
+    // a return inside a nested destructible scope unwinds through its own,
+    // private copy of every enclosing finally part, chained one to the
+    // next: it must not be able to reach the code that lexically follows
+    // the scope it escapes, the way it would if it fell into a finally
+    // shared with that scope's *normal* completion instead -- see the
+    // comment on `CFG::visitTryFinally`
+    let df = dataflowOf("test_resources/dataflow/test5.yr", "foo");
+    let cfg = df.getCfg();
+
+    let exit = cfg.getExit();
+    let mut returns: [&BasicBlock] = [];
+    for b in cfg.getBlocks() {
+        for i in b.getInstrs() {
+            match i {
+                _: &YILReturn => { if (b.getNext().len == 1us) { returns ~= [b]; } }
+            }
+        }
+    }
+
+    assert (returns.len == 2us,
+            format("test5 : expected 2 returns unwinding through a finally, found %", returns.len));
+
+    // the one escaping two nested scopes is farther, in hops, from the exit
+    let mut inner = returns[0us];
+    let mut outer = returns[1us];
+    if (hopsTo(returns[0us], exit) < hopsTo(returns[1us], exit)) {
+        inner = returns[1us];
+        outer = returns[0us];
+    }
+
+    assert (reaches(inner, cfg.getExit()),
+            "test5 : the innermost return cannot reach the exit at all");
+    assert (!reaches(inner, outer),
+            "test5 : the innermost return reaches the block of the outer return, it falls through a finally instead of unwinding through it");
+}
+
+__test {
+    // every frame of a package with a rich control flow reaches a fixpoint
+    for package in SWEEP {
+        let dfs = buildDataflows(utils::compilePackage(package));
+        assert (dfs.len != 0us, format("% : no frame", package));
+
+        for df in dfs {
+            checkFixpoints(df);
+            assert (df.toDump().len != 0us, format("% : % : empty dump", package, df.getName()));
+        }
+    }
+}
