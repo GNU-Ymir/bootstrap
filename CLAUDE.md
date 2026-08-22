@@ -178,6 +178,30 @@ The whole frontend is orchestrated by `Parser` (`src/ymirc/parser.yr`), in three
    pointer-wide integers are the same address, integer widths are the backend's business —
    so the verifier compares storage classes, not types.
 
+   `optimizer/defuse.yr`, `optimizer/dataflow.yr` and `optimizer/analysis.yr` are the
+   dataflow framework the passes consume. `DefUse` says what one instruction reads and
+   writes, `dataflow.yr` is a worklist fixpoint solver parameterised by direction and meet,
+   and `FrameDataflow` (`analysis.yr`) instantiates it three times per frame: liveness
+   (backward, union), reaching definitions (forward, union) and available expressions
+   (forward, intersection). It also fills `BasicBlock::getGens()`/`getKills()`, the liveness
+   summary of every block. Two things it deliberately gets right, and that a change here must
+   keep: an address passed to a runtime function whose signature is in the `runtimeParamModes`
+   table is a *definition* when the callee writes the pointee (`_yrt_dup_slice(&YI_4, ...)`)
+   and a use when it reads it; and a variable whose address escaped is never killed by
+   anything but a direct assignment to it, every unknown call and every store through a
+   pointer only *may* write it. A third: an exception edge leaves from the *middle* of the
+   instruction closing its block, so what that block contributes on such an edge is its
+   `preGen`/`preKill` — the block minus that instruction — never its whole-block sets. A
+   forward analysis meets those at the top of the handler (`meetOf`), a backward one
+   transfers what the handler needs through them (`transferOf`), which is why a backward
+   analysis meets *after* the transfer instead of before: applying the closing instruction's
+   kill to what a handler reads reports dead a variable it reads.
+   `--fdump-dataflow=<frame>` writes the three analyses per block
+   to `<module>.<frame>.dataflow.txt`, naming the temporaries the way the YIL dump does so the
+   two can be read side by side. The `.df` goldens under `test_resources/dataflow/` are that
+   dump (`test/integration/dataflow.yr`, which also checks the fixpoint equations hold on
+   every frame of a sweep of packages, exception edges included).
+
 Cross-cutting: `src/ymirc/errors` (the `ErrorMsg` type and its pretty-printing/formatting —
 this is what both compiler diagnostics and `.err` golden files render through),
 `src/ymirc/global` (process-wide compiler state, versions, include dirs, debug/dump flags —
