@@ -239,6 +239,49 @@ The whole frontend is orchestrated by `Parser` (`src/ymirc/parser.yr`), in three
    must not move that difference somewhere unchecked. The pass reruns over a frame while it
    still changes something, since each transformation exposes the other.
 
+   `optimizer/dce.yr` is the second pass (`dead-code`, `-O1`), and the one that makes the
+   copies copy-prop leaves behind actually disappear. It does four things per round and
+   repeats the round until none of them fires: it deletes the instructions of every block no
+   path reaches, it deletes an assignment to a whole variable that is not live afterwards and
+   whose right hand side has no effect of its own (`_ = t._1;`), it folds the control flow (a
+   conditional jump on a literal or on twice the same label becomes a goto, a goto into a
+   label that only jumps is retargeted to the end of that chain, a goto into the label right
+   after it is dropped, a label nothing names is dropped), and it drops the declaration of
+   every variable the body stopped naming. The four feed each other, which is why the round
+   repeats: folding a jump orphans a block, deleting a block unnames a label, deleting a store
+   unuses a variable.
+
+   Three things it must keep getting right. **A landing pad is a root of reachability**: a
+   handler is entered by the personality routine and never by a jump, so `CFG::deadBlocks` —
+   not `CFG::unreachableBlocks`, which answers the graph's question and is what the `.dot`
+   dump reports — seeds the walk from the entry *and* from every `YILTryCatch`/`YILTryFinally`
+   pad. Deciding a pad is dead is YMI-84's job, not this pass's. **Only a whole variable is
+   ever stored-dead**: writing a field or an element leaves the rest alone, and a variable
+   whose address escaped is read by things that do not name it, so liveness has nothing to say
+   about either. **A read must be rooted in the frame to be removable**: a call, a
+   `YILBeginCatch`, a division and a dereference all stay, an index into a real array does
+   not. `YILFrame::refs` is deliberately *not* narrowed when an unreachable call goes: the
+   dependency files come out wider than needed, which costs a rebuild and never misses one,
+   whereas its entries are not only calls (typeinfos, vtables, globals) and dropping one of
+   those does go unnoticed. Block layout in reverse post order is not implemented: the YIL
+   body is a tree whose `YILTryCatch`/`YILTryFinally` nodes say which region an instruction is
+   protected by, so blocks cannot be reordered across them, and the fallthrough that layout
+   buys is what dropping the goto into the following label already gives.
+
+   The pass is tied back to the tree by an ordinal. `CFG` numbers every instruction of the
+   body in preorder as it builds (`BasicBlock::getOrds()`, `NO_ORD` for the jumps the builder
+   synthesizes at a fallthrough), the pass decides about ranks on the graph, and the walk
+   rewriting the body counts exactly the same way to find the instruction again. A change to
+   the order `CFG::visit` walks the body in has to be mirrored in `dce::strip`. One subtree is
+   built twice: the finally part of a `YILTryFinally`, once for the region completing normally
+   and once for the unwinding leaving it. Both copies are numbered from the same rank and the
+   walk resumes past the part at `nbOrdsList(finPart)`, never at wherever a copy left the
+   counter — either copy is skipped when nothing reaches it, and a rank counted one copy short
+   names another instruction from there on. A rank is therefore reachable from two blocks, and
+   removing it removes it from both paths, so a block only *votes* in `markDead`: a rank goes
+   when every block carrying it voted, since what the unwinding no longer needs may be exactly
+   what the normal path returns.
+
 Cross-cutting: `src/ymirc/errors` (the `ErrorMsg` type and its pretty-printing/formatting —
 this is what both compiler diagnostics and `.err` golden files render through),
 `src/ymirc/global` (process-wide compiler state, versions, include dirs, debug/dump flags —
