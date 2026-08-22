@@ -1,0 +1,639 @@
+/*
+ * Declares the CFG, the control flow graph of a single YIL frame.
+ *
+ * The graph is built once per frame, from the YIL produced by the expander, and
+ * is the input of every dataflow analysis of the optimizer: liveness, reaching
+ * definitions, dead code elimination.
+ *
+ * The frame body is a tree of instructions, in which control flow is expressed
+ * in three different ways, and the builder has to flatten the three of them into
+ * the same graph:
+ *
+ *   - explicit jumps(`YILGoto`, `YILCondJmp`) to a `YILLabel`. Nothing forces
+ *     the label to sit in the same `YILBlock` as the jump, so labels are
+ *     collected frame wide: the block of a label is created the first time it is
+ *     named, whether by its definition or by a jump that has not seen it yet.
+ *
+ *   - exceptions. Any instruction that contains a call may leave the middle of a
+ *     protected region for the handler of the enclosing `YILTryCatch`, so such
+ *     an instruction ends its block, and an exception edge is added towards
+ *     every handler protecting it. Ignoring those edges is not a missing
+ *     optimization, it is a miscompilation: liveness would conclude that a
+ *     variable read by the handler is dead.
+ *
+ *   - `YILTryFinally`. The finally part is reachable from every exit of its
+ *     body, the normal one(falling out of the body) and the abnormal ones(a
+ *     `YILReturn`, or a throwing instruction).
+ *
+ * Blocks that no path from the entry reaches are kept in the graph rather than
+ * dropped: reporting them is what the dead code elimination pass consumes.
+ *
+ * <hr>
+ *
+ * @Package: ymirc
+ * @Module: ymirc::lint::optimizer::cfg
+ * @File: ymirc/lint/optimizer/cfg.yr
+ * @Author(s):
+ *   - Emile Cadorel <ecadorel@gmail.com>
+ *
+ * @Created(YYYY-MM-DD): 2026-08-22
+ * @Copyright(C) 2021–2026 GNU-Ymir
+ * @License
+ *   ```text
+ *   This file is part of the Ymir language project.
+ *
+ *   Ymir is free software: you can redistribute it and/or modify it
+ *   under the terms of the GNU General Public License as published by
+ *   the Free Software Foundation, either version 3 of the License, or
+ *   (at your option) any later version.
+ *
+ *   Ymir is distributed in the hope that it will be useful,
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *   GNU General Public License for more details.
+ *
+ *   You should have received a copy of the GNU General Public License
+ *   along with Ymir.  If not, see <https://www.gnu.org/licenses/>.
+ *   ```
+ */
+
+in cfg;
+
+use std::{io, stream};
+
+use ymirc::utils::format;
+use ymirc::lint::node::{_, global::_, instr::_, type::_, value::_};
+use ymirc::lint::optimizer::bblock;
+
+use ymirc::lexing::word;
+use ymirc::lexing::keys;
+
+/**
+ * The value put on an edge that is always taken.
+ * */
+lazy CFG_ALWAYS = copy YILIntValue(EOF_WORD, YIL_UINT_8, 1);
+
+/**
+ * The control flow graph of a frame.
+ * */
+pub class CFG {
+
+    // The mangled name of the frame the graph was built from
+    let _name: [c8];
+
+    // The block every path starts from, it contains no instruction
+    let dmut _entry: &BasicBlock = copy BasicBlock(0us);
+
+    // The block every path ends in, it contains no instruction
+    let dmut _exit: &BasicBlock = copy BasicBlock(1us);
+
+    // The identifier given to the next created block
+    let mut _nextUid: usize = 2us;
+
+    // Every block of the graph, in creation order
+    let mut _blocks: [dmut &BasicBlock] = [];
+
+    // The block starting at each label of the frame, indexed by label id
+    let mut _labels: [usize => dmut &BasicBlock] = copy [];
+
+    // The handlers protecting the instruction being visited, innermost last
+    let mut _handlers: [dmut &BasicBlock] = [];
+
+    // The finally parts protecting the instruction being visited, innermost last
+    let mut _finallys: [dmut &BasicBlock] = [];
+
+    /**
+     * Build the control flow graph of a frame.
+     *
+     * @params:
+     *    - frame: the frame to build the graph of
+     * */
+    pub self (frame: &YILFrame)
+        with _name = frame.name
+    {
+        self:.build(frame);
+    }
+
+    /*!
+     * ================================================================================
+     * ================================================================================
+     * ============================          GETTERS          =========================
+     * ================================================================================
+     * ================================================================================
+     */
+
+    /**
+     * @returns: the mangled name of the frame the graph was built from
+     * */
+    pub fn getName(self)-> [c8] {
+        self._name
+    }
+
+    /**
+     * @returns: the entry block, it has no predecessor and no instruction
+     * */
+    pub fn getEntry(self)-> &BasicBlock {
+        self._entry
+    }
+
+    /**
+     * @returns: the exit block, it has no successor and no instruction
+     * */
+    pub fn getExit(self)-> &BasicBlock {
+        self._exit
+    }
+
+    /**
+     * @returns: every block of the graph, in creation order
+     * */
+    pub fn getBlocks(self)-> [&BasicBlock] {
+        copy [b for b in self._blocks]
+    }
+
+    /*!
+     * ================================================================================
+     * ================================================================================
+     * ============================          BUILD          ===========================
+     * ================================================================================
+     * ================================================================================
+     */
+
+    /**
+     * Build the graph of the body of a frame.
+     *
+     * The body is any instruction, not necessarily a `YILBlock`: the destructor
+     * scheduling of the expander wraps the body of a frame owning an aggregate
+     * in a `YILTryFinally`, and a frame whose body is a single instruction is
+     * not wrapped in a block either.
+     *
+     * @params:
+     *    - frame: the frame to build the graph of
+     * */
+    fn build(mut self, frame: &YILFrame) {
+        self._blocks ~= [alias self._entry];
+
+        let dmut start = self:.newBlock();
+        start:.insertFrom(alias self._entry, CFG_ALWAYS);
+
+        let dmut end = self:.visit(frame.body, alias start);
+        if (end.isFalling() && self.isLive(end)) { // the body falls out of its last instruction, it returns void
+            self._exit:.insertFrom(alias end, CFG_ALWAYS);
+        }
+
+        self._blocks ~= [alias self._exit];
+        self:.removeEmptyOrphans();
+    }
+
+    /**
+     * Append the instruction to the graph.
+     *
+     * @params:
+     *    - instr: the instruction to append
+     *    - current: the block the instruction is appended to
+     * @returns: the block in which the instruction following it must be appended
+     * */
+    fn visit(mut self, instr: &YILInstr, dmut current: &BasicBlock)-> dmut &BasicBlock {
+        match instr {
+            b: &YILBlock => { return alias self:.visitBlock(b, alias current); }
+            l: &YILLabel => { return alias self:.visitLabel(l, alias current); }
+            g: &YILGoto => { return alias self:.visitGoto(g, alias current); }
+            c: &YILCondJmp => { return alias self:.visitCondJmp(c, alias current); }
+            r: &YILReturn => { return alias self:.visitReturn(r, alias current); }
+            t: &YILTryCatch => { return alias self:.visitTryCatch(t, alias current); }
+            t: &YILTryFinally => { return alias self:.visitTryFinally(t, alias current); }
+            _ => { return alias self:.visitSimple(instr, alias current); }
+        }
+    }
+
+    /**
+     * Append a list of instructions to the graph, in order.
+     *
+     * @params:
+     *    - instrs: the instructions to append
+     *    - current: the block the first instruction is appended to
+     * @returns: the block in which the instruction following them must be appended
+     * */
+    fn visitList(mut self, instrs: [&YILInstr], dmut current: &BasicBlock)-> dmut &BasicBlock {
+        let dmut cur = alias current;
+        for i in instrs {
+            cur = alias self:.visit(i, alias cur);
+        }
+
+        alias cur
+    }
+
+    /**
+     * Append a block of instructions to the graph.
+     * */
+    fn visitBlock(mut self, bl: &YILBlock, dmut current: &BasicBlock)-> dmut &BasicBlock {
+        alias self:.visitList(bl.instrs, alias current)
+    }
+
+    /**
+     * Start the block of a label.
+     *
+     * A label always starts a new basic block, and when the instructions
+     * preceding it fall into it, an explicit goto is inserted so that the block
+     * that was left ends on a terminator, like every other block of the graph.
+     * */
+    fn visitLabel(mut self, l: &YILLabel, dmut current: &BasicBlock)-> dmut &BasicBlock {
+        let dmut target = alias self:.labelBlock(l.id);
+        if (current.isFalling() && self.isLive(current)) {
+            current:.push(copy YILGoto(l.loc, l));
+            target:.insertFrom(alias current, CFG_ALWAYS);
+        }
+
+        alias target
+    }
+
+    /**
+     * Close the current block on an unconditional jump.
+     * */
+    fn visitGoto(mut self, g: &YILGoto, dmut current: &BasicBlock)-> dmut &BasicBlock {
+        current:.push(g);
+
+        let dmut target = alias self:.labelBlock(g.label.id);
+        target:.insertFrom(alias current, CFG_ALWAYS);
+
+        alias self:.newBlock()
+    }
+
+    /**
+     * Close the current block on a conditional jump.
+     * */
+    fn visitCondJmp(mut self, c: &YILCondJmp, dmut current: &BasicBlock)-> dmut &BasicBlock {
+        current:.push(c);
+        if (self.mayThrow(c.cond)) { self:.addExceptionEdges(alias current); }
+
+        let dmut thenB = alias self:.labelBlock(c.then.id);
+        thenB:.insertFrom(alias current, c.cond);
+
+        let dmut elseB = alias self:.labelBlock(c.else_.id);
+        elseB:.insertFrom(alias current, copy YILUnaryValue(c.loc, YIL_UINT_8, UnaryOperators::NOT, c.cond));
+
+        alias self:.newBlock()
+    }
+
+    /**
+     * Close the current block on a return.
+     *
+     * A return leaving the body of a `YILTryFinally` runs the finally part
+     * before actually leaving the frame, so it enters the innermost finally
+     * rather than the exit block.
+     * */
+    fn visitReturn(mut self, r: &YILReturn, dmut current: &BasicBlock)-> dmut &BasicBlock {
+        current:.push(r);
+        if (self.mayThrow(r.value)) { self:.addExceptionEdges(alias current); }
+
+        if (self._finallys.len != 0us) {
+            let dmut fin = alias self._finallys[$ - 1us];
+            fin:.insertFrom(alias current, CFG_ALWAYS);
+        } else {
+            self._exit:.insertFrom(alias current, CFG_ALWAYS);
+        }
+
+        alias self:.newBlock()
+    }
+
+    /**
+     * Append a try/catch to the graph.
+     *
+     * The handler is created before the protected region is visited, so that the
+     * throwing instructions of the region can point at it. It is entered by
+     * exception edges only: when nothing in the region can throw, the handler is
+     * unreachable, and reported as such.
+     * */
+    fn visitTryCatch(mut self, t: &YILTryCatch, dmut current: &BasicBlock)-> dmut &BasicBlock {
+        let dmut handler = self:.newBlock();
+
+        self._handlers ~= [alias handler];
+        let dmut bodyEnd = self:.visitList(t.tryPart, alias current);
+        self._handlers = alias self._handlers[0us .. $ - 1us];
+
+        let dmut cont = self:.newBlock();
+        if (bodyEnd.isFalling() && self.isLive(bodyEnd)) {
+            cont:.insertFrom(alias bodyEnd, CFG_ALWAYS);
+        }
+
+        // the catch part starts on the YILBeginCatch affectation put there by
+        // the expander, which is the entry definition of the caught variable
+        let dmut catchEnd = self:.visitList(t.catchPart, alias handler);
+        if (catchEnd.isFalling() && self.isLive(catchEnd)) {
+            cont:.insertFrom(alias catchEnd, CFG_ALWAYS);
+        }
+
+        alias cont
+    }
+
+    /**
+     * Append a try/finally to the graph.
+     *
+     * The finally part is entered from every exit of the protected region: the
+     * normal one when the region falls out of its last instruction, and the
+     * abnormal ones(returns and throwing instructions) through the handler
+     * stack.
+     * */
+    fn visitTryFinally(mut self, t: &YILTryFinally, dmut current: &BasicBlock)-> dmut &BasicBlock {
+        let dmut fin = self:.newBlock();
+
+        self._handlers ~= [alias fin];
+        self._finallys ~= [alias fin];
+        let dmut bodyEnd = self:.visitList(t.tryPart, alias current);
+        self._handlers = alias self._handlers[0us .. $ - 1us];
+        self._finallys = alias self._finallys[0us .. $ - 1us];
+
+        if (bodyEnd.isFalling() && self.isLive(bodyEnd)) {
+            fin:.insertFrom(alias bodyEnd, CFG_ALWAYS);
+        }
+
+        let dmut finEnd = self:.visitList(t.finPart, alias fin);
+        let dmut cont = self:.newBlock();
+        if (finEnd.isFalling() && self.isLive(finEnd)) {
+            cont:.insertFrom(alias finEnd, CFG_ALWAYS);
+        }
+
+        alias cont
+    }
+
+    /**
+     * Append a straight line instruction to the graph.
+     *
+     * An instruction containing a call ends its block when it is protected by a
+     * handler: the call is a branch to that handler, and everything after it in
+     * the block is only reached when the call returns normally.
+     * */
+    fn visitSimple(mut self, instr: &YILInstr, dmut current: &BasicBlock)-> dmut &BasicBlock {
+        current:.push(instr);
+
+        if (self._handlers.len == 0us) return alias current;
+        if (!self.mayThrowInstr(instr)) return alias current;
+
+        self:.addExceptionEdges(alias current);
+
+        let dmut cont = self:.newBlock();
+        cont:.insertFrom(alias current, CFG_ALWAYS);
+
+        alias cont
+    }
+
+    /*!
+     * ================================================================================
+     * ================================================================================
+     * ==========================          BUILDING          ==========================
+     * ================================================================================
+     * ================================================================================
+     */
+
+    /**
+     * @params:
+     *    - bb: a block of the graph
+     * @returns: false iif the block is the one the builder opened after a
+     * terminator and nothing ever entered
+     *
+     * Closing a block on a terminator opens a new one, because an instruction
+     * may follow. When none does, that block is not a piece of the frame, and
+     * connecting it to the rest of the graph would invent a path.
+     * */
+    fn isLive(self, bb: &BasicBlock)-> bool {
+        !bb.isEmpty() || bb.getPrevious().len != 0us
+    }
+
+    /**
+     * Create a block and register it in the graph.
+     *
+     * @returns: the created block, empty and unconnected
+     * */
+    fn newBlock(mut self)-> dmut &BasicBlock {
+        let dmut bb = copy BasicBlock(self._nextUid);
+        self._nextUid += 1us;
+        self._blocks ~= [alias bb];
+
+        alias bb
+    }
+
+    /**
+     * @params:
+     *    - id: the uniq identifier of a label of the frame
+     * @returns: the block starting at that label, creating it if it is the first
+     * time the label is named
+     * */
+    fn labelBlock(mut self, id: usize)-> dmut &BasicBlock {
+        if let Ok(dmut bb: &BasicBlock) = alias self._labels[id] {
+            return alias bb;
+        }
+
+        let dmut bb = self:.newBlock();
+        self._labels[id] = alias bb;
+
+        alias bb
+    }
+
+    /**
+     * Add an exception edge from a block to every handler protecting it.
+     *
+     * Every enclosing handler is connected, not only the innermost one: a
+     * handler may rethrow, and a finally part always does.
+     * */
+    fn addExceptionEdges(mut self, dmut from: &BasicBlock) {
+        for i in 0us .. self._handlers.len {
+            let dmut h = alias self._handlers[self._handlers.len - 1us - i];
+            h:.insertFrom(alias from, CFG_ALWAYS, kind-> EdgeKind::EXCEPTION);
+        }
+    }
+
+    /**
+     * Drop the blocks that the builder created but never used.
+     *
+     * Closing a block on a terminator opens a new one, which stays empty when
+     * the terminator is immediately followed by a label. Such a block is an
+     * artifact of the walk, not a piece of the frame.
+     * */
+    fn removeEmptyOrphans(mut self) {
+        let mut res: [dmut &BasicBlock] = [];
+        for i in 0us .. self._blocks.len {
+            let dmut b = alias self._blocks[i];
+            if (b.isEmpty() && b.getPrevious().len == 0us && b.getNext().len == 0us
+                && b.getUid() != self._entry.getUid() && b.getUid() != self._exit.getUid()) {
+                continue;
+            }
+
+            res ~= [alias b];
+        }
+
+        self._blocks = alias res;
+    }
+
+    /*!
+     * ================================================================================
+     * ================================================================================
+     * ===========================          THROWING          =========================
+     * ================================================================================
+     * ================================================================================
+     */
+
+    /**
+     * @params:
+     *    - instr: an instruction of the frame
+     * @returns: true iif the instruction can leave the frame through an exception
+     * */
+    pub fn mayThrowInstr(self, instr: &YILInstr)-> bool {
+        match instr {
+            a: &YILAffect => { return self.mayThrow(a.left) || self.mayThrow(a.right); }
+            _: &YILCall => { return true; } // a call instruction is always a call
+            r: &YILReturn => { return self.mayThrow(r.value); }
+            c: &YILCondJmp => { return self.mayThrow(c.cond); }
+            _ => { return false; }
+        }
+    }
+
+    /**
+     * @params:
+     *    - value: a value of the frame
+     * @returns: true iif evaluating the value can leave the frame through an exception
+     *
+     * Only calls can throw: every other value is either a leaf, or built from
+     * values that are checked recursively.
+     * */
+    pub fn mayThrow(self, value: &YILValue)-> bool {
+        match value {
+            _: &YILNameCallValue => { return true; }
+            _: &YILPtrCallValue => { return true; }
+            a: &YILArrayAccessValue => { return self.mayThrow(a.value) || self.mayThrow(a.index); }
+            a: &YILAddrValue => { return self.mayThrow(a.value); }
+            a: &YILArrayValue => { return self.mayThrowAny(a.value); }
+            b: &YILBinaryValue => { return self.mayThrow(b.left) || self.mayThrow(b.right); }
+            c: &YILCastValue => { return self.mayThrow(c.value); }
+            f: &YILFieldValue => { return self.mayThrow(f.tuple); }
+            t: &YILTupleValue => { return self.mayThrowAny(t.values); }
+            u: &YILUnaryValue => { return self.mayThrow(u.left); }
+            u: &YILUnrefValue => { return self.mayThrow(u.value); }
+            _ => { return false; }
+        }
+    }
+
+    /**
+     * @returns: true iif at least one of the values can throw
+     * */
+    fn mayThrowAny(self, values: [&YILValue])-> bool {
+        for v in values {
+            if (self.mayThrow(v)) return true;
+        }
+
+        false
+    }
+
+    /*!
+     * ================================================================================
+     * ================================================================================
+     * ==========================          TRAVERSAL          =========================
+     * ================================================================================
+     * ================================================================================
+     */
+
+    /**
+     * @returns: the blocks of the graph in reverse post order
+     *
+     * A block always appears before every block it dominates, which is the order
+     * in which a forward dataflow analysis converges the fastest. Unreachable
+     * blocks are not part of the result: no path reaches them, so no analysis
+     * has anything to say about them.
+     * */
+    pub fn reversePostOrder(self)-> [&BasicBlock] {
+        let mut post: [&BasicBlock] = [];
+        let mut done: [usize => mut()] = copy [];
+
+        self.postOrder(self._entry, ref post, ref done);
+
+        let mut res: [&BasicBlock] = [];
+        for i in 0us .. post.len {
+            res ~= [post[post.len - 1us - i]];
+        }
+
+        res
+    }
+
+    /**
+     * Append the blocks reachable from a block in post order.
+     * */
+    fn postOrder(self, bb: &BasicBlock, ref mut post: [&BasicBlock], ref mut done: [usize => mut()]) {
+        if (bb.getUid() in done) return;
+        done[bb.getUid()] = ();
+
+        for n in bb.getNext() {
+            self.postOrder(n.0, ref post, ref done);
+        }
+
+        post ~= [bb];
+    }
+
+    /**
+     * @returns: the blocks that no path from the entry reaches
+     *
+     * They are the input of the dead code elimination pass: unreachable code is
+     * kept in the graph, and removing it is a transformation, not a side effect
+     * of the construction.
+     * */
+    pub fn unreachableBlocks(self)-> [&BasicBlock] {
+        let mut done: [usize => mut()] = copy [];
+        let mut post: [&BasicBlock] = [];
+        self.postOrder(self._entry, ref post, ref done);
+
+        let mut res: [&BasicBlock] = [];
+        for b in self._blocks {
+            if (b.getUid() !in done) res ~= [b];
+        }
+
+        res
+    }
+
+    /*!
+     * ================================================================================
+     * ================================================================================
+     * ============================          DUMPING          =========================
+     * ================================================================================
+     * ================================================================================
+     */
+
+    /**
+     * @returns: the graphviz representation of the graph(`--fdump-cfg=`)
+     * */
+    pub fn toDot(self)-> [c8] {
+        let unreach = self.unreachableBlocks();
+        let mut isUnreach: [usize => mut()] = copy [];
+        for b in unreach {
+            isUnreach[b.getUid()] = ();
+        }
+
+        let dmut stream = copy Formatter(tags-> FormatTags(short-> true));
+        stream:.write("digraph \"", escapeDot(self._name), "\" {\n");
+        stream:.write("  labelloc=\"t\"\n");
+        stream:.write("  label=\"", escapeDot(self._name), "\"\n");
+        stream:.write("  node [shape=box, fontname=\"monospace\"]\n");
+        stream:.write("  BB", self._entry.getUid(), " [label=\"entry\", shape=ellipse]\n");
+        stream:.write("  BB", self._exit.getUid(), " [label=\"exit\", shape=ellipse]\n");
+
+        for b in self._blocks {
+            if (b.getUid() == self._entry.getUid() || b.getUid() == self._exit.getUid()) {
+                // the node itself is already written, only the edges are missing
+                for n in b.getNext() {
+                    stream:.write("  BB", b.getUid(), " -> BB", (n.0).getUid(), "\n");
+                }
+
+                continue;
+            }
+
+            b.formatDot(alias stream, unreachable-> (b.getUid() in isUnreach));
+        }
+
+        stream:.write("}\n");
+
+        stream[]
+    }
+
+    impl Streamable {
+        pub over toStream(self, dmut stream: &StringStream) {
+            stream:.write(self.toDot());
+        }
+    }
+
+}
