@@ -217,6 +217,28 @@ The whole frontend is orchestrated by `Parser` (`src/ymirc/parser.yr`), in three
    dump (`test/integration/dataflow.yr`, which also checks the fixpoint equations hold on
    every frame of a sweep of packages, exception edges included).
 
+   `optimizer/copyprop.yr` is the first pass of the pipeline (`copy-prop`, `-O1`). It walks a
+   frame forward holding, per variable, the value it is known to hold, and does two things
+   with it: it renames a read of `x` to `y` after `x = y` (the copy itself survives until dead
+   code elimination lands), and it substitutes a compiler-generated temporary the frame
+   assigns once and reads once into that read, deleting the assignment (`YI_2 = a + 9;
+   return YI_2;` becomes `return a + 9;`). The environment is dropped at every label, jump and
+   handler boundary, so a substituted value is always written earlier on the same straight-line
+   run as its use, and dominance holds without a dominator tree. The two ends are not
+   necessarily in the same basic block — a call in a try region ends one in the middle of that
+   run, and the pass keeps its environment across it — the invariant to check a change against
+   is dominance, not same-block. Four rules keep it honest and must survive
+   any change: nothing is ever substituted under a `&` (which covers the runtime out
+   parameters and the address-taken variables at once), the left of an assignment is storage
+   rather than a value and is left alone, only a side-effect-free expression is coalesced
+   (no call, no read through a pointer, no indexing, no division), and nothing naming a
+   variable outside the frame's universe is moved — a reference to a global symbol carries the
+   id `0`, no write to it is ever recorded as a def, so nothing would invalidate a value that
+   reads it. A destination and its value
+   must also have the same type — YIL types are looser than the backend's, and moving a value
+   must not move that difference somewhere unchecked. The pass reruns over a frame while it
+   still changes something, since each transformation exposes the other.
+
 Cross-cutting: `src/ymirc/errors` (the `ErrorMsg` type and its pretty-printing/formatting —
 this is what both compiler diagnostics and `.err` golden files render through),
 `src/ymirc/global` (process-wide compiler state, versions, include dirs, debug/dump flags —
