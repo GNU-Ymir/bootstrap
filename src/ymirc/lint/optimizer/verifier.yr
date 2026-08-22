@@ -1,0 +1,517 @@
+/*
+ * Declares the YIL verifier, the structural check run between optimization passes.
+ *
+ * An optimizer bug does not look like a compiler error, it looks like a program
+ * that builds fine and misbehaves at runtime in code generated three modules
+ * away. The verifier turns the subset of those bugs that leave a trace in the
+ * intermediate language into a located `ErrorMsg` raised right after the pass
+ * that introduced them.
+ *
+ * It checks well formedness only: that the frame is something the backend can be
+ * handed. It says nothing about the frame still meaning what it meant before the
+ * pass, which no structural check can establish.
+ *
+ * <hr>
+ *
+ * @Package: ymirc
+ * @Module: ymirc::lint::optimizer::verifier
+ * @File: ymirc/lint/optimizer/verifier.yr
+ * @Author(s):
+ *   - Emile Cadorel <ecadorel@gmail.com>
+ *
+ * @Created(YYYY-MM-DD): 2026-08-22
+ * @Copyright(C) 2021–2026 GNU-Ymir
+ * @License
+ *   ```text
+ *   This file is part of the Ymir language project.
+ *
+ *   Ymir is free software: you can redistribute it and/or modify it
+ *   under the terms of the GNU General Public License as published by
+ *   the Free Software Foundation, either version 3 of the License, or
+ *   (at your option) any later version.
+ *
+ *   Ymir is distributed in the hope that it will be useful,
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *   GNU General Public License for more details.
+ *
+ *   You should have received a copy of the GNU General Public License
+ *   along with Ymir.  If not, see <https://www.gnu.org/licenses/>.
+ *   ```
+ */
+
+in verifier;
+
+use ymirc::errors;
+use ymirc::utils::format;
+use ymirc::lint::node::{_, global::_, instr::_, type::_, value::_};
+use ymirc::lint::optimizer::{bblock, cfg};
+use ymirc::lint::optimizer::errors::_;
+
+use ymirc::lexing::word;
+
+/**
+ * The prefix of the symbols provided by the runtime library.
+ *
+ * They are called by name from the frames the expander builds, but they are no
+ * dependency of the module: nothing recompiles when the runtime changes, and
+ * they are consequently absent from `YILFrame::refs`.
+ * */
+def RUNTIME_PREFIX = "_yrt";
+
+/**
+ * The structural verifier of a YIL frame.
+ *
+ * The same instance may verify any number of frames: every check is reset at the
+ * beginning of `verify`.
+ * */
+pub class Verifier {
+
+    // The name of the pass whose output is verified, empty for the raw expander output
+    let mut _pass: [c8] = "";
+
+    // The mangled name of the frame being verified
+    let mut _frame: [c8] = "";
+
+    // The symbols the frame declares depending on
+    let mut _refs: [[c8] => mut ()] = copy [];
+
+    // Location of the declaration of every variable of the frame, indexed by variable id
+    let mut _decls: [usize => mut (&Word, [c8])] = copy [];
+
+    // Location of the definition of every label of the frame, indexed by label id
+    let mut _labels: [usize => mut &Word] = copy [];
+
+    // The errors found so far, reported as the notes of a single fatal error
+    let mut _errors: [&ErrorMsg] = [];
+
+    // The number of enclosing catching parts, a YILBeginCatch is only valid inside one
+    let mut _inCatch: usize = 0us;
+
+    /**
+     * Create a verifier.
+     *
+     * @params:
+     *    - pass: the name of the pass whose output is verified, empty when
+     *            verifying the frame as the expander produced it
+     * */
+    pub self (pass: [c8] = "")
+        with _pass = pass
+    {}
+
+    /*!
+     * ================================================================================
+     * ================================================================================
+     * ============================          VERIFY          ==========================
+     * ================================================================================
+     * ================================================================================
+     */
+
+    /**
+     * Verify a frame, raising every malformation found in it at once.
+     *
+     * @params:
+     *    - frame: the frame to verify
+     * @throws:
+     *    - ErrorMsg: iif the frame is malformed, one note per malformation
+     * */
+    pub fn verify(mut self, frame: &YILFrame)
+        throws ErrorMsg
+    {
+        self:.reset(frame);
+
+        self:.collect(frame.body);
+        self:.checkInstr(frame.body);
+        self:.checkFlow(frame);
+
+        if (self._errors.len != 0us) {
+            let msg = if (self._pass == "") {
+                format(VerifierErrorMessage::MALFORMED_YIL_EXPANSION, self._frame)
+            } else {
+                format(VerifierErrorMessage::MALFORMED_YIL, self._frame, self._pass)
+            };
+
+            throw copy ErrorMsg::fatal(frame.loc, msg-> msg, notes-> self._errors, forceVerbose-> true);
+        }
+    }
+
+    /**
+     * Forget everything the previous frame left, and register what the next one
+     * declares before its body is walked: a jump may target a label defined
+     * further down, and a variable declared in one block may be used in another.
+     *
+     * @params:
+     *    - frame: the frame about to be verified
+     * */
+    fn reset(mut self, frame: &YILFrame) {
+        self._frame = frame.name;
+        self._errors = [];
+        self._inCatch = 0us;
+
+        self._refs = copy [];
+        for name, _ in frame.references {
+            self._refs[name] = ();
+        }
+
+        self._decls = copy [];
+        self._labels = copy [];
+        for p in frame.params {
+            self._decls[p.id] = (p.loc, p.name);
+        }
+    }
+
+    /*!
+     * ================================================================================
+     * ================================================================================
+     * ===========================          COLLECT          ==========================
+     * ================================================================================
+     * ================================================================================
+     */
+
+    /**
+     * Register the variables and the labels defined by an instruction, reporting
+     * the ones defined twice.
+     *
+     * @params:
+     *    - instr: the instruction to collect the definitions of
+     * */
+    fn collect(mut self, instr: &YILInstr) {
+        match instr {
+            b: &YILBlock => { for i in b.instrs { self:.collect(i); } }
+            t: &YILTryCatch => {
+                for i in t.tryPart { self:.collect(i); }
+                for i in t.catchPart { self:.collect(i); }
+            }
+            t: &YILTryFinally => {
+                for i in t.tryPart { self:.collect(i); }
+                for i in t.finPart { self:.collect(i); }
+            }
+            v: &YILVarDecl => {
+                if let Ok(old) = self._decls[v.id] {
+                    self:.error(v.loc, format(VerifierErrorMessage::DUPLICATED_VAR_DECL, v.name, v.id),
+                                note-> (old.0, VerifierErrorMessage::FIRST_DEFINED_HERE));
+                } else {
+                    self._decls[v.id] = (v.loc, v.name);
+                }
+            }
+            l: &YILLabel => {
+                if let Ok(old) = self._labels[l.id] {
+                    self:.error(l.loc, format(VerifierErrorMessage::DUPLICATED_LABEL, l.name, l.id),
+                                note-> (old, VerifierErrorMessage::FIRST_DEFINED_HERE));
+                } else {
+                    self._labels[l.id] = l.loc;
+                }
+            }
+        }
+    }
+
+    /*!
+     * ================================================================================
+     * ================================================================================
+     * ==========================          INSTRUCTIONS          ======================
+     * ================================================================================
+     * ================================================================================
+     */
+
+    /**
+     * Check an instruction and everything it contains.
+     *
+     * @params:
+     *    - instr: the instruction to check
+     * */
+    fn checkInstr(mut self, instr: &YILInstr) {
+        match instr {
+            b: &YILBlock => { for i in b.instrs { self:.checkInstr(i); } }
+            t: &YILTryCatch => { self:.checkTryCatch(t); }
+            t: &YILTryFinally => {
+                for i in t.tryPart { self:.checkInstr(i); }
+                for i in t.finPart { self:.checkInstr(i); }
+            }
+            a: &YILAffect => { self:.checkAffect(a); }
+            c: &YILCall => { self:.checkValue(c.content); }
+            r: &YILReturn => { self:.checkValue(r.value); }
+            g: &YILGoto => { self:.checkLabel(g.loc, g.label); }
+            c: &YILCondJmp => {
+                self:.checkValue(c.cond);
+                self:.checkLabel(c.loc, c.then);
+                self:.checkLabel(c.loc, c.else_);
+            }
+        }
+    }
+
+    /**
+     * Check a try/catch.
+     *
+     * The catching part is the only place a `YILBeginCatch` is allowed to appear:
+     * it is the value binding the exception the personality routine selected, and
+     * it reads a register that only holds it there.
+     * */
+    fn checkTryCatch(mut self, t: &YILTryCatch) {
+        for i in t.tryPart { self:.checkInstr(i); }
+
+        self._inCatch += 1us;
+        for i in t.catchPart { self:.checkInstr(i); }
+        self._inCatch -= 1us;
+    }
+
+    /**
+     * Check an affectation.
+     *
+     * An affectation is a move of a fixed width, so the two operands must have
+     * compatible types. Compatible is not identical: YIL types carry no
+     * semantics the backend does not need, and the expander freely affects a
+     * pointer to a pointer to another type, or to an integer of the same width.
+     * What it never does is move a value of one width into a slot of another,
+     * and that is what a pass getting a rewrite wrong produces.
+     * */
+    fn checkAffect(mut self, a: &YILAffect) {
+        self:.checkValue(a.left);
+        self:.checkValue(a.right);
+
+        if (!self.isCompatible(a.left.type, a.right.type)) {
+            self:.error(a.loc, format(VerifierErrorMessage::AFFECT_TYPE_MISMATCH, a.right.type, a.left.type));
+        }
+    }
+
+    /**
+     * @params:
+     *    - left:  the type of the destination of a move
+     *    - right: the type of its source
+     * @returns: true iif a value of the second type can be moved into a location
+     * of the first one
+     *
+     * The comparison is made on the storage class, not on the type, because YIL
+     * types are deliberately loose about everything the backend converts on its
+     * own:
+     *   - a pointer, an array and an integer as wide as a pointer are the same
+     *     address, and the expander affects one to the other freely,
+     *   - the width and the signedness of an integer are the backend's business:
+     *     the expander does affect the `i32` count of a range to the `u64`
+     *     counter of the loop it drives,
+     *   - the declared width of a tuple is not the width moved when its last
+     *     field is a flexible payload, which is how a lazy value and a closure
+     *     are laid out.
+     *
+     * What is left is the mismatch a pass produces when it substitutes the wrong
+     * value: an aggregate moved into a scalar, or a float into an integer.
+     * */
+    fn isCompatible(self, left: &YILType, right: &YILType)-> bool {
+        if (left == right) return true;
+        if (self.isAddress(left) && self.isAddress(right)) return true;
+
+        match (left, right) {
+            (_: &YILInt, _: &YILInt) => { return true; }
+            (_: &YILFloat, _: &YILFloat) => { return true; }
+            (_: &YILTuple, _: &YILTuple) => { return true; }
+        }
+
+        false
+    }
+
+    /**
+     * @params:
+     *    - type: a type of the frame
+     * @returns: true iif values of that type are addresses as far as the backend
+     * is concerned
+     * */
+    fn isAddress(self, type: &YILType)-> bool {
+        match type {
+            _: &YILPointer => { return true; }
+            _: &YILArray => { return true; }
+            i: &YILInt => { return i.size == YIL_PTR_VOID.size; }
+            _ => { return false; }
+        }
+    }
+
+    /**
+     * Check that a jump targets a label the frame defines.
+     * */
+    fn checkLabel(mut self, loc: &Word, label: &YILLabel) {
+        if (label.id in self._labels) return;
+
+        self:.error(loc, format(VerifierErrorMessage::UNKNOWN_LABEL, label.name, label.id));
+    }
+
+    /*!
+     * ================================================================================
+     * ================================================================================
+     * =============================          VALUES          =========================
+     * ================================================================================
+     * ================================================================================
+     */
+
+    /**
+     * Check a value and everything it is built from.
+     *
+     * @params:
+     *    - value: the value to check
+     * */
+    fn checkValue(mut self, value: &YILValue) {
+        match value {
+            v: &YILVar => { self:.checkVar(v); }
+            f: &YILFieldValue => { self:.checkField(f); }
+            a: &YILArrayAccessValue => { self:.checkArrayAccess(a); }
+            n: &YILNameCallValue => { self:.checkNameCall(n); }
+            b: &YILBeginCatch => { self:.checkBeginCatch(b); }
+            a: &YILAddrValue => { self:.checkValue(a.value); }
+            a: &YILArrayValue => { for v in a.value { self:.checkValue(v); } }
+            b: &YILBinaryValue => { self:.checkValue(b.left); self:.checkValue(b.right); }
+            c: &YILCastValue => { self:.checkValue(c.value); }
+            p: &YILPtrCallValue => {
+                self:.checkValue(p.funcPtr);
+                for v in p.params { self:.checkValue(v); }
+            }
+            t: &YILTupleValue => { for v in t.values { self:.checkValue(v); } }
+            u: &YILUnaryValue => { self:.checkValue(u.left); }
+            u: &YILUnrefValue => { self:.checkValue(u.value); }
+        }
+    }
+
+    /**
+     * Check that a variable refers to a declaration the frame contains.
+     *
+     * The identifier `0` is not a variable identifier, it is what a reference to
+     * a global symbol by name carries: those are checked as references, not as
+     * variables.
+     * */
+    fn checkVar(mut self, v: &YILVar) {
+        if (v.id == 0us) return;
+        if (v.id in self._decls) return;
+
+        self:.error(v.loc, format(VerifierErrorMessage::UNDECLARED_VAR, v.name, v.id));
+    }
+
+    /**
+     * Check that a field access names a field the accessed tuple has.
+     *
+     * Nothing is checked when the accessed value is not typed as a tuple: a
+     * field access on a pointer to a tuple is how every class instance is
+     * accessed, and the pointed type is not always reachable from there.
+     * */
+    fn checkField(mut self, f: &YILFieldValue) {
+        self:.checkValue(f.tuple);
+
+        match f.tuple.type {
+            t: &YILTuple => {
+                if (f.name != "") {
+                    for n in t.fieldNames {
+                        if (n == f.name) return;
+                    }
+
+                    if (t.fieldNames.len != 0us) {
+                        self:.error(f.loc, format(VerifierErrorMessage::FIELD_UNKNOWN_NAME, f.name, t));
+                    }
+                } else if (f.index >= t.inners.len) {
+                    self:.error(f.loc, format(VerifierErrorMessage::FIELD_INDEX_OUT_OF_RANGE, f.index, t.inners.len));
+                }
+            }
+        }
+    }
+
+    /**
+     * Check that an index access is made on something indexable.
+     * */
+    fn checkArrayAccess(mut self, a: &YILArrayAccessValue) {
+        self:.checkValue(a.value);
+        self:.checkValue(a.index);
+
+        match a.value.type {
+            _: &YILArray => {}
+            _: &YILPointer => {}
+            _ => {
+                self:.error(a.loc, format(VerifierErrorMessage::ARRAY_ACCESS_ON_SCALAR, a.value.type));
+            }
+        }
+    }
+
+    /**
+     * Check that a call by name is a dependency the frame declares.
+     *
+     * `YILFrame::refs` is what `Parser::writeModuleDependencies` writes the
+     * dependency files from, so a pass that rewrites a call without maintaining
+     * it does not produce a wrong program, it produces a build that stops
+     * rebuilding when the called symbol changes.
+     * */
+    fn checkNameCall(mut self, n: &YILNameCallValue) {
+        for v in n.params { self:.checkValue(v); }
+
+        if (n.funcName.len >= RUNTIME_PREFIX.len && n.funcName[0us .. RUNTIME_PREFIX.len] == RUNTIME_PREFIX) return;
+        if (n.funcName == self._frame) return;
+        if (n.funcName in self._refs) return;
+
+        self:.error(n.loc, format(VerifierErrorMessage::DANGLING_REF, n.funcName));
+    }
+
+    /**
+     * Check that an exception is bound where the personality routine selected one.
+     * */
+    fn checkBeginCatch(mut self, b: &YILBeginCatch) {
+        if (self._inCatch != 0us) return;
+
+        self:.error(b.loc, format(VerifierErrorMessage::BEGIN_CATCH_OUTSIDE, b.name));
+    }
+
+    /*!
+     * ================================================================================
+     * ================================================================================
+     * ==============================          FLOW          ==========================
+     * ================================================================================
+     * ================================================================================
+     */
+
+    /**
+     * Check the properties of the frame that only its control flow graph tells.
+     *
+     * @params:
+     *    - frame: the frame being verified
+     * */
+    fn checkFlow(mut self, frame: &YILFrame) {
+        match frame.retType {
+            _: &YILVoid => { return; }
+        }
+
+        let graph = copy CFG(frame);
+        let exit = graph.getExit();
+        for p in exit.getPrevious() {
+            let instrs = (p.0).getInstrs();
+            if (instrs.len == 0us) continue;
+
+            match instrs[$ - 1us] {
+                _: &YILReturn => { continue; }
+            }
+
+            // YIL has no way of saying that a call never returns, so a frame
+            // ending on a call to a panic helper leaves the graph falling into
+            // the exit. Such a block is not a path missing its return.
+            if (graph.mayThrowInstr(instrs[$ - 1us])) continue;
+
+            self:.error(frame.loc, format(VerifierErrorMessage::MISSING_RETURN, frame.retType, (p.0).getUid()));
+        }
+    }
+
+    /*!
+     * ================================================================================
+     * ================================================================================
+     * =============================          ERRORS          =========================
+     * ================================================================================
+     * ================================================================================
+     */
+
+    /**
+     * Append a malformation to the list reported at the end of the verification.
+     *
+     * @params:
+     *    - loc:  the location of the malformed node
+     *    - msg:  what is wrong with it
+     *    - note: an optional second location, and what it is
+     * */
+    fn error(mut self, loc: &Word, msg: [c8], note: (&Word, [c8]) = (EOF_WORD, "")) {
+        let err: &ErrorMsg = copy ErrorMsg::note(loc, msg-> msg);
+        if ((note.1) != "") {
+            self._errors ~= [err.withNote(copy [copy ErrorMsg::note(note.0, msg-> (note.1))])];
+        } else {
+            self._errors ~= [err];
+        }
+    }
+
+}

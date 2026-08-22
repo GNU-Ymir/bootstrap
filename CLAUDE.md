@@ -35,11 +35,12 @@ Build system is `gyllir` (config in `gyllir.toml`, compiler path points at a loc
 ### Running tests
 
 ```
-./ymirc.test -f "integration::<module>*"
+./ymirc.test -f "integration::<module>::*"
 ```
 
 - The filter matches the **test module path**, not the resource directory, and the trailing
-  `*` is required. `integration::class_ops*` works; `integration::class_ops` matches nothing.
+  `::*` is required. `integration::class_ops::*` works; neither `integration::class_ops` nor
+  `integration::class_ops*` matches anything.
 - **A filter that matches nothing prints nothing and exits 0.** Empty output means "no test
   ran", never "everything passed". Always confirm you see `[SUCCESS] : integration::<module>…`.
 - The module name often differs from the resource directory — e.g. `test_resources/lit_class/operators`
@@ -69,11 +70,19 @@ Either way, each case:
    - `testN.sem` — expected formatted dump of the semantic generators (`Formatter`-rendered),
      if compilation is expected to succeed.
    - `testN.yil` — expected formatted dump of the expanded YIL nodes/types (only compared if
-     this file exists, since not every test needs to check lowering).
+     this file exists, since not every test needs to check lowering). This is the *raw*
+     expander output, whatever the optimization level, so it stays valid when a case is
+     optimized.
+   - `testN.yil.opt` — the same dump after the optimizer ran. A case carrying this file is
+     compiled at `-O1` instead of `-O0`; absent, no pass runs. This is where a pass is
+     regression tested, one case per pass under `test_resources/optimizer/`.
 
 If a case has *no* golden file at all, the only assertion is "compilation raised no error" —
 and when it does raise one, the full formatted error is printed to stderr. That makes a
 golden-less case the way to see what the compiler currently does with a snippet.
+
+Every test compile also runs the YIL verifier (`activateYilVerify()` in `compileFile`), which
+checks the well-formedness of every frame after every pass — see below.
 
 When you change validator/semantic behavior, the golden `.sem`/`.err`/`.yil` files are the
 source of truth for expected behavior — treat a diff against them as a real regression/fix
@@ -157,6 +166,17 @@ The whole frontend is orchestrated by `Parser` (`src/ymirc/parser.yr`), in three
    (`lint/node`) — desugaring operators, normalizing control flow, scheduling destructors,
    finalizing types (`lint/expander`, `lint/optimizer`), and optionally serializing YIL
    (`lint/serialize`).
+
+   `lint/optimizer` is the pass pipeline: `Optimizer` (`optimizer/visitor.yr`) applies an
+   ordered list of `OptimizerPass`es to every frame, `optimizer/cfg.yr` builds the per-frame
+   control flow graph, and `optimizer/verifier.yr` checks the well-formedness of a frame —
+   variables declared, labels defined and unique, affectations moving compatible widths,
+   `YILBeginCatch` inside a handler, calls covered by `YILFrame::refs`, non-void frames
+   returning. Verification runs on the raw expander output and again after every pass, so a
+   pass is only ever blamed for what it introduced; it is gated by `--fverify-yil` and is
+   always on in the test suite. YIL types are looser than they look — pointers, arrays and
+   pointer-wide integers are the same address, integer widths are the backend's business —
+   so the verifier compares storage classes, not types.
 
 Cross-cutting: `src/ymirc/errors` (the `ErrorMsg` type and its pretty-printing/formatting —
 this is what both compiler diagnostics and `.err` golden files render through),
