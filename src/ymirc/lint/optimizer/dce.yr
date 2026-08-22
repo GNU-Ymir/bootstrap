@@ -1,0 +1,595 @@
+/*
+ * Declares DeadCodePass, the pass removing what a frame cannot execute and what
+ * nothing of it observes, and flattening the control flow the expander leaves
+ * behind.
+ *
+ * The pass does three things, in this order, and repeats them until none of them
+ * changes anything:
+ *
+ *   - it removes the instructions of the blocks no path reaches, a landing pad
+ *     counting as a path of its own;
+ *   - it removes the assignments to a variable that is not live afterwards, as
+ *     long as the value assigned has no effect of its own;
+ *   - it removes the declarations of the variables nothing names any more.
+ *
+ * The three feed each other, which is why they are repeated: removing a block
+ * makes a store dead, removing a store makes a variable unused, and removing a
+ * variable makes the store defining it dead.
+ *
+ * <hr>
+ *
+ * @Package: ymirc
+ * @Module: ymirc::lint::optimizer::dce
+ * @File: ymirc/lint/optimizer/dce.yr
+ * @Author(s):
+ *   - Emile Cadorel <ecadorel@gmail.com>
+ *
+ * @Created(YYYY-MM-DD): 2026-08-22
+ * @Copyright(C) 2021–2026 GNU-Ymir
+ * @License
+ *   ```text
+ *   This file is part of the Ymir language project.
+ *
+ *   Ymir is free software: you can redistribute it and/or modify it
+ *   under the terms of the GNU General Public License as published by
+ *   the Free Software Foundation, either version 3 of the License, or
+ *   (at your option) any later version.
+ *
+ *   Ymir is distributed in the hope that it will be useful,
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *   GNU General Public License for more details.
+ *
+ *   You should have received a copy of the GNU General Public License
+ *   along with Ymir.  If not, see <https://www.gnu.org/licenses/>.
+ *   ```
+ */
+
+in dce;
+
+use ymirc::lexing::{keys, word};
+use ymirc::lint::node::{_, global::_, instr::_, type::_, value::_};
+use ymirc::lint::optimizer::{analysis, bblock, cfg, copyprop, defuse, pass_};
+
+/**
+ * The number of times the pass walks a frame before giving up on a fixpoint.
+ * */
+def MAX_ROUNDS = 8us;
+
+/**
+ * The pass removing the dead code of a frame and flattening its control flow.
+ * */
+@final
+pub class DeadCodePass over OptimizerPass {
+
+    pub self ()
+        with super ("dead-code", 1u32)
+    {}
+
+    /**
+     * Remove what the frame cannot execute and what nothing of it observes.
+     *
+     * @params:
+     *    - frame: the frame to transform
+     * @returns: the transformed frame, or `frame` itself when nothing moved
+     *
+     * `YILFrame::refs` is left alone. Removing an unreachable call can only make
+     * it name a symbol the frame no longer calls, and the dependency files
+     * `Parser::writeModuleDependencies` writes from it are then wider than they
+     * need to be: the module is rebuilt when a symbol it stopped calling
+     * changes, which costs a compilation and never misses one. Narrowing it
+     * here would mean deciding which of its entries a body still needs, and its
+     * entries are not only the calls: a typeinfo, a vtable and a global the
+     * expander registered are in there too, and dropping one of those is the
+     * failure that does go unnoticed.
+     * */
+    pub over apply(mut self, frame: &YILFrame)-> &YILFrame {
+        let mut current = frame;
+        let mut round = 0us;
+
+        while round < MAX_ROUNDS {
+            let dmut cl = copy Cleaner(current);
+            let body = cl:.run();
+            if (cl.getRemoved() == 0us) break;
+
+            self:.count("unreachable statements", nb-> cl.getUnreachable());
+            self:.count("dead stores", nb-> cl.getStores());
+            self:.count("declarations removed", nb-> cl.getDecls());
+
+            current = current.withBody(body);
+            round += 1us;
+        }
+
+        current
+    }
+
+}
+
+/**
+ * The cleaning of a single frame, one walk of its body.
+ *
+ * It owns the two things a round needs: the ranks of the instructions the
+ * dataflow proved useless, and the counters saying whether the round changed
+ * anything at all.
+ * */
+pub class Cleaner {
+
+    // The frame being cleaned
+    let _frame: &YILFrame;
+
+    // The ranks, in the preorder walk of the body, of the instructions to remove
+    let mut _dead: [usize => mut ()] = copy [];
+
+    // The number of blocks that found the instruction of a rank useless, a rank
+    // being removed only once every block carrying it did
+    let mut _votes: [usize => mut usize] = copy [];
+
+    // The ranks at least one of those blocks voted on as unreachable rather than
+    // as a dead store, which is only what the two counters report
+    let mut _unreachVote: [usize => mut ()] = copy [];
+
+    // The rank of the instruction the walk reached
+    let mut _ord: usize = 0us;
+
+    // The number of instructions removed because no path reaches them
+    let mut _unreachable: usize = 0us;
+
+    // The number of assignments removed because nothing reads what they write
+    let mut _stores: usize = 0us;
+
+    // The number of declarations removed because nothing names their variable
+    let mut _decls: usize = 0us;
+
+    /**
+     * @params:
+     *    - frame: the frame to clean
+     * */
+    pub self (frame: &YILFrame)
+        with _frame = frame
+    {}
+
+    /**
+     * Clean the body of the frame once.
+     *
+     * @returns: the new body
+     * */
+    pub fn run(mut self)-> &YILInstr {
+        self:.markDead();
+
+        let mut body = self._frame.body;
+        if (self._dead.len != 0us) {
+            self._ord = 0us;
+            body = self:.stripOne(body);
+        }
+
+        body = self:.dropDecls(body);
+
+        body
+    }
+
+    /**
+     * @returns: the number of changes the round made, 0 iif it made none
+     * */
+    pub fn getRemoved(self)-> usize {
+        self._unreachable + self._stores + self._decls
+    }
+
+    /**
+     * @returns: the number of instructions removed because no path reaches them
+     * */
+    pub fn getUnreachable(self)-> usize {
+        self._unreachable
+    }
+
+    /**
+     * @returns: the number of assignments removed because nothing reads what they write
+     * */
+    pub fn getStores(self)-> usize {
+        self._stores
+    }
+
+    /**
+     * @returns: the number of declarations removed because nothing names their variable
+     * */
+    pub fn getDecls(self)-> usize {
+        self._decls
+    }
+
+    /*!
+     * ================================================================================
+     * ================================================================================
+     * =============================          DEAD          ===========================
+     * ================================================================================
+     * ================================================================================
+     */
+
+    /**
+     * Mark the instructions the dataflow proves useless.
+     *
+     * Two things make an instruction useless: being in a block no path reaches,
+     * and writing a variable nothing reads afterwards. The two are found on the
+     * same graph, and named by the rank the graph gave them, which is the rank
+     * the walk rewriting the body counts up to.
+     *
+     * A rank is not necessarily reached by one block: the graph builds the
+     * finally part of a try/finally twice, once for the region completing
+     * normally and once for an unwinding leaving it, and the body holds it once.
+     * Removing the instruction removes it from both copies, so a block only
+     * votes here, and a rank is removed when every block carrying it voted --
+     * what the unwinding no longer needs may well be what the normal path
+     * returns.
+     * */
+    fn markDead(mut self) {
+        let df = copy FrameDataflow(self._frame);
+        let graph = df.getCfg();
+        let du = df.getDefUse();
+
+        let mut nbOf: [usize => mut usize] = copy [];
+        for b in graph.getBlocks() {
+            for o in b.getOrds() {
+                if (o == bblock::NO_ORD) continue;
+                if let Ok(n) = nbOf[o] { nbOf[o] = n + 1us; } else { nbOf[o] = 1us; }
+            }
+        }
+
+        let mut isDead: [usize => mut ()] = copy [];
+        for b in graph.deadBlocks() {
+            isDead[b.getUid()] = ();
+            for o in b.getOrds() {
+                if (o == bblock::NO_ORD) continue;
+
+                self:.vote(o, unreachable-> true);
+            }
+        }
+
+        for b in graph.getBlocks() {
+            if (b.getUid() in isDead) continue;
+
+            self:.markDeadStores(df, du, b);
+        }
+
+        for o, n in self._votes {
+            let mut total = 0us;
+            if let Ok(t) = nbOf[o] { total = t; }
+            if (n != total) continue;
+
+            self._dead[o] = ();
+            if (o in self._unreachVote) { self._unreachable += 1us; }
+            else { self._stores += 1us; }
+        }
+    }
+
+    /**
+     * Record that one block considers the instruction of a rank useless.
+     *
+     * @params:
+     *    - ord:         the rank of the instruction
+     *    - unreachable: true iif the block voting is one no path reaches
+     * */
+    fn vote(mut self, ord: usize, unreachable: bool = false) {
+        if let Ok(n) = self._votes[ord] { self._votes[ord] = n + 1us; }
+        else { self._votes[ord] = 1us; }
+
+        if (unreachable) { self._unreachVote[ord] = (); }
+    }
+
+    /**
+     * Mark the assignments of a block that write a variable nothing reads.
+     *
+     * The block is walked backward from the variables that are live on leaving
+     * it, which is the only way an assignment knows whether anything is waiting
+     * for what it writes. An assignment that is removed does not update the set:
+     * it is gone, so it neither kills what it wrote nor reads what it read.
+     *
+     * @params:
+     *    - df: the dataflow of the frame
+     *    - du: what every instruction of the frame reads and writes
+     *    - bb: the block to walk
+     * */
+    fn markDeadStores(mut self, df: &FrameDataflow, du: &DefUse, bb: &BasicBlock) {
+        let instrs = bb.getInstrs();
+        let ords = bb.getOrds();
+
+        let mut live: [usize] = [];
+        for v in du.getVars() {
+            if (df.isLiveOut(bb, v.id)) live ~= [v.id];
+        }
+
+        for i in 0us .. instrs.len {
+            let idx = instrs.len - 1us - i;
+            let instr = instrs[idx];
+
+            if (ords[idx] != bblock::NO_ORD && self.isDeadStore(instr, du, live)) {
+                self:.vote(ords[idx]);
+                continue;
+            }
+
+            let set = du.ofInstr(instr);
+            for d in set.getDefs() { live = removeId(live, d); }
+            for u in set.getUses() {
+                if (!defuse::containsId(live, u)) live ~= [u];
+            }
+        }
+    }
+
+    /**
+     * @params:
+     *    - instr: an instruction of the frame
+     *    - du:    what the frame reads and writes
+     *    - live:  the variables read after the instruction
+     * @returns: true iif removing the instruction changes nothing observable
+     *
+     * Only a whole variable is ever removed this way. Writing a field or an
+     * element leaves the rest of the variable alone, so the write is not the
+     * only thing standing between the old value and a reader, and a variable
+     * whose address escaped is read by things that do not name it: liveness has
+     * nothing to say about either.
+     * */
+    fn isDeadStore(self, instr: &YILInstr, du: &DefUse, live: [usize])-> bool {
+        match instr {
+            a: &YILAffect => {
+                match a.left {
+                    v: &YILVar => {
+                        if (!du.isTracked(v.id)) return false;
+                        if (defuse::containsId(du.getEscaped(), v.id)) return false;
+                        if (defuse::containsId(live, v.id)) return false;
+
+                        return isPure(a.right);
+                    }
+                }
+            }
+        }
+
+        false
+    }
+
+    /*!
+     * ================================================================================
+     * ================================================================================
+     * ============================          STRIP          ===========================
+     * ================================================================================
+     * ================================================================================
+     */
+
+    /**
+     * Rewrite an instruction, dropping the ones the dataflow marked.
+     *
+     * The walk counts exactly the way the graph builder counted: every
+     * instruction of the body has a rank, containers included, and the rank is
+     * given before the children are walked.
+     *
+     * @params:
+     *    - instr: the instruction to rewrite
+     * @returns: the rewritten instruction, none iif it was marked
+     * */
+    fn strip(mut self, instr: &YILInstr)-> (&YILInstr)? {
+        let ord = self._ord;
+        self._ord += 1us;
+
+        match instr {
+            b: &YILBlock => {
+                let res: &YILInstr = copy YILBlock(b.loc, self:.stripList(b.instrs));
+                return res?;
+            }
+            t: &YILTryCatch => {
+                let tryPart = self:.stripList(t.tryPart);
+                let catchPart = self:.stripList(t.catchPart);
+                let res: &YILInstr = copy YILTryCatch(t.loc, t.catchType, tryPart, catchPart);
+
+                return res?;
+            }
+            t: &YILTryFinally => {
+                let tryPart = self:.stripList(t.tryPart);
+                let finPart = self:.stripList(t.finPart);
+                let res: &YILInstr = copy YILTryFinally(t.loc, tryPart, finPart);
+
+                return res?;
+            }
+        }
+
+        if (ord in self._dead) return none;
+
+        instr?
+    }
+
+    /**
+     * Rewrite a list of instructions, dropping the ones the dataflow marked.
+     * */
+    fn stripList(mut self, instrs: [&YILInstr])-> [&YILInstr] {
+        let mut res: [mut &YILInstr] = [];
+        for i in instrs {
+            if let Ok(x) = self:.strip(i) { res ~= [x]; }
+        }
+
+        res
+    }
+
+    /**
+     * Rewrite the body of the frame, which is never itself removable.
+     * */
+    fn stripOne(mut self, instr: &YILInstr)-> &YILInstr {
+        if let Ok(x) = self:.strip(instr) { return x; }
+
+        copy YILBlock(instr.loc, [])
+    }
+
+    /*!
+     * ================================================================================
+     * ================================================================================
+     * ============================          DECLS          ===========================
+     * ================================================================================
+     * ================================================================================
+     */
+
+    /**
+     * Drop the declarations of the variables the body no longer names.
+     *
+     * A declaration is not a definition: it gives the variable a storage, and a
+     * storage nothing writes and nothing reads is work the backend does for
+     * nobody. What makes it removable is that the dead stores are gone by the
+     * time this runs, so a variable is named by the body iif something still
+     * reads it or writes it.
+     * */
+    fn dropDecls(mut self, body: &YILInstr)-> &YILInstr {
+        let mut used: [usize => mut ()] = copy [];
+        namedVars(body, ref used);
+
+        onlyOne(self:.dropDeclsList(copy [body], used), body)
+    }
+
+    /**
+     * Drop, in a list of instructions, the declarations of the variables the
+     * body no longer names.
+     * */
+    fn dropDeclsList(mut self, instrs: [&YILInstr], used: [usize => ()])-> [&YILInstr] {
+        let mut res: [mut &YILInstr] = [];
+        for i in instrs {
+            match i {
+                b: &YILBlock => { res ~= [copy YILBlock(b.loc, self:.dropDeclsList(b.instrs, used))]; }
+                t: &YILTryCatch => {
+                    res ~= [copy YILTryCatch(t.loc, t.catchType,
+                                             self:.dropDeclsList(t.tryPart, used),
+                                             self:.dropDeclsList(t.catchPart, used))];
+                }
+                t: &YILTryFinally => {
+                    res ~= [copy YILTryFinally(t.loc,
+                                               self:.dropDeclsList(t.tryPart, used),
+                                               self:.dropDeclsList(t.finPart, used))];
+                }
+                v: &YILVarDecl => {
+                    if (v.id !in used) {
+                        self._decls += 1us;
+                        continue;
+                    }
+
+                    res ~= [v];
+                }
+                _ => { res ~= [i]; }
+            }
+        }
+
+        res
+    }
+
+}
+
+/*!
+ * ================================================================================
+ * ================================================================================
+ * =============================          VALUES          =========================
+ * ================================================================================
+ * ================================================================================
+ */
+
+/**
+ * @params:
+ *    - value: the value to remove
+ * @returns: true iif not evaluating the value at all is the same as evaluating it
+ *
+ * A call is not, it is the effect. A `YILBeginCatch` is not either, it binds the
+ * exception the personality routine selected and there is one of them per
+ * handler. A division may trap, and a read through a pointer may fault: nothing
+ * says the pointer points anywhere. A read rooted at a variable of the frame is
+ * fine, the storage is there whether it is read or not.
+ * */
+pub fn isPure(value: &YILValue)-> bool {
+    match value {
+        _: &YILNameCallValue => { return false; }
+        _: &YILPtrCallValue => { return false; }
+        _: &YILBeginCatch => { return false; }
+        _: &YILUnrefValue => { return false; }
+        b: &YILBinaryValue => {
+            if (b.op == BinaryOperators::DIV || b.op == BinaryOperators::PERCENT) return false;
+
+            return isPure(b.left) && isPure(b.right);
+        }
+        u: &YILUnaryValue => { return isPure(u.left); }
+        c: &YILCastValue => { return isPure(c.value); }
+        f: &YILFieldValue => { return isPure(f.tuple); }
+        a: &YILArrayAccessValue => {
+            // indexing a pointer is a read of memory the frame knows nothing of,
+            // indexing an array of the frame is a read of the frame itself
+            match a.value.type {
+                _: &YILArray => {}
+                _ => { return false; }
+            }
+
+            return isPure(a.value) && isPure(a.index);
+        }
+        a: &YILAddrValue => { return isPure(a.value); }
+        t: &YILTupleValue => {
+            for v in t.values { if (!isPure(v)) return false; }
+            return true;
+        }
+        a: &YILArrayValue => {
+            for v in a.value { if (!isPure(v)) return false; }
+            return true;
+        }
+    }
+
+    true
+}
+
+/**
+ * @params:
+ *    - instrs: the rewriting of a body, as a list of one instruction
+ *    - loc:    the body that was rewritten
+ * @returns: the rewritten body
+ *
+ * A body of a single instruction is handed to the list rewritings as a list of
+ * one, and comes back empty when that instruction was the removable kind: a
+ * label nothing names, a declaration nothing uses. The body of such a frame is
+ * an empty block, and taking it out is not worth a special case in every
+ * rewriting.
+ * */
+fn onlyOne(instrs: [&YILInstr], loc: &YILInstr)-> &YILInstr {
+    if (instrs.len == 1us) return instrs[0us];
+
+    copy YILBlock(loc.loc, instrs)
+}
+
+/**
+ * @params:
+ *    - arr: a set of variable identifiers
+ *    - id:  the identifier to take out of it
+ * @returns: the set, without the identifier
+ * */
+pub fn removeId(arr: [usize], id: usize)-> [usize] {
+    if (!defuse::containsId(arr, id)) return arr;
+
+    let mut res: [usize] = [];
+    for i in arr {
+        if (i != id) res ~= [i];
+    }
+
+    res
+}
+
+/**
+ * Collect the identifier of every variable an instruction names, be it read,
+ * written or only addressed.
+ *
+ * A declaration does not count: naming a variable to give it a storage is not a
+ * reason to keep the storage.
+ * */
+fn namedVars(instr: &YILInstr, ref mut res: [usize => mut ()]) {
+    match instr {
+        b: &YILBlock => { for i in b.instrs { namedVars(i, ref res); } }
+        t: &YILTryCatch => {
+            for i in t.tryPart { namedVars(i, ref res); }
+            for i in t.catchPart { namedVars(i, ref res); }
+        }
+        t: &YILTryFinally => {
+            for i in t.tryPart { namedVars(i, ref res); }
+            for i in t.finPart { namedVars(i, ref res); }
+        }
+        _: &YILVarDecl => {}
+        a: &YILAffect => {
+            for i in copyprop::varsIn(a.left) { res[i] = (); }
+            for i in copyprop::varsIn(a.right) { res[i] = (); }
+        }
+        c: &YILCall => { for i in copyprop::varsIn(c.content) { res[i] = (); } }
+        r: &YILReturn => { for i in copyprop::varsIn(r.value) { res[i] = (); } }
+        c: &YILCondJmp => { for i in copyprop::varsIn(c.cond) { res[i] = (); } }
+    }
+}
