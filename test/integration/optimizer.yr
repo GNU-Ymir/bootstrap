@@ -3,7 +3,7 @@ in optimizer;
 use std::io;
 
 use ymirc::utils::_;
-use ymirc::lint::node::{_, global::_, instr::_};
+use ymirc::lint::node::{_, global::_, instr::_, value::_};
 use utils;
 
 /**
@@ -22,6 +22,9 @@ def SWEEP = ["test_resources/control_flow/test11.yr",
              "test_resources/lazyness/test2.yr",
              "test_resources/scope_guards/test1.yr",
              "test_resources/scope_guards/test2.yr",
+             "test_resources/scope_guards/test5.yr",
+             "test_resources/scope_guards/test8.yr",
+             "test_resources/scope_guards/test9.yr",
              "test_resources/for_loops/arrays/test1.yr",
              "test_resources/pattern_match/test1.yr",
              "test_resources/templates/test1.yr"];
@@ -122,4 +125,176 @@ fn countInstr(instr: &YILInstr)-> usize {
     }
 
     1us
+}
+
+/**
+ * The dead code elimination over the frames a scope guard and a try/catch
+ * produce.
+ *
+ * A landing pad is entered by the personality routine and by nothing the frame
+ * does, so a pass rooting its reachability at the entry alone sees the handler
+ * of every region it believes cannot throw as dead code, and empties it. What
+ * is asserted here is the property that catches that: a body that holds a
+ * handler before the pipeline holds as many after, and they are not left empty.
+ *
+ * The instructions of a handler are not counted, they are allowed to go: a
+ * store the handler makes to a variable nothing reads afterwards is as dead
+ * there as anywhere else.
+ * */
+__test {
+    for package in ["test_resources/scope_guards/test1.yr",
+                    "test_resources/scope_guards/test2.yr",
+                    "test_resources/scope_guards/test5.yr",
+                    "test_resources/scope_guards/test8.yr",
+                    "test_resources/scope_guards/test9.yr"] {
+        let res = utils::compilePackage(package, optLevel-> 1u32);
+        if let Ok(err) = res.err {
+            throw copy AssertError(format("% : -O1 : %", package, err));
+        }
+
+        let raw = countHandlers(res.exp), opt = countHandlers(res.opt);
+        assert (raw.0 != 0us, format("% : no handler to check", package));
+        assert (opt.0 == raw.0, format("% : -O1 : % handlers, down from %", package, opt.0, raw.0));
+        assert (opt.1 != 0us, format("% : -O1 : % handlers, all of them empty", package, opt.0));
+    }
+}
+
+/**
+ * The pass never turns a jump into a jump to nowhere.
+ *
+ * Removing a label nothing names, retargeting a jump onto the end of the chain
+ * of jumps it starts and dropping the jump that falls into the label following
+ * it are three transformations that all end with a label being deleted, and the
+ * failure they share is deleting one something still names. The YIL verifier
+ * catches it after every pass, this states it on the optimized output itself so
+ * that the case reads as what it checks.
+ * */
+__test {
+    for package in SWEEP {
+        let res = utils::compilePackage(package, optLevel-> 1u32);
+        if let Ok(err) = res.err {
+            throw copy AssertError(format("% : -O1 : %", package, err));
+        }
+
+        for n in res.opt {
+            if let f: &YILFrame = n {
+                let mut defined: [usize => mut ()] = copy [];
+                collectLabels(f.body, ref defined);
+
+                let mut named: [usize => mut ()] = copy [];
+                collectJumps(f.body, ref named);
+
+                for id, _ in named {
+                    assert (id in defined, format("% : % : the jump to #% names no label", package, f.name, id));
+                }
+            }
+        }
+    }
+}
+
+/**
+ * @params:
+ *    - nodes: the nodes of a module
+ * @returns: the number of handlers the module holds, and the number of
+ * instructions they hold between them
+ *
+ * A pass rooting its reachability wrong does not remove the try itself, it
+ * empties the pad, so the two are counted: the handlers that are gone, and the
+ * handlers that are still there with nothing left in them.
+ * */
+fn countHandlers(nodes: [&YILNode])-> (usize, usize) {
+    let mut nb = 0us, mut instrs = 0us;
+    for n in nodes {
+        if let f: &YILFrame = n {
+            let c = countHandler(f.body);
+            nb += c.0;
+            instrs += c.1;
+        }
+    }
+
+    (nb, instrs)
+}
+
+/**
+ * @returns: the number of handlers an instruction holds, and the number of
+ * instructions they hold between them
+ * */
+fn countHandler(instr: &YILInstr)-> (usize, usize) {
+    let mut nb = 0us, mut instrs = 0us;
+    let inner = |i: &YILInstr| => {
+        let c = countHandler(i);
+        (c.0, c.1)
+    };
+
+    match instr {
+        b: &YILBlock => {
+            for i in b.instrs {
+                let c = inner(i);
+                nb += c.0; instrs += c.1;
+            }
+        }
+        t: &YILTryCatch => {
+            nb += 1us;
+            for i in t.tryPart {
+                let c = inner(i);
+                nb += c.0; instrs += c.1;
+            }
+
+            for i in t.catchPart {
+                let c = inner(i);
+                nb += c.0; instrs += c.1 + countInstr(i);
+            }
+        }
+        t: &YILTryFinally => {
+            nb += 1us;
+            for i in t.tryPart {
+                let c = inner(i);
+                nb += c.0; instrs += c.1;
+            }
+
+            for i in t.finPart {
+                let c = inner(i);
+                nb += c.0; instrs += c.1 + countInstr(i);
+            }
+        }
+    }
+
+    (nb, instrs)
+}
+
+/**
+ * Collect the identifier of every label an instruction defines.
+ * */
+fn collectLabels(instr: &YILInstr, ref mut res: [usize => mut ()]) {
+    match instr {
+        b: &YILBlock => { for i in b.instrs { collectLabels(i, ref res); } }
+        t: &YILTryCatch => {
+            for i in t.tryPart { collectLabels(i, ref res); }
+            for i in t.catchPart { collectLabels(i, ref res); }
+        }
+        t: &YILTryFinally => {
+            for i in t.tryPart { collectLabels(i, ref res); }
+            for i in t.finPart { collectLabels(i, ref res); }
+        }
+        l: &YILLabel => { res[l.id] = (); }
+    }
+}
+
+/**
+ * Collect the identifier of every label an instruction jumps to.
+ * */
+fn collectJumps(instr: &YILInstr, ref mut res: [usize => mut ()]) {
+    match instr {
+        b: &YILBlock => { for i in b.instrs { collectJumps(i, ref res); } }
+        t: &YILTryCatch => {
+            for i in t.tryPart { collectJumps(i, ref res); }
+            for i in t.catchPart { collectJumps(i, ref res); }
+        }
+        t: &YILTryFinally => {
+            for i in t.tryPart { collectJumps(i, ref res); }
+            for i in t.finPart { collectJumps(i, ref res); }
+        }
+        g: &YILGoto => { res[g.label.id] = (); }
+        c: &YILCondJmp => { res[c.then.id] = (); res[c.else_.id] = (); }
+    }
 }
