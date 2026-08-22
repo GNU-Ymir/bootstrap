@@ -1,32 +1,73 @@
+/*
+ * Declares the BasicBlock, the node of the per frame control flow graph.
+ *
+ * A basic block is a maximal sequence of instructions with a single entry point
+ * and a single exit point: control enters at the first instruction and leaves
+ * after the last one, without any jump in between. The graph itself lives in
+ * `optimizer::cfg`, the block only knows its own instructions and the edges that
+ * enter and leave it.
+ *
+ * An edge carries the value that conditions the jump(the condition of a
+ * `YILCondJmp`, its negation on the else side, the constant 1 on an
+ * unconditional one), and a kind. Exception edges are kept apart from normal
+ * ones: they leave from the middle of a protected region rather than from its
+ * terminator, and a pass that rewrites branches must not touch them.
+ *
+ * <hr>
+ *
+ * @Package: ymirc
+ * @Module: ymirc::lint::optimizer::bblock
+ * @File: ymirc/lint/optimizer/bblock.yr
+ * @Author(s):
+ *   - Emile Cadorel <ecadorel@gmail.com>
+ *
+ * @Created(YYYY-MM-DD): 2025-01-04
+ * @Copyright(C) 2021–2026 GNU-Ymir
+ * @License
+ *   ```text
+ *   This file is part of the Ymir language project.
+ *
+ *   Ymir is free software: you can redistribute it and/or modify it
+ *   under the terms of the GNU General Public License as published by
+ *   the Free Software Foundation, either version 3 of the License, or
+ *   (at your option) any later version.
+ *
+ *   Ymir is distributed in the hope that it will be useful,
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *   GNU General Public License for more details.
+ *
+ *   You should have received a copy of the GNU General Public License
+ *   along with Ymir.  If not, see <https://www.gnu.org/licenses/>.
+ *   ```
+ */
+
 in bblock;
 
 use ymirc::utils::format;
 use ymirc::lint::node::{_, instr::_, value::_, type::_, global::_};
 use std::{stream, io};
 
-lazy dmut __ID__ = copy [0us];
-
 /**
- * @returns: a uniq identifier
- */
-pub fn generateUniqID()-> usize {
-    __ID__[0] += 1us;
-    __ID__[0]
-}
-
+ * The nature of an edge of the control flow graph.
+ * */
+pub enum EdgeKind: u8
+| NORMAL    = 0
+| EXCEPTION = 1;
 
 /**
  * A basic block used to represent control flow
  * */
 pub class BasicBlock {
 
+    // Identifier of the block, uniq inside the graph it belongs to
     let _uid: usize;
 
     // BasicBlocks that can enter self, associated with the value conditionning the jump
-    let mut _previous: [mut(&BasicBlock, &YILValue)] = [];
+    let mut _previous: [mut(&BasicBlock, &YILValue, EdgeKind)] = [];
 
     // BasicBlock where self can go to, associated with the value conditionning the jump
-    let mut _next: [mut(&BasicBlock, &YILValue)] = [];
+    let mut _next: [mut(&BasicBlock, &YILValue, EdgeKind)] = [];
 
     // List of instruction inside the basic block
     let mut _instrs: [mut &YILInstr] = [];
@@ -39,9 +80,12 @@ pub class BasicBlock {
 
     /**
      * Create an empty basic block
+     *
+     * @params:
+     *    - uid: the identifier of the block, uniq inside its graph
      * */
-    pub self ()
-        with _uid = generateUniqID()
+    pub self (uid: usize)
+        with _uid = uid
     {}
 
     /**
@@ -49,6 +93,34 @@ pub class BasicBlock {
      * */
     pub fn push(mut self, instr: &YILInstr) {
         self._instrs ~= [instr];
+    }
+
+    /**
+     * @returns: the uniq identifier of the block
+     * */
+    pub fn getUid(self)-> usize {
+        self._uid
+    }
+
+    /**
+     * @returns: the instructions of the block, in execution order
+     * */
+    pub fn getInstrs(self)-> [&YILInstr] {
+        self._instrs
+    }
+
+    /**
+     * @returns: the blocks that can enter self, and the reason of the jump
+     * */
+    pub fn getPrevious(self)-> [(&BasicBlock, &YILValue, EdgeKind)] {
+        self._previous
+    }
+
+    /**
+     * @returns: the blocks self can jump to, and the reason of the jump
+     * */
+    pub fn getNext(self)-> [(&BasicBlock, &YILValue, EdgeKind)] {
+        self._next
     }
 
     /**
@@ -60,6 +132,13 @@ pub class BasicBlock {
         }
 
         none
+    }
+
+    /**
+     * @returns: true iif the block contains no instruction at all
+     * */
+    pub fn isEmpty(self)-> bool {
+        self._instrs.len == 0us
     }
 
     /**
@@ -77,10 +156,14 @@ pub class BasicBlock {
 
     /**
      * Insert an ancestor of the basic block
+     * @params:
+     *    - bb: the block that jumps to self
+     *    - reason: the value conditionning the jump
+     *    - kind: the nature of the edge
      * */
-    pub fn insertFrom(mut self, dmut bb: &BasicBlock, reason: &YILValue) {
-        self._previous ~= [(bb, reason)];
-        bb._next ~= [(self, reason)];
+    pub fn insertFrom(mut self, dmut bb: &BasicBlock, reason: &YILValue, kind: EdgeKind = EdgeKind::NORMAL) {
+        self._previous ~= [(bb, reason, kind)];
+        bb._next ~= [(self, reason, kind)];
     }
 
     /*!
@@ -93,31 +176,81 @@ pub class BasicBlock {
 
     impl Streamable;
 
+    /**
+     * Write the graphviz node of the block, and the edges leaving it.
+     *
+     * A jump closing the block is not written inside the node: where it goes is
+     * already rendered by the edges leaving the block, and their labels carry
+     * the condition. A return is written, it is not redundant with anything.
+     *
+     * @params:
+     *    - stream: the stream in which the dot is written
+     *    - unreachable: true iif the block is not reachable from the entry of the graph
+     * */
+    pub fn formatDot(self, dmut stream: &Formatter, unreachable: bool = false) {
+        let dmut inner = copy Formatter(tags-> FormatTags(short-> true));
+        let isJumping = match self.getLast() {
+            Ok(_: &YILGoto) => { true }
+            Ok(_: &YILCondJmp) => { true }
+            _ => { false }
+        };
+
+        for z, instr in self._instrs {
+            if (isJumping && z == self._instrs.len - 1us) break;
+            match instr {
+                YILVarDecl() => {}
+                _ => {
+                    instr.format(alias inner);
+                    inner:.write("\n");
+                }
+            }
+        }
+
+        let style = if (unreachable) { ", style=dashed, color=\"#a0a0a0\"" } else { "" };
+        stream:.write("  BB", self._uid, " [label=\"BB", self._uid, "\\n", escapeDot(inner[]), "\"", style, "]\n");
+
+        for i in self._next {
+            let isExc = (i.2 == EdgeKind::EXCEPTION);
+            let label = if (isExc) { "exception" } else { escapeDot(format("%", i.1, tags-> FormatTags(short-> true))) };
+            let attrs = if (isExc) { ", style=dashed, color=\"#c04040\"" } else { "" };
+
+            stream:.write("  BB", self._uid, " -> BB", (i.0)._uid, " [label=\"", label, "\"", attrs, "]\n");
+        }
+    }
 
     pub fn format(self, dmut stream: &Formatter, ref mut done: [usize => mut()]) {
         if (self._uid !in done) {
-            let dmut inner = copy Formatter(tags-> FormatTags(short-> true));
-            let isFalling = self.isFalling();
-            for z, instr in self._instrs {
-                if (!isFalling && z == self._instrs.len - 1us) break;
-                match instr {
-                    YILVarDecl() => {}
-                    _ => {
-                        instr.format(alias inner);
-                        inner:.write(";\n");
-                    }
-                }
-            }
-
-            stream:.write("BB", self._uid, " [label=\"", inner[], "\"]\n");
             done[self._uid] = ();
-
+            self.formatDot(alias stream);
             for i in self._next {
                 (i.0).format(alias stream, done-> ref done);
-                let reason = format("%", i.1);
-                stream:.write("BB", self._uid, "-> "s8, "BB", (i.0)._uid, "[label=\"", reason, "\"]\n");
             }
         }
     }
 
+}
+
+/**
+ * Escape a text so that it can be used as the label of a graphviz node or edge.
+ *
+ * Newlines are turned into left aligned line breaks(`\l`), which is what makes
+ * a multi instruction block readable in the rendered graph.
+ *
+ * @params:
+ *    - str: the text to escape
+ * @returns: the escaped text
+ * */
+pub fn escapeDot(str: [c8])-> [c8] {
+    let dmut res = copy Formatter(tags-> FormatTags(short-> true));
+    for c in str {
+        match c {
+            '"' => { res:.write("\\\""); }
+            '\\' => { res:.write("\\\\"); }
+            '\n' => { res:.write("\\l"); }
+            '\r' => {}
+            _ => { res:.write(c); }
+        }
+    }
+
+    res[]
 }
