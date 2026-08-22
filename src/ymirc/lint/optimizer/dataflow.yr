@@ -32,10 +32,11 @@
  * liveness that ignores the edge reports it dead. They do carry one subtlety: an
  * exception edge leaves from the middle of the instruction closing its block,
  * not after it. What that block computes has therefore not necessarily happened
- * when the handler is entered, so an analysis whose meet is an intersection
- * propagates the facts entering the block rather than the ones leaving it. An
- * analysis whose meet is a union propagates the ones leaving it: the assignment
- * preceding the throw did happen.
+ * when the handler is entered, so a forward analysis — reaching definitions and
+ * available expressions alike, regardless of whether its meet is a union or an
+ * intersection — propagates what the block produced before its closing
+ * instruction, not what it produced once that instruction (which may not have
+ * run to completion) is accounted for.
  *
  * <hr>
  *
@@ -236,6 +237,16 @@ pub class Analysis {
     // The facts a block invalidates, indexed by block identifier
     let mut _kills: [usize => mut [bool]] = copy [];
 
+    // The facts produced by a block up to, but excluding, its closing
+    // instruction, indexed by block identifier — what a forward analysis sees
+    // on an exception edge, since that edge leaves before the closing
+    // instruction completes
+    let mut _preGens: [usize => mut [bool]] = copy [];
+
+    // The facts invalidated by a block up to, but excluding, its closing
+    // instruction, indexed by block identifier
+    let mut _preKills: [usize => mut [bool]] = copy [];
+
     /**
      * Create an analysis whose blocks generate and kill nothing yet.
      *
@@ -267,6 +278,25 @@ pub class Analysis {
     }
 
     /**
+     * Set the gen and kill sets of a block, up to but excluding its closing
+     * instruction.
+     *
+     * A block whose closing instruction throws is entered by an exception edge
+     * that leaves before that instruction completes, so what it contributes on
+     * that edge is this, not the whole-block `setBlock`. Only forward analyses
+     * consume it.
+     *
+     * @params:
+     *    - uid:  the identifier of the block
+     *    - gen:  the facts produced before the closing instruction
+     *    - kill: the facts invalidated before the closing instruction
+     * */
+    pub fn setBlockPre(mut self, uid: usize, gen: [bool], kill: [bool]) {
+        self._preGens[uid] = gen;
+        self._preKills[uid] = kill;
+    }
+
+    /**
      * @returns: the facts the block produces, none when it produces nothing
      * */
     pub fn genOf(self, uid: usize)-> [bool] {
@@ -280,6 +310,24 @@ pub class Analysis {
      * */
     pub fn killOf(self, uid: usize)-> [bool] {
         if let Ok(k) = self._kills[uid] { return k; }
+
+        setEmpty(self.nbFacts)
+    }
+
+    /**
+     * @returns: the facts the block produces before its closing instruction
+     * */
+    pub fn preGenOf(self, uid: usize)-> [bool] {
+        if let Ok(g) = self._preGens[uid] { return g; }
+
+        setEmpty(self.nbFacts)
+    }
+
+    /**
+     * @returns: the facts the block invalidates before its closing instruction
+     * */
+    pub fn preKillOf(self, uid: usize)-> [bool] {
+        if let Ok(k) = self._preKills[uid] { return k; }
 
         setEmpty(self.nbFacts)
     }
@@ -503,6 +551,20 @@ pub fn solve(graph: &CFG, analysis: &Analysis)-> &Solution {
 }
 
 /**
+ * The facts a block contributes on an exception edge: what it produced before
+ * its closing instruction, applied to whatever entered the block.
+ *
+ * A block's closing instruction is the one an exception edge leaves from, and
+ * it leaves before that instruction completes — so a definition or an
+ * invalidation the instruction itself would make has not necessarily happened.
+ * `preGenOf`/`preKillOf` already exclude it; this just applies them the same
+ * way the normal transfer function applies the whole-block sets.
+ * */
+pub fn preTransferOf(analysis: &Analysis, uid: usize, entering: [bool])-> [bool] {
+    setUnion(analysis.preGenOf(uid), setDiff(entering, analysis.preKillOf(uid)))
+}
+
+/**
  * Combine the facts leaving every block flowing into a block.
  *
  * A block that nothing flows into starts from the boundary value: at the entry
@@ -510,8 +572,9 @@ pub fn solve(graph: &CFG, analysis: &Analysis)-> &Solution {
  * backward one nothing is live anymore.
  *
  * An exception edge leaves from the middle of the instruction closing its
- * source, so a forward analysis whose meet is an intersection propagates the
- * facts entering that block rather than the ones leaving it: what the block
+ * source, so a forward analysis — union or intersection alike — propagates
+ * what that block contributes up to its closing instruction rather than what
+ * it produces once that instruction has run: what the block's last instruction
  * computes has not necessarily happened when the handler is entered.
  * */
 fn meetOf(bb: &BasicBlock, analysis: &Analysis, entering: [usize => [bool]], leaving: [usize => [bool]], boundary: [bool])-> [bool] {
@@ -521,13 +584,12 @@ fn meetOf(bb: &BasicBlock, analysis: &Analysis, entering: [usize => [bool]], lea
     for p in flowPrevious(bb, analysis.direction) {
         let uid = (p.0).getUid();
         let midEdge = (p.1 == EdgeKind::EXCEPTION
-                       && analysis.direction == Direction::FORWARD
-                       && analysis.meet == MeetKind::INTERSECTION);
+                       && analysis.direction == Direction::FORWARD);
 
         let mut fact: [bool] = [];
         let mut known = false;
         if (midEdge) {
-            if let Ok(e) = entering[uid] { fact = e; known = true; }
+            if let Ok(e) = entering[uid] { fact = preTransferOf(analysis, uid, e); known = true; }
         } else {
             if let Ok(l) = leaving[uid] { fact = l; known = true; }
         }
