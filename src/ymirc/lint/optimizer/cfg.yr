@@ -96,6 +96,19 @@ pub class CFG {
     // The block starting at each label of the frame, indexed by label id
     let mut _labels: [usize => dmut &BasicBlock] = copy [];
 
+    // The block starting at each label of a finally part's unwind copy,
+    // indexed by label id -- kept apart from `_labels` since building the
+    // unwind copy visits the exact same `YILLabel`s the normal copy already
+    // resolved through `_labels`; see `visitTryFinally`. Ids never collide
+    // across two different finally parts, only between the two copies of
+    // the same one, so every unwind copy of the frame can share this map
+    let mut _privateLabels: [usize => dmut &BasicBlock] = copy [];
+
+    // The nesting depth of unwind copies currently being built; `labelBlock`
+    // resolves against `_privateLabels` instead of `_labels` while this is
+    // nonzero
+    let mut _unwindDepth: usize = 0us;
+
     // The handlers protecting the instruction being visited, innermost last
     let mut _handlers: [dmut &BasicBlock] = [];
 
@@ -148,6 +161,16 @@ pub class CFG {
      * */
     pub fn getBlocks(self)-> [&BasicBlock] {
         copy [b for b in self._blocks]
+    }
+
+    /**
+     * @returns: every block of the graph, in creation order, mutable
+     *
+     * The dataflow fills the def/use summary of the blocks it walks, which is
+     * the only thing anything but the builder writes into them.
+     * */
+    pub fn blocksMut(mut self)-> dmut [&BasicBlock] {
+        alias self._blocks
     }
 
     /*!
@@ -277,22 +300,34 @@ pub class CFG {
     /**
      * Close the current block on a return.
      *
-     * A return leaving the body of a `YILTryFinally` runs the finally part
-     * before actually leaving the frame, so it enters the innermost finally
-     * rather than the exit block.
+     * A return leaving the body of a `YILTryFinally` runs every enclosing
+     * finally part before actually leaving the frame -- see `addUnwindEdges`
+     * for why it is wired directly to each of them rather than only the
+     * innermost one.
      * */
     fn visitReturn(mut self, r: &YILReturn, dmut current: &BasicBlock)-> dmut &BasicBlock {
         current:.push(r);
         if (self.mayThrow(r.value)) { self:.addExceptionEdges(alias current); }
 
-        if (self._finallys.len != 0us) {
-            let dmut fin = alias self._finallys[$ - 1us];
-            fin:.insertFrom(alias current, CFG_ALWAYS);
-        } else {
-            self._exit:.insertFrom(alias current, CFG_ALWAYS);
-        }
+        self:.addUnwindEdges(alias current);
 
         alias self:.newBlock()
+    }
+
+    /**
+     * Connect a block leaving the frame -- a return, or the end of an
+     * unwind copy of a finally part that itself falls out normally -- to
+     * the next step of unwinding: the innermost enclosing finally's own
+     * unwind copy, or the exit when none encloses it.
+     *     
+     * */
+    fn addUnwindEdges(mut self, dmut from: &BasicBlock) {
+        if (self._finallys.len != 0us) {
+            let dmut f = alias self._finallys[$ - 1us];
+            f:.insertFrom(alias from, CFG_ALWAYS);
+        } else {
+            self._exit:.insertFrom(alias from, CFG_ALWAYS);
+        }
     }
 
     /**
@@ -328,28 +363,51 @@ pub class CFG {
     /**
      * Append a try/finally to the graph.
      *
-     * The finally part is entered from every exit of the protected region: the
-     * normal one when the region falls out of its last instruction, and the
-     * abnormal ones(returns and throwing instructions) through the handler
-     * stack.
+     * The finally part runs on every exit of the protected region, but the
+     * region completing normally and one leaving it early(a return, or an
+     * exception) do not resume the same way afterward: normal completion
+     * falls into whatever follows the try/finally in the source, an early
+     * exit keeps leaving, through the next enclosing finally or out of the
+     * frame.
+     *
      * */
     fn visitTryFinally(mut self, t: &YILTryFinally, dmut current: &BasicBlock)-> dmut &BasicBlock {
         let dmut fin = self:.newBlock();
+        let dmut unwindFin = self:.newBlock();
 
-        self._handlers ~= [alias fin];
-        self._finallys ~= [alias fin];
+        self._handlers ~= [alias unwindFin];
+        self._finallys ~= [alias unwindFin];
         let dmut bodyEnd = self:.visitList(t.tryPart, alias current);
         self._handlers = alias self._handlers[0us .. $ - 1us];
         self._finallys = alias self._finallys[0us .. $ - 1us];
 
+        let dmut cont = self:.newBlock();
+
+        // built, and connected onward, only if the body actually completes
+        // normally into it: an unentered copy left non-empty by visiting
+        // `finPart` regardless would still look "live" to `isLive` (it has
+        // content, whether or not anything reaches it), so it would get
+        // wired forward as if it were a real path -- a phantom exit for a
+        // block nothing runs
         if (bodyEnd.isFalling() && self.isLive(bodyEnd)) {
             fin:.insertFrom(alias bodyEnd, CFG_ALWAYS);
+
+            let dmut finEnd = self:.visitList(t.finPart, alias fin);
+            if (finEnd.isFalling() && self.isLive(finEnd)) {
+                cont:.insertFrom(alias finEnd, CFG_ALWAYS);
+            }
         }
 
-        let dmut finEnd = self:.visitList(t.finPart, alias fin);
-        let dmut cont = self:.newBlock();
-        if (finEnd.isFalling() && self.isLive(finEnd)) {
-            cont:.insertFrom(alias finEnd, CFG_ALWAYS);
+        // likewise, built only if something inside the region actually
+        // unwound through it
+        if (unwindFin.getPrevious().len != 0us) {
+            self._unwindDepth += 1us;
+            let dmut unwindEnd = self:.visitList(t.finPart, alias unwindFin);
+            self._unwindDepth -= 1us;
+
+            if (unwindEnd.isFalling() && self.isLive(unwindEnd)) {
+                self:.addUnwindEdges(alias unwindEnd);
+            }
         }
 
         alias cont
@@ -418,6 +476,17 @@ pub class CFG {
      * time the label is named
      * */
     fn labelBlock(mut self, id: usize)-> dmut &BasicBlock {
+        if (self._unwindDepth != 0us) {
+            if let Ok(dmut bb: &BasicBlock) = alias self._privateLabels[id] {
+                return alias bb;
+            }
+
+            let dmut bb = self:.newBlock();
+            self._privateLabels[id] = alias bb;
+
+            return alias bb;
+        }
+
         if let Ok(dmut bb: &BasicBlock) = alias self._labels[id] {
             return alias bb;
         }
