@@ -3,18 +3,23 @@
  * nothing of it observes, and flattening the control flow the expander leaves
  * behind.
  *
- * The pass does three things, in this order, and repeats them until none of them
+ * The pass does four things, in this order, and repeats them until none of them
  * changes anything:
  *
  *   - it removes the instructions of the blocks no path reaches, a landing pad
  *     counting as a path of its own;
  *   - it removes the assignments to a variable that is not live afterwards, as
  *     long as the value assigned has no effect of its own;
+ *   - it folds the jumps: a conditional jump on a literal or on twice the same
+ *     label becomes unconditional, a jump to a label that only jumps is
+ *     retargeted, a jump to the label that immediately follows it goes, and a
+ *     label nothing names goes;
  *   - it removes the declarations of the variables nothing names any more.
  *
- * The three feed each other, which is why they are repeated: removing a block
- * makes a store dead, removing a store makes a variable unused, and removing a
- * variable makes the store defining it dead.
+ * The four feed each other, which is why they are repeated: folding a jump
+ * makes a block unreachable, removing a block makes a label unnamed, removing a
+ * store makes a variable unused, and removing a variable makes the store
+ * defining it dead.
  *
  * <hr>
  *
@@ -57,6 +62,12 @@ use ymirc::lint::optimizer::{analysis, bblock, cfg, copyprop, defuse, pass_};
 def MAX_ROUNDS = 8us;
 
 /**
+ * The number of labels a jump is threaded through before the pass assumes the
+ * chain of jumps is a cycle and stops following it.
+ * */
+def MAX_THREAD = 16us;
+
+/**
  * The pass removing the dead code of a frame and flattening its control flow.
  * */
 @final
@@ -94,6 +105,8 @@ pub class DeadCodePass over OptimizerPass {
 
             self:.count("unreachable statements", nb-> cl.getUnreachable());
             self:.count("dead stores", nb-> cl.getStores());
+            self:.count("jumps simplified", nb-> cl.getJumps());
+            self:.count("labels removed", nb-> cl.getLabels());
             self:.count("declarations removed", nb-> cl.getDecls());
 
             current = current.withBody(body);
@@ -137,6 +150,12 @@ pub class Cleaner {
     // The number of assignments removed because nothing reads what they write
     let mut _stores: usize = 0us;
 
+    // The number of jumps folded, retargeted or dropped
+    let mut _jumps: usize = 0us;
+
+    // The number of labels removed because nothing names them
+    let mut _labels: usize = 0us;
+
     // The number of declarations removed because nothing names their variable
     let mut _decls: usize = 0us;
 
@@ -162,6 +181,7 @@ pub class Cleaner {
             body = self:.stripOne(body);
         }
 
+        body = self:.cleanJumps(body);
         body = self:.dropDecls(body);
 
         body
@@ -171,7 +191,7 @@ pub class Cleaner {
      * @returns: the number of changes the round made, 0 iif it made none
      * */
     pub fn getRemoved(self)-> usize {
-        self._unreachable + self._stores + self._decls
+        self._unreachable + self._stores + self._jumps + self._labels + self._decls
     }
 
     /**
@@ -186,6 +206,20 @@ pub class Cleaner {
      * */
     pub fn getStores(self)-> usize {
         self._stores
+    }
+
+    /**
+     * @returns: the number of jumps folded, retargeted or dropped
+     * */
+    pub fn getJumps(self)-> usize {
+        self._jumps
+    }
+
+    /**
+     * @returns: the number of labels removed because nothing names them
+     * */
+    pub fn getLabels(self)-> usize {
+        self._labels
     }
 
     /**
@@ -416,6 +450,211 @@ pub class Cleaner {
     /*!
      * ================================================================================
      * ================================================================================
+     * ============================          JUMPS          ===========================
+     * ================================================================================
+     * ================================================================================
+     */
+
+    /**
+     * Flatten the control flow of a body.
+     *
+     * The four simplifications are ordered so that each one produces what the
+     * next one consumes: folding a conditional jump produces a jump, threading
+     * it moves it onto the label the jump chain ends at, dropping the jumps that
+     * fall into the label that follows them makes that label unnamed, and the
+     * last step removes it.
+     * */
+    fn cleanJumps(mut self, body: &YILInstr)-> &YILInstr {
+        let folded = onlyOne(self:.foldList(copy [body]), body);
+
+        let threads = threadTargets(folded);
+        let threaded = if (threads.len != 0us) { onlyOne(self:.retargetList(copy [folded], threads), folded) } else { folded };
+
+        let joined = onlyOne(self:.dropAdjacentList(copy [threaded]), threaded);
+
+        let refs = labelRefs(joined);
+        onlyOne(self:.dropLabelsList(copy [joined], refs), joined)
+    }
+
+    /**
+     * Replace, in a list of instructions, the conditional jumps that are not
+     * conditional any more.
+     *
+     * A jump on a literal always goes the same way, and a jump whose two arms
+     * are the same label goes there whatever the condition says. The condition
+     * of the second one is dropped, which is only allowed when evaluating it is
+     * not something the frame does for its effect.
+     * */
+    fn foldList(mut self, instrs: [&YILInstr])-> [&YILInstr] {
+        let mut res: [mut &YILInstr] = [];
+        for i in instrs {
+            match i {
+                b: &YILBlock => { res ~= [copy YILBlock(b.loc, self:.foldList(b.instrs))]; }
+                t: &YILTryCatch => {
+                    res ~= [copy YILTryCatch(t.loc, t.catchType, self:.foldList(t.tryPart), self:.foldList(t.catchPart))];
+                }
+                t: &YILTryFinally => {
+                    res ~= [copy YILTryFinally(t.loc, self:.foldList(t.tryPart), self:.foldList(t.finPart))];
+                }
+                c: &YILCondJmp => {
+                    match c.cond {
+                        v: &YILIntValue => {
+                            let target = if (v.value == 0) { c.else_ } else { c.then };
+                            self._jumps += 1us;
+                            res ~= [copy YILGoto(c.loc, target)];
+
+                            continue;
+                        }
+                    }
+
+                    if (c.then.id == c.else_.id && isPure(c.cond)) {
+                        self._jumps += 1us;
+                        res ~= [copy YILGoto(c.loc, c.then)];
+
+                        continue;
+                    }
+
+                    res ~= [c];
+                }
+                _ => { res ~= [i]; }
+            }
+        }
+
+        res
+    }
+
+    /**
+     * Retarget, in a list of instructions, the jumps whose label only jumps.
+     *
+     * @params:
+     *    - instrs:  the instructions to rewrite
+     *    - threads: the label every threadable label ends at
+     * */
+    fn retargetList(mut self, instrs: [&YILInstr], threads: [usize => &YILLabel])-> [&YILInstr] {
+        let mut res: [mut &YILInstr] = [];
+        for i in instrs {
+            match i {
+                b: &YILBlock => { res ~= [copy YILBlock(b.loc, self:.retargetList(b.instrs, threads))]; }
+                t: &YILTryCatch => {
+                    res ~= [copy YILTryCatch(t.loc, t.catchType,
+                                             self:.retargetList(t.tryPart, threads),
+                                             self:.retargetList(t.catchPart, threads))];
+                }
+                t: &YILTryFinally => {
+                    res ~= [copy YILTryFinally(t.loc,
+                                               self:.retargetList(t.tryPart, threads),
+                                               self:.retargetList(t.finPart, threads))];
+                }
+                g: &YILGoto => {
+                    if let Ok(t) = threads[g.label.id] {
+                        self._jumps += 1us;
+                        res ~= [copy YILGoto(g.loc, t)];
+
+                        continue;
+                    }
+
+                    res ~= [g];
+                }
+                c: &YILCondJmp => {
+                    let mut then = c.then, mut else_ = c.else_;
+                    let mut moved = false;
+
+                    if let Ok(t) = threads[then.id] { then = t; moved = true; }
+                    if let Ok(t) = threads[else_.id] { else_ = t; moved = true; }
+
+                    if (moved) {
+                        self._jumps += 1us;
+                        res ~= [copy YILCondJmp(c.loc, c.cond, then, else_)];
+
+                        continue;
+                    }
+
+                    res ~= [c];
+                }
+                _ => { res ~= [i]; }
+            }
+        }
+
+        res
+    }
+
+    /**
+     * Drop, in a list of instructions, the jumps to the label that immediately
+     * follows them.
+     *
+     * Such a jump goes where the frame was going anyway. Dropping it is what
+     * merges a block into the predecessor it is the only successor of: the label
+     * is then named by nothing and goes in its turn, and the two blocks are one.
+     * */
+    fn dropAdjacentList(mut self, instrs: [&YILInstr])-> [&YILInstr] {
+        let mut res: [mut &YILInstr] = [];
+        for z in 0us .. instrs.len {
+            let i = instrs[z];
+            match i {
+                b: &YILBlock => { res ~= [copy YILBlock(b.loc, self:.dropAdjacentList(b.instrs))]; }
+                t: &YILTryCatch => {
+                    res ~= [copy YILTryCatch(t.loc, t.catchType,
+                                             self:.dropAdjacentList(t.tryPart),
+                                             self:.dropAdjacentList(t.catchPart))];
+                }
+                t: &YILTryFinally => {
+                    res ~= [copy YILTryFinally(t.loc,
+                                               self:.dropAdjacentList(t.tryPart),
+                                               self:.dropAdjacentList(t.finPart))];
+                }
+                g: &YILGoto => {
+                    if (z + 1us < instrs.len) {
+                        if let l: &YILLabel = instrs[z + 1us] if l.id == g.label.id {
+                            self._jumps += 1us;
+                            continue;
+                        }
+                    }
+
+                    res ~= [g];
+                }
+                _ => { res ~= [i]; }
+            }
+        }
+
+        res
+    }
+
+    /**
+     * Drop, in a list of instructions, the labels nothing names.
+     * */
+    fn dropLabelsList(mut self, instrs: [&YILInstr], refs: [usize => ()])-> [&YILInstr] {
+        let mut res: [mut &YILInstr] = [];
+        for i in instrs {
+            match i {
+                b: &YILBlock => { res ~= [copy YILBlock(b.loc, self:.dropLabelsList(b.instrs, refs))]; }
+                t: &YILTryCatch => {
+                    res ~= [copy YILTryCatch(t.loc, t.catchType,
+                                             self:.dropLabelsList(t.tryPart, refs),
+                                             self:.dropLabelsList(t.catchPart, refs))];
+                }
+                t: &YILTryFinally => {
+                    res ~= [copy YILTryFinally(t.loc,
+                                               self:.dropLabelsList(t.tryPart, refs),
+                                               self:.dropLabelsList(t.finPart, refs))];
+                }
+                l: &YILLabel => {
+                    if (l.id !in refs) {
+                        self._labels += 1us;
+                        continue;
+                    }
+
+                    res ~= [l];
+                }
+                _ => { res ~= [i]; }
+            }
+        }
+
+        res
+    }
+
+    /*!
+     * ================================================================================
+     * ================================================================================
      * ============================          DECLS          ===========================
      * ================================================================================
      * ================================================================================
@@ -560,6 +799,107 @@ pub fn removeId(arr: [usize], id: usize)-> [usize] {
     let mut res: [usize] = [];
     for i in arr {
         if (i != id) res ~= [i];
+    }
+
+    res
+}
+
+/*!
+ * ================================================================================
+ * ================================================================================
+ * =============================          LABELS          =========================
+ * ================================================================================
+ * ================================================================================
+ */
+
+/**
+ * @params:
+ *    - body: the body of a frame
+ * @returns: the identifier of every label a jump of the body names
+ * */
+pub fn labelRefs(body: &YILInstr)-> [usize => ()] {
+    let mut res: [usize => mut ()] = copy [];
+    collectRefs(body, ref res);
+
+    res
+}
+
+/**
+ * Collect the identifier of every label a jump of an instruction names.
+ * */
+fn collectRefs(instr: &YILInstr, ref mut res: [usize => mut ()]) {
+    match instr {
+        b: &YILBlock => { for i in b.instrs { collectRefs(i, ref res); } }
+        t: &YILTryCatch => {
+            for i in t.tryPart { collectRefs(i, ref res); }
+            for i in t.catchPart { collectRefs(i, ref res); }
+        }
+        t: &YILTryFinally => {
+            for i in t.tryPart { collectRefs(i, ref res); }
+            for i in t.finPart { collectRefs(i, ref res); }
+        }
+        g: &YILGoto => { res[g.label.id] = (); }
+        c: &YILCondJmp => { res[c.then.id] = (); res[c.else_.id] = (); }
+    }
+}
+
+/**
+ * @params:
+ *    - body: the body of a frame
+ * @returns: for every label whose block does nothing but jump, the label that
+ * block jumps to, chains followed to their end
+ *
+ * Only the labels the body holds directly are threaded. A label inside a
+ * protected region is left alone: reaching it is being inside that region, and
+ * whether a jump leaving it runs the handler is the backend's business, not a
+ * property this pass is allowed to decide by moving the jump elsewhere.
+ * */
+pub fn threadTargets(body: &YILInstr)-> [usize => &YILLabel] {
+    let instrs = match body {
+        b: &YILBlock => { b.instrs }
+        _ => { copy [body] }
+    };
+
+    // the label a label falls straight into a jump towards, one step only
+    let mut step: [usize => mut &YILLabel] = copy [];
+    for z in 0us .. instrs.len {
+        if let l: &YILLabel = instrs[z] {
+            let mut next = z + 1us;
+            while next < instrs.len {
+                // a run of labels all name the same point of the frame
+                match instrs[next] {
+                    _: &YILLabel => { next += 1us; }
+                    _ => { break; }
+                }
+            }
+
+            if (next >= instrs.len) continue;
+            if let g: &YILGoto = instrs[next] if g.label.id != l.id {
+                step[l.id] = g.label;
+            }
+        }
+    }
+
+    // a jump towards a label that only jumps goes to the end of the chain, the
+    // length being bounded so that a loop of empty blocks does not spin here
+    let mut res: [usize => mut &YILLabel] = copy [];
+    for id, first in step {
+        let mut target = first;
+        let mut nb = 0us;
+
+        while nb < MAX_THREAD {
+            match step[target.id] {
+                Ok(t: &YILLabel) => {
+                    if (t.id == id || t.id == target.id) break;
+                    target = t;
+                }
+                _ => { break; }
+            }
+
+            nb += 1us;
+        }
+
+        if (target.id != id) res[id] = target;
     }
 
     res
