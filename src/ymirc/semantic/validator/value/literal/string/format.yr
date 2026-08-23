@@ -1,0 +1,410 @@
+/*
+ * Formatted strings(`f"...${expr}..."`) are desugared into a slice concatenation
+ * of their literal parts and a `std::conv::to!{[cX]}(expr)` conversion of each
+ * interpolated part, then reparsed and validated like ordinary source code. This
+ * lets ordinary constant folding collapse a fully constant format string into a
+ * single string constant, without any dedicated compile-time formatting logic.
+
+ *
+ * <hr>
+ *
+ * @Package: ymirc
+ * @Module: ymirc::semantic::validator::value::literal::string::format
+ * @File: ymirc/semantic/validator/value/literal/string/format.yr
+ * @Author(s):
+ *   - Emile Cadorel <ecadorel@gmail.com>
+ *
+ * @Created (YYYY-MM-DD): 2026-08-23
+ * @Copyright (C) 2021–2026 GNU-Ymir
+ * @License
+ *   ```text
+ *   This file is part of the Ymir language project.
+ *
+ *   Ymir is free software: you can redistribute it and/or modify it
+ *   under the terms of the GNU General Public License as published by
+ *   the Free Software Foundation, either version 3 of the License, or
+ *   (at your option) any later version.
+ *
+ *   Ymir is distributed in the hope that it will be useful,
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *   GNU General Public License for more details.
+ *
+ *   You should have received a copy of the GNU General Public License
+ *   along with Ymir.  If not, see <https://www.gnu.org/licenses/>.
+ *   ```
+ */
+
+in format;
+
+use ymirc::errors;
+use ymirc::global::core_;
+use ymirc::lexing::{tokens, word};
+use ymirc::semantic::generator::{type::_, value::_};
+use ymirc::semantic::validator::value::validate::_;
+use ymirc::syntax::{errors, expression::_, visitor};
+
+/**
+ * The position in the source file of one line of the content of a string literal.
+ *
+ *   - .0: the offset of the line inside the content of the literal
+ *   - .1: the line of the file it was read from
+ *   - .2: the seek of the beginning of that file line
+ *   - .3: the seek of the first character of the line that is part of the content
+ * */
+pub def FormatStringLine: (usize, u64, usize, usize);
+
+/**
+ * FormatStringParts module
+ *
+ * Splits the content of a format string into literal/interpolation parts, and
+ * validates each of them.
+ *
+ * Every part is located in the file the format string was read from, so the errors
+ * reported on an interpolated expression, and the symbols named after it, point at
+ * the real source. That mapping is the job of `lineMap`, the content of a
+ * multiline format string is not a verbatim slice of the file.
+ * */
+pub mod FormatStringParts {
+
+    /**
+     * Split the raw(still escaped) content of a format string into an ordered
+     * list of validated literal and interpolated parts.
+     *
+     * @params:
+     *   - context: the validation context
+     *   - s:       the format string literal
+     *   - slcType: the slice type the interpolated values are converted to
+     *
+     * @returns: the validated parts, in source order
+     *
+     * @throws:
+     *   - ErrorMsg if an interpolation('${') is empty, never closed, or fails to
+     *     parse/validate
+     * */
+    pub fn split(dmut context: &ValidationContext, s: &StringExpr, slcType: &Type)-> [&Value]
+        throws ErrorMsg
+    {
+        let map = FormatStringParts::lineMap(s);
+        let seq = s.seq;
+
+        let convTemp = ValueValidation::validate(alias context, VariableCreation::createSyntaxVarFromPath(s.loc, StringUtils::CONV));
+        let convFunc = TemplateValidation::validateCall(alias context, s.loc, convTemp, copy [slcType]);
+
+        let dmut parts: [&Value] = [];
+        let mut i = 0us;
+        let mut litStart = 0us;
+
+        while i < seq.len {
+            if seq[i] == '\\' && i + 1us < seq.len {
+                i += 2us;
+            } else if seq[i] == '$' && i + 1us < seq.len && seq[i + 1us] == '{' {
+                if i > litStart {
+                    parts ~= [FormatStringParts::literal(s, map, litStart, i)];
+                }
+
+                let embedStart = i + 2us;
+                let openLoc = FormatStringParts::locate(s, map, i, embedStart);
+                let embedEnd = FormatStringParts::skipToMatchingBrace(openLoc, seq, embedStart);
+
+                parts ~= [FormatStringParts::embed(alias context, s, map, convFunc, embedStart, embedEnd)];
+
+                i = embedEnd + Tokens::RACC.len;
+                litStart = i;
+            } else {
+                i += 1us;
+            }
+        }
+
+        if litStart < seq.len {
+            parts ~= [FormatStringParts::literal(s, map, litStart, seq.len)];
+        }
+
+        return parts;
+    }
+
+    /**
+     * Validate the literal part `s.seq[from .. to]` of a format string.
+     *
+     * @throws:
+     *   - ErrorMsg if the escape sequences of the part are invalid
+     * */
+    fn literal(s: &StringExpr, map: [FormatStringLine], from: usize, to: usize)-> &Value
+        throws ErrorMsg
+    {
+        let innerLoc = FormatStringParts::locate(s, map, from, to);
+        let str = Utf::escape(innerLoc, s.seq[from .. to]);
+
+        StringLiteralValidation::validate(innerLoc, str, s.suffix.str)
+    }
+
+    /**
+     * Validate the interpolated part `s.seq[from .. to]`(the content of a `${...}`,
+     * braces excluded) into a `std::conv::to!{slcType}(expr)` call.
+     *
+     * @throws:
+     *   - ErrorMsg if the interpolation is empty, holds more than one expression,
+     *     or fails to parse or validate
+     * */
+    fn embed(dmut context: &ValidationContext, s: &StringExpr, map: [FormatStringLine], convFunc: &Value, from: usize, to: usize)-> &Value
+        throws ErrorMsg
+    {
+        let innerLoc = FormatStringParts::locate(s, map, from, to);
+        if FormatStringParts::isBlank(s.seq[from .. to]) {
+            throw copy ErrorMsg::fatal(innerLoc, ymirc::utils::format::format(ValidateErrorMessage::EMPTY_FORMAT_EMBED));
+        }
+
+        let expr = FormatStringParts::parse(s, map, innerLoc, to);
+        let value = ValueValidation::validate(alias context, expr);
+
+        CallValidation::validate(alias context, innerLoc, convFunc, copy [value])
+    }
+
+    /**
+     * Parse the source text of an interpolated expression.
+     *
+     * The expression is read from the file the format string comes from rather than
+     * from its content, so that its words carry their real location. Reading the raw
+     * source also puts back the indentation a multiline literal had trimmed away,
+     * which changes nothing to the tokens that are read.
+     *
+     * The whole interpolation must be consumed, a `${a b}` holding two expressions
+     * is an error rather than a silently dropped `b`.
+     *
+     * @params:
+     *   - s:        the format string literal
+     *   - map:      the file positions of the lines of its content
+     *   - innerLoc: the location of the interpolated text
+     *   - to:       the offset of the closing brace inside the content
+     *
+     * @throws:
+     *   - ErrorMsg if the text does not parse, or does not parse entirely
+     * */
+    fn parse(s: &StringExpr, map: [FormatStringLine], innerLoc: &Word, to: usize)-> &Expression
+        throws ErrorMsg
+    {
+        let loc = s.loc;
+        let end = FormatStringParts::fileSeek(map, to);
+
+        let dmut visitor = if end <= loc.fileContent.len && innerLoc.seek <= end {
+            copy SyntaxVisitor::fromStr(loc.filename, loc.fileContent[0us .. end],
+                                        fileContent-> loc.fileContent,
+                                        line-> innerLoc.line, col-> innerLoc.col,
+                                        seek-> innerLoc.seek, lineSeek-> innerLoc.lineSeek)
+        } else { // not read from a file, the content is all there is to parse
+            copy SyntaxVisitor::fromStr(loc.filename, innerLoc.str)
+        };
+
+        let expr = ExpressionVisitor::readExpressionSimple(alias visitor, 0u32);
+
+        let rest = visitor:.getLexer().peek();
+        if !rest.isEof {
+            throw copy ErrorMsg::fatal(rest, ymirc::utils::format::format(SyntaxErrorMessage::UNEXPECTED, rest.str),
+                                       notes-> copy [copy ErrorMsg::note(innerLoc, ymirc::utils::format::format(ValidateErrorMessage::IN_FORMAT_EMBED))]);
+        }
+
+        expr
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          LOCATING          ====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Build the mapping from an offset in the content of `s` to its position in the
+     * file, one entry per line of that content.
+     *
+     * The content of a single line format string(`f"..."`) is a verbatim slice of
+     * the file starting right after the opening token. A multiline one
+     * (`f"""..."""`) went through `SrcLexer::trimString`, which drops a blank first
+     * line, drops the `s.trim` leading spaces of every line, and drops entirely the
+     * lines that are not longer than that indentation. The raw source is therefore
+     * walked line by line to find where each surviving line came from.
+     *
+     * @warning
+     *   The rules applied here mirror `SrcLexer::trimString`, and are checked
+     *   against `s.seq`, cf. the fallback below.
+     *
+     * @returns: one `FormatStringLine` per line of `s.seq`
+     *
+     * @info
+     *   Falls back to a single entry describing the content as a verbatim slice of
+     *   the file when the raw source cannot be walked(a literal that was not read
+     *   from a file), or when the walk does not rebuild `s.seq`.
+     * */
+    fn lineMap(s: &StringExpr)-> [FormatStringLine] {
+        let loc = s.loc;
+        let flat: [FormatStringLine] = copy [(0us, loc.line, loc.lineSeek, loc.seek + loc.str.len)];
+
+        let rawStart = loc.seek + loc.str.len;
+        if s.end.str.len > s.end.seek return flat;
+
+        let rawEnd = s.end.seek - s.end.str.len;
+        if rawStart > rawEnd || rawEnd > loc.fileContent.len return flat;
+
+        let raw = loc.fileContent[rawStart .. rawEnd];
+        let dmut res: [FormatStringLine] = [];
+        let mut seqOff = 0us;
+        let mut line = loc.line;
+        let mut lineSeek = loc.lineSeek;
+        let mut start = 0us;
+        let mut isFirst = true;
+
+        while start < raw.len {
+            let mut e = start;
+            while e < raw.len && raw[e] != '\n' { e += 1us; }
+            if e < raw.len { e += 1us; } // the line owns its '\n'
+
+            let txt = raw[start .. e];
+            if isFirst && FormatStringParts::isBlankLine(txt) {} // a blank first line is dropped
+            else if txt.len > s.trim { // shorter lines are dropped, indentation included
+                res ~= [(seqOff, line, lineSeek, rawStart + start + s.trim)];
+                seqOff += txt.len - s.trim;
+            }
+
+            if raw[e - 1us] == '\n' { // the line was closed, the next one starts here
+                line += 1;
+                lineSeek = rawStart + e;
+            }
+
+            isFirst = false;
+            start = e;
+        }
+
+        if seqOff != s.seq.len || res.len == 0us return flat; // not what the lexer produced
+
+        res
+    }
+
+    /**
+     * Build the location of `s.seq[from .. to]` in the file `s` was read from.
+     * */
+    fn locate(s: &StringExpr, map: [FormatStringLine], from: usize, to: usize)-> &Word {
+        let (lineOff, line, lineSeek, seek) = FormatStringParts::lineOf(map, from);
+        let start = seek + (from - lineOff);
+
+        copy LocWord(str-> s.seq[from .. to],
+                     filename-> s.loc.filename,
+                     fileContent-> s.loc.fileContent,
+                     line-> line,
+                     col-> cast!{u64}(start - lineSeek) + 1u64,
+                     seek-> start,
+                     lineSeek-> lineSeek)
+    }
+
+    /**
+     * @returns: the seek in the file of the character at offset `off` of the content
+     * */
+    fn fileSeek(map: [FormatStringLine], off: usize)-> usize {
+        let (lineOff, _, _, seek) = FormatStringParts::lineOf(map, off);
+
+        seek + (off - lineOff)
+    }
+
+    /**
+     * @returns: the entry of `map` describing the line holding the offset `off`
+     * */
+    fn lineOf(map: [FormatStringLine], off: usize)-> FormatStringLine {
+        let mut res = map[0];
+        for i in map {
+            if i.0 > off break;
+            res = i;
+        }
+
+        res
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          SCANNING          ====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * @returns: true iif `txt` is a line(it ends with a line return) made of spaces
+     *
+     * @warning
+     *   Mirrors `SrcLexer::isBlankLine`.
+     * */
+    fn isBlankLine(txt: [c8])-> bool {
+        let inner = if txt.len >= 2us && txt[$ - 2us .. $] == Tokens::RRETURN_CMP {
+            txt[0us .. $ - 2us]
+        } else if txt.len >= 1us && txt[$ - 1us] == '\n' {
+            txt[0us .. $ - 1us]
+        } else {
+            return false; // a line that does not have a '\n' is not a line
+        };
+
+        for c in inner if c != ' ' return false;
+
+        true
+    }
+
+    /**
+     * @returns: true iif `seq` holds nothing but spacing
+     * */
+    fn isBlank(seq: [c8])-> bool {
+        for i in seq {
+            match i {
+                ' ' | '\t' | '\n' | '\r' => {}
+                _ => { return false; }
+            }
+        }
+
+        true
+    }
+
+    /**
+     * Scan forward from `start`(just past the opening '${') looking for the
+     * matching closing '}', tracking nested braces and skipping over nested
+     * quoted substrings so a '}' inside a string literal isn't mistaken for
+     * the closer.
+     *
+     * @params:
+     *   - loc:   the location of the opening '${'(used for error reporting)
+     *   - seq:   the content of the format string
+     *   - start: the offset just past the opening '${'
+     *
+     * @returns: the index of the matching '}'
+     *
+     * @throws:
+     *   - ErrorMsg if the matching '}' is never found
+     * */
+    fn skipToMatchingBrace(loc: &Word, seq: [c8], start: usize)-> usize
+        throws ErrorMsg
+    {
+        let mut depth = 1;
+        let mut j = start;
+
+        while j < seq.len {
+            match seq[j] {
+                '{' => { depth += 1; j += 1us; }
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 { return j; }
+
+                    j += 1us;
+                }
+                '"' | '\'' => {
+                    let quote = seq[j];
+                    j += 1us;
+                    while j < seq.len && seq[j] != quote {
+                        if seq[j] == '\\' && j + 1us < seq.len { j += 2us; }
+                        else { j += 1us; }
+                    }
+
+                    if j < seq.len { j += 1us; }
+                }
+                _ => { j += 1us; }
+            }
+        }
+
+        throw copy ErrorMsg::fatal(loc, ymirc::utils::format::format(ValidateErrorMessage::UNTERMINATED_FORMAT_EMBED));
+    }
+}
