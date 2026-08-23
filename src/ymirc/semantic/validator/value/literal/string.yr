@@ -7,8 +7,6 @@
  *   - suffix-based selection of the output character width,
  *   - and construction of slice values containing the encoded characters.
  *
- * Formatted strings are recognized syntactically but are not yet supported.
- *
  * <hr>
  *
  * @Package: ymirc
@@ -40,14 +38,15 @@
 
 in string;
 
-use ymirc::syntax::expression::_;
+mod ::format;
+
 use ymirc::errors;
-use ymirc::semantic::generator::{value::_, type::_};
-
+use ymirc::global::common;
+use ymirc::lexing::{keys, word};
+use ymirc::semantic::generator::{type::_, value::_};
+use ymirc::semantic::validator::{_, value::validate::_};
+use ymirc::syntax::expression::_;
 use ymirc::utils::format;
-use ymirc::lexing::keys;
-
-use ymirc::global::common; // version
 
 
 /**
@@ -58,7 +57,8 @@ use ymirc::global::common; // version
  * processing before encoding. Produces a slice of immutable characters wrapped
  * in a StringValue.
  *
- * Formatted strings(`f"..."`) are detected but currently rejected.
+ * Formatted strings(`f"..."`) are desugared into a concatenation, see
+ * `validateFormat` below.
  *
  */
 pub mod StringLiteralValidation {
@@ -67,7 +67,8 @@ pub mod StringLiteralValidation {
      * Validate a string literal and construct its semantic value.
      *
      * Steps:
-     *   1. Reject formatted strings(not yet supported).
+     *   1. If the literal is a format string, desugar it and delegate to
+     *      `validateFormat` instead(see below).
      *   2. Apply escape-sequence processing to the raw sequence.
      *   3. Encode the resulting Unicode string as UTF-8, UTF-16, or UTF-32
      *      depending on the suffix.
@@ -82,7 +83,7 @@ pub mod StringLiteralValidation {
      *   - a StringValue containing the encoded characters and slice type
      *
      * @throws:
-     *   - ErrorMsg if escape processing fails or formatted strings are used
+     *   - ErrorMsg if escape processing fails
      */
     pub fn validate(dmut context: &ValidationContext, s: &StringExpr)-> &Value
         throws ErrorMsg
@@ -92,60 +93,104 @@ pub mod StringLiteralValidation {
         }
 
         let str = Utf::escape(s.loc, s.seq);
+        return StringLiteralValidation::validate(s.loc, str, s.suffix.str);
+    }
 
-        if s.suffix.str == StringSuffixes::UTF32 {
+
+    /**
+     * Validate a string sequence into a string value
+     *
+     * @params:
+     *   - context: validation context
+     *   - loc: the location of the string value
+     *   - str: the sequence to validate
+     *   - encoding: the encoding of the result value
+     *
+     */
+    pub fn validate(loc: &Word, str: [c8], encoding: [c8])-> &StringValue
+        throws ErrorMsg
+    {
+        if encoding == StringSuffixes::UTF32 {
             let encoded = Utf::encodeUtf32(str);
-            let inner = copy CharType(s.loc, size-> 32u16, isMutable-> false);
-            let slcType = copy SliceType(s.loc,
-                                          inner,
-                                          isMutable-> true,
-                                          withSize-> copy IntValue(s.loc, USIZE_TYPE, encoded.len));
+            let inner = copy CharType(loc, size-> 32u16, isMutable-> false);
+            let slcType = copy SliceType(loc,
+                                         inner,
+                                         isMutable-> true,
+                                         withSize-> copy IntValue(loc, USIZE_TYPE, encoded.len));
 
-            return copy StringValue(s.loc, slcType, encoded);
+            return copy StringValue(loc, slcType, encoded);
         }
 
-        if s.suffix.str == StringSuffixes::UTF16 {
+        if encoding == StringSuffixes::UTF16 {
             let encoded = Utf::encodeUtf16(str);
-            let inner = copy CharType(s.loc, size-> 16u16, isMutable-> false);
-            let slcType = copy SliceType(s.loc, inner, isMutable-> true,
-                                          withSize-> copy IntValue(s.loc, USIZE_TYPE, encoded.len));
+            let inner = copy CharType(loc, size-> 16u16, isMutable-> false);
+            let slcType = copy SliceType(loc, inner, isMutable-> true,
+                                         withSize-> copy IntValue(loc, USIZE_TYPE, encoded.len));
 
-            return copy StringValue(s.loc, slcType, encoded);
+            return copy StringValue(loc, slcType, encoded);
         }
 
         let encoded = Utf::encodeUtf8(str);
-        let inner = copy CharType(s.loc, size-> 8u16, isMutable-> false);
-        let slcType = copy SliceType(s.loc,
-                                      inner,
-                                      isMutable-> true,
-                                      withSize-> copy IntValue(s.loc, USIZE_TYPE, encoded.len));
+        let inner = copy CharType(loc, size-> 8u16, isMutable-> false);
+        let slcType = copy SliceType(loc,
+                                     inner,
+                                     isMutable-> true,
+                                     withSize-> copy IntValue(loc, USIZE_TYPE, encoded.len));
 
-        return copy StringValue(s.loc, slcType, encoded);
+        return copy StringValue(loc, slcType, encoded);
     }
 
     /**
      * Validate a formatted string literal.
      *
-     * Formatted strings are recognized syntactically but not yet implemented.
-     * This function always reports an error.
+     * Desugars `f"...${expr}..."` into a slice concatenation of its literal
+     * parts and a `std::conv::to!{[cX]}(expr)` conversion of each interpolated
+     * part(same char width `cX` as the format string's own suffix), then
+     * reparses and validates that composite expression like ordinary source
+     * code. This is what lets constant format strings fold into a single
+     * string constant, for free, via the normal constant-folding machinery.
      *
      * @params:
      *   - context: validation context
      *   - s:       the StringExpr representing the formatted string
      *
      * @returns:
-     *   - never returns; always throws
+     *   - the validated value of the resulting concatenation
      *
      * @throws:
-     *   - ErrorMsg indicating that formatted strings are not supported
+     *   - ErrorMsg if an interpolation is empty or unterminated, or if any of the
+     *     interpolated expressions fail to parse or validate
      */
     fn validateFormat(dmut context: &ValidationContext, s: &StringExpr)-> &Value
         throws ErrorMsg
     {
-        context;
-        s;
+        let slcType: &SliceType = if s.suffix.str == StringSuffixes::UTF32 {
+            let inner = copy CharType(s.loc, size-> 32u16, isMutable-> false);
+            copy SliceType(s.loc, inner, isMutable-> true)
+        }
+        else if s.suffix.str == StringSuffixes::UTF16 {
+            let inner = copy CharType(s.loc, size-> 16u16, isMutable-> false);
+            copy SliceType(s.loc, inner, isMutable-> true)
+        }
+        else {
+            let inner = copy CharType(s.loc, size-> 8u16, isMutable-> false);
+            copy SliceType(s.loc, inner, isMutable-> true)
+        };
 
-        throw copy ErrorMsg::fatal(s.loc, format(ValidateErrorMessage::NOT_SUPPORTED_IN, __YMIR_VERSION__));
+        let parts = format::FormatStringParts::split(alias context, s, slcType);
+        if (parts.len == 0) { // `f""`, no literal part and no interpolation
+            return StringLiteralValidation::validate(s.loc, "", s.suffix.str);
+        }
+
+        let mut finalValue = parts[0];
+        let mut i = 1us;
+        while i < parts.len {
+            finalValue = BinaryConcatValidation::validate(alias context, s.loc, BinaryOperators::TILDE,
+                                                          finalValue,
+                                                          parts[i]);
+            i += 1;
+        }
+
+        return finalValue;
     }
-
 }
