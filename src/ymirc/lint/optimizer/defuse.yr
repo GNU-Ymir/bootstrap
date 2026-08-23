@@ -1,0 +1,602 @@
+/*
+ * Declares the def/use extraction, the part of the dataflow framework that
+ * knows what a YIL instruction reads and what it writes.
+ *
+ * Everything the analyses of `optimizer::dataflow` compute is built from three
+ * sets per instruction:
+ *
+ *   - the defs, the variables the instruction entirely overwrites. A def kills
+ *     whatever the variable held before it,
+ *   - the may defs, the variables the instruction may write without the old
+ *     value being necessarily gone: a field or an element of an aggregate, a
+ *     store through a pointer, an in/out parameter of a runtime call. A may def
+ *     never kills,
+ *   - the uses, the variables the instruction reads.
+ *
+ * Two things make the extraction less obvious than walking the tree.
+ *
+ * The first one is that the expander passes out parameters by address:
+ * `_yrt_dup_slice(&YI_4, &YI_3, 4)` writes `YI_4` and reads `YI_3`, though the
+ * two are spelled the same way. Reading `&YI_4` as a use makes the framework
+ * conservative for exactly the temporaries it is meant to eliminate, and reading
+ * it as a def is wrong for `&YI_3`. The known runtime functions consequently
+ * carry a small signature table saying, for each of their parameters, whether
+ * the callee writes the pointee, reads it, or does both(`runtimeParamModes`).
+ * An address passed to anything else is a may def and a use at once.
+ *
+ * The second one is aliasing. Once the address of a variable has escaped, a
+ * store through a pointer may write it, and a call may read it. The rule used
+ * here is the crude but sound one: a variable whose address escapes is never
+ * killed by anything but a direct assignment to it, every unknown call reads and
+ * may write it, and so does every store through a pointer. An address handed to
+ * a runtime function whose signature is known does not escape: the callee reads
+ * or writes the pointee and does not keep the pointer.
+ *
+ * <hr>
+ *
+ * @Package: ymirc
+ * @Module: ymirc::lint::optimizer::defuse
+ * @File: ymirc/lint/optimizer/defuse.yr
+ * @Author(s):
+ *   - Emile Cadorel <ecadorel@gmail.com>
+ *
+ * @Created(YYYY-MM-DD): 2026-08-22
+ * @Copyright(C) 2021–2026 GNU-Ymir
+ * @License
+ *   ```text
+ *   This file is part of the Ymir language project.
+ *
+ *   Ymir is free software: you can redistribute it and/or modify it
+ *   under the terms of the GNU General Public License as published by
+ *   the Free Software Foundation, either version 3 of the License, or
+ *   (at your option) any later version.
+ *
+ *   Ymir is distributed in the hope that it will be useful,
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *   GNU General Public License for more details.
+ *
+ *   You should have received a copy of the GNU General Public License
+ *   along with Ymir.  If not, see <https://www.gnu.org/licenses/>.
+ *   ```
+ */
+
+in defuse;
+
+use ymirc::lint::node::{_, global::_, instr::_, type::_, value::_};
+
+/**
+ * What a callee does with a parameter it receives by address.
+ * */
+pub enum ParamMode: u8
+| VALUE = 0 // the parameter is not an address the callee dereferences
+| OUT   = 1 // the callee writes the whole pointee, and never reads it
+| IN    = 2 // the callee reads the pointee, and never writes it
+| INOUT = 3; // the callee reads the pointee and writes it
+
+/**
+ * The signature of a runtime function, as far as the dataflow is concerned.
+ *
+ * The frames the expander produces call the runtime by name, and those calls are
+ * the ones standing between a temporary and its elimination. Knowing that
+ * `_yrt_dup_slice` writes its first parameter and only reads the second one is
+ * what makes the difference between a framework that can move those temporaries
+ * and one that gives up on every frame allocating a slice.
+ *
+ * A function that is absent from the table is unknown: it is assumed to read and
+ * write everything whose address escaped, which is always sound.
+ *
+ * @params:
+ *    - name: the name of the called function
+ * @returns: the mode of each of its parameters, empty iif the function is unknown
+ * */
+pub fn runtimeParamModes(name: [c8])-> [ParamMode] {
+    // memory/dupl.h
+    if (name == "_yrt_dup_slice") return copy [ParamMode::OUT, ParamMode::IN, ParamMode::VALUE];
+    if (name == "_yrt_dup_tuple") return copy [ParamMode::OUT, ParamMode::IN, ParamMode::VALUE];
+
+    // memory/alloc.h
+    if (name == "_yrt_alloc_slice") return copy [ParamMode::OUT, ParamMode::IN, ParamMode::VALUE, ParamMode::VALUE];
+    if (name == "_yrt_alloc_slice_no_set") return copy [ParamMode::OUT, ParamMode::VALUE, ParamMode::VALUE];
+    if (name == "_yrt_concat_slices") return copy [ParamMode::OUT, ParamMode::IN, ParamMode::IN, ParamMode::VALUE];
+    if (name == "_yrt_append_slice") return copy [ParamMode::INOUT, ParamMode::IN, ParamMode::VALUE];
+
+    // memory/map.h
+    if (name == "_yrt_map_empty") return copy [ParamMode::OUT, ParamMode::IN];
+    if (name == "_yrt_dup_map") return copy [ParamMode::OUT, ParamMode::IN, ParamMode::IN];
+    if (name == "_yrt_map_insert") return copy [ParamMode::INOUT, ParamMode::IN, ParamMode::IN];
+    if (name == "_yrt_map_find") return copy [ParamMode::IN, ParamMode::IN];
+
+    // memory/classes.h, memory/tinfo.h
+    if (name == "_yrt_alloc_class") return copy [ParamMode::IN];
+    if (name == "_yrt_unsafe_cast") return copy [ParamMode::IN];
+    if (name == "_yrt_cmp_class_of_type") return copy [ParamMode::IN, ParamMode::IN];
+
+    copy []
+}
+
+/**
+ * What a single instruction defines and uses.
+ * */
+pub class DefUseSet {
+
+    // The variables the instruction entirely overwrites
+    let mut _defs: [usize] = [];
+
+    // The variables the instruction may write, the old value possibly surviving
+    let mut _mayDefs: [usize] = [];
+
+    // The variables the instruction reads
+    let mut _uses: [usize] = [];
+
+    pub self () {}
+
+    /**
+     * Register a variable the instruction entirely overwrites.
+     * */
+    pub fn addDef(mut self, id: usize) {
+        if (!containsId(self._defs, id)) self._defs ~= [id];
+    }
+
+    /**
+     * Register a variable the instruction may write.
+     * */
+    pub fn addMayDef(mut self, id: usize) {
+        if (!containsId(self._mayDefs, id)) self._mayDefs ~= [id];
+    }
+
+    /**
+     * Register a variable the instruction reads.
+     * */
+    pub fn addUse(mut self, id: usize) {
+        if (!containsId(self._uses, id)) self._uses ~= [id];
+    }
+
+    /**
+     * @returns: the variables the instruction entirely overwrites
+     * */
+    pub fn getDefs(self)-> [usize] {
+        self._defs
+    }
+
+    /**
+     * @returns: the variables the instruction may write
+     * */
+    pub fn getMayDefs(self)-> [usize] {
+        self._mayDefs
+    }
+
+    /**
+     * @returns: the variables the instruction reads
+     * */
+    pub fn getUses(self)-> [usize] {
+        self._uses
+    }
+
+    /**
+     * @returns: the variables the instruction writes, killing or not
+     * */
+    pub fn getAllDefs(self)-> [usize] {
+        let mut res = self._defs;
+        for i in self._mayDefs {
+            if (!containsId(res, i)) res ~= [i];
+        }
+
+        res
+    }
+
+}
+
+/**
+ * The def/use extractor of a single frame.
+ *
+ * It owns the universe the analyses work on: the variables the frame declares,
+ * numbered in declaration order, and among them the ones whose address escaped.
+ * */
+pub class DefUse {
+
+    // The variables of the frame, parameters first, then in declaration order
+    let mut _vars: [&YILVarDecl] = [];
+
+    // The index of every variable in `_vars`, indexed by variable id
+    let mut _index: [usize => mut usize] = copy [];
+
+    // The variables whose address escaped, in declaration order
+    let mut _escaped: [usize] = [];
+
+    /**
+     * Extract the variables of a frame and the ones whose address escapes.
+     *
+     * @params:
+     *    - frame: the frame to analyse
+     * */
+    pub self (frame: &YILFrame) {
+        self:.declare(frame);
+        self:.escapesInstr(frame.body);
+    }
+
+    /*!
+     * ================================================================================
+     * ================================================================================
+     * ============================          GETTERS          =========================
+     * ================================================================================
+     * ================================================================================
+     */
+
+    /**
+     * @returns: the variables of the frame, parameters first, then in declaration order
+     * */
+    pub fn getVars(self)-> [&YILVarDecl] {
+        self._vars
+    }
+
+    /**
+     * @returns: the variables whose address escaped
+     * */
+    pub fn getEscaped(self)-> [usize] {
+        self._escaped
+    }
+
+    /**
+     * @params:
+     *    - id: the identifier of a variable
+     * @returns: true iif the variable is one the frame declares
+     *
+     * The identifier `0` is not a variable identifier, it is what a reference to
+     * a global symbol by name carries. Such a reference is not part of the
+     * universe: nothing the frame does to it is tracked.
+     * */
+    pub fn isTracked(self, id: usize)-> bool {
+        id != 0us && id in self._index
+    }
+
+    /**
+     * @params:
+     *    - id: the identifier of a variable of the frame
+     * @returns: the index of the variable in the universe, or the size of the
+     * universe when the variable is not one of the frame
+     * */
+    pub fn indexOf(self, id: usize)-> usize {
+        if let Ok(i) = self._index[id] {
+            return i;
+        }
+
+        self._vars.len
+    }
+
+    /**
+     * @params:
+     *    - value: a value of the frame
+     * @returns: the variable the value is an access into, none iif the value is
+     * not rooted at a variable of the frame
+     *
+     * A field, an element and a cast are accesses into the value they are built
+     * from. A dereference is not: what a pointer points at is not known from the
+     * pointer.
+     * */
+    pub fn baseVar(self, value: &YILValue)-> (usize)? {
+        match value {
+            v: &YILVar => {
+                if (self.isTracked(v.id)) return v.id?;
+            }
+            f: &YILFieldValue => { return self.baseVar(f.tuple); }
+            a: &YILArrayAccessValue => { return self.baseVar(a.value); }
+            c: &YILCastValue => { return self.baseVar(c.value); }
+        }
+
+        none
+    }
+
+    /*!
+     * ================================================================================
+     * ================================================================================
+     * ===========================          UNIVERSE          =========================
+     * ================================================================================
+     * ================================================================================
+     */
+
+    /**
+     * Register every variable the frame owns, its parameters and its declarations.
+     * */
+    fn declare(mut self, frame: &YILFrame) {
+        for p in frame.params {
+            self:.declareVar(p);
+        }
+
+        self:.declareInstr(frame.body);
+    }
+
+    /**
+     * Register a variable in the universe, ignoring the ones already in it.
+     * */
+    fn declareVar(mut self, v: &YILVarDecl) {
+        if (v.id == 0us) return;
+        if (v.id in self._index) return;
+
+        self._index[v.id] = self._vars.len;
+        self._vars ~= [v];
+    }
+
+    /**
+     * Register every variable declared by an instruction and the ones it contains.
+     * */
+    fn declareInstr(mut self, instr: &YILInstr) {
+        match instr {
+            b: &YILBlock => { for i in b.instrs { self:.declareInstr(i); } }
+            t: &YILTryCatch => {
+                for i in t.tryPart { self:.declareInstr(i); }
+                for i in t.catchPart { self:.declareInstr(i); }
+            }
+            t: &YILTryFinally => {
+                for i in t.tryPart { self:.declareInstr(i); }
+                for i in t.finPart { self:.declareInstr(i); }
+            }
+            v: &YILVarDecl => { self:.declareVar(v); }
+        }
+    }
+
+    /*!
+     * ================================================================================
+     * ================================================================================
+     * ===========================          ESCAPING          =========================
+     * ================================================================================
+     * ================================================================================
+     */
+
+    /**
+     * Collect the variables whose address escapes in an instruction.
+     * */
+    fn escapesInstr(mut self, instr: &YILInstr) {
+        match instr {
+            b: &YILBlock => { for i in b.instrs { self:.escapesInstr(i); } }
+            t: &YILTryCatch => {
+                for i in t.tryPart { self:.escapesInstr(i); }
+                for i in t.catchPart { self:.escapesInstr(i); }
+            }
+            t: &YILTryFinally => {
+                for i in t.tryPart { self:.escapesInstr(i); }
+                for i in t.finPart { self:.escapesInstr(i); }
+            }
+            a: &YILAffect => { self:.escapesValue(a.left); self:.escapesValue(a.right); }
+            c: &YILCall => { self:.escapesValue(c.content); }
+            r: &YILReturn => { self:.escapesValue(r.value); }
+            c: &YILCondJmp => { self:.escapesValue(c.cond); }
+        }
+    }
+
+    /**
+     * Collect the variables whose address escapes in a value.
+     *
+     * Taking the address of a variable is what makes it escape, unless the
+     * address is handed to a runtime function whose signature is known: such a
+     * callee reads or writes the pointee and does not keep the pointer, so the
+     * store it makes is described by the signature rather than by aliasing.
+     * */
+    fn escapesValue(mut self, value: &YILValue) {
+        match value {
+            a: &YILAddrValue => {
+                if let Ok(id) = self.baseVar(a.value) { self:.markEscaped(id); }
+                self:.escapesValue(a.value);
+            }
+            n: &YILNameCallValue => { self:.escapesCall(runtimeParamModes(n.funcName), n.params); }
+            p: &YILPtrCallValue => {
+                self:.escapesValue(p.funcPtr);
+                self:.escapesCall([], p.params);
+            }
+            b: &YILBinaryValue => { self:.escapesValue(b.left); self:.escapesValue(b.right); }
+            u: &YILUnaryValue => { self:.escapesValue(u.left); }
+            c: &YILCastValue => { self:.escapesValue(c.value); }
+            f: &YILFieldValue => { self:.escapesValue(f.tuple); }
+            a: &YILArrayAccessValue => { self:.escapesValue(a.value); self:.escapesValue(a.index); }
+            t: &YILTupleValue => { for v in t.values { self:.escapesValue(v); } }
+            a: &YILArrayValue => { for v in a.value { self:.escapesValue(v); } }
+            u: &YILUnrefValue => { self:.escapesValue(u.value); }
+        }
+    }
+
+    /**
+     * Collect the variables whose address escapes in the arguments of a call.
+     *
+     * @params:
+     *    - modes:  the signature of the callee, empty when it is unknown
+     *    - params: the arguments of the call
+     * */
+    fn escapesCall(mut self, modes: [ParamMode], params: [&YILValue]) {
+        for i, p in params {
+            let known = i < modes.len && modes[i] != ParamMode::VALUE;
+            match p {
+                a: &YILAddrValue => {
+                    if (!known) {
+                        if let Ok(id) = self.baseVar(a.value) { self:.markEscaped(id); }
+                    }
+
+                    self:.escapesValue(a.value);
+                }
+                _ => { self:.escapesValue(p); }
+            }
+        }
+    }
+
+    /**
+     * Register a variable as one whose address escaped.
+     * */
+    fn markEscaped(mut self, id: usize) {
+        if (!self.isTracked(id)) return;
+        if (containsId(self._escaped, id)) return;
+
+        self._escaped ~= [id];
+    }
+
+    /*!
+     * ================================================================================
+     * ================================================================================
+     * ============================          DEF/USE          =========================
+     * ================================================================================
+     * ================================================================================
+     */
+
+    /**
+     * Extract what an instruction defines and uses.
+     *
+     * @params:
+     *    - instr: the instruction to extract the def/use of
+     * @returns: its defs, may defs and uses
+     * */
+    pub fn ofInstr(self, instr: &YILInstr)-> &DefUseSet {
+        let dmut res = copy DefUseSet();
+        match instr {
+            v: &YILVarDecl => { self.defVar(v.id, killing-> true, alias res); }
+            a: &YILAffect => {
+                self.useValue(a.right, alias res);
+                self.destValue(a.left, killing-> true, alias res);
+            }
+            c: &YILCall => { self.useValue(c.content, alias res); }
+            r: &YILReturn => { self.useValue(r.value, alias res); }
+            c: &YILCondJmp => { self.useValue(c.cond, alias res); }
+        }
+
+        res
+    }
+
+    /**
+     * Register the write a value standing on the left of an assignment makes.
+     *
+     * @params:
+     *    - value:   the destination of the assignment
+     *    - killing: true iif the destination is entirely overwritten
+     * */
+    fn destValue(self, value: &YILValue, killing: bool, dmut res: &DefUseSet) {
+        match value {
+            v: &YILVar => { self.defVar(v.id, killing-> killing, alias res); }
+            c: &YILCastValue => { self.destValue(c.value, killing-> killing, alias res); }
+            f: &YILFieldValue => {
+                // a field is a part of the aggregate: what the rest of it holds
+                // survives the assignment, so the aggregate is read and may
+                // written, never killed
+                self.useValue(f.tuple, alias res);
+                self.destValue(f.tuple, killing-> false, alias res);
+            }
+            a: &YILArrayAccessValue => {
+                self.useValue(a.index, alias res);
+                self.useValue(a.value, alias res);
+                self.destValue(a.value, killing-> false, alias res);
+            }
+            u: &YILUnrefValue => {
+                // nothing says what the pointer points at, so the store may
+                // reach any variable whose address escaped
+                self.useValue(u.value, alias res);
+                self.clobberEscaped(alias res);
+            }
+            _ => { self.useValue(value, alias res); }
+        }
+    }
+
+    /**
+     * Register a write to a variable.
+     * */
+    fn defVar(self, id: usize, killing: bool, dmut res: &DefUseSet) {
+        if (!self.isTracked(id)) return;
+
+        if (killing) { res:.addDef(id); }
+        else { res:.addMayDef(id); }
+    }
+
+    /**
+     * Register everything a value reads.
+     * */
+    fn useValue(self, value: &YILValue, dmut res: &DefUseSet) {
+        match value {
+            v: &YILVar => { if (self.isTracked(v.id)) { res:.addUse(v.id); } }
+            n: &YILNameCallValue => { self.callDefUse(runtimeParamModes(n.funcName), n.params, alias res); }
+            p: &YILPtrCallValue => {
+                self.useValue(p.funcPtr, alias res);
+                self.callDefUse([], p.params, alias res);
+            }
+            u: &YILUnrefValue => {
+                // reading through a pointer reads whatever it points at
+                self.useValue(u.value, alias res);
+                self.readEscaped(alias res);
+            }
+            a: &YILAddrValue => { self.useValue(a.value, alias res); }
+            b: &YILBinaryValue => { self.useValue(b.left, alias res); self.useValue(b.right, alias res); }
+            u: &YILUnaryValue => { self.useValue(u.left, alias res); }
+            c: &YILCastValue => { self.useValue(c.value, alias res); }
+            f: &YILFieldValue => { self.useValue(f.tuple, alias res); }
+            a: &YILArrayAccessValue => { self.useValue(a.value, alias res); self.useValue(a.index, alias res); }
+            t: &YILTupleValue => { for v in t.values { self.useValue(v, alias res); } }
+            a: &YILArrayValue => { for v in a.value { self.useValue(v, alias res); } }
+        }
+    }
+
+    /**
+     * Register what a call does to the variables its arguments name.
+     *
+     * An argument that is the address of a variable is a write when the callee
+     * is known to write the pointee, a read when it is known to read it, and
+     * both when nothing is known about the callee. A call to an unknown callee
+     * also reads and may write every variable whose address escaped: nothing
+     * says the callee did not receive that address earlier.
+     *
+     * @params:
+     *    - modes:  the signature of the callee, empty when it is unknown
+     *    - params: the arguments of the call
+     * */
+    fn callDefUse(self, modes: [ParamMode], params: [&YILValue], dmut res: &DefUseSet) {
+        for i, p in params {
+            let mode = if (i < modes.len) { modes[i] } else { ParamMode::VALUE };
+            match p {
+                a: &YILAddrValue => {
+                    if (mode == ParamMode::OUT) {
+                        self.destValue(a.value, killing-> true, alias res);
+                    } else if (mode == ParamMode::IN) {
+                        self.useValue(a.value, alias res);
+                    } else if (mode == ParamMode::INOUT) {
+                        self.useValue(a.value, alias res);
+                        self.destValue(a.value, killing-> false, alias res);
+                    } else {
+                        self.useValue(a.value, alias res);
+                    }
+                }
+                _ => { self.useValue(p, alias res); }
+            }
+        }
+
+        if (modes.len == 0us) {
+            self.readEscaped(alias res);
+            self.clobberEscaped(alias res);
+        }
+    }
+
+    /**
+     * Register a read of every variable whose address escaped.
+     * */
+    fn readEscaped(self, dmut res: &DefUseSet) {
+        for i in self._escaped {
+            res:.addUse(i);
+        }
+    }
+
+    /**
+     * Register a possible write to every variable whose address escaped.
+     * */
+    fn clobberEscaped(self, dmut res: &DefUseSet) {
+        for i in self._escaped {
+            res:.addMayDef(i);
+        }
+    }
+
+}
+
+/**
+ * @params:
+ *    - arr: a list of variable identifiers
+ *    - id:  the identifier to look for
+ * @returns: true iif the list contains the identifier
+ * */
+pub fn containsId(arr: [usize], id: usize)-> bool {
+    for i in arr {
+        if (i == id) return true;
+    }
+
+    false
+}
