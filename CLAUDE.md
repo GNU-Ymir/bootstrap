@@ -251,11 +251,22 @@ The whole frontend is orchestrated by `Parser` (`src/ymirc/parser.yr`), in three
    repeats: folding a jump orphans a block, deleting a block unnames a label, deleting a store
    unuses a variable.
 
-   Three things it must keep getting right. **A landing pad is a root of reachability**: a
+   Five things it must keep getting right. **A landing pad is a root of reachability**: a
    handler is entered by the personality routine and never by a jump, so `CFG::deadBlocks` —
    not `CFG::unreachableBlocks`, which answers the graph's question and is what the `.dot`
    dump reports — seeds the walk from the entry *and* from every `YILTryCatch`/`YILTryFinally`
-   pad. Deciding a pad is dead is YMI-84's job, not this pass's. **Only a whole variable is
+   pad. Deciding a pad is dead is YMI-84's job, not this pass's. **A block the pad walk keeps
+   alive has no dataflow facts**: the solver runs over `CFG::reversePostOrder()`, which is
+   entry-rooted, so a pad protecting a region no path reaches is in the graph, not in the
+   solution, and `Solution::inOf`/`outOf` answer it the empty set — "no variable is live",
+   which is a lie, not a conservative default. `FrameDataflow::hasFacts` is the question to
+   ask before reading the facts of a block, and `dce.yr` skips the dead-store analysis of a
+   block that fails it. **The closing instruction of a block does not kill on the exception
+   edge**: it is the instruction an exception leaves from the middle of, so the backward walk
+   in `markDeadStores` puts back, after transferring it, whatever the handlers protecting the
+   block read — the instruction-at-a-time form of the `preGen`/`preKill` sets `transferOf`
+   applies on such an edge. Without it, `[x = <pure>, x = <throwing call>]` reports the first
+   store dead while the handler is exactly what reads it. **Only a whole variable is
    ever stored-dead**: writing a field or an element leaves the rest alone, and a variable
    whose address escaped is read by things that do not name it, so liveness has nothing to say
    about either. **A read must be rooted in the frame to be removable**: a call, a
@@ -267,6 +278,16 @@ The whole frontend is orchestrated by `Parser` (`src/ymirc/parser.yr`), in three
    body is a tree whose `YILTryCatch`/`YILTryFinally` nodes say which region an instruction is
    protected by, so blocks cannot be reordered across them, and the fallthrough that layout
    buys is what dropping the goto into the following label already gives.
+
+   The first two of those five are tested by `test/integration/dead_code.yr`, on frames built
+   by hand the way `integration::verifier` builds its own, and for the same reason: no source
+   program makes the expander produce either shape. It hoists every call into a temporary
+   written once, so a block never closes on a store to a variable a handler reads, and the
+   validator rejects every source shape whose protected region cannot throw (`nothing to
+   catch`, `failure guard cannot be used when guarding a scope that cannot throw`,
+   `unreachable statement`), so a pad is never left out of the solution. Both invariants are
+   therefore contracts with the framework rather than properties of anything compiled today —
+   a golden cannot state them, and dropping either one leaves the whole corpus green.
 
    The pass is tied back to the tree by an ordinal. `CFG` numbers every instruction of the
    body in preorder as it builds (`BasicBlock::getOrds()`, `NO_ORD` for the jumps the builder
