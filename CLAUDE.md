@@ -301,7 +301,16 @@ The whole frontend is orchestrated by `Parser` (`src/ymirc/parser.yr`), in three
    rewriting the body counts exactly the same way to find the instruction again. A change to
    the order `CFG::visit` walks the body in has to be mirrored in `dce::strip`. One subtree is
    built twice: the finally part of a `YILTryFinally`, once for the region completing normally
-   and once for the unwinding leaving it. Both copies are numbered from the same rank and the
+   and once for the unwinding leaving it. Every one of those copies is a region of its own, so
+   each gets its own map from label id to block — a label is what decides which block an
+   instruction lands in, and resolving two copies through one map hands them one block, which
+   then holds the same ordinal twice and votes twice on a liveness that merges paths that
+   never run together. One map per unwind copy is not enough: a `YILTryFinally` inside another
+   one's finally part is built once per copy of the enclosing part, the inner *normal* copy
+   included, which is why `visitTryFinally` saves the map and replaces it with an empty one
+   around every copy it builds under one. `integration::cfg` states it: no block holds a rank
+   twice, over a sweep that includes `scope_guards/test13.yr`, a guard inside a guard's body
+   whose own body holds a jump. Both copies are numbered from the same rank and the
    walk resumes past the part at `nbOrdsList(finPart)`, never at wherever a copy left the
    counter — either copy is skipped when nothing reaches it, and a rank counted one copy short
    names another instruction from there on. A rank is therefore reachable from two blocks, and
