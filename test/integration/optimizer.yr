@@ -133,13 +133,19 @@ fn countInstr(instr: &YILInstr)-> usize {
  *
  * A landing pad is entered by the personality routine and by nothing the frame
  * does, so a pass rooting its reachability at the entry alone sees the handler
- * of every region it believes cannot throw as dead code, and empties it. What
- * is asserted here is the property that catches that: a body that holds a
- * handler before the pipeline holds as many after, and they are not left empty.
+ * of every region it believes cannot throw as dead code, and removes what it
+ * holds. What is asserted here is the property that catches that, handler by
+ * handler: a body that holds a handler before the pipeline holds the same one
+ * after, making the same calls.
  *
- * The instructions of a handler are not counted, they are allowed to go: a
- * store the handler makes to a variable nothing reads afterwards is as dead
- * there as anywhere else.
+ * The calls are what is compared rather than the instructions. A handler is
+ * cleaned like anything else -- the `exit` of `test9::foo2` is a store to a
+ * variable nothing reads, and leaving it empty is right -- so a count of
+ * instructions has a legitimate reason to drop, and asserting on it would state
+ * nothing. A call is never a dead store and never a pure value, so the pass has
+ * exactly one reason to remove one: believing no path reaches it. That is the
+ * mistake this states, and it has to be stated per handler, since a module
+ * holds several and one that survives says nothing about the others.
  * */
 __test {
     for package in ["test_resources/scope_guards/test1.yr",
@@ -153,9 +159,26 @@ __test {
         }
 
         let raw = countHandlers(res.exp), opt = countHandlers(res.opt);
-        assert (raw.0 != 0us, format("% : no handler to check", package));
-        assert (opt.0 == raw.0, format("% : -O1 : % handlers, down from %", package, opt.0, raw.0));
-        assert (opt.1 != 0us, format("% : -O1 : % handlers, all of them empty", package, opt.0));
+        assert (raw.len != 0us, format("% : no frame with a handler to check", package));
+
+        let mut checked = 0us;
+        for name, before in raw {
+            let mut after: [usize] = [];
+            if let Ok(a) = opt[name] { after = a; }
+
+            assert (after.len == before.len,
+                    format("% : -O1 : % : % handlers, down from %", package, name, after.len, before.len));
+
+            for i, nb in before {
+                assert (after[i] == nb,
+                        format("% : -O1 : % : handler #% makes % calls, down from %",
+                               package, name, i, after[i], nb));
+
+                checked += nb;
+            }
+        }
+
+        assert (checked != 0us, format("% : no handler makes a call, nothing to check", package));
     }
 }
 
@@ -195,71 +218,94 @@ __test {
 /**
  * @params:
  *    - nodes: the nodes of a module
- * @returns: the number of handlers the module holds, and the number of
- * instructions they hold between them
+ * @returns: for every frame of the module holding one, the number of calls each
+ * of its handlers makes
  *
  * A pass rooting its reachability wrong does not remove the try itself, it
- * empties the pad, so the two are counted: the handlers that are gone, and the
- * handlers that are still there with nothing left in them.
+ * removes what the pad holds, so what is reported is one number per handler:
+ * comparing the lists tells a handler that is gone from a handler that is still
+ * there with its body taken away, which a sum over the module cannot -- one
+ * handler that kept its calls would answer for all of them.
+ *
+ * The handlers of a frame are listed in the order the body holds them, the
+ * enclosing one before the ones its parts hold, which is an order the pass does
+ * not move: it removes instructions, it does not reorder the tree.
  * */
-fn countHandlers(nodes: [&YILNode])-> (usize, usize) {
-    let mut nb = 0us, mut instrs = 0us;
+fn countHandlers(nodes: [&YILNode])-> [[c8] => [usize]] {
+    let mut res: [[c8] => mut [usize]] = copy [];
     for n in nodes {
         if let f: &YILFrame = n {
-            let c = countHandler(f.body);
-            nb += c.0;
-            instrs += c.1;
+            let mut inFrame: [usize] = [];
+            collectHandlers(f.body, ref inFrame);
+            if (inFrame.len != 0us) res[f.name] = inFrame;
         }
     }
 
-    (nb, instrs)
+    res
 }
 
 /**
- * @returns: the number of handlers an instruction holds, and the number of
- * instructions they hold between them
+ * Append the number of calls every handler an instruction holds makes.
+ *
+ * A handler is counted whole, the handlers nested in it included: those appear
+ * again as entries of their own, so a nested one being emptied is caught by its
+ * own entry as well and does not have to be told apart in the enclosing count.
  * */
-fn countHandler(instr: &YILInstr)-> (usize, usize) {
-    let mut nb = 0us, mut instrs = 0us;
-    let inner = |i: &YILInstr| => {
-        let c = countHandler(i);
-        (c.0, c.1)
-    };
-
+fn collectHandlers(instr: &YILInstr, ref mut res: [usize]) {
     match instr {
         b: &YILBlock => {
-            for i in b.instrs {
-                let c = inner(i);
-                nb += c.0; instrs += c.1;
-            }
+            for i in b.instrs { collectHandlers(i, ref res); }
         }
         t: &YILTryCatch => {
-            nb += 1us;
-            for i in t.tryPart {
-                let c = inner(i);
-                nb += c.0; instrs += c.1;
-            }
+            let mut nb = 0us;
+            for i in t.catchPart { nb += countCalls(i); }
+            res ~= [nb];
 
-            for i in t.catchPart {
-                let c = inner(i);
-                nb += c.0; instrs += c.1 + countInstr(i);
-            }
+            for i in t.tryPart { collectHandlers(i, ref res); }
+            for i in t.catchPart { collectHandlers(i, ref res); }
         }
         t: &YILTryFinally => {
-            nb += 1us;
-            for i in t.tryPart {
-                let c = inner(i);
-                nb += c.0; instrs += c.1;
-            }
+            let mut nb = 0us;
+            for i in t.finPart { nb += countCalls(i); }
+            res ~= [nb];
 
-            for i in t.finPart {
-                let c = inner(i);
-                nb += c.0; instrs += c.1 + countInstr(i);
+            for i in t.tryPart { collectHandlers(i, ref res); }
+            for i in t.finPart { collectHandlers(i, ref res); }
+        }
+    }
+}
+
+/**
+ * @returns: the number of instructions an instruction holds that call something
+ *
+ * A call made for what it does(`YILCall`) and a call whose result is stored
+ * (`__self_1 = _yrt_alloc_class(...)`) both count, and a call nested deeper in a
+ * value is not looked for: what the number is for is naming the instructions the
+ * pass has no licence to remove whatever the dataflow says, and one per calling
+ * instruction says that.
+ * */
+fn countCalls(instr: &YILInstr)-> usize {
+    let mut res = 0us;
+    match instr {
+        b: &YILBlock => { for i in b.instrs { res += countCalls(i); } }
+        t: &YILTryCatch => {
+            for i in t.tryPart { res += countCalls(i); }
+            for i in t.catchPart { res += countCalls(i); }
+        }
+        t: &YILTryFinally => {
+            for i in t.tryPart { res += countCalls(i); }
+            for i in t.finPart { res += countCalls(i); }
+        }
+        _: &YILCall => { return 1us; }
+        a: &YILAffect => {
+            match a.right {
+                _: &YILNameCallValue => { return 1us; }
+                _: &YILPtrCallValue => { return 1us; }
             }
         }
     }
 
-    (nb, instrs)
+    res
 }
 
 /**
