@@ -196,9 +196,13 @@ The whole frontend is orchestrated by `Parser` (`src/ymirc/parser.yr`), in three
    `optimizer/defuse.yr`, `optimizer/dataflow.yr` and `optimizer/analysis.yr` are the
    dataflow framework the passes consume. `DefUse` says what one instruction reads and
    writes, `dataflow.yr` is a worklist fixpoint solver parameterised by direction and meet,
-   and `FrameDataflow` (`analysis.yr`) instantiates it three times per frame: liveness
+   and `FrameDataflow` (`analysis.yr`) instantiates it up to three times per frame: liveness
    (backward, union), reaching definitions (forward, union) and available expressions
-   (forward, intersection). It also fills `BasicBlock::getGens()`/`getKills()`, the liveness
+   (forward, intersection). Only liveness is always solved — it is what `hasFacts` answers
+   from; the other two are asked for (`withReaching`/`withAvailable`), since solving one is
+   not free and `buildAvailable` alone enumerates every expression of the frame into an
+   `ExprTable`. Reading an analysis that was not solved panics rather than answering the empty
+   set, which reads as "nothing holds" and is a lie, not a conservative default. It also fills `BasicBlock::getGens()`/`getKills()`, the liveness
    summary of every block. Two things it deliberately gets right, and that a change here must
    keep: an address passed to a runtime function whose signature is in the `runtimeParamModes`
    table is a *definition* when the callee writes the pointee (`_yrt_dup_slice(&YI_4, ...)`)
