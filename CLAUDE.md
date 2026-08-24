@@ -177,7 +177,11 @@ The whole frontend is orchestrated by `Parser` (`src/ymirc/parser.yr`), in three
    control flow graph, and `optimizer/verifier.yr` checks the well-formedness of a frame —
    variables declared, labels defined and unique, affectations moving compatible widths,
    `YILBeginCatch` inside a handler, calls covered by `YILFrame::refs`, non-void frames
-   returning. Verification runs on the raw expander output and again after every pass, so a
+   returning. That last one reads the edges, not the blocks: an edge into the exit is
+   `EdgeKind::UNWIND` when what leaves the frame is an unwinding resuming past the finally
+   part that interrupted it (`cfg.yr`'s unwind copy of a `YILTryFinally`), and a frame left
+   that way returns nothing whatever its return type — demanding a return there reports a
+   correct frame as malformed. Verification runs on the raw expander output and again after every pass, so a
    pass is only ever blamed for what it introduced; it is gated by `--fverify-yil` and is
    always on in the test suite. YIL types are looser than they look — pointers, arrays and
    pointer-wide integers are the same address, integer widths are the backend's business —
