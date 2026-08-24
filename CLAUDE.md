@@ -173,7 +173,13 @@ The whole frontend is orchestrated by `Parser` (`src/ymirc/parser.yr`), in three
    (`lint/serialize`).
 
    `lint/optimizer` is the pass pipeline: `Optimizer` (`optimizer/visitor.yr`) applies an
-   ordered list of `OptimizerPass`es to every frame, `optimizer/cfg.yr` builds the per-frame
+   ordered list of `OptimizerPass`es to every frame — sweeping the whole list again while a
+   pass still reports having changed something (`MAX_PIPELINE_ROUNDS`), since the passes feed
+   each other in both directions and one sweep leaves work behind: dead code removes the
+   copies copy propagation left, and the straight-line runs it makes by folding the jumps are
+   runs copy propagation never saw. A round asks whether a pass's counters moved rather than
+   resetting them: they are cumulative, and are what `--fopt-stats` reports at the end.
+   `optimizer/cfg.yr` builds the per-frame
    control flow graph, and `optimizer/verifier.yr` checks the well-formedness of a frame —
    variables declared, labels defined and unique, affectations moving compatible widths,
    `YILBeginCatch` inside a handler, calls covered by `YILFrame::refs`, non-void frames
