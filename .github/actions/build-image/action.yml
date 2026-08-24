@@ -1,0 +1,79 @@
+name: Build ymirc image
+description: >-
+  Builds the Dockerfile's `build` stage - the image holding ./ymirc.test, the stdlib the test
+  suite compiles against and the test resources - and loads it into the local docker daemon under
+  `tag`. The toolchain build-args have no default in the Dockerfile on purpose: YMIR_VERSION at
+  the repo root is the single source of truth, and every workflow computes them from it, here.
+
+  Every job of a CI run asks for the same tag: the build job is the one that actually compiles
+  (it is also the only one exporting to the shared layer cache), the shard and coverage jobs hit
+  that cache and only pay for loading the image into the daemon.
+
+inputs:
+  tag:
+    description: The tag to load the built image under.
+    required: true
+  cache-to:
+    description: >-
+      "true" in the single job meant to populate the shared layer cache. Every other job leaves it
+      false and only reads that cache, so a job that compiled nothing does not spend time
+      exporting layers it did not build.
+    required: false
+    default: "false"
+
+runs:
+  using: composite
+  steps:
+    # The jobs of one run queue on the same runner, hence the same docker daemon: by the time a
+    # shard asks for the image, the build job has already put it there, and there is no builder to
+    # start, no layer to export and nothing to load. A pool of more than one machine just misses
+    # here and rebuilds from the shared cache below.
+    - name: Look for the image in the local daemon
+      id: local
+      shell: bash
+      run: |
+        set -euo pipefail
+        if docker image inspect "${{ inputs.tag }}" >/dev/null 2>&1; then
+          echo "hit=true" >> "$GITHUB_OUTPUT"
+          echo "${{ inputs.tag }} is already loaded - nothing to build"
+        else
+          echo "hit=false" >> "$GITHUB_OUTPUT"
+        fi
+
+    - name: Compute toolchain build-args from YMIR_VERSION
+      id: toolchain
+      if: steps.local.outputs.hit != 'true'
+      shell: bash
+      run: |
+        set -euo pipefail
+        . ./YMIR_VERSION
+        GCC_MAJOR_VERSION="$(echo "$GCC_VERSION" | cut -d. -f1)"
+        {
+          echo "gyc_release_tag=${YMIR_BOOTSTRAP_VERSION}"
+          echo "gyc_asset=gyc-${GCC_MAJOR_VERSION}_${YMIR_BOOTSTRAP_VERSION}_amd64.deb"
+          echo "gyllir_release_tag=${GYLLIR_VERSION}"
+          echo "gyllir_asset=gyllir_${GYLLIR_VERSION}_amd64.deb"
+          echo "midgard_release_tag=${MIDGARD_VERSION}"
+          echo "midgard_asset=midgard-${MIDGARD_VERSION}-src.zip"
+        } >> "$GITHUB_OUTPUT"
+
+    - uses: docker/setup-buildx-action@v4
+      if: steps.local.outputs.hit != 'true'
+
+    - uses: docker/build-push-action@v7
+      if: steps.local.outputs.hit != 'true'
+      with:
+        context: .
+        target: build
+        push: false
+        load: true
+        tags: ${{ inputs.tag }}
+        build-args: |
+          GYC_RELEASE_TAG=${{ steps.toolchain.outputs.gyc_release_tag }}
+          GYC_ASSET=${{ steps.toolchain.outputs.gyc_asset }}
+          GYLLIR_RELEASE_TAG=${{ steps.toolchain.outputs.gyllir_release_tag }}
+          GYLLIR_ASSET=${{ steps.toolchain.outputs.gyllir_asset }}
+          MIDGARD_RELEASE_TAG=${{ steps.toolchain.outputs.midgard_release_tag }}
+          MIDGARD_ASSET=${{ steps.toolchain.outputs.midgard_asset }}
+        cache-from: type=gha
+        cache-to: ${{ inputs.cache-to == 'true' && 'type=gha,mode=max' || '' }}

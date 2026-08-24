@@ -1,89 +1,242 @@
 name: CI
 
+# Builds ./ymirc.test once, runs the suite in parallel shards, then merges what they produced back
+# into a single coverage report:
+#
+#   build ---> shard (syntax, types, classes, control-flow, literals, lint, regressions) ---> coverage
+#
+# The shards are independent jobs: they queue one after another while the pool has a single
+# runner, and spread out on their own the day it has more. Either way each one has the machine to
+# itself while it runs, so run-shard.sh gives ymirc.test `-j $(nproc)`.
+#
+# The shards do not report coverage themselves: every ymirc.test run writes a
+# `.ymir_coverage_<pid>.json` whatever the flags, and the `coverage` job hands all of them, plus a
+# merge of the shards' `.ymir_test_success` maps, to one last `ymirc.test --resume -cov`. --resume
+# is what makes that run print the whole suite's coverage without re-running a single test that a
+# shard already passed - and what makes it run any test no shard claimed, so a stale filter below
+# costs parallelism, never coverage.
+
 on:
   push:
     branches: [master]
   pull_request:
 
+# A CI run is ten queued jobs now; a new push to a PR cancels the previous run's shards instead of
+# queueing another ten behind them. Pushes to master are never cancelled.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  # Unique per run: the shards of two concurrent runs share one docker daemon, and a fixed tag
+  # would have them silently testing each other's binary. Dropped again by the `cleanup` job.
+  IMAGE: ymirc-build:${{ github.run_id }}-${{ github.run_attempt }}
+
 jobs:
-  test:
+  build:
+    name: Build ymirc.test
     runs-on: [self-hosted, linux, x64]
     steps:
       - uses: actions/checkout@v7
 
-      - name: Compute toolchain build-args from YMIR_VERSION
-        id: toolchain
-        run: |
-          . ./YMIR_VERSION
-          GCC_MAJOR_VERSION="$(echo "$GCC_VERSION" | cut -d. -f1)"
-          echo "gyc_release_tag=${YMIR_BOOTSTRAP_VERSION}" >> "$GITHUB_OUTPUT"
-          echo "gyc_asset=gyc-${GCC_MAJOR_VERSION}_${YMIR_BOOTSTRAP_VERSION}_amd64.deb" >> "$GITHUB_OUTPUT"
-          echo "gyllir_release_tag=${GYLLIR_VERSION}" >> "$GITHUB_OUTPUT"
-          echo "gyllir_asset=gyllir_${GYLLIR_VERSION}_amd64.deb" >> "$GITHUB_OUTPUT"
-          echo "midgard_release_tag=${MIDGARD_VERSION}" >> "$GITHUB_OUTPUT"
-          echo "midgard_asset=midgard-${MIDGARD_VERSION}-src.zip" >> "$GITHUB_OUTPUT"
-
-      - uses: docker/setup-buildx-action@v4
-
-      - uses: docker/build-push-action@v7
+      # The only job that compiles anything: it populates the layer cache the shards below read.
+      - uses: ./.github/actions/build-image
         with:
-          context: .
-          target: build
-          push: false
-          load: true
-          tags: ymirc-build:ci
-          build-args: |
-            GYC_RELEASE_TAG=${{ steps.toolchain.outputs.gyc_release_tag }}
-            GYC_ASSET=${{ steps.toolchain.outputs.gyc_asset }}
-            GYLLIR_RELEASE_TAG=${{ steps.toolchain.outputs.gyllir_release_tag }}
-            GYLLIR_ASSET=${{ steps.toolchain.outputs.gyllir_asset }}
-            MIDGARD_RELEASE_TAG=${{ steps.toolchain.outputs.midgard_release_tag }}
-            MIDGARD_ASSET=${{ steps.toolchain.outputs.midgard_asset }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          tag: ${{ env.IMAGE }}
+          cache-to: "true"
 
-      - name: Run tests and collect coverage
+  shard:
+    name: ${{ matrix.shard }}
+    needs: build
+    runs-on: [self-hosted, linux, x64]
+    strategy:
+      # One shard failing must not cancel the others: the point of the split is to see every area
+      # that broke in one go, not just the first.
+      fail-fast: false
+      matrix:
+        # Roughly balanced by number of compiled test cases, grouped by the area of the compiler
+        # they exercise. A module listed nowhere is not skipped - the coverage job runs it and
+        # says so - so this is a parallelism knob, not a correctness one.
+        include:
+          - shard: syntax
+            filters: >-
+              integration::syntax::*
+              integration::doc::*
+              integration::format_string::*
+
+          - shard: types
+            filters: >-
+              integration::aka::*
+              integration::binary_*::*
+              integration::bool_type::*
+              integration::cast_float::*
+              integration::char_type::*
+              integration::enumeration::*
+              integration::implicit_cast*::*
+              integration::references::*
+              integration::structures::*
+              integration::union_type::*
+              integration::unions::*
+
+          - shard: classes
+            filters: >-
+              integration::class_*::*
+              integration::entities::*
+              integration::implement::*
+              integration::templates*::*
+              integration::lazyness::*
+              integration::concurrency::*
+
+          - shard: control-flow
+            filters: >-
+              integration::control_flow::*
+              integration::for_loops::*::*
+              integration::function::*
+              integration::pattern_match::*
+              integration::scope_guards::*
+
+          - shard: literals
+            filters: >-
+              integration::lit_*::*
+              integration::lit_*::*::*
+
+          - shard: lint
+            filters: >-
+              integration::cfg::*
+              integration::coverage::*
+              integration::dataflow::*
+              integration::expansion::*
+              integration::first::*
+              integration::global::*
+              integration::optimizer::*
+              integration::pragma::*
+              integration::root_path::*
+              integration::third::*
+              integration::unittest::*
+              integration::verifier::*
+              integration::yil_serialize::*
+
+          - shard: regressions
+            filters: >-
+              integration::regressions::*::*
+              ymirc_test::*::*
+              ymirc_test::*::*::*
+
+    steps:
+      - uses: actions/checkout@v7
+
+      # Free while the whole run is on one runner: the build job left the image in the daemon.
+      - uses: ./.github/actions/build-image
+        with:
+          tag: ${{ env.IMAGE }}
+
+      - name: Run the ${{ matrix.shard }} tests
+        env:
+          CONTAINER: ymirc-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.shard }}
+          SHARD: ${{ matrix.shard }}
+          FILTERS: ${{ matrix.filters }}
+          # Unset: run-shard.sh reads `nproc` in the container. Set it here to cap a shard's
+          # workers, e.g. the day several shards run side by side on one machine again.
+          JOBS: ${{ matrix.jobs }}
+        run: |
+          set -uo pipefail
+          docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
+
+          code=0
+          # The filters are globs for ymirc.test, not for the shell: -f keeps the word splitting
+          # below from expanding them against the workspace.
+          set -f
+          docker run --name "$CONTAINER" -e JOBS="$JOBS" "$IMAGE" \
+              bash .github/scripts/run-shard.sh "$SHARD" $FILTERS || code=$?
+          set +f
+
+          # Even a failed shard hands back what it managed to run, so the artifact is uploaded and
+          # the log of the failure stays readable next to it. The destination must not exist -
+          # docker cp would then nest the directory inside it instead of becoming it.
+          rm -rf ./shard-out
+          docker cp "$CONTAINER:/tmp/shard-out" ./shard-out || true
+          docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
+
+          exit "$code"
+
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: shard-${{ matrix.shard }}
+          path: shard-out/
+          # Both the coverage dumps and the success map are dotfiles, which upload-artifact drops
+          # by default.
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 7
+
+  coverage:
+    name: Coverage
+    needs: shard
+    runs-on: [self-hosted, linux, x64]
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: ./.github/actions/build-image
+        with:
+          tag: ${{ env.IMAGE }}
+
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: shard-*
+          merge-multiple: true
+          path: merged
+
+      - name: Merge the shard results
+        run: |
+          set -euo pipefail
+          ls -l merged
+
+          # One success map out of every shard's own. A test is recorded as passed only if the
+          # shard that ran it says so, and a test no shard claimed is simply absent - which is
+          # precisely what makes the --resume run below run it rather than skip it.
+          awk -F';' 'NF == 2 {
+                       if ($2 == "false") failed[$1] = 1
+                       seen[$1] = 1
+                     }
+                     END {
+                       for (test in seen) print test ";" (test in failed ? "false" : "true")
+                     }' merged/success-*.txt > merged/.ymir_test_success
+          rm -f merged/success-*.txt
+
+          echo "$(wc -l < merged/.ymir_test_success) test result(s) merged from" \
+               "$(find merged -name '.ymir_coverage_*.json' | wc -l) coverage file(s)"
+
+      - name: Report the whole-suite coverage
         id: run_tests
         run: |
-          set -o pipefail
-          docker run --rm ymirc-build:ci ./ymirc.test -sf -cov | tee coverage.txt
+          set -uo pipefail
+
+          # docker cp rather than a bind mount: it works the same whether or not the runner itself
+          # is containerised, and the files land owned by the container's own user.
+          CID="$(docker create "$IMAGE" ./ymirc.test --resume -cov)"
+          docker cp merged/. "$CID:/bootstrap/"
+
+          # A failing run must still leave the log to summarise and the container to reap, so the
+          # exit status is read back from docker rather than aborting the step here.
+          set +e
+          docker start -a "$CID" 2>&1 | tee coverage.txt
+          code="$(docker wait "$CID")"
+          docker rm -f "$CID" >/dev/null 2>&1
+
+          exit "${code:-1}"
 
       - name: Publish coverage summary
         if: always()
-        run: |
-          CLEAN="$(sed -E 's/\x1b\[[0-9;]*m//g' coverage.txt)"
+        run: bash .github/scripts/coverage-summary.sh coverage.txt "${{ steps.run_tests.outcome }}"
 
-          if [ "${{ steps.run_tests.outcome }}" = "success" ]; then
-            HEADER_LINE="$(echo "$CLEAN" | grep -n 'COVERAGE' | head -1 | cut -d: -f1)"
-            REPORT="$(echo "$CLEAN" | tail -n "+$((HEADER_LINE - 1))")"
-            TOTAL_LINE="$(echo "$CLEAN" | grep -E 'TOTAL:' | tail -1)"
-            TOTAL_PCT="$(echo "$TOTAL_LINE" | grep -oE '^\[[0-9]+%\]' | tr -d '[]')"
-            TOTAL_NUM="${TOTAL_PCT%\%}"
-
-            if [ -z "$TOTAL_NUM" ]; then
-              BADGE_COLOR="lightgrey"
-              TOTAL_NUM="unknown"
-            elif [ "$TOTAL_NUM" -lt 50 ]; then
-              BADGE_COLOR="red"
-            elif [ "$TOTAL_NUM" -gt 95 ]; then
-              BADGE_COLOR="brightgreen"
-            else
-              BADGE_COLOR="yellow"
-            fi
-
-            {
-              echo "## Coverage ![coverage](https://img.shields.io/badge/coverage-${TOTAL_NUM}%25-${BADGE_COLOR})"
-              echo
-              echo '```'
-              echo "$REPORT"
-              echo '```'
-            } >> "$GITHUB_STEP_SUMMARY"
-          else
-            {
-              echo "## Tests failed - no coverage report"
-              echo
-              echo '```'
-              echo "$CLEAN"
-              echo '```'
-            } >> "$GITHUB_STEP_SUMMARY"
-          fi
+  cleanup:
+    name: Cleanup
+    # Whatever happened above, the run's image tag must go: it is unique per run, so leaving it
+    # behind piles up one full image per CI run on the self-hosted machine.
+    if: always()
+    needs: [build, shard, coverage]
+    runs-on: [self-hosted, linux, x64]
+    steps:
+      - name: Drop this run's image tag
+        run: docker image rm -f "$IMAGE" || true

@@ -1,0 +1,725 @@
+/*
+ * Declares CopyPropagationPass, the pass collapsing the chains of temporaries
+ * the expander emits.
+ *
+ * The expander materialises a fresh temporary at nearly every recursion step,
+ * because that is what keeps its expansion rules local and composable. The
+ * result is that roughly a third of the statements of a raw frame are of the
+ * form `YI_n = YI_m`, and that an expression is almost never written where it is
+ * read. This pass is the cleanup of that:
+ *
+ *   - copy propagation: after `x = y`, a read of `x` is a read of `y`, so later
+ *     reads are renamed to `y` until something writes either of them. The copy
+ *     itself stays, it is dead code elimination that removes it,
+ *   - temporary coalescing: a compiler generated temporary that the frame
+ *     assigns once and reads once is substituted into its use site, and the
+ *     assignment is deleted. `YI_2 = a + 9; return YI_2;` becomes `return a + 9;`.
+ *
+ * Both are driven by one forward walk holding, for every variable, the value it
+ * is known to hold. That environment is exact rather than approximated: it is
+ * dropped at every label, every jump and every entry into a handler, so what it
+ * describes is always the straight line run the rewritten instruction belongs
+ * to, and a value it substitutes is always written earlier on that very run.
+ * That is what makes the rewrite dominance safe without a dominator tree: the
+ * two ends may sit in two blocks, a call in a try region ending one in the
+ * middle of the run, but the writing one still dominates the reading one.
+ *
+ * What may not be moved is what the walk is careful about:
+ *
+ *   - the address of a variable is the variable itself, never a copy of it, so
+ *     nothing is ever substituted under a `&`. That covers the out parameters of
+ *     the runtime(`_yrt_dup_slice(&YI_4, ...)` defines `YI_4`) and the address
+ *     taken variables in one rule,
+ *   - the left of an assignment names the storage that is written, not a value
+ *     that is read, so it is left alone,
+ *   - only a side effect free expression is coalesced: no call, no read through
+ *     a pointer, no indexing(indexing a pointer is a read through it), and no
+ *     division, whose trap must not cross a call,
+ *   - only a variable of the frame is moved: a reference to a global symbol is
+ *     outside the universe the def/use analysis describes, so nothing that
+ *     writes it invalidates what reads it.
+ *
+ * The two transformations feed each other(a propagated copy leaves a temporary
+ * with a single use, a coalesced temporary exposes the next one), so the pass
+ * walks the frame again as long as it changed something, up to MAX_ROUNDS times.
+ *
+ * <hr>
+ *
+ * @Package: ymirc
+ * @Module: ymirc::lint::optimizer::copyprop
+ * @File: ymirc/lint/optimizer/copyprop.yr
+ * @Author(s):
+ *   - Emile Cadorel <ecadorel@gmail.com>
+ *
+ * @Created(YYYY-MM-DD): 2026-08-22
+ * @Copyright(C) 2021–2026 GNU-Ymir
+ * @License
+ *   ```text
+ *   This file is part of the Ymir language project.
+ *
+ *   Ymir is free software: you can redistribute it and/or modify it
+ *   under the terms of the GNU General Public License as published by
+ *   the Free Software Foundation, either version 3 of the License, or
+ *   (at your option) any later version.
+ *
+ *   Ymir is distributed in the hope that it will be useful,
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *   GNU General Public License for more details.
+ *
+ *   You should have received a copy of the GNU General Public License
+ *   along with Ymir.  If not, see <https://www.gnu.org/licenses/>.
+ *   ```
+ */
+
+in copyprop;
+
+use ymirc::lexing::{keys, word};
+use ymirc::lint::node::{_, global::_, instr::_, type::_, value::_};
+use ymirc::lint::optimizer::{defuse, pass_};
+
+/**
+ * The number of times the pass walks a frame before giving up on a fixpoint.
+ * */
+def MAX_ROUNDS = 8us;
+
+/**
+ * The pass propagating the copies and coalescing the temporaries of a frame.
+ * */
+@final
+pub class CopyPropagationPass over OptimizerPass {
+
+    pub self ()
+        with super ("copy-prop", 1u32)
+    {}
+
+    /**
+     * Collapse the copies and the single use temporaries of a frame.
+     *
+     * @params:
+     *    - frame: the frame to transform
+     * @returns: the transformed frame, or `frame` itself when nothing moved
+     * */
+    pub over apply(mut self, frame: &YILFrame)-> &YILFrame {
+        let mut current = frame;
+        let mut round = 0us;
+
+        while round < MAX_ROUNDS {
+            let dmut rw = copy Rewriter(current);
+            let body = rw:.run();
+            if (rw.getCopies() == 0us && rw.getCoalesced() == 0us) break;
+
+            self:.count("copies propagated", nb-> rw.getCopies());
+            self:.count("temporaries coalesced", nb-> rw.getCoalesced());
+
+            current = current.withBody(body);
+            round += 1us;
+        }
+
+        current
+    }
+
+}
+
+/**
+ * The rewriting of a single frame, one walk of its body.
+ *
+ * It owns the environment of the walk: for every variable, the value it is known
+ * to hold at the point the walk reached, and for a temporary that is coalesced,
+ * the assignment to delete once its use has been rewritten.
+ * */
+pub class Rewriter {
+
+    // The frame being rewritten
+    let _frame: &YILFrame;
+
+    // What every instruction of the frame reads and writes
+    let _du: &DefUse;
+
+    // The number of writes the frame makes to a variable, its declaration apart
+    let mut _defs: [usize => mut usize] = copy [];
+
+    // The number of reads the frame makes of a variable
+    let mut _uses: [usize => mut usize] = copy [];
+
+    // The value a variable is known to hold at the point the walk reached
+    let mut _env: [usize => mut &YILValue] = copy [];
+
+    // The variables a known value reads, the ones a write to invalidates it
+    let mut _deps: [usize => mut [usize]] = copy [];
+
+    // The assignment to delete when the known value of a variable is substituted
+    let mut _drops: [usize => mut usize] = copy [];
+
+    // The instructions the substitutions made useless, by rank in the walk
+    let mut _dropped: [usize => mut bool] = copy [];
+
+    // The rank of the instruction the walk reached, containers apart
+    let mut _ord: usize = 0us;
+
+    // The number of reads renamed to the variable the value was copied from
+    let mut _copies: usize = 0us;
+
+    // The number of temporaries substituted into their use site
+    let mut _coalesced: usize = 0us;
+
+    /**
+     * @params:
+     *    - frame: the frame to rewrite
+     * */
+    pub self (frame: &YILFrame)
+        with _frame = frame
+        , _du = copy DefUse(frame)
+    {
+        self:.countInstr(frame.body);
+    }
+
+    /**
+     * Rewrite the body of the frame.
+     *
+     * @returns: the new body, the substitutions made and the assignments they
+     * made useless removed
+     * */
+    pub fn run(mut self)-> &YILInstr {
+        self._ord = 0us;
+        let body = self:.rewriteInstr(self._frame.body);
+        if (self._coalesced == 0us) return body;
+
+        // the instructions are removed in a second walk: an assignment is known
+        // to be useless only once the use of the temporary it defines has been
+        // rewritten, which happens after it has been emitted
+        self._ord = 0us;
+        let filtered = self:.filterList(copy [body]);
+        if (filtered.len == 1us) return filtered[0];
+
+        copy YILBlock(body.loc, filtered)
+    }
+
+    /**
+     * @returns: the number of reads renamed to the variable the value was copied from
+     * */
+    pub fn getCopies(self)-> usize {
+        self._copies
+    }
+
+    /**
+     * @returns: the number of temporaries substituted into their use site
+     * */
+    pub fn getCoalesced(self)-> usize {
+        self._coalesced
+    }
+
+    /*!
+     * ================================================================================
+     * ================================================================================
+     * ===========================          COUNTING          =========================
+     * ================================================================================
+     * ================================================================================
+     */
+
+    /**
+     * Count the writes and the reads an instruction makes.
+     *
+     * A declaration is not a write: it gives the variable a storage, not a
+     * value. Everything else is counted the safe way round, a read that is
+     * really a write(the out parameter of a runtime function) being counted as
+     * both: over counting only ever blocks a substitution.
+     * */
+    fn countInstr(mut self, instr: &YILInstr) {
+        match instr {
+            b: &YILBlock => { for i in b.instrs { self:.countInstr(i); } }
+            t: &YILTryCatch => {
+                for i in t.tryPart { self:.countInstr(i); }
+                for i in t.catchPart { self:.countInstr(i); }
+            }
+            t: &YILTryFinally => {
+                for i in t.tryPart { self:.countInstr(i); }
+                for i in t.finPart { self:.countInstr(i); }
+            }
+            _: &YILVarDecl => {}
+            a: &YILAffect => {
+                for d in self._du.ofInstr(a).getAllDefs() { self:.bumpDef(d); }
+                self:.countValue(a.right);
+                match a.left {
+                    _: &YILVar => {}
+                    _ => { self:.countValue(a.left); }
+                }
+            }
+            c: &YILCall => {
+                for d in self._du.ofInstr(c).getAllDefs() { self:.bumpDef(d); }
+                self:.countValue(c.content);
+            }
+            r: &YILReturn => { self:.countValue(r.value); }
+            c: &YILCondJmp => { self:.countValue(c.cond); }
+        }
+    }
+
+    /**
+     * Count every variable a value names, wherever it names it.
+     * */
+    fn countValue(mut self, value: &YILValue) {
+        for id in varsIn(value) { self:.bumpUse(id); }
+    }
+
+    /**
+     * Register one more write to a variable.
+     * */
+    fn bumpDef(mut self, id: usize) {
+        if let Ok(old) = self._defs[id] { self._defs[id] = old + 1us; }
+        else { self._defs[id] = 1us; }
+    }
+
+    /**
+     * Register one more read of a variable.
+     * */
+    fn bumpUse(mut self, id: usize) {
+        if let Ok(old) = self._uses[id] { self._uses[id] = old + 1us; }
+        else { self._uses[id] = 1us; }
+    }
+
+    /**
+     * @returns: the number of writes the frame makes to a variable
+     * */
+    fn defCount(self, id: usize)-> usize {
+        if let Ok(c) = self._defs[id] { return c; }
+
+        0us
+    }
+
+    /**
+     * @returns: the number of reads the frame makes of a variable
+     * */
+    fn useCount(self, id: usize)-> usize {
+        if let Ok(c) = self._uses[id] { return c; }
+
+        0us
+    }
+
+    /*!
+     * ================================================================================
+     * ================================================================================
+     * ==========================          REWRITING          =========================
+     * ================================================================================
+     * ================================================================================
+     */
+
+    /**
+     * Rewrite a list of instructions, in execution order.
+     * */
+    fn rewriteList(mut self, instrs: [&YILInstr])-> [&YILInstr] {
+        let mut res: [mut &YILInstr] = [];
+        for i in instrs {
+            res ~= [self:.rewriteInstr(i)];
+        }
+
+        res
+    }
+
+    /**
+     * Rewrite one instruction, and update the environment with what it does.
+     *
+     * The environment describes a straight line run: it is dropped at a label
+     * and at a jump, which are the boundaries of a basic block, and at the entry
+     * and the exit of a handler, which is entered from anywhere in the part it
+     * protects.
+     * */
+    fn rewriteInstr(mut self, instr: &YILInstr)-> &YILInstr {
+        match instr {
+            b: &YILBlock => { return copy YILBlock(b.loc, self:.rewriteList(b.instrs)); }
+            t: &YILTryCatch => {
+                let tryPart = self:.rewriteList(t.tryPart);
+                self:.clear();
+
+                let catchPart = self:.rewriteList(t.catchPart);
+                self:.clear();
+
+                return copy YILTryCatch(t.loc, t.catchType, tryPart, catchPart);
+            }
+            t: &YILTryFinally => {
+                let tryPart = self:.rewriteList(t.tryPart);
+                self:.clear();
+
+                let finPart = self:.rewriteList(t.finPart);
+                self:.clear();
+
+                return copy YILTryFinally(t.loc, tryPart, finPart);
+            }
+            a: &YILAffect => {
+                let right = self:.rewriteValue(a.right);
+                let ord = self._ord;
+                self._ord += 1us;
+
+                self:.invalidate(self._du.ofInstr(a).getAllDefs());
+                self:.learn(a.left, right, ord);
+
+                return copy YILAffect(a.loc, a.left, right);
+            }
+            c: &YILCall => {
+                let content = self:.rewriteValue(c.content);
+                self._ord += 1us;
+
+                self:.invalidate(self._du.ofInstr(c).getAllDefs());
+
+                return copy YILCall(c.loc, content);
+            }
+            r: &YILReturn => {
+                let value = self:.rewriteValue(r.value);
+                self._ord += 1us;
+                self:.clear();
+
+                return copy YILReturn(r.loc, value);
+            }
+            c: &YILCondJmp => {
+                let cond = self:.rewriteValue(c.cond);
+                self._ord += 1us;
+                self:.clear();
+
+                return copy YILCondJmp(c.loc, cond, c.then, c.else_);
+            }
+            v: &YILVarDecl => {
+                self._ord += 1us;
+                self:.invalidate(copy [v.id]);
+
+                return v;
+            }
+            _ => {
+                // a label is entered from anywhere the frame jumps from, a goto
+                // leaves for anywhere: either way what is known here is not
+                // known on the other side
+                self._ord += 1us;
+                self:.clear();
+
+                return instr;
+            }
+        }
+    }
+
+    /**
+     * Rewrite a value, substituting the variables whose value is known.
+     *
+     * The address of a variable is never rewritten: `&x` names the storage of
+     * `x`, and the storage of a copy of `x` is another one.
+     * */
+    fn rewriteValue(mut self, value: &YILValue)-> &YILValue {
+        match value {
+            v: &YILVar => {
+                if let Ok(known) = self._env[v.id] {
+                    if let Ok(ord) = self._drops[v.id] {
+                        self._dropped[ord] = true;
+                        self._coalesced += 1us;
+                        self:.forget(v.id);
+                    } else {
+                        self._copies += 1us;
+                    }
+
+                    return known;
+                }
+
+                return value;
+            }
+            _: &YILAddrValue => { return value; }
+            b: &YILBinaryValue => {
+                let left = self:.rewriteValue(b.left);
+                let right = self:.rewriteValue(b.right);
+
+                return copy YILBinaryValue(b.loc, b.type, b.op, left, right);
+            }
+            u: &YILUnaryValue => { return copy YILUnaryValue(u.loc, u.type, u.op, self:.rewriteValue(u.left)); }
+            c: &YILCastValue => { return copy YILCastValue(c.loc, c.type, self:.rewriteValue(c.value)); }
+            u: &YILUnrefValue => { return copy YILUnrefValue(u.loc, u.type, self:.rewriteValue(u.value)); }
+            f: &YILFieldValue => {
+                let inner = self:.rewriteValue(f.tuple);
+                if (f.name != "") return copy YILFieldValue(f.loc, f.type, inner, f.name);
+
+                return copy YILFieldValue(f.loc, f.type, inner, f.index);
+            }
+            a: &YILArrayAccessValue => {
+                let inner = self:.rewriteValue(a.value);
+                let index = self:.rewriteValue(a.index);
+
+                return copy YILArrayAccessValue(a.loc, a.type, inner, index);
+            }
+            t: &YILTupleValue => {
+                let mut values: [mut &YILValue] = [];
+                for v in t.values { values ~= [self:.rewriteValue(v)]; }
+
+                return copy YILTupleValue(t.loc, t.type, values, fieldNames-> t.fieldNames);
+            }
+            a: &YILArrayValue => {
+                let mut values: [mut &YILValue] = [];
+                for v in a.value { values ~= [self:.rewriteValue(v)]; }
+
+                return copy YILArrayValue(a.loc, a.type, values);
+            }
+            n: &YILNameCallValue => {
+                let mut params: [mut &YILValue] = [];
+                for v in n.params { params ~= [self:.rewriteValue(v)]; }
+
+                return copy YILNameCallValue(n.loc, n.type, n.funcName, params);
+            }
+            p: &YILPtrCallValue => {
+                let funcPtr = self:.rewriteValue(p.funcPtr);
+                let mut params: [mut &YILValue] = [];
+                for v in p.params { params ~= [self:.rewriteValue(v)]; }
+
+                return copy YILPtrCallValue(p.loc, p.type, funcPtr, params);
+            }
+        }
+
+        value
+    }
+
+    /*!
+     * ================================================================================
+     * ================================================================================
+     * =========================          ENVIRONMENT          ========================
+     * ================================================================================
+     * ================================================================================
+     */
+
+    /**
+     * Remember what an assignment leaves in a variable.
+     *
+     * Two things are worth remembering. A copy of a variable, whose reads are
+     * renamed to the variable it was copied from, the assignment surviving for
+     * dead code elimination to remove. And the value of a compiler generated
+     * temporary the frame assigns once and reads once, which is substituted into
+     * that single read, the assignment being deleted by this very pass.
+     *
+     * @params:
+     *    - left:  the destination of the assignment
+     *    - right: the value assigned, already rewritten
+     *    - ord:   the rank of the assignment in the walk
+     * */
+    fn learn(mut self, left: &YILValue, right: &YILValue, ord: usize) {
+        match left {
+            v: &YILVar => {
+                if (!self._du.isTracked(v.id)) return;
+
+                // a variable and the value it is given may differ in type where
+                // the backend does not care(an integer and an address are the
+                // same thing to it), substituting one for the other would move
+                // that difference to a place that was not checked for it
+                if (v.type != right.type) return;
+
+                match right {
+                    r: &YILVar => {
+                        if (r.id == v.id) return;
+                        if (!self._du.isTracked(r.id)) return;
+
+                        self:.remember(v.id, right);
+                        return;
+                    }
+                }
+
+                if (!v.isTemp) return;
+
+                // a variable whose address escaped is read and written by things
+                // that do not name it, so the counts say nothing about it
+                if (defuse::containsId(self._du.getEscaped(), v.id)) return;
+                if (self.defCount(v.id) != 1us) return;
+                if (self.useCount(v.id) != 1us) return;
+                if (!isMovable(right)) return;
+
+                // a variable the frame does not track(a reference to a global
+                // symbol carries the identifier `0`) is written by things that
+                // are not recorded as writing it, so no write to it would ever
+                // invalidate a value that reads it
+                for id in varsIn(right) {
+                    if (!self._du.isTracked(id)) return;
+                }
+
+                self:.remember(v.id, right);
+                self._drops[v.id] = ord;
+            }
+        }
+    }
+
+    /**
+     * Register the value a variable is known to hold.
+     * */
+    fn remember(mut self, id: usize, value: &YILValue) {
+        self._env[id] = value;
+        self._deps[id] = varsIn(value);
+    }
+
+    /**
+     * Forget the value a variable was known to hold.
+     * */
+    fn forget(mut self, id: usize) {
+        self._env:.remove(id);
+        self._deps:.remove(id);
+        self._drops:.remove(id);
+    }
+
+    /**
+     * Forget everything the walk knew.
+     * */
+    fn clear(mut self) {
+        self._env = copy [];
+        self._deps = copy [];
+        self._drops = copy [];
+    }
+
+    /**
+     * Forget what a write to a set of variables invalidates: the value of the
+     * variables written, and every value read from one of them.
+     *
+     * @params:
+     *    - ids: the variables written, killing or not
+     * */
+    fn invalidate(mut self, ids: [usize]) {
+        if (ids.len == 0us) return;
+
+        let mut killed: [usize] = [];
+        for k, _ in self._env {
+            if (defuse::containsId(ids, k)) {
+                killed ~= [k];
+                continue;
+            }
+
+            if let Ok(deps) = self._deps[k] {
+                for d in deps {
+                    if (defuse::containsId(ids, d)) {
+                        killed ~= [k];
+                        break;
+                    }
+                }
+            }
+        }
+
+        for k in killed { self:.forget(k); }
+    }
+
+    /*!
+     * ================================================================================
+     * ================================================================================
+     * ===========================          FILTERING          ========================
+     * ================================================================================
+     * ================================================================================
+     */
+
+    /**
+     * Remove, from a list of instructions, the assignments the substitutions
+     * made useless.
+     *
+     * The rank an instruction is dropped by is the one the rewriting walk gave
+     * it, so this walk counts exactly the way that one did: a container is not
+     * an instruction, everything else is.
+     * */
+    fn filterList(mut self, instrs: [&YILInstr])-> [&YILInstr] {
+        let mut res: [mut &YILInstr] = [];
+        for i in instrs {
+            match i {
+                b: &YILBlock => { res ~= [copy YILBlock(b.loc, self:.filterList(b.instrs))]; }
+                t: &YILTryCatch => {
+                    let tryPart = self:.filterList(t.tryPart);
+                    let catchPart = self:.filterList(t.catchPart);
+
+                    res ~= [copy YILTryCatch(t.loc, t.catchType, tryPart, catchPart)];
+                }
+                t: &YILTryFinally => {
+                    let tryPart = self:.filterList(t.tryPart);
+                    let finPart = self:.filterList(t.finPart);
+
+                    res ~= [copy YILTryFinally(t.loc, tryPart, finPart)];
+                }
+                _ => {
+                    let ord = self._ord;
+                    self._ord += 1us;
+
+                    if (!self.isDropped(ord)) res ~= [i];
+                }
+            }
+        }
+
+        res
+    }
+
+    /**
+     * @returns: true iif the instruction of that rank was made useless
+     * */
+    fn isDropped(self, ord: usize)-> bool {
+        if let Ok(d) = self._dropped[ord] { return d; }
+
+        false
+    }
+
+}
+
+/*!
+ * ================================================================================
+ * ================================================================================
+ * =============================          VALUES          =========================
+ * ================================================================================
+ * ================================================================================
+ */
+
+/**
+ * @params:
+ *    - value: the value to look into
+ * @returns: the identifiers of every variable the value names, be it read,
+ * written or only addressed
+ * */
+pub fn varsIn(value: &YILValue)-> [usize] {
+    let mut res: [usize] = [];
+    match value {
+        v: &YILVar => { res ~= [v.id]; }
+        b: &YILBinaryValue => { res ~= varsIn(b.left); res ~= varsIn(b.right); }
+        u: &YILUnaryValue => { res ~= varsIn(u.left); }
+        c: &YILCastValue => { res ~= varsIn(c.value); }
+        f: &YILFieldValue => { res ~= varsIn(f.tuple); }
+        a: &YILArrayAccessValue => { res ~= varsIn(a.value); res ~= varsIn(a.index); }
+        a: &YILAddrValue => { res ~= varsIn(a.value); }
+        u: &YILUnrefValue => { res ~= varsIn(u.value); }
+        t: &YILTupleValue => { for v in t.values { res ~= varsIn(v); } }
+        a: &YILArrayValue => { for v in a.value { res ~= varsIn(v); } }
+        n: &YILNameCallValue => { for v in n.params { res ~= varsIn(v); } }
+        p: &YILPtrCallValue => {
+            res ~= varsIn(p.funcPtr);
+            for v in p.params { res ~= varsIn(v); }
+        }
+    }
+
+    res
+}
+
+/**
+ * @params:
+ *    - value: the value to move
+ * @returns: true iif evaluating the value later than where it is written is the
+ * same as evaluating it there, as long as nothing writes the variables it reads
+ *
+ * A call is not, it has effects and an order. A read through a pointer is not,
+ * nothing says what writes the memory it reads, and indexing is such a read: the
+ * indexed value is as often a pointer as an array. A division is not either, the
+ * trap it may raise must not cross a call.
+ * */
+pub fn isMovable(value: &YILValue)-> bool {
+    match value {
+        _: &YILNameCallValue => { return false; }
+        _: &YILPtrCallValue => { return false; }
+        _: &YILUnrefValue => { return false; }
+        _: &YILArrayAccessValue => { return false; }
+        _: &YILBeginCatch => { return false; }
+        b: &YILBinaryValue => {
+            if (b.op == BinaryOperators::DIV || b.op == BinaryOperators::PERCENT) return false;
+
+            return isMovable(b.left) && isMovable(b.right);
+        }
+        u: &YILUnaryValue => { return isMovable(u.left); }
+        c: &YILCastValue => { return isMovable(c.value); }
+        f: &YILFieldValue => { return isMovable(f.tuple); }
+        a: &YILAddrValue => { return isMovable(a.value); }
+        t: &YILTupleValue => {
+            for v in t.values { if (!isMovable(v)) return false; }
+            return true;
+        }
+        a: &YILArrayValue => {
+            for v in a.value { if (!isMovable(v)) return false; }
+            return true;
+        }
+    }
+
+    true
+}
