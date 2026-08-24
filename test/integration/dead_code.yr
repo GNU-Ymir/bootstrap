@@ -1,0 +1,146 @@
+in dead_code;
+
+use ymirc::utils::_;
+use ymirc::lexing::word;
+use ymirc::lint::node::{_, global::_, instr::_, type::_, value::_};
+use ymirc::lint::optimizer;
+
+use std::{io, fs::path};
+
+use utils;
+
+/**
+ * The dead code pass over the two shapes no source program makes the expander
+ * produce.
+ *
+ * The pass reads a dataflow solution and a reachability walk that disagree
+ * about landing pads, and the two ways of getting that wrong are invisible on
+ * anything the frontend can be asked to compile: the expander hoists every call
+ * into a temporary written once, so a block never closes on a store to a
+ * variable a handler reads, and the validator rejects every source shape whose
+ * protected region cannot throw(`nothing to catch`, `failure guard cannot be
+ * used when guarding a scope that cannot throw`, `unreachable statement`), so a
+ * pad is never left out of the solution.
+ *
+ * The frames are therefore built by hand, the way `integration::verifier` does
+ * for the same reason: what is checked is the contract between the pass and the
+ * framework, not the output of a compilation.
+ * */
+
+/**
+ * Build a void frame around a body.
+ * */
+fn frame(body: [&YILInstr], refs: [[c8] => Path] = copy [])-> &YILFrame {
+    copy YILFrame(EOF_WORD, EOF_WORD, "_YtestFZv",
+                  [],
+                  YIL_VOID,
+                  body-> copy YILBlock(EOF_WORD, body),
+                  refs-> refs)
+}
+
+/**
+ * Run the dead code pass over a frame, and check it left a well formed one.
+ * */
+fn optimized(f: &YILFrame)-> &YILFrame
+    throws AssertError
+{
+    let dmut pass = copy DeadCodePass();
+    let res = pass:.apply(f);
+
+    let dmut ver = copy Verifier(pass-> "dead-code");
+    {
+        ver:.verify(res);
+    } catch {
+        err: &ymirc::errors::ErrorMsg => {
+            throw copy AssertError(format("the pass left a malformed frame :\n%\n%", res, err));
+        }
+    }
+
+    res
+}
+
+/**
+ * @returns: true iif the body still holds the instruction
+ * */
+fn holds(instr: &YILInstr, needle: &YILInstr)-> bool {
+    if (instr == needle) return true;
+
+    match instr {
+        b: &YILBlock => {
+            for i in b.instrs { if (holds(i, needle)) return true; }
+        }
+        t: &YILTryCatch => {
+            for i in t.tryPart { if (holds(i, needle)) return true; }
+            for i in t.catchPart { if (holds(i, needle)) return true; }
+        }
+        t: &YILTryFinally => {
+            for i in t.tryPart { if (holds(i, needle)) return true; }
+            for i in t.finPart { if (holds(i, needle)) return true; }
+        }
+    }
+
+    false
+}
+
+__test {
+    // the closing instruction of a block is the one an exception edge leaves
+    // from the middle of, so the store it makes has not necessarily happened
+    // when the handler runs: `x = 1` is what the handler reads, and the normal
+    // path reading nothing of `x` does not make it dead
+    let x : &YILValue = copy YILVar(EOF_WORD, "x", YIL_SINT_32, 1us);
+    let e : &YILValue = copy YILVar(EOF_WORD, "e", YIL_PTR_VOID, 2us);
+    let args : [&YILValue] = copy [x];
+
+    let store: &YILInstr = copy YILAffect(EOF_WORD, x, copy YILIntValue(EOF_WORD, YIL_SINT_32, 1));
+    let throwing: &YILInstr = copy YILAffect(EOF_WORD, x,
+                                             copy YILNameCallValue(EOF_WORD, YIL_SINT_32, "_Y3foo3barFZi32", []));
+
+    let bind: &YILInstr = copy YILAffect(EOF_WORD, e, copy YILBeginCatch(EOF_WORD, "AssertError"));
+    let read: &YILInstr = copy YILCall(EOF_WORD,
+                                       copy YILNameCallValue(EOF_WORD, YIL_VOID, "_Y3foo4sinkFi32Zv", args));
+
+    let body: [&YILInstr] = copy [copy YILVarDecl(EOF_WORD, "x", YIL_SINT_32, 1us),
+                                  copy YILVarDecl(EOF_WORD, "e", YIL_PTR_VOID, 2us),
+                                  copy YILTryCatch(EOF_WORD, YIL_PTR_VOID,
+                                                   copy [store, throwing],
+                                                   copy [bind, read])];
+
+    let refs: [[c8] => Path] = copy ["_Y3foo3barFZi32" => Path("foo"),
+                                     "_Y3foo4sinkFi32Zv" => Path("foo")];
+
+    let res = optimized(frame(body, refs-> refs));
+    assert (holds(res.body, store),
+            format("the store the handler reads was removed :\n%", res));
+}
+
+__test {
+    // a pad protecting a region that cannot throw is kept by the reachability
+    // walk and absent from the dataflow solution, whose empty facts read as
+    // "nothing is live": the store is read by a later block of the handler,
+    // which only the solution could have said
+    let y : &YILValue = copy YILVar(EOF_WORD, "y", YIL_SINT_32, 1us);
+    let e : &YILValue = copy YILVar(EOF_WORD, "e", YIL_PTR_VOID, 2us);
+    let args : [&YILValue] = copy [y];
+
+    let bind: &YILInstr = copy YILAffect(EOF_WORD, e, copy YILBeginCatch(EOF_WORD, "AssertError"));
+    let store: &YILInstr = copy YILAffect(EOF_WORD, y, copy YILIntValue(EOF_WORD, YIL_SINT_32, 42));
+
+    // the label the store is read after, which is what puts the reader in
+    // another block than the store
+    let after = copy YILLabel(EOF_WORD, "after", 1us);
+    let read: &YILInstr = copy YILCall(EOF_WORD,
+                                       copy YILNameCallValue(EOF_WORD, YIL_VOID, "_Y3foo4sinkFi32Zv", args));
+
+    let body: [&YILInstr] = copy [copy YILVarDecl(EOF_WORD, "y", YIL_SINT_32, 1us),
+                                  copy YILVarDecl(EOF_WORD, "e", YIL_PTR_VOID, 2us),
+                                  copy YILTryCatch(EOF_WORD, YIL_PTR_VOID,
+                                                   [],
+                                                   copy [bind, store, copy YILGoto(EOF_WORD, after),
+                                                         after, read])];
+
+    let refs: [[c8] => Path] = copy ["_Y3foo4sinkFi32Zv" => Path("foo")];
+
+    let res = optimized(frame(body, refs-> refs));
+    assert (holds(res.body, store),
+            format("the store of an unsolved pad was removed :\n%", res));
+}
