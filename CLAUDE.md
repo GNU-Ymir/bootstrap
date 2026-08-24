@@ -66,6 +66,11 @@ Either way, each case:
 
 1. Compiles the given `.yr` file through the real `Parser` pipeline.
 2. Compares the result against golden files with the same basename:
+   - `testN.stx` — expected formatted dump of the *syntax* tree (`Formatter`-rendered
+     `Declaration`), if this file exists. This is the only thing that exercises the
+     `Formattable` impls of the syntax nodes, so it is compared whether or not the case
+     compiles: the tree is produced by the syntax step, before anything can fail.
+     `test_resources/syntax/` is the directory dedicated to it, one case per construct family.
    - `testN.err` — expected formatted `ErrorMsg` output, if compilation is expected to fail.
    - `testN.sem` — expected formatted dump of the semantic generators (`Formatter`-rendered),
      if compilation is expected to succeed.
