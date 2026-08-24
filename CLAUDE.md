@@ -244,7 +244,9 @@ The whole frontend is orchestrated by `Parser` (`src/ymirc/parser.yr`), in three
    repeats the round until none of them fires: it deletes the instructions of every block no
    path reaches, it deletes an assignment to a whole variable that is not live afterwards and
    whose right hand side has no effect of its own (`_ = t._1;`), it folds the control flow (a
-   conditional jump on a literal or on twice the same label becomes a goto, a goto into a
+   conditional jump on a literal or on twice the same label becomes a goto — keeping the
+   condition, as the `YILCall` that is what YIL calls a value evaluated as a statement, when
+   the frame evaluates it for its effect rather than for the branch — a goto into a
    label that only jumps is retargeted to the end of that chain, a goto into the label right
    after it is dropped, a label nothing names is dropped), and it drops the declaration of
    every variable the body stopped naming. The four feed each other, which is why the round
@@ -287,7 +289,11 @@ The whole frontend is orchestrated by `Parser` (`src/ymirc/parser.yr`), in three
    catch`, `failure guard cannot be used when guarding a scope that cannot throw`,
    `unreachable statement`), so a pad is never left out of the solution. Both invariants are
    therefore contracts with the framework rather than properties of anything compiled today —
-   a golden cannot state them, and dropping either one leaves the whole corpus green.
+   a golden cannot state them, and dropping either one leaves the whole corpus green. The
+   condition kept across a folded branch is stated there too, and is latent for the same kind
+   of reason: the expander hoists every condition into a temporary, and copy propagation only
+   ever substitutes a pure value back into one, so the condition of a condjmp is pure in
+   everything the pipeline produces.
 
    The pass is tied back to the tree by an ordinal. `CFG` numbers every instruction of the
    body in preorder as it builds (`BasicBlock::getOrds()`, `NO_ORD` for the jumps the builder
