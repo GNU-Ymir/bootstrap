@@ -3,7 +3,7 @@ in optimizer;
 use std::io;
 
 use ymirc::utils::_;
-use ymirc::lint::node::{_, global::_, instr::_};
+use ymirc::lint::node::{_, global::_, instr::_, value::_};
 use utils;
 
 /**
@@ -22,6 +22,9 @@ def SWEEP = ["test_resources/control_flow/test11.yr",
              "test_resources/lazyness/test2.yr",
              "test_resources/scope_guards/test1.yr",
              "test_resources/scope_guards/test2.yr",
+             "test_resources/scope_guards/test5.yr",
+             "test_resources/scope_guards/test8.yr",
+             "test_resources/scope_guards/test9.yr",
              "test_resources/for_loops/arrays/test1.yr",
              "test_resources/pattern_match/test1.yr",
              "test_resources/templates/test1.yr"];
@@ -122,4 +125,222 @@ fn countInstr(instr: &YILInstr)-> usize {
     }
 
     1us
+}
+
+/**
+ * The dead code elimination over the frames a scope guard and a try/catch
+ * produce.
+ *
+ * A landing pad is entered by the personality routine and by nothing the frame
+ * does, so a pass rooting its reachability at the entry alone sees the handler
+ * of every region it believes cannot throw as dead code, and removes what it
+ * holds. What is asserted here is the property that catches that, handler by
+ * handler: a body that holds a handler before the pipeline holds the same one
+ * after, making the same calls.
+ *
+ * The calls are what is compared rather than the instructions. A handler is
+ * cleaned like anything else -- the `exit` of `test9::foo2` is a store to a
+ * variable nothing reads, and leaving it empty is right -- so a count of
+ * instructions has a legitimate reason to drop, and asserting on it would state
+ * nothing. A call is never a dead store and never a pure value, so the pass has
+ * exactly one reason to remove one: believing no path reaches it. That is the
+ * mistake this states, and it has to be stated per handler, since a module
+ * holds several and one that survives says nothing about the others.
+ * */
+__test {
+    for package in ["test_resources/scope_guards/test1.yr",
+                    "test_resources/scope_guards/test2.yr",
+                    "test_resources/scope_guards/test5.yr",
+                    "test_resources/scope_guards/test8.yr",
+                    "test_resources/scope_guards/test9.yr"] {
+        let res = utils::compilePackage(package, optLevel-> 1u32);
+        if let Ok(err) = res.err {
+            throw copy AssertError(format("% : -O1 : %", package, err));
+        }
+
+        let raw = countHandlers(res.exp), opt = countHandlers(res.opt);
+        assert (raw.len != 0us, format("% : no frame with a handler to check", package));
+
+        let mut checked = 0us;
+        for name, before in raw {
+            let mut after: [usize] = [];
+            if let Ok(a) = opt[name] { after = a; }
+
+            assert (after.len == before.len,
+                    format("% : -O1 : % : % handlers, down from %", package, name, after.len, before.len));
+
+            for i, nb in before {
+                assert (after[i] == nb,
+                        format("% : -O1 : % : handler #% makes % calls, down from %",
+                               package, name, i, after[i], nb));
+
+                checked += nb;
+            }
+        }
+
+        assert (checked != 0us, format("% : no handler makes a call, nothing to check", package));
+    }
+}
+
+/**
+ * The pass never turns a jump into a jump to nowhere.
+ *
+ * Removing a label nothing names, retargeting a jump onto the end of the chain
+ * of jumps it starts and dropping the jump that falls into the label following
+ * it are three transformations that all end with a label being deleted, and the
+ * failure they share is deleting one something still names. The YIL verifier
+ * catches it after every pass, this states it on the optimized output itself so
+ * that the case reads as what it checks.
+ * */
+__test {
+    for package in SWEEP {
+        let res = utils::compilePackage(package, optLevel-> 1u32);
+        if let Ok(err) = res.err {
+            throw copy AssertError(format("% : -O1 : %", package, err));
+        }
+
+        for n in res.opt {
+            if let f: &YILFrame = n {
+                let mut defined: [usize => mut ()] = copy [];
+                collectLabels(f.body, ref defined);
+
+                let mut named: [usize => mut ()] = copy [];
+                collectJumps(f.body, ref named);
+
+                for id, _ in named {
+                    assert (id in defined, format("% : % : the jump to #% names no label", package, f.name, id));
+                }
+            }
+        }
+    }
+}
+
+/**
+ * @params:
+ *    - nodes: the nodes of a module
+ * @returns: for every frame of the module holding one, the number of calls each
+ * of its handlers makes
+ *
+ * A pass rooting its reachability wrong does not remove the try itself, it
+ * removes what the pad holds, so what is reported is one number per handler:
+ * comparing the lists tells a handler that is gone from a handler that is still
+ * there with its body taken away, which a sum over the module cannot -- one
+ * handler that kept its calls would answer for all of them.
+ *
+ * The handlers of a frame are listed in the order the body holds them, the
+ * enclosing one before the ones its parts hold, which is an order the pass does
+ * not move: it removes instructions, it does not reorder the tree.
+ * */
+fn countHandlers(nodes: [&YILNode])-> [[c8] => [usize]] {
+    let mut res: [[c8] => mut [usize]] = copy [];
+    for n in nodes {
+        if let f: &YILFrame = n {
+            let mut inFrame: [usize] = [];
+            collectHandlers(f.body, ref inFrame);
+            if (inFrame.len != 0us) res[f.name] = inFrame;
+        }
+    }
+
+    res
+}
+
+/**
+ * Append the number of calls every handler an instruction holds makes.
+ *
+ * A handler is counted whole, the handlers nested in it included: those appear
+ * again as entries of their own, so a nested one being emptied is caught by its
+ * own entry as well and does not have to be told apart in the enclosing count.
+ * */
+fn collectHandlers(instr: &YILInstr, ref mut res: [usize]) {
+    match instr {
+        b: &YILBlock => {
+            for i in b.instrs { collectHandlers(i, ref res); }
+        }
+        t: &YILTryCatch => {
+            let mut nb = 0us;
+            for i in t.catchPart { nb += countCalls(i); }
+            res ~= [nb];
+
+            for i in t.tryPart { collectHandlers(i, ref res); }
+            for i in t.catchPart { collectHandlers(i, ref res); }
+        }
+        t: &YILTryFinally => {
+            let mut nb = 0us;
+            for i in t.finPart { nb += countCalls(i); }
+            res ~= [nb];
+
+            for i in t.tryPart { collectHandlers(i, ref res); }
+            for i in t.finPart { collectHandlers(i, ref res); }
+        }
+    }
+}
+
+/**
+ * @returns: the number of instructions an instruction holds that call something
+ *
+ * A call made for what it does(`YILCall`) and a call whose result is stored
+ * (`__self_1 = _yrt_alloc_class(...)`) both count, and a call nested deeper in a
+ * value is not looked for: what the number is for is naming the instructions the
+ * pass has no licence to remove whatever the dataflow says, and one per calling
+ * instruction says that.
+ * */
+fn countCalls(instr: &YILInstr)-> usize {
+    let mut res = 0us;
+    match instr {
+        b: &YILBlock => { for i in b.instrs { res += countCalls(i); } }
+        t: &YILTryCatch => {
+            for i in t.tryPart { res += countCalls(i); }
+            for i in t.catchPart { res += countCalls(i); }
+        }
+        t: &YILTryFinally => {
+            for i in t.tryPart { res += countCalls(i); }
+            for i in t.finPart { res += countCalls(i); }
+        }
+        _: &YILCall => { return 1us; }
+        a: &YILAffect => {
+            match a.right {
+                _: &YILNameCallValue => { return 1us; }
+                _: &YILPtrCallValue => { return 1us; }
+            }
+        }
+    }
+
+    res
+}
+
+/**
+ * Collect the identifier of every label an instruction defines.
+ * */
+fn collectLabels(instr: &YILInstr, ref mut res: [usize => mut ()]) {
+    match instr {
+        b: &YILBlock => { for i in b.instrs { collectLabels(i, ref res); } }
+        t: &YILTryCatch => {
+            for i in t.tryPart { collectLabels(i, ref res); }
+            for i in t.catchPart { collectLabels(i, ref res); }
+        }
+        t: &YILTryFinally => {
+            for i in t.tryPart { collectLabels(i, ref res); }
+            for i in t.finPart { collectLabels(i, ref res); }
+        }
+        l: &YILLabel => { res[l.id] = (); }
+    }
+}
+
+/**
+ * Collect the identifier of every label an instruction jumps to.
+ * */
+fn collectJumps(instr: &YILInstr, ref mut res: [usize => mut ()]) {
+    match instr {
+        b: &YILBlock => { for i in b.instrs { collectJumps(i, ref res); } }
+        t: &YILTryCatch => {
+            for i in t.tryPart { collectJumps(i, ref res); }
+            for i in t.catchPart { collectJumps(i, ref res); }
+        }
+        t: &YILTryFinally => {
+            for i in t.tryPart { collectJumps(i, ref res); }
+            for i in t.finPart { collectJumps(i, ref res); }
+        }
+        g: &YILGoto => { res[g.label.id] = (); }
+        c: &YILCondJmp => { res[c.then.id] = (); res[c.else_.id] = (); }
+    }
 }

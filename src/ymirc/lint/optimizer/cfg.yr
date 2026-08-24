@@ -96,17 +96,18 @@ pub class CFG {
     // The block starting at each label of the frame, indexed by label id
     let mut _labels: [usize => dmut &BasicBlock] = copy [];
 
-    // The block starting at each label of a finally part's unwind copy,
-    // indexed by label id -- kept apart from `_labels` since building the
-    // unwind copy visits the exact same `YILLabel`s the normal copy already
-    // resolved through `_labels`; see `visitTryFinally`. Ids never collide
-    // across two different finally parts, only between the two copies of
-    // the same one, so every unwind copy of the frame can share this map
+    // The block starting at each label of the copy of a finally part being
+    // built, indexed by label id -- kept apart from `_labels` since a copy
+    // visits the exact same `YILLabel`s another copy already resolved; see
+    // `visitTryFinally`. One map is not enough: a `YILTryFinally` inside
+    // another one's finally part is built once per copy of the enclosing
+    // part, and every one of those is a region of its own, so the map is
+    // saved and replaced by an empty one per copy, and restored after it
     let mut _privateLabels: [usize => dmut &BasicBlock] = copy [];
 
-    // The nesting depth of unwind copies currently being built; `labelBlock`
-    // resolves against `_privateLabels` instead of `_labels` while this is
-    // nonzero
+    // The nesting depth of finally part copies currently being built;
+    // `labelBlock` resolves against `_privateLabels` instead of `_labels`
+    // while this is nonzero
     let mut _unwindDepth: usize = 0us;
 
     // The handlers protecting the instruction being visited, innermost last
@@ -114,6 +115,13 @@ pub class CFG {
 
     // The finally parts protecting the instruction being visited, innermost last
     let mut _finallys: [dmut &BasicBlock] = [];
+
+    // The blocks a handler starts at, they are entered by exception edges only,
+    // which is why `deadBlocks` roots its walk at them as well as at the entry
+    let mut _pads: [usize] = [];
+
+    // The rank of the next instruction met by the preorder walk of the body
+    let mut _ord: usize = 0us;
 
     /**
      * Build the control flow graph of a frame.
@@ -216,15 +224,21 @@ pub class CFG {
      * @returns: the block in which the instruction following it must be appended
      * */
     fn visit(mut self, instr: &YILInstr, dmut current: &BasicBlock)-> dmut &BasicBlock {
+        // every instruction of the body is numbered, containers included, so
+        // that the rank of an instruction is the one a plain preorder walk of
+        // the body gives it and a pass can go from the graph back to the tree
+        let ord = self._ord;
+        self._ord += 1us;
+
         match instr {
             b: &YILBlock => { return alias self:.visitBlock(b, alias current); }
             l: &YILLabel => { return alias self:.visitLabel(l, alias current); }
-            g: &YILGoto => { return alias self:.visitGoto(g, alias current); }
-            c: &YILCondJmp => { return alias self:.visitCondJmp(c, alias current); }
-            r: &YILReturn => { return alias self:.visitReturn(r, alias current); }
+            g: &YILGoto => { return alias self:.visitGoto(g, ord, alias current); }
+            c: &YILCondJmp => { return alias self:.visitCondJmp(c, ord, alias current); }
+            r: &YILReturn => { return alias self:.visitReturn(r, ord, alias current); }
             t: &YILTryCatch => { return alias self:.visitTryCatch(t, alias current); }
             t: &YILTryFinally => { return alias self:.visitTryFinally(t, alias current); }
-            _ => { return alias self:.visitSimple(instr, alias current); }
+            _ => { return alias self:.visitSimple(instr, ord, alias current); }
         }
     }
 
@@ -272,8 +286,8 @@ pub class CFG {
     /**
      * Close the current block on an unconditional jump.
      * */
-    fn visitGoto(mut self, g: &YILGoto, dmut current: &BasicBlock)-> dmut &BasicBlock {
-        current:.push(g);
+    fn visitGoto(mut self, g: &YILGoto, ord: usize, dmut current: &BasicBlock)-> dmut &BasicBlock {
+        current:.push(g, ord-> ord);
 
         let dmut target = alias self:.labelBlock(g.label.id);
         target:.insertFrom(alias current, CFG_ALWAYS);
@@ -284,8 +298,8 @@ pub class CFG {
     /**
      * Close the current block on a conditional jump.
      * */
-    fn visitCondJmp(mut self, c: &YILCondJmp, dmut current: &BasicBlock)-> dmut &BasicBlock {
-        current:.push(c);
+    fn visitCondJmp(mut self, c: &YILCondJmp, ord: usize, dmut current: &BasicBlock)-> dmut &BasicBlock {
+        current:.push(c, ord-> ord);
         if (self.mayThrow(c.cond)) { self:.addExceptionEdges(alias current); }
 
         let dmut thenB = alias self:.labelBlock(c.then.id);
@@ -305,8 +319,8 @@ pub class CFG {
      * for why it is wired directly to each of them rather than only the
      * innermost one.
      * */
-    fn visitReturn(mut self, r: &YILReturn, dmut current: &BasicBlock)-> dmut &BasicBlock {
-        current:.push(r);
+    fn visitReturn(mut self, r: &YILReturn, ord: usize, dmut current: &BasicBlock)-> dmut &BasicBlock {
+        current:.push(r, ord-> ord);
         if (self.mayThrow(r.value)) { self:.addExceptionEdges(alias current); }
 
         self:.addUnwindEdges(alias current);
@@ -344,6 +358,7 @@ pub class CFG {
      * */
     fn visitTryCatch(mut self, t: &YILTryCatch, dmut current: &BasicBlock)-> dmut &BasicBlock {
         let dmut handler = self:.newBlock();
+        self._pads ~= [handler.getUid()];
 
         self._handlers ~= [alias handler];
         let dmut bodyEnd = self:.visitList(t.tryPart, alias current);
@@ -374,10 +389,21 @@ pub class CFG {
      * exit keeps leaving, through the next enclosing finally or out of the
      * frame.
      *
+     * The finally part is therefore built twice while the tree holds it once,
+     * and the two copies are numbered from the same rank: a rank names an
+     * instruction of the body, and the body has one of them here whichever copy
+     * runs it. The walk resumes past the part at the rank a plain preorder walk
+     * of the tree gives the instruction following it, rather than wherever a
+     * copy left the counter -- neither copy is built when nothing reaches it,
+     * and a rank counted one copy short names another instruction from there on.
      * */
     fn visitTryFinally(mut self, t: &YILTryFinally, dmut current: &BasicBlock)-> dmut &BasicBlock {
         let dmut fin = self:.newBlock();
         let dmut unwindFin = self:.newBlock();
+
+        // the unwind copy is the one the personality routine enters, `fin` is
+        // reached by the body falling into it: the pad is the former
+        self._pads ~= [unwindFin.getUid()];
 
         self._handlers ~= [alias unwindFin];
         self._finallys ~= [alias unwindFin];
@@ -386,6 +412,10 @@ pub class CFG {
         self._finallys = alias self._finallys[0us .. $ - 1us];
 
         let dmut cont = self:.newBlock();
+
+        // the rank of the first instruction of the finally part, which both
+        // copies are numbered from
+        let ordFin = self._ord;
 
         // built, and connected onward, only if the body actually completes
         // normally into it: an unentered copy left non-empty by visiting
@@ -396,7 +426,24 @@ pub class CFG {
         if (bodyEnd.isFalling() && self.isLive(bodyEnd)) {
             fin:.insertFrom(alias bodyEnd, CFG_ALWAYS);
 
+            self._ord = ordFin;
+
+            // the normal copy is the canonical one only when nothing encloses
+            // it: built inside a copy, it is one more region of its own, and
+            // resolving its labels through the enclosing copy's map would hand
+            // it the blocks that copy already made
+            let fresh = self._unwindDepth != 0us;
+            let dmut savedLabels = alias self._privateLabels;
+            let savedDepth = self._unwindDepth;
+            if (fresh) {
+                self._privateLabels = copy [];
+                self._unwindDepth = savedDepth + 1us;
+            }
+
             let dmut finEnd = self:.visitList(t.finPart, alias fin);
+            self._privateLabels = alias savedLabels;
+            self._unwindDepth = savedDepth;
+
             if (finEnd.isFalling() && self.isLive(finEnd)) {
                 cont:.insertFrom(alias finEnd, CFG_ALWAYS);
             }
@@ -405,9 +452,15 @@ pub class CFG {
         // likewise, built only if something inside the region actually
         // unwound through it
         if (unwindFin.getPrevious().len != 0us) {
-            self._unwindDepth += 1us;
+            self._ord = ordFin;
+            let dmut savedLabels = alias self._privateLabels;
+            let savedDepth = self._unwindDepth;
+            self._privateLabels = copy [];
+            self._unwindDepth = savedDepth + 1us;
+
             let dmut unwindEnd = self:.visitList(t.finPart, alias unwindFin);
-            self._unwindDepth -= 1us;
+            self._privateLabels = alias savedLabels;
+            self._unwindDepth = savedDepth;
 
             // what leaves the unwind copy is the unwinding itself, resuming
             // where the finally part interrupted it: the frame is left without
@@ -416,6 +469,8 @@ pub class CFG {
                 self:.addUnwindEdges(alias unwindEnd, kind-> EdgeKind::UNWIND);
             }
         }
+
+        self._ord = ordFin + nbOrdsList(t.finPart);
 
         alias cont
     }
@@ -427,8 +482,8 @@ pub class CFG {
      * handler: the call is a branch to that handler, and everything after it in
      * the block is only reached when the call returns normally.
      * */
-    fn visitSimple(mut self, instr: &YILInstr, dmut current: &BasicBlock)-> dmut &BasicBlock {
-        current:.push(instr);
+    fn visitSimple(mut self, instr: &YILInstr, ord: usize, dmut current: &BasicBlock)-> dmut &BasicBlock {
+        current:.push(instr, ord-> ord);
 
         // a call that never returns closes the path it ends, not only its
         // block: control reappears in the handlers protecting it, or nowhere in
@@ -695,6 +750,32 @@ pub class CFG {
         res
     }
 
+    /**
+     * @returns: the blocks no path reaches, a landing pad being a path of its own
+     *
+     * This is what a pass removing what cannot execute must ask, rather than
+     * `unreachableBlocks`: a handler is entered by the personality routine, and
+     * a pad protecting a region the graph believes cannot throw still runs when
+     * the belief is wrong. `unreachableBlocks` answers the question the graph
+     * was asked, this one answers the question a transformation may act on.
+     * */
+    pub fn deadBlocks(self)-> [&BasicBlock] {
+        let mut done: [usize => mut()] = copy [];
+        let mut post: [&BasicBlock] = [];
+
+        self.postOrder(self._entry, ref post, ref done);
+        for b in self._blocks {
+            if (containsUid(self._pads, b.getUid())) self.postOrder(b, ref post, ref done);
+        }
+
+        let mut res: [&BasicBlock] = [];
+        for b in self._blocks {
+            if (b.getUid() !in done) res ~= [b];
+        }
+
+        res
+    }
+
     /*!
      * ================================================================================
      * ================================================================================
@@ -745,4 +826,50 @@ pub class CFG {
         }
     }
 
+}
+
+/**
+ * @params:
+ *    - instr: an instruction of a body
+ * @returns: the number of ranks the subtree it roots takes up, which is the
+ * number of instructions a preorder walk of it meets
+ *
+ * The walk this counts is the one `visit` makes, and the one a pass rewriting
+ * the body makes to find an instruction again by its rank: an instruction, then
+ * the instructions it contains, in order.
+ * */
+fn nbOrds(instr: &YILInstr)-> usize {
+    match instr {
+        b: &YILBlock => { return 1us + nbOrdsList(b.instrs); }
+        t: &YILTryCatch => { return 1us + nbOrdsList(t.tryPart) + nbOrdsList(t.catchPart); }
+        t: &YILTryFinally => { return 1us + nbOrdsList(t.tryPart) + nbOrdsList(t.finPart); }
+    }
+
+    1us
+}
+
+/**
+ * @params:
+ *    - instrs: a list of instructions of a body
+ * @returns: the number of ranks they take up together
+ * */
+fn nbOrdsList(instrs: [&YILInstr])-> usize {
+    let mut res = 0us;
+    for i in instrs { res += nbOrds(i); }
+
+    res
+}
+
+/**
+ * @params:
+ *    - arr: a list of block identifiers
+ *    - uid: the identifier to look for
+ * @returns: true iif the list holds the identifier
+ * */
+fn containsUid(arr: [usize], uid: usize)-> bool {
+    for i in arr {
+        if (i == uid) return true;
+    }
+
+    false
 }
