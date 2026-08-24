@@ -181,7 +181,13 @@ The whole frontend is orchestrated by `Parser` (`src/ymirc/parser.yr`), in three
    `EdgeKind::UNWIND` when what leaves the frame is an unwinding resuming past the finally
    part that interrupted it (`cfg.yr`'s unwind copy of a `YILTryFinally`), and a frame left
    that way returns nothing whatever its return type — demanding a return there reports a
-   correct frame as malformed. Verification runs on the raw expander output and again after every pass, so a
+   correct frame as malformed. What it can rely on is that a path stops where control
+   stops: a call to a function `defuse.yr`'s `runtimeNeverReturns` names (`_yrt_exc_panic`,
+   `_yrt_exc_throw`) ends its block on nothing, control reappearing in a handler protecting
+   it or nowhere in the frame. That table is the only thing telling YIL a call never comes
+   back, so a new runtime helper that aborts or throws belongs in it: left out, it makes the
+   graph invent a path leaving it, and every analysis reads that path.
+   Verification runs on the raw expander output and again after every pass, so a
    pass is only ever blamed for what it introduced; it is gated by `--fverify-yil` and is
    always on in the test suite. YIL types are looser than they look — pointers, arrays and
    pointer-wide integers are the same address, integer widths are the backend's business —
