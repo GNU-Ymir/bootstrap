@@ -1,0 +1,177 @@
+/*
+ * Implement semantic validation for option binary operators.
+ *
+ * <hr>
+ *
+ * @Package: ymirc
+ * @Module: ymirc::semantic::validator::value::operator::binary::option
+ * @File: ymirc/semantic/validator/value/operator/binary/option.yr
+ * @Author(s):
+ *   - Emile Cadorel <ecadorel@gmail.com>
+ *
+ * @Created (YYYY-MM-DD): 2026-08-27
+ * @Copyright (C) 2021–2026 GNU-Ymir
+ * @License
+ *   ```text
+ *   This file is part of the Ymir language project.
+ *
+ *   Ymir is free software: you can redistribute it and/or modify it
+ *   under the terms of the GNU General Public License as published by
+ *   the Free Software Foundation, either version 3 of the License, or
+ *   (at your option) any later version.
+ *
+ *   Ymir is distributed in the hope that it will be useful,
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *   GNU General Public License for more details.
+ *
+ *   You should have received a copy of the GNU General Public License
+ *   along with Ymir.  If not, see <https://www.gnu.org/licenses/>.
+ *   ```
+ */
+
+in option;
+
+use ymirc::errors;
+use ymirc::lexing::{keys, tokens, word};
+use ymirc::semantic::validator;
+use ymirc::semantic::generator::{type::_, value::_};
+use ymirc::syntax::expression::_;
+use ymirc::utils::format;
+
+/**
+ * BinaryOptionValidation module
+ *
+ * Provides semantic validation for the option binary operator `??`.
+ *
+ * Semantics of `left ?? right`:
+ *   - if `left` is an option that holds a value, the operator evaluates to that value,
+ *   - otherwise it evaluates to `right`.
+ *
+ * The left operand does not have to be an option already. When it is a throwing
+ * expression, `left ?? right` is a shorthand for `left? ?? right`: the exception is
+ * caught by the operator(cf. `OptionComposeValidation`) and `right` is taken instead.
+ *
+ * A left operand that is neither an option nor a thrower is an error, the right
+ * operand would never be evaluated.
+ */
+pub mod BinaryOptionValidation {
+
+    /**
+     * Validate an option binary expression.
+     *
+     * @returns:
+     *   - the validated Value
+     *
+     * @throws:
+     *   - ErrorMsg if validation fails
+     */
+    pub fn validate(dmut context: &ValidationContext, bin: &BinaryExpr, op: BinaryOperators)-> &Value
+        throws ErrorMsg
+    {
+        return BinaryOptionValidation::validate(alias context, bin.loc, op,
+                                                left-> ValueValidation::validate(alias context, bin.left),
+                                                right-> ValueValidation::validate(alias context, bin.right));
+    }
+
+    /**
+     * Validate an option binary operation given validated operands.
+     *
+     * @returns:
+     *   - the validated Value
+     *
+     * @throws:
+     *   - ErrorMsg if validation fails
+     */
+    pub fn validate(dmut context: &ValidationContext,
+                    loc:          &Word,
+                    op:           BinaryOperators,
+                    left:         &Value,
+                    right:        &Value)-> &Value
+        throws ErrorMsg
+    {
+        // only the left operand is unwrapped, the right one is a branch of the result and
+        // must keep its type to be unified with the type wrapped by the option
+        return BinaryOptionValidation::validateImpl(alias context, loc, op,
+                                                    left-> ValueCreation::createEnumUnwrap(left),
+                                                    right-> right);
+    }
+
+    /**
+     * Core implementation of option binary validation.
+     *
+     * @throws:
+     *   - ErrorMsg if the left operand can never be empty, or if the two operands have no
+     *     common type
+     */
+    fn validateImpl(dmut context: &ValidationContext,
+                    loc:          &Word,
+                    op:           BinaryOperators,
+                    left:         &Value,
+                    right:        &Value)-> &Value
+        throws ErrorMsg
+    {
+        if let o: &OptionType = left.type {
+            return BinaryOptionValidation::validateUnwrap(alias context, loc, left, o, right);
+        }
+
+        // `f () ?? x` is a shorthand for `f ()? ?? x` when `f` is a thrower
+        if (left.throwers.len != 0us) {
+            let asOption = OptionComposeValidation::validate(alias context, loc, left);
+            if let o: &OptionType = asOption.type {
+                return BinaryOptionValidation::validateUnwrap(alias context, loc, asOption, o, right);
+            }
+        }
+
+        // the left operand always has a value, `right` would never be evaluated
+        throw copy ErrorMsg::fatal(loc, format(ValidateErrorMessage::USELESS_OPTION_OR_ELSE, op, left.type));
+    }
+
+    /**
+     * Validate `left ?? right`, where `left` is known to be an option.
+     *
+     * Constructs the lowering:
+     *
+     *     if (!left.hasValue) { right } else { left.value }
+     *
+     * When `left.hasValue` is known at compile time, the branch that is taken is returned
+     * directly, and the other one is dropped.
+     *
+     * @returns:
+     *   - the validated Value
+     *
+     * @throws:
+     *   - ErrorMsg if no common type can be inferred for the two branches
+     */
+    fn validateUnwrap(dmut context: &ValidationContext,
+                      loc:          &Word,
+                      left:         &Value,
+                      leftType:     &OptionType,
+                      right:        &Value)-> &Value
+        throws ErrorMsg
+    {
+        let dmut interpret = alias context.cteInterpret;
+        let isNone = interpret:.reduce(copy UnaryOperatorValue(loc,
+                                                               BOOL_TYPE,
+                                                               UnaryOperators::NOT,
+                                                               copy OptionFieldAccessValue(loc, BOOL_TYPE, left, OptionKeys::SET, isLvalue-> false)));
+
+        let mut valueOnSet: &Value = copy OptionFieldAccessValue(loc, leftType.wrapped, left, OptionKeys::VALUE);
+        if (leftType.wrapped.needsExplicitAlias && !MemoryVerification::needsExplicitAlias(left)) {
+            valueOnSet = copy AliaserValue(loc, leftType.wrapped, valueOnSet);
+        }
+
+        // we know at cte if the option has a value or not
+        if let b: &BoolValue = isNone {
+            if (b.isTrue) { // !left.hasValue, thus return the right operand
+                return right;
+            }
+
+            return valueOnSet; // left.hasValue, thus return the value
+        }
+
+        let (finalType, lvalue, rvalue) = TypeInference::inferValuesForBranch(alias context, loc, valueOnSet, right);
+
+        return copy ConditionalValue(loc, finalType, isNone, rvalue, lvalue, isComplete-> true);
+    }
+}
