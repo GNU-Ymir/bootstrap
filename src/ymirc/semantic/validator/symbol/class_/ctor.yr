@@ -178,8 +178,8 @@ pub mod ClassCtorValidation {
 
         if (!hasDefault) {
             {
-                let nCtor = ClassCtorValidation::createDefault(alias context, alias sym, cref,
-                                                               inModule-> inModule);
+                let nCtor = ClassCtorValidation::createDefaultEmpty(alias context, alias sym, cref,
+                                                                    inModule-> inModule);
                 cref:.setCtors(oldCtors ~ [nCtor], oldCtorProts ~ [MethodProtection::PUB]);
             } catch {
                 err => {
@@ -187,6 +187,43 @@ pub mod ClassCtorValidation {
                                                notes-> copy [err]);
                 }
             }
+        }
+    }
+
+    /**
+     * Ensure that data records have a constructor built from their fields.
+     *
+     * @params:
+     *   - context:  validation context
+     *   - sym:      class symbol
+     *   - inModule: whether to insert the synthesized constructor into add-methods
+     *   - precary:  whether the fields were validated without their values
+     *
+     * @throws:
+     *   - ErrorMsg if default constructor synthesis fails
+     *
+     */
+    pub fn validateDataRecord(dmut context: &ValidationContext,
+                              dmut sym:     &ClassSymbol,
+                              inModule:     bool,
+                              precary:      bool)
+        throws ErrorMsg
+    {
+        // In a precary validation the field values are left unvalidated, so there is
+        // nothing to build the ctor from. The class is validated again afterwards.
+        if (!sym.isData || precary) {
+            return;
+        }
+
+        let dmut cref = alias sym.classRefUnwrapped;
+        let oldCtors = cref.ctors;
+        let oldCtorProts = cref.ctorProtections;
+
+        let nCtorOpt = ClassCtorValidation::createDefaultWithParams(alias context, alias sym, cref,
+                                                                    inModule-> inModule,
+                                                                    ctorList-> oldCtors);
+        if let Ok(nCtor) = nCtorOpt {
+            cref:.setCtors(oldCtors ~ [nCtor], oldCtorProts ~ [MethodProtection::PUB]);
         }
     }
 
@@ -259,10 +296,10 @@ pub mod ClassCtorValidation {
      *   - ErrorMsg::list if any field is uninitialized
      *   - ErrorMsg if prototype validation fails
      */
-    fn createDefault(dmut context: &ValidationContext,
-                     dmut sym:     &ClassSymbol,
-                     cl:           &ClassRefType,
-                     inModule: bool)-> &CtorPrototypeValue
+    fn createDefaultEmpty(dmut context: &ValidationContext,
+                          dmut sym:     &ClassSymbol,
+                          cl:           &ClassRefType,
+                          inModule: bool)-> &CtorPrototypeValue
         throws ErrorMsg
     {
         let mut errors: [&ErrorMsg] = [];
@@ -298,5 +335,149 @@ pub mod ClassCtorValidation {
         }
 
         return ctProto;
+    }
+
+    /**
+     * Synthesize the constructor of a data record from its fields.
+     *
+     * Every field that is not private becomes a parameter of the constructor, in
+     * declaration order, and every field is set in the `with` part of the
+     * constructor - from its parameter, or from the default value it declares
+     * when the field is private.
+     *
+     * @params:
+     *   - context:  validation context
+     *   - sym:      class symbol
+     *   - cl:       class reference type
+     *   - inModule: whether to insert the constructor into add-methods
+     *   - ctorList: the constructors already declared by the record
+     *
+     * @returns:
+     *   - the validated constructor prototype, or none if the record already
+     *     declares a constructor with the same signature
+     *
+     * @throws:
+     *   - ErrorMsg::list if a private field has no default value
+     *   - ErrorMsg if prototype validation fails
+     */
+    fn createDefaultWithParams(dmut context: &ValidationContext,
+                               dmut sym:     &ClassSymbol,
+                               cl:           &ClassRefType,
+                               inModule:     bool,
+                               ctorList:     [&CtorPrototypeValue])-> (&CtorPrototypeValue)?
+        throws ErrorMsg
+    {
+        let mut errors: [&ErrorMsg] = [];
+        let mut params: [&VarDeclExpr] = [];
+        let mut setters: [FieldCtor] = [];
+        let mut throwers: [&Expression] = [];
+        let mut thrownTypes: [&Type] = [];
+
+        for fi in cl.localFields {
+            if (sym.isFieldPrivate(fi.name)) {
+                // A private field is not exposed as a parameter, it is always
+                // constructed from the default value it declares
+                if (fi.value of UnitValue) {
+                    errors ~= [copy ErrorMsg::fatal(fi.loc, format(ValidateErrorMessage::DATA_PRIVATE_FIELD_NO_VALUE, fi.name))];
+                    continue;
+                }
+
+                setters ~= [FieldCtor(fi.loc, fi.loc, copy ValueWrapperExpr(fi.loc, fi.value))];
+
+                // That value is constructed inside the ctor, so the ctor throws whatever it throws
+                for th in fi.value.throwers if !ClassCtorValidation::containsType(thrownTypes, th.type) {
+                    thrownTypes ~= [th.type];
+                    throwers ~= [copy TypeWrapperExpr(th.loc, th.type, asIs-> true)];
+                }
+            } else {
+                let (param, setter) = ClassCtorValidation::createDefaultFieldCtor(fi);
+                params ~= [param];
+                setters ~= [setter];
+            }
+        }
+
+        let rename = sym.loc.locate(Keys::SELF);
+        let proto = FunctionPrototype(params, EMPTY_EXPR, false);
+        let body = copy BlockExpr(rename, rename, []);
+
+        let ctor = copy CtorDecl(loc-> rename,
+                                 comm-> "",
+                                 rename-> EOF_WORD,
+                                 proto-> proto,
+                                 redirect-> none,
+                                 fields-> setters,
+                                 body-> body,
+                                 attrs-> [],
+                                 throwers-> throwers,
+                                 throwerLoc-> rename);
+
+        let dmut ctorSym: &CtorSymbol = context.declarator.declareCtor(ctor, alias sym,
+                                                                       protection-> Protection::PUBLIC,
+                                                                       insert-> false);
+        let ctProto = CtorValidation::validateProto(alias context, alias ctorSym, cl);
+
+        // The record already writes that ctor by hand, the generated one is dropped
+        for it in ctorList if ClassCtorVerification::areSimilar(ctProto, it) {
+            return none;
+        }
+
+        // We throw errors only if a default ctor is inserted
+        if (errors.len != 0us) {
+            throw copy ErrorMsg::list(errors);
+        }
+
+        if inModule {
+            sym:.insertDefaultCtor(alias ctorSym);
+        }
+
+        return ctProto?;
+    }
+
+    /**
+     * Create the parameter and the field setter of a field of a data record that
+     * is exposed by the generated constructor.
+     *
+     * The parameter is declared from the field itself, wrapping its type as is -
+     * the type is what describes the inner mutability, so the parameter is only
+     * decorated `mut` when that type needs an explicit alias.
+     *
+     * @params:
+     *    - field: the validated field
+     *
+     * @returns:
+     *    - .0: the parameter decl to put in the ctor prototype
+     *    - .1: the setter of the field to put in the field construction part of the ctor
+     */
+    fn createDefaultFieldCtor(field: &VarDeclValue)-> (&VarDeclExpr, FieldCtor) {
+        // The mutability of the field is kept only when it borrows mutable data: a
+        // parameter is what the field is constructed from, it has no reason to be
+        // mutable otherwise
+        let needsMut = field.varType.needsExplicitAlias;
+        let type = copy TypeWrapperExpr(field.loc, field.varType, asIs-> needsMut);
+        let value: &Expression = if (field.value of UnitValue) {
+            EMPTY_EXPR
+        } else {
+            copy ValueWrapperExpr(field.loc, field.value)
+        };
+
+        let param = copy VarDeclExpr(loc-> field.loc,
+                                     name-> field.loc,
+                                     value-> value,
+                                     type-> type,
+                                     isMutOrDmut-> if (needsMut) { field.loc.locate(Keys::MUTABLE) } else { EOF_WORD },
+                                     isLazyOrRef-> EOF_WORD);
+
+        return (param, FieldCtor(field.loc, field.loc, copy VarExpr(field.loc, isQuoted-> field.loc.isString)));
+    }
+
+    /**
+     * @returns: true iff `type` is already listed in `types`
+     */
+    fn containsType(types: [&Type], type: &Type)-> bool {
+        for it in types if it == type {
+            return true;
+        }
+
+        false
     }
 }
