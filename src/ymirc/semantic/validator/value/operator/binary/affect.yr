@@ -3,6 +3,7 @@
  *
  * This includes:
  *   - simple assignment:          a = b
+ *   - tuple left affectation:     (a, b) = foo()
  *   - affect operators:           a += b, a -= b, a *= b, ...
  *   - slice append:               a ~= b
  *   - index assignment:           a[i] = b, a[i] += b
@@ -71,6 +72,7 @@ use ymirc::utils::format;
  * it may:
  *
  *   - assign to a variable
+ *   - assign to each lvalue of a tuple
  *   - assign to an array/slice element
  *   - assign to a map entry
  *   - assign to a class field
@@ -89,14 +91,16 @@ pub mod BinaryAffectValidation {
      *
      * Dispatches based on the shape of the left operand:
      *
+     *   - tuple left affectation((a, b) = v)
      *   - index assignment(a[i] = b)
      *   - field assignment(a.x = b)
      *   - simple variable assignment(a = b)
      *
      * Steps:
-     *   1. Detect index assignment via MultOperatorExpr.
-     *   2. Detect field assignment via BinaryExpr with FIELD operator.
-     *   3. Otherwise, validate left value and forward to validate(loc, op, left, right).
+     *   1. Detect a tuple left operand via ListExpr.
+     *   2. Detect index assignment via MultOperatorExpr.
+     *   3. Detect field assignment via BinaryExpr with FIELD operator.
+     *   4. Otherwise, validate left value and forward to validate(loc, op, left, right).
      *
      * @params:
      *   - context: validation context
@@ -112,6 +116,11 @@ pub mod BinaryAffectValidation {
     pub fn validate(dmut context: &ValidationContext, bin: &BinaryExpr, op: BinaryOperators)-> &Value
         throws ErrorMsg
     {
+        // Affection can be a tuple left affectation(i.e. (a, b) = foo())
+        if let l: &ListExpr = bin.left && l.isTuple {
+            return BinaryAffectValidation::validateTupleAssign(alias context, op, l, bin);
+        }
+
         // Affection can be an index assign operation(i.e. obj[index] = value)
         if let m: &MultOperatorExpr = bin.left && m.isIndex {
             return BinaryAffectValidation::validateIndexAssign(alias context, op, m, bin);
@@ -238,6 +247,70 @@ pub mod BinaryAffectValidation {
 
         // verify the type compatibility, and return the casted value if needed
         return TypeInference::inferValueForType(alias context, loc, rightV, left.type, byReference-> false);
+    }
+
+    /**
+     * Validate a tuple left affectation:
+     *
+     *     (a, b) = foo()
+     *
+     * The right operand is validated once and shared by every element
+     * affectation, so it is evaluated once whatever the number of elements.
+     *
+     * Each element is then affected through the standard assignment machinery,
+     * which is what makes `(a.x, t[i]) = foo()` and the nested form
+     * `((a, b), c) = foo()` work without anything specific here. It is also
+     * what rejects an element that is not an lvalue.
+     *
+     * @params:
+     *   - context:  validation context
+     *   - op:       assignment operator(only `=` is defined on a tuple left operand)
+     *   - leftExpr: the tuple literal on the left of the operator
+     *   - bin:      the full binary assignment expression
+     *
+     * @returns:
+     *   A &Value performing the element wise affectations.
+     *
+     * @throws:
+     *   ErrorMsg if the operator is not `=`, if the right operand is not a
+     *   tuple of the same arity, or if any element affectation fails.
+     */
+    fn validateTupleAssign(dmut context: &ValidationContext,
+                            op:           BinaryOperators,
+                            leftExpr:     &ListExpr,
+                            bin:          &BinaryExpr)-> &Value
+        throws ErrorMsg
+    {
+        // `(a, b) += v` has no obvious meaning, only the plain affectation is defined
+        if (op != BinaryOperators::EQUAL) {
+            throw copy ErrorMsg::fatal(leftExpr.loc, end-> bin.loc,
+                                        format(ValidateErrorMessage::TUPLE_AFFECT_OPERATOR, Tokens::EQUAL));
+        }
+
+        let right = ValueValidation::validate(alias context, bin.right);
+        let type = match right.type {
+            t: &TupleType => { t }
+            _ => {
+                throw copy ErrorMsg::fatal(bin.right.loc, end-> bin.loc,
+                                            format(ValidateErrorMessage::NOT_A_TUPLE, right.type));
+            }
+        };
+
+        if (leftExpr.params.len != type.inners.len) {
+            throw copy ErrorMsg::fatal(leftExpr.loc, end-> bin.right.loc,
+                                        format(ValidateErrorMessage::MISMATCH_TUPLE_ARITY,
+                                               leftExpr.params.len, type.inners.len));
+        }
+
+        let mut values: [&Value] = [];
+        for i, elem in leftExpr.params {
+            let field = copy TupleFieldAccessValue(bin.loc, type.inners[i], right, i, isReduced-> true);
+            let elemBin = copy BinaryExpr(bin.loc, elem, copy ValueWrapperExpr(bin.right.loc, field));
+
+            values ~= [BinaryAffectValidation::validate(alias context, elemBin, op)];
+        }
+
+        return copy BlockValue(bin.loc, VOID_TYPE, values ~ [UNIT_VALUE], isSet-> true);
     }
 
     /**
