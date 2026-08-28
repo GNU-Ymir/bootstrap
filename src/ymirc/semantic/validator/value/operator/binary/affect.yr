@@ -3,6 +3,7 @@
  *
  * This includes:
  *   - simple assignment:          a = b
+ *   - tuple left affectation:     (a, b) = foo()
  *   - affect operators:           a += b, a -= b, a *= b, ...
  *   - slice append:               a ~= b
  *   - index assignment:           a[i] = b, a[i] += b
@@ -53,13 +54,11 @@
 
 in affect;
 
-use ymirc::lexing::{word, tokens, keys};
-
-use ymirc::syntax::expression::_;
-use ymirc::semantic::validator;
-use ymirc::semantic::generator::{value::_, type::_};
-
 use ymirc::errors;
+use ymirc::lexing::{keys, tokens, word};
+use ymirc::semantic::validator;
+use ymirc::semantic::generator::{type::_, value::_};
+use ymirc::syntax::expression::_;
 use ymirc::utils::format;
 
 /**
@@ -71,6 +70,7 @@ use ymirc::utils::format;
  * it may:
  *
  *   - assign to a variable
+ *   - assign to each lvalue of a tuple
  *   - assign to an array/slice element
  *   - assign to a map entry
  *   - assign to a class field
@@ -89,14 +89,16 @@ pub mod BinaryAffectValidation {
      *
      * Dispatches based on the shape of the left operand:
      *
+     *   - tuple left affectation((a, b) = v)
      *   - index assignment(a[i] = b)
      *   - field assignment(a.x = b)
      *   - simple variable assignment(a = b)
      *
      * Steps:
-     *   1. Detect index assignment via MultOperatorExpr.
-     *   2. Detect field assignment via BinaryExpr with FIELD operator.
-     *   3. Otherwise, validate left value and forward to validate(loc, op, left, right).
+     *   1. Detect a tuple left operand via ListExpr.
+     *   2. Detect index assignment via MultOperatorExpr.
+     *   3. Detect field assignment via BinaryExpr with FIELD operator.
+     *   4. Otherwise, validate left value and forward to validate(loc, op, left, right).
      *
      * @params:
      *   - context: validation context
@@ -112,6 +114,11 @@ pub mod BinaryAffectValidation {
     pub fn validate(dmut context: &ValidationContext, bin: &BinaryExpr, op: BinaryOperators)-> &Value
         throws ErrorMsg
     {
+        // Affection can be a tuple left affectation(i.e. (a, b) = foo())
+        if let l: &ListExpr = bin.left && l.isTuple {
+            return BinaryAffectValidation::validateTupleAssign(alias context, op, l, bin);
+        }
+
         // Affection can be an index assign operation(i.e. obj[index] = value)
         if let m: &MultOperatorExpr = bin.left && m.isIndex {
             return BinaryAffectValidation::validateIndexAssign(alias context, op, m, bin);
@@ -209,10 +216,10 @@ pub mod BinaryAffectValidation {
      *   A &Value representing the validated right operand.
      */
     fn validateRight(dmut context: &ValidationContext,
-                      loc:          &Word,
-                      op:           BinaryOperators,
-                      left:         &Value,
-                      right:        &Expression)-> &Value
+                     loc:          &Word,
+                     op:           BinaryOperators,
+                     left:         &Value,
+                     right:        &Expression)-> &Value
         throws ErrorMsg
     {
         // The right operand can be a math operation(e.g. a += 1, b /= 98)
@@ -241,6 +248,88 @@ pub mod BinaryAffectValidation {
     }
 
     /**
+     * Validate a tuple left affectation:
+     *
+     *     (a, b) = foo()
+     *
+     * The right operand is validated once and shared by every element
+     * affectation, so it is evaluated once whatever the number of elements.
+     *
+     * Each element is then affected through the standard assignment machinery,
+     * which is what makes `(a.x, t[i]) = foo()` and the nested form
+     * `((a, b), c) = foo()` work without anything specific here. It is also
+     * what rejects an element that is not an lvalue.
+     *
+     * @params:
+     *   - context:  validation context
+     *   - op:       assignment operator(only `=` is defined on a tuple left operand)
+     *   - leftExpr: the tuple literal on the left of the operator
+     *   - bin:      the full binary assignment expression
+     *
+     * @returns:
+     *   A &Value performing the element wise affectations.
+     *
+     * @throws:
+     *   ErrorMsg if the operator is not `=`, if the right operand is not a
+     *   tuple of the same arity, or if any element affectation fails.
+     */
+    fn validateTupleAssign(dmut context: &ValidationContext,
+                           op:           BinaryOperators,
+                           leftExpr:     &ListExpr,
+                           bin:          &BinaryExpr)-> &Value
+        throws ErrorMsg
+    {
+        // `(a, b) += v` has no obvious meaning, only the plain affectation is defined
+        if (op != BinaryOperators::EQUAL) {
+            throw copy ErrorMsg::fatal(leftExpr.loc, end-> bin.loc,
+                                       format(ValidateErrorMessage::TUPLE_AFFECT_OPERATOR, Tokens::EQUAL));
+        }
+
+        let rightV = ValueValidation::validate(alias context, bin.right);
+        let (right, byAlias) = if let a: &AliaserValue = rightV {
+            (a.value, true)
+        } else {
+            (rightV, false)
+        };
+
+        let type = match right.type {
+            t: &TupleType => { t }
+            _ => {
+                throw copy ErrorMsg::fatal(bin.right.loc, end-> bin.loc,
+                                           format(ValidateErrorMessage::NOT_A_TUPLE, right.type));
+            }
+        };
+
+        if (leftExpr.params.len != type.inners.len) {
+            throw copy ErrorMsg::fatal(leftExpr.loc, end-> bin.right.loc,
+                                       format(ValidateErrorMessage::MISMATCH_TUPLE_ARITY,
+                                              leftExpr.params.len, type.inners.len));
+        }
+
+        let mut values: [&Value] = [];
+        for i, elem in leftExpr.params {
+            let inner = type.inners[i];
+            let access = copy TupleFieldAccessValue(bin.loc, inner, right, i, isReduced-> true);
+            let elemAliased = if let t: &TupleValue = right && t.values.len > i {
+                !MemoryVerification::needsExplicitAlias(t.values[i])
+            } else {
+                false
+            };
+
+            let field: &Value = if ((byAlias || elemAliased) && inner.isMutable && inner.needsExplicitAlias) {
+                copy AliaserValue(access.loc, inner, access, isFromExpansion-> false)
+            } else {
+                access
+            };
+
+            let elemBin = copy BinaryExpr(bin.loc, elem, copy ValueWrapperExpr(bin.right.loc, field));
+            values ~= [BinaryAffectValidation::validate(alias context, elemBin, op)];
+        }
+
+        return copy BlockValue(bin.loc, VOID_TYPE, values ~ [UNIT_VALUE], isSet-> true);
+    }
+
+    /**
      * Validate an index assignment expression:
      *
      *     a[i] = v
@@ -265,9 +354,9 @@ pub mod BinaryAffectValidation {
      *   ErrorMsg if validation fails or aliasing rules are violated.
      */
     fn validateIndexAssign(dmut context: &ValidationContext,
-                            op:           BinaryOperators,
-                            leftExpr:     &MultOperatorExpr,
-                            bin:          &BinaryExpr)-> &Value
+                           op:           BinaryOperators,
+                           leftExpr:     &MultOperatorExpr,
+                           bin:          &BinaryExpr)-> &Value
         throws ErrorMsg
     {
         // `a:[i] = v` is prohibited, the affectation already aliases the value
@@ -292,10 +381,10 @@ pub mod BinaryAffectValidation {
 
         // Otherwise it is just an affectation of a slice/array access
         let left = IndexValidation::validate(alias context,
-                                              leftExpr.loc,
-                                              object-> ValueCreation::createEnumUnwrap(leftIndex),
-                                              indices-> leftExpr.rights,
-                                              inCopy-> false);
+                                             leftExpr.loc,
+                                             object-> ValueCreation::createEnumUnwrap(leftIndex),
+                                             indices-> leftExpr.rights,
+                                             inCopy-> false);
 
         return BinaryAffectValidation::validate(alias context, bin.loc, op, left, bin.right);
     }
@@ -323,18 +412,18 @@ pub mod BinaryAffectValidation {
      *   ErrorMsg if class index access or assignment fails.
      */
     fn validateIndexClass(dmut context: &ValidationContext,
-                           op:           BinaryOperators,
-                           object:       &Value,
-                           leftExpr:     &MultOperatorExpr,
-                           bin:          &BinaryExpr)-> &Value
+                          op:           BinaryOperators,
+                          object:       &Value,
+                          leftExpr:     &MultOperatorExpr,
+                          bin:          &BinaryExpr)-> &Value
         throws ErrorMsg
     {
         let right = if op != BinaryOperators::EQUAL {
             let rightIndex = IndexValidation::validate(alias context,
-                                                        leftExpr.loc,
-                                                        object-> object,
-                                                        indices-> leftExpr.rights,
-                                                        inCopy-> false);
+                                                       leftExpr.loc,
+                                                       object-> object,
+                                                       indices-> leftExpr.rights,
+                                                       inCopy-> false);
 
             BinaryAffectValidation::validateRight(alias context, bin.loc, op, rightIndex, bin.right)
         } else {
@@ -342,10 +431,10 @@ pub mod BinaryAffectValidation {
         };
 
         return IndexValidation::validateAssign(alias context,
-                                                leftExpr.loc,
-                                                object-> object,
-                                                indices-> leftExpr.rights,
-                                                assign-> right);
+                                               leftExpr.loc,
+                                               object-> object,
+                                               indices-> leftExpr.rights,
+                                               assign-> right);
     }
 
     /**
@@ -372,18 +461,18 @@ pub mod BinaryAffectValidation {
      *
      */
     fn validateIndexMap(dmut context: &ValidationContext,
-                         op:           BinaryOperators,
-                         object:       &Value,
-                         leftExpr:     &MultOperatorExpr,
-                         bin:          &BinaryExpr)-> &Value
+                        op:           BinaryOperators,
+                        object:       &Value,
+                        leftExpr:     &MultOperatorExpr,
+                        bin:          &BinaryExpr)-> &Value
         throws ErrorMsg
     {
         let right = if op != BinaryOperators::EQUAL {
             let rightIndex = IndexValidation::validate(alias context,
-                                                        leftExpr.loc,
-                                                        object-> ValueCreation::createEnumUnwrap(object),
-                                                        indices-> leftExpr.rights,
-                                                        inCopy-> false);
+                                                       leftExpr.loc,
+                                                       object-> ValueCreation::createEnumUnwrap(object),
+                                                       indices-> leftExpr.rights,
+                                                       inCopy-> false);
 
             BinaryAffectValidation::validateRight(alias context, bin.loc, op, rightIndex, bin.right)
         } else {
@@ -391,10 +480,10 @@ pub mod BinaryAffectValidation {
         };
 
         return IndexValidation::validateAssign(alias context,
-                                                leftExpr.loc,
-                                                object-> object,
-                                                indices-> leftExpr.rights,
-                                                assign-> right);
+                                               leftExpr.loc,
+                                               object-> object,
+                                               indices-> leftExpr.rights,
+                                               assign-> right);
     }
 
     /**
@@ -417,9 +506,9 @@ pub mod BinaryAffectValidation {
      *   A &Value representing the field assignment.
      */
     fn validateFieldAssign(dmut context: &ValidationContext,
-                            op:           BinaryOperators,
-                            leftExpr:     &BinaryExpr,
-                            bin:          &BinaryExpr)-> &Value
+                           op:           BinaryOperators,
+                           leftExpr:     &BinaryExpr,
+                           bin:          &BinaryExpr)-> &Value
         throws ErrorMsg
     {
         let leftIndex = ValueCreation::createEnumUnwrap(ValueValidation::validate(alias context, leftExpr.left));
@@ -482,31 +571,31 @@ pub mod BinaryAffectValidation {
      *   A &Value representing the setter call.
      */
     fn validateFieldSetter(dmut context: &ValidationContext,
-                            cptr:         &ClassPtrType,
-                            op:           BinaryOperators,
-                            leftIndex:    &Value,
-                            leftExpr:     &BinaryExpr,
-                            bin:          &BinaryExpr)-> &Value
+                           cptr:         &ClassPtrType,
+                           op:           BinaryOperators,
+                           leftIndex:    &Value,
+                           leftExpr:     &BinaryExpr,
+                           bin:          &BinaryExpr)-> &Value
         throws ErrorMsg
     {
         let leftMeth = ClassVtableAccessValidation::validate(alias context,
-                                                              loc-> leftExpr.loc,
-                                                              object-> leftIndex,
-                                                              cref-> cptr.inner,
-                                                              method-> leftExpr.right,
-                                                              isProxy-> TypeVerification::isSuperProxy(leftIndex),
-                                                              assign-> true,
-                                                              inCall-> false);
+                                                             loc-> leftExpr.loc,
+                                                             object-> leftIndex,
+                                                             cref-> cptr.inner,
+                                                             method-> leftExpr.right,
+                                                             isProxy-> TypeVerification::isSuperProxy(leftIndex),
+                                                             assign-> true,
+                                                             inCall-> false);
 
         let right = if op != BinaryOperators::EQUAL {
             let rightMeth = ClassVtableAccessValidation::validate(alias context,
-                                                                   loc-> leftExpr.loc,
-                                                                   object-> leftIndex,
-                                                                   cref-> cptr.inner,
-                                                                   method-> leftExpr.right,
-                                                                   isProxy-> TypeVerification::isSuperProxy(leftIndex),
-                                                                   assign-> false,
-                                                                   inCall-> false);
+                                                                  loc-> leftExpr.loc,
+                                                                  object-> leftIndex,
+                                                                  cref-> cptr.inner,
+                                                                  method-> leftExpr.right,
+                                                                  isProxy-> TypeVerification::isSuperProxy(leftIndex),
+                                                                  assign-> false,
+                                                                  inCall-> false);
 
             BinaryAffectValidation::validateRight(alias context, bin.loc, op, rightMeth, bin.right)
         } else {
@@ -530,18 +619,18 @@ pub mod BinaryAffectValidation {
      *   A &Value representing the field assignment.
      */
     fn validateFieldAffect(dmut context: &ValidationContext,
-                            cptr:         &ClassPtrType,
-                            op:           BinaryOperators,
-                            leftIndex:    &Value,
-                            leftExpr:     &BinaryExpr,
-                            bin:          &BinaryExpr)-> &Value
+                           cptr:         &ClassPtrType,
+                           op:           BinaryOperators,
+                           leftIndex:    &Value,
+                           leftExpr:     &BinaryExpr,
+                           bin:          &BinaryExpr)-> &Value
         throws ErrorMsg
     {
         let field = ClassFieldAccessValidation::validate(alias context,
-                                                          loc-> leftExpr.loc,
-                                                          object-> leftIndex,
-                                                          cref-> cptr.inner,
-                                                          field-> leftExpr.right);
+                                                         loc-> leftExpr.loc,
+                                                         object-> leftIndex,
+                                                         cref-> cptr.inner,
+                                                         field-> leftExpr.right);
 
         return BinaryAffectValidation::validate(alias context, bin.loc, op, field, bin.right);
     }
@@ -565,10 +654,10 @@ pub mod BinaryAffectValidation {
      *   A &Value representing the append assignment.
      */
     pub fn validateSliceAppend(dmut context: &ValidationContext,
-                                loc:          &Word,
-                                stype:        &SliceType,
-                                left:         &Value,
-                                right:        &Value)-> &Value
+                               loc:          &Word,
+                               stype:        &SliceType,
+                               left:         &Value,
+                               right:        &Value)-> &Value
         throws ErrorMsg
     {
         let finRight = {
@@ -584,8 +673,8 @@ pub mod BinaryAffectValidation {
         } catch {
             err: &ErrorMsg => {
                 throw copy ErrorMsg::fatal(loc,
-                                            format(ValidateErrorMessage::UNDEFINED_BIN_OP, Tokens::TILDE, left.type, right.type),
-                                            notes-> copy [err]);
+                                           format(ValidateErrorMessage::UNDEFINED_BIN_OP, Tokens::TILDE, left.type, right.type),
+                                           notes-> copy [err]);
             }
         };
 
@@ -614,11 +703,11 @@ pub mod BinaryAffectValidation {
         if let c: &ClassPtrType = left.type {
             if let dtor: &DtorPrototypeValue = c.inner.dtor {
                 let methDg = copy MethodDelegateValue(loc,
-                                                       dtor,
-                                                       closure-> left,
-                                                       direct-> true,
-                                                       vtableIndex-> 0us,
-                                                       isStruct-> true);
+                                                      dtor,
+                                                      closure-> left,
+                                                      direct-> true,
+                                                      vtableIndex-> 0us,
+                                                      isStruct-> true);
 
                 let lSet = copy StructFieldAccessValue(loc, BOOL_TYPE, left, ClassKeys::SET);
                 let call = copy MethodCallValue(loc, VOID_TYPE, methDg, []);
