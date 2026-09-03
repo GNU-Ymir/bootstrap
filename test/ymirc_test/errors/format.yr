@@ -1,0 +1,196 @@
+use ymirc::errors;
+use ymirc::lexing::word;
+use ymirc::utils::_;
+
+use std::io;
+
+/**
+ * A line long enough that formatLocation elides its beginning, with two markers
+ * near the end to point at. The '@' sits past byte 100, so the excerpt printed
+ * before it is shortened and carries the color codes of the elision marker
+ * */
+lazy LONG = "let a0 = 0; let a1 = 1; let a2 = 2; let a3 = 3; let a4 = 4; let a5 = 5; let a6 = 6; let a7 = 7; let z = @; let w = #;\n";
+
+/**
+ * A short line, so nothing is elided, holding a non ascii identifier. The
+ * accented character is two bytes and one column
+ * */
+lazy ACCENT = "let café = 1; let x = @;\n";
+
+/**
+ * A short ascii line, the case where a byte and a column are the same thing
+ * */
+lazy PLAIN = "let x = 1; let y = @;\n";
+
+/**
+ * @returns: a word pointing at the single occurrence of 'c' in 'content'
+ * */
+fn at(content: [c8], c: c8)-> &Word {
+    let idx = findLast(content, c);
+    copy LocWord(str-> content[idx .. idx + 1us], filename-> "a.yr", fileContent-> content,
+                 line-> 1u64, col-> cast!{u64}(idx + 1us), seek-> idx, lineSeek-> 0us)
+}
+
+/**
+ * @returns: the columns at which 'needle' is printed on 'str'
+ *
+ * This is what a terminal shows, so the escape sequences are stepped over and
+ * count for nothing, cf. skipAnsi
+ * */
+fn columnsOf(str: [c8], needle: [c8])-> [usize] {
+    let mut res: [usize] = [];
+    let mut col = 0us;
+    let mut i = 0us;
+
+    while i < str.len {
+        let j = skipAnsi(str, i);
+        if (j != i) {
+            i = j;
+        } else {
+            if (i + needle.len <= str.len && str[i .. i + needle.len] == needle) {
+                res ~= [col];
+            }
+
+            if ((cast!u8(str[i]) & 0xC0u8) != 0x80u8) { col += 1us; }
+            i += 1us;
+        }
+    }
+
+    res
+}
+
+/**
+ * @returns: the lines of 'str'
+ * */
+fn lines(str: [c8])-> [[c8]] {
+    let mut res: [[c8]] = [];
+    let mut last = 0us;
+    for i in 0us .. str.len {
+        if (str[i] == '\n') {
+            res ~= [str[last .. i]];
+            last = i + 1us;
+        }
+    }
+
+    if (last < str.len) { res ~= [str[last .. $]]; }
+    res
+}
+
+/**
+ * @returns: the first line of 'ls' holding 'needle'
+ * */
+fn lineWith(ls: [[c8]], needle: [c8])-> [c8] {
+    for l in ls {
+        if (contains(l, needle)) return l;
+    }
+
+    ""
+}
+
+/**
+ * @returns: the excerpt line and the caret line of a formatted location
+ * */
+fn render(err: &ErrorMsg)-> [[c8]] {
+    let dmut f = copy Formatter(tags-> FormatTags(verbose-> true));
+    f:.write(err);
+
+    lines(f[])
+}
+
+/**
+ * @returns: the excerpt line and the caret line of a diagnostic on 'c'
+ * */
+fn excerptAndCaret(content: [c8], c: c8, notes: [&ErrorMsg] = [])-> ([c8], [c8]) {
+    let ls = render(copy ErrorMsg::fatal(at(content, c), msg-> "e", notes-> notes));
+
+    (lineWith(ls, "┃"), lineWith(ls, "╋"))
+}
+
+/**
+ * ======================================================================
+ * ======================     CARET COLUMN      =========================
+ * ======================================================================
+ */
+
+__test the_caret_sits_under_the_token {
+    // the plain case, nothing elided and nothing but ascii
+    let (src, caret) = excerptAndCaret(PLAIN, '@'c8);
+
+    let tok = columnsOf(src, "@");
+    let hat = columnsOf(caret, "^");
+
+    assert(tok.len == 1us && hat.len == 1us, format("expected one of each, got % and %", tok.len, hat.len));
+    assert(tok[0] == hat[0], format("the token is at column %, the caret at %", tok[0], hat[0]));
+}
+
+__test the_caret_sits_under_the_token_past_an_accented_identifier {
+    // 'café' is five bytes and four columns, so a caret indented per byte lands
+    // one column too far right
+    let (src, caret) = excerptAndCaret(ACCENT, '@'c8);
+
+    assert(columnsOf(src, "é").len == 1us, "the excerpt lost the accented identifier");
+    assert(columnsOf(src, "@")[0] == columnsOf(caret, "^")[0]);
+}
+
+__test the_caret_sits_under_the_token_on_an_elided_line {
+    // YMI-223: the excerpt before the token is shortened, and its marker carries
+    // eleven bytes of color that the terminal does not print
+    let (src, caret) = excerptAndCaret(LONG, '@'c8);
+
+    assert(contains(src, "[...]"), format("the excerpt was not elided :\n%", src));
+
+    let tok = columnsOf(src, "@");
+    let hat = columnsOf(caret, "^");
+
+    assert(tok.len == 1us && hat.len == 1us, format("expected one of each, got % and %", tok.len, hat.len));
+    assert(tok[0] == hat[0], format("the token is at column %, the caret at %", tok[0], hat[0]));
+}
+
+/**
+ * ======================================================================
+ * =========================     MESSAGES      ==========================
+ * ======================================================================
+ */
+
+__test a_note_hangs_under_the_caret_it_belongs_to {
+    // the continuation lines of a multi message note are indented the same way,
+    // so they inherit the shift when it is there
+    let notes = copy [copy ErrorMsg::note(at(LONG, '@'c8), msg-> "first", oneLine-> true),
+                      copy ErrorMsg::note(at(LONG, '@'c8), msg-> "second", oneLine-> true)];
+
+    let ls = render(copy ErrorMsg::fatal(at(LONG, '@'c8), msg-> "e", notes-> notes));
+    let src = lineWith(ls, "┃");
+    let cont = lineWith(ls, "┗━");
+
+    let tok = columnsOf(src, "@");
+    let con = columnsOf(cont, "┗━");
+
+    assert(tok.len == 1us && con.len == 1us, format("expected one of each, got % and %", tok.len, con.len));
+
+    // the token is one column wide, so the connector hangs right under it. The
+    // caret line and this one are indented the same way, so checking it against
+    // the caret would only say they drifted together
+    assert(tok[0] == con[0], format("the token is at column %, the connector at %", tok[0], con[0]));
+}
+
+/**
+ * ======================================================================
+ * ========================     TWO CARETS      =========================
+ * ======================================================================
+ */
+
+__test both_carets_sit_under_their_token {
+    // the one line form indents twice, once over the elided beginning and once
+    // over what separates the two tokens, so the second caret drifts twice
+    let ls = render(copy ErrorMsg::fatal(at(LONG, '@'c8), end-> at(LONG, '#'c8), msg-> "e"));
+    let src = lineWith(ls, "┃");
+    let caret = lineWith(ls, "╋");
+
+    let fst = columnsOf(src, "@");
+    let snd = columnsOf(src, "#");
+    let hat = columnsOf(caret, "^");
+
+    assert(hat.len == 2us, format("expected two carets, got % :\n%", hat.len, caret));
+    assert(fst[0] == hat[0], format("the first token is at column %, its caret at %", fst[0], hat[0]));
+    assert(snd[0] == hat[1], format("the second token is at column %, its caret at %", snd[0], hat[1]));
+}
