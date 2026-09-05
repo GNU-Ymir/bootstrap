@@ -1,0 +1,248 @@
+/*
+ * Implements semantic validation for the unary address-to-option operator `&?` in Ymir.
+ *
+ * <hr>
+ *
+ * @Package: ymirc
+ * @Module: ymirc::semantic::validator::value::operator::unary::and_integ
+ * @File: ymirc/semantic/validator/value/operator/unary/and_integ.yr
+ * @Author(s):
+ *   - Emile Cadorel <ecadorel@gmail.com>
+ *
+ * @Created (YYYY-MM-DD): 2026-09-05
+ * @Copyright (C) 2021–2026 GNU-Ymir
+ * @License
+ *   ```text
+ *   This file is part of the Ymir language project.
+ *
+ *   Ymir is free software: you can redistribute it and/or modify it
+ *   under the terms of the GNU General Public License as published by
+ *   the Free Software Foundation, either version 3 of the License, or
+ *   (at your option) any later version.
+ *
+ *   Ymir is distributed in the hope that it will be useful,
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *   GNU General Public License for more details.
+ *
+ *   You should have received a copy of the GNU General Public License
+ *   along with Ymir.  If not, see <https://www.gnu.org/licenses/>.
+ *   ```
+ */
+
+in and_integ;
+
+use ymirc::errors;
+use ymirc::lexing::{keys, word};
+use ymirc::semantic::validator;
+use ymirc::semantic::generator::{type::_, value::_};
+use ymirc::syntax::expression::operator;
+use ymirc::utils::format;
+
+/**
+ * UnaryAndIntegValidation
+ *
+ * Provides semantic validation for the unary address-to-option operator:
+ *
+ *      &?value
+ *
+ * Where '&' creates a function pointer or a delegate from a function, and refuses to do
+ * so for a throwing function(neither type can express what a function throws), '&?'
+ * creates a delegate calling that function inside a catcher, and returning an option:
+ *
+ *      &?foo   =>   dg(args...) => (foo(args...))?
+ *
+ * The generated delegate throws nothing, the option it returns carries the exception the
+ * call raised, exactly as the postfix '?' operator does.
+ *
+ */
+pub mod UnaryAndIntegValidation {
+
+    /**
+     * Validate a unary address-to-option expression
+     *
+     * @params:
+     *   - context: validation context
+     *   - op:      unary expression containing the operand
+     *
+     * @returns:
+     *   A &Value representing the address to the function wrapping the result into an option.
+     *
+     * @throws:
+     *   ErrorMsg if the operand cannot be transformed into a toOption function, or violates rules for
+     *   method delegates or prototypes.
+     */
+    pub fn validate(dmut context: &ValidationContext, op: &UnaryExpr)-> &Value
+        throws ErrorMsg
+    {
+        let value = {
+            context:.enterCall(op);
+            ValueValidation::validate(alias context, op.value, noReduce-> true)
+        } exit {
+            context:.exitCall();
+        };
+
+        if let m: &MethodDelegateValue = value {
+            return UnaryAndIntegValidation::validateFromMethodDg(alias context, op.loc, m, op);
+        }
+
+        if let p: &PrototypeValue = value {
+            return UnaryAndIntegValidation::validateFromProto(alias context, op.loc, p);
+        }
+
+        throw copy ErrorMsg::fatal(op.loc, format(ValidateErrorMessage::UNDEFINED_UN_OP, op.loc.str, value.type));
+    }
+
+
+
+    /**
+     * Validate an address-to-option on a method delegate.
+     *
+     * Behavior:
+     *   - Rejects an already addressed method delegate.
+     *   - Rejects a method that:
+     *        • declares no thrower, the plain '&' operator creates a delegate from it
+     *        • is unsafe
+     *   - Rejects a method delegate whose closure entity is movable.
+     *   - Applies the struct specific rules of '&':
+     *        • &?method on a struct requires being inside a copy expression
+     *        • deep-copy contexts forbid it
+     *   - Produces a delegate enclosing the addressed method delegate, and calling it
+     *     inside a catcher.
+     *
+     * @params:
+     *   - context: validation context
+     *   - loc:     operator location
+     *   - m:       method delegate value
+     *   - un:      unary expression(used for copy/deep-copy checks)
+     *
+     * @returns:
+     *   A &Value representing the delegate returning an option.
+     *
+     * @throws:
+     *   ErrorMsg if any of the above constraints are violated.
+     */
+    fn validateFromMethodDg(dmut context: &ValidationContext, loc: &Word, m: &MethodDelegateValue, un: &UnaryExpr)-> &Value
+        throws ErrorMsg
+    {
+        if m.isAddressed {
+            throw copy ErrorMsg::fatal(m.addressLoc, format(ValidateErrorMessage::UNECESSARY_ADDRESS_METHOD));
+        }
+
+        if m.proto.throwers.len == 0 {
+            // nothing to catch, the delegate would be a delegate on the method itself
+            throw copy ErrorMsg::fatal(loc, format(ValidateErrorMessage::FUNCTION_TO_OPTION_NO_THROW, m,
+                                                   tags-> FormatTags(withParams-> true)),
+                                       notes-> copy [copy ErrorMsg::note(loc, format(ValidateErrorMessage::SIMPLE_ADDRESS_REPLACE, loc.str),
+                                                                         oneLine-> true)]);
+        }
+
+        if m.proto.isUnsafe {
+            // We cannot recover an unsafe panic, it's forbidden to transform unsafe in a dg implicitely
+            throw copy ErrorMsg::fatal(loc, format(ValidateErrorMessage::FUNCTION_TO_FPTR_UNSAFE, m,
+                                                   tags-> FormatTags(withParams-> true)));
+        }
+
+        if m.closure.type.isMovable {
+            // Borrowing problems
+            throw copy ErrorMsg::fatal(loc, format(ValidateErrorMessage::FUNCTION_TO_FPTR_ENTITY));
+        }
+
+        if m.isStruct {
+            if (!context.isInCopy(un)) {
+                // Borrowing problems
+                throw copy ErrorMsg::fatal(loc, format(ValidateErrorMessage::FUNCTION_TO_FPTR_RECORD),
+                                           notes-> copy [copy ErrorMsg::note(loc, format(ValidateErrorMessage::ENCLOSE_COPY_LST),
+                                                                             oneLine-> true)]);
+
+            }
+
+            if (context.isInDeepCopy()) {
+                throw copy ErrorMsg::fatal(loc, format(ValidateErrorMessage::FUNCTION_TO_FPTR_RECORD_DCOPY),
+                                           notes-> copy [copy ErrorMsg::note(context.getCopyExpr().loc, format(ValidateErrorMessage::SIMPLE_COPY_DCOPY_REPLACE))]);
+            }
+        }
+
+        // the method delegate is what the generated delegate encloses, it is the only
+        // thing knowing which method to call, virtual dispatch included
+        let dgValue = m.cloneAsAddressed(loc);
+        let dgType = if let d: &DelegateType = dgValue.type {
+            d
+        } else {
+            panic; // an addressed method delegate always has a delegate type
+        };
+
+        return LambdaCreation::createOptionDelegateFromDg(alias context, loc, dgType, dgValue);
+    }
+
+    /**
+     * Validate an address-to-option on a function prototype.
+     *
+     * Behavior:
+     *   - Only function prototypes are convertible, constructors, destructors, methods
+     *     and name prototypes are rejected.
+     *   - Rejects a prototype that:
+     *        • declares no thrower, the plain '&' operator creates a function pointer from it
+     *        • is unsafe
+     *   - Produces a delegate enclosing the function pointer of the prototype, and
+     *     calling it inside a catcher.
+     *
+     * @params:
+     *   - context: validation context
+     *   - loc:     operator location
+     *   - proto:   prototype value
+     *
+     * @returns:
+     *   A &Value representing the delegate returning an option.
+     *
+     * @throws:
+     *   ErrorMsg if the prototype is not a function or violates safety rules.
+     */
+    fn validateFromProto(dmut context: &ValidationContext, loc: &Word, proto: &PrototypeValue)-> &Value
+        throws ErrorMsg
+    {
+        let isFunc = match proto {
+            CtorPrototypeValue() => { false }
+            DtorPrototypeValue() => { false }
+            MethodPrototypeValue() => { false }
+            NamePrototypeValue() => { false }
+            _ => { true }
+        };
+
+        if !isFunc {
+            throw copy ErrorMsg::fatal(loc, format(ValidateErrorMessage::UNDEFINED_UN_OP, loc.str, proto,
+                                                   tags-> FormatTags(withParams-> true)));
+        }
+
+        if proto.throwers.len == 0 {
+            // nothing to catch, a function pointer on the function itself is enough
+            throw copy ErrorMsg::fatal(loc, format(ValidateErrorMessage::FUNCTION_TO_OPTION_NO_THROW, proto,
+                                                   tags-> FormatTags(withParams-> true)),
+                                       notes-> copy [copy ErrorMsg::note(loc, format(ValidateErrorMessage::SIMPLE_ADDRESS_REPLACE, loc.str),
+                                                                         oneLine-> true)]);
+        }
+
+        if proto.isUnsafe {
+            throw copy ErrorMsg::fatal(loc, format(ValidateErrorMessage::FUNCTION_TO_FPTR_UNSAFE, proto,
+                                                   tags-> FormatTags(withParams-> true)));
+        }
+
+        let types = copy [v.type for v in proto.params];
+        let references = copy [v.isReference for v in proto.params];
+        let lazys = copy [v.isLazy for v in proto.params];
+        let retType = proto.retType;
+
+        // the generated delegate is the only thing calling through that pointer, and it
+        // catches everything the function throws
+        let closure = copy ProtoFuncPtrValue(loc, proto, references, lazys, types, retType,
+                                             isCaught-> true);
+        let fptrType = if let f: &FuncPtrType = closure.type {
+            f
+        } else {
+            panic; // a ProtoFuncPtrValue is always of a function pointer type
+        };
+
+        return LambdaCreation::createOptionDelegateFromFptr(alias context, loc, fptrType, closure);
+    }
+
+}
