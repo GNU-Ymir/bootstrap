@@ -13,6 +13,9 @@
  * synthetic lambda whose closure is the function pointer itself. This allows
  * function pointers to be used in any context requiring a delegate value.
  *
+ * The same machinery builds the delegates of the '&?' operator, whose synthetic lambda
+ * calls what it encloses inside a catcher, and returns an option.
+ *
  * <hr>
  *
  * @Package: ymirc
@@ -71,7 +74,12 @@ use ymirc::global::_;
  *
  *     dg(args...) => fptr(args...)
  *
- * where the closure is the function pointer itself.
+ * where the closure is the function pointer itself, or, for the '&?' operator:
+ *
+ *     dg(args...) => (callee(args...))?
+ *
+ * where the closure is the function pointer, or the address of a heap copy of the
+ * delegate being wrapped, a delegate being two addresses where a closure is one.
  */
 pub mod LambdaCreation {
 
@@ -150,6 +158,267 @@ pub mod LambdaCreation {
         }
 
         return retProto;
+    }
+
+    /**
+     * Create a delegate wrapping the call of a throwing function pointer into an option.
+     *
+     * The function pointer is used as the closure of the generated lambda, exactly as in
+     * createDelegateFromFptr(), the only difference being the body of the lambda:
+     *
+     *     dg(args...) => (fptr(args...))?
+     *
+     * @params:
+     *   - context:  validation context
+     *   - loc:      location of the conversion expression
+     *   - fptrType: function-pointer type of the wrapped function
+     *   - func:     function-pointer value used as closure
+     *
+     * @returns:
+     *   - a NameDelegateValue returning an option
+     */
+    pub fn createOptionDelegateFromFptr(dmut context: &ValidationContext,
+                                        loc:      &Word,
+                                        fptrType: &FuncPtrType,
+                                        func:     &Value)-> &Value
+        throws ErrorMsg
+    {
+        let frameName = copy SymbolPath(DelegateUtils::FPTR_TO_OPTION_DG.toStr(sep-> "::"));
+
+        // a function pointer is one address, so it fits in the closure slot of a delegate
+        let fstParam = copy ProtoVarDeclValue(loc.locate("#{CLOSURE-VARREF}"), fptrType, UNIT_VALUE,
+                                              isMutable-> false,
+                                              isReference-> false,
+                                              isLazy-> false,
+                                              isSelf-> false,
+                                              nbConsume-> 1);
+
+        let closureRef = VariableCreation::createVarFromDecl(fstParam);
+
+        return LambdaCreation::createOptionDelegate(alias context, loc, frameName, fstParam,
+                                                    callee-> closureRef,
+                                                    closure-> func,
+                                                    refs-> fptrType.references,
+                                                    lazys-> fptrType.lazys,
+                                                    types-> fptrType.params,
+                                                    retType-> fptrType.retType);
+    }
+
+    /**
+     * Create a delegate wrapping the call of a throwing delegate into an option.
+     *
+     *     dg(args...) => (inner(args...))?
+     *
+     * The closure of a delegate is a single address, and a delegate is two(the closure and
+     * the function), so the wrapped delegate cannot be the closure of the generated lambda
+     * directly. It is enclosed the way a lambda encloses its captures: a tuple copied onto
+     * the heap, of which the generated frame receives the address.
+     *
+     * @params:
+     *   - context: validation context
+     *   - loc:     location of the conversion expression
+     *   - dgType:  delegate type of the wrapped delegate
+     *   - dgValue: the delegate value being wrapped
+     *
+     * @returns:
+     *   - a NameDelegateValue returning an option
+     */
+    pub fn createOptionDelegateFromDg(dmut context: &ValidationContext,
+                                      loc:     &Word,
+                                      dgType:  &DelegateType,
+                                      dgValue: &Value)-> &Value
+        throws ErrorMsg
+    {
+        let frameName = copy SymbolPath(DelegateUtils::DG_TO_OPTION_DG.toStr(sep-> "::"));
+
+        let closureType = copy TupleType(loc, copy [dgType], isMutable-> false);
+        let ptrType = copy PointerType(loc, closureType, isMutable-> false);
+        let fstParam = copy ProtoVarDeclValue(loc.locate("#{CLOSURE-VARREF}"), ptrType, UNIT_VALUE,
+                                              isMutable-> false,
+                                              isReference-> false,
+                                              isLazy-> false,
+                                              isSelf-> false,
+                                              nbConsume-> 1);
+
+        let closureRef = VariableCreation::createVarFromDecl(fstParam);
+        let callee = copy ClosureFieldAccessValue(loc.locate("#{CLOSURE-DG}"), dgType, closureRef, 0us,
+                                                  name-> "#{CLOSURE-DG}",
+                                                  isByRef-> false);
+
+        let closure = copy CopierValue(loc, ptrType, copy TupleValue(loc, closureType, copy [dgValue]));
+
+        return LambdaCreation::createOptionDelegate(alias context, loc, frameName, fstParam,
+                                                    callee-> callee,
+                                                    closure-> closure,
+                                                    refs-> dgType.references,
+                                                    lazys-> dgType.lazys,
+                                                    types-> dgType.params,
+                                                    retType-> dgType.retType);
+    }
+
+    /**
+     * Create the delegate returning an option of the result of `callee`.
+     *
+     * Steps:
+     *   1. Generate the body of the lambda(see createLambdaOptionFromCallee()).
+     *   2. Construct a NamePrototypeValue for the synthetic lambda.
+     *   3. Construct the NameDelegateValue closed over `closure`.
+     *   4. Generate the FrameGenerator, if the exact same frame was not generated before.
+     *
+     * @params:
+     *   - context:   validation context
+     *   - loc:       location of the conversion expression
+     *   - frameName: the path of the generated frame
+     *   - fstParam:  the implicit closure parameter of the generated frame
+     *   - callee:    the function called by the body, expressed inside the frame
+     *   - closure:   the value stored in the closure slot of the resulting delegate
+     *   - refs:      reference flags of the parameters of the callee
+     *   - lazys:     laziness flags of the parameters of the callee
+     *   - types:     the parameter types of the callee
+     *   - retType:   the return type of the callee
+     *
+     * @returns:
+     *   - a NameDelegateValue returning an option
+     */
+    fn createOptionDelegate(dmut context: &ValidationContext,
+                            loc:       &Word,
+                            frameName: &SymbolPath,
+                            fstParam:  &ProtoVarDeclValue,
+                            callee:    &Value,
+                            closure:   &Value,
+                            refs:      [bool],
+                            lazys:     [bool],
+                            types:     [&Type],
+                            retType:   &Type)-> &Value
+        throws ErrorMsg
+    {
+        let (paramVars, optType, body) = LambdaCreation::createLambdaOptionFromCallee(alias context, loc, callee,
+                                                                                      refs-> refs,
+                                                                                      lazys-> lazys,
+                                                                                      types-> types,
+                                                                                      retType-> retType);
+
+        let frameProto = copy NamePrototypeValue(loc, loc, frameName, copy [fstParam] ~ paramVars, optType,
+                                                 isLambda-> true);
+
+        let retProto = copy NameDelegateValue(loc, frameProto, refs, lazys, types, optType,
+                                              closure-> closure);
+
+        let mnglName = Mangler::mangle(frameProto);
+        if mnglName !in context.lambdaContext {
+            let frame = copy FrameGenerator(loc, loc, frameName, params-> copy [fstParam] ~ paramVars, optType, body, FrameKind::LMBD,
+                                            isWeak-> true);
+            LambdaCreation::insertGenerator(alias context, frame);
+            context.lambdaContext:.insert(mnglName);
+        }
+
+        return retProto;
+    }
+
+    /**
+     * Generate the parameters and the body of a synthetic lambda calling `callee` and
+     * wrapping its result into an option.
+     *
+     * The call is always enclosed in a catcher, even though it declares no thrower: it is
+     * performed through a function pointer, and a function type cannot express what the
+     * function it points to throws. Catching is the whole point of the operator, the
+     * generated delegate is the only form of the throwing function that a delegate type,
+     * which cannot express throwers either, can hold.
+     *
+     * @params:
+     *   - context: validation context
+     *   - loc:     location of the synthetic lambda
+     *   - callee:  the function called by the body, expressed inside the frame
+     *   - refs:    reference flags of the parameters of the callee
+     *   - lazys:   laziness flags of the parameters of the callee
+     *   - types:   the parameter types of the callee
+     *   - retType: the return type of the callee
+     *
+     * @returns:
+     *   - (params, optType, body)
+     *       params:  list of ProtoVarDeclValue for parameters
+     *       optType: the option type returned by the lambda
+     *       body:    the return of the option
+     */
+    fn createLambdaOptionFromCallee(dmut context: &ValidationContext,
+                                    loc:     &Word,
+                                    callee:  &Value,
+                                    refs:    [bool],
+                                    lazys:   [bool],
+                                    types:   [&Type],
+                                    retType: &Type)-> ([&ProtoVarDeclValue], &Type, &Value)
+        throws ErrorMsg
+    {
+        let mut params: [&ProtoVarDeclValue] = [];
+        let mut usedCall: [&Value] = [];
+
+        context:.enterForeign(isFnBody-> false, classRef-> context.getCurrentClassReferent());
+        context:.enterBlock();
+
+        return {
+            for i, type in types {
+                let paramGen = copy ProtoVarDeclValue(loc.locate(format("v_%", i)), type, UNIT_VALUE,
+                                                      isMutable-> type.isMutable,
+                                                      isSelf-> false,
+                                                      isReference-> refs[i],
+                                                      isLazy-> lazys[i],
+                                                      nbConsume-> 1);
+
+                params ~= [paramGen];
+                context:.insertLocal(paramGen.loc, paramGen.name, paramGen,
+                                     canShadow-> true)?;
+            }
+
+            context:.enterFunctionBody();
+            for i in 0us .. types.len {
+                let var = VariableCreation::createVarFromDecl(params[i],
+                                                              isReference-> params[i].isReference,
+                                                              isLazy-> params[i].isLazy);
+                let mut value: &Value = var;
+                if params[i].isLazy {
+                    value = copy LazyValue(var.loc, var.type, var, UNIT_VALUE,
+                                           isByAlias-> false,
+                                           isDone-> true);
+                } else if params[i].isReference {
+                    value = copy ReferencerValue(var.loc, var.type, var);
+                }
+
+                usedCall ~= [value];
+            }
+
+            let call = LambdaCreation::createCallOfCallee(loc, callee, retType, usedCall);
+            let optValue = OptionComposeValidation::validateCatching(alias context, loc, call);
+
+            (params, optValue.type, copy ReturnValue(loc, optValue))
+        } exit {
+            context:.safeQuitBlock();
+            context:.exitForeign();
+        };
+    }
+
+    /**
+     * Create the call of the function held by `callee`.
+     *
+     * @params:
+     *   - loc:     location of the call
+     *   - callee:  a function pointer, or a delegate
+     *   - retType: the return type of the callee
+     *   - args:    the arguments of the call
+     *
+     * @returns:
+     *   - the FuncPtrCallValue performing the call
+     */
+    fn createCallOfCallee(loc: &Word, callee: &Value, retType: &Type, args: [&Value])-> &Value {
+        if let dgType: &DelegateType = callee.type {
+            // calling a delegate is calling the function it holds, with its closure as
+            // hidden first argument
+            let closure: &Value = copy StructFieldAccessValue(loc, PTR_VOID_TYPE, callee, DelegateKeys::CLOSURE);
+            let func = copy StructFieldAccessValue(loc, dgType.cloneAsFptr(), callee, DelegateKeys::FUNC);
+
+            return copy FuncPtrCallValue(loc, retType, func, copy [closure] ~ args);
+        }
+
+        return copy FuncPtrCallValue(loc, retType, callee, args);
     }
 
     /**
