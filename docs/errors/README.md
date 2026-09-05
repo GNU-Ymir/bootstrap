@@ -21,18 +21,18 @@ compilation.
 A code names the pipeline stage that raises it, so the code alone says where the
 check lives:
 
-| Range | Stage | Catalogue | Codes |
+| Range | Stage | Catalogue | Live codes |
 |---|---|---|---|
 | `E1xxx` | lexing | `LexingErrorMessage` -- `src/ymirc/lexing/errors.yr` | 25 |
-| `E2xxx` | parsing | `SyntaxErrorMessage` -- `src/ymirc/syntax/errors.yr` | 11 |
+| `E2xxx` | parsing | `SyntaxErrorMessage` -- `src/ymirc/syntax/errors.yr` | 7 |
 | `E3xxx` | declaration | `DeclareErrorMessage` -- `src/ymirc/semantic/declarator/errors.yr` | 34 |
-| `E4xxx` | validation | `ValidateErrorMessage` -- `src/ymirc/semantic/validator/errors.yr` | 282 |
+| `E4xxx` | validation | `ValidateErrorMessage` -- `src/ymirc/semantic/validator/errors.yr` | 264 |
 | `E5xxx` | lowering (YIL) | `SerializeYILErrorMessage` -- `src/ymirc/lint/serialize/errors.yr` | 10 |
 
 Each page carries an example wherever a case in the suite raises the code: the
 snippet is quoted from `test_resources/`, so it is one the suite keeps compiling.
-`test_resources/diagnostics/` is the category dedicated to that -- one minimal
-case per code -- and `test/integration/diagnostics.yr` registers it.
+`test_resources/diagnostics/` is the category dedicated to that -- one minimal case
+per code -- and `test/integration/diagnostics.yr` registers it.
 
 Messages that are not diagnostics of their own -- the context notes a diagnostic
 hangs under, such as "when validating ...", "candidate ...", "did you mean ..." --
@@ -74,15 +74,11 @@ deliberately carry no code, and have no page here.
 |---|---|---|
 | [E2001](E2001.md) | `BLOCK_NEVER_CLOSED` | block is never closed |
 | [E2002](E2002.md) | `MULTIPLE_ATTRS` | decorator <> is defined multiple times |
-| [E2003](E2003.md) | `MULTIPLE_AUX_CSTRS` | multiple constructor redirects are not permitted |
 | [E2004](E2004.md) | `MULTIPLE_SAME_GUARD` | scope guard <> is declared multiple times |
-| [E2005](E2005.md) | `UNDEFINED_ATTRIBUTE` | undefined attribute <> |
 | [E2006](E2006.md) | `UNDEF_DECORATOR_IN_MATCH` | decorator <> cannot be applied to a subpattern variable |
 | [E2007](E2007.md) | `UNEXPECTED` | unexpected <> |
 | [E2008](E2008.md) | `UNEXPECTED_ATTRIBUTES` | unexpected attribute list <> |
 | [E2009](E2009.md) | `UNEXPECTED_BUT_LST` | read <>, but expected <> |
-| [E2010](E2010.md) | `UNTERMINATED_BLOCK` | unterminated block |
-| [E2011](E2011.md) | `USED_AS_IDENTIFIER` | <> cannot be used as an identifier |
 
 ## E3xxx -- declaration
 
@@ -151,14 +147,12 @@ deliberately carry no code, and have no page here.
 | [E4022](E4022.md) | `CLOSURE_TEMPLATE_LAMBDA` | closure functions cannot be used as template values |
 | [E4023](E4023.md) | `COLLIDING_FUNCTION_DEFINITION` | colliding function definitions <> and <> |
 | [E4024](E4024.md) | `COLLIDING_METHOD_DEFINITION` | colliding method definitions <> and <> |
-| [E4025](E4025.md) | `CONFLIT_DECORATORS` | conflicting decorators <> and <> |
 | [E4026](E4026.md) | `CONSTRUCT_ABSTRACT_CLASS` | cannot construct an instance of class <> that is abstract |
 | [E4027](E4027.md) | `CONST_METHOD` | method <> is defined as constant |
 | [E4028](E4028.md) | `CONTAIN_ALIASABLE_TYPE` | type <> cannot be embedded within a union type |
 | [E4029](E4029.md) | `CONTAIN_MOVABLE_TYPE` | movable type <> cannot be embedded within another type |
 | [E4030](E4030.md) | `CTE_ASSERT_NO_MSG` | cte assertion failed |
 | [E4031](E4031.md) | `CTE_ASSERT_WITH_MSG` | cte assertion failed <> |
-| [E4032](E4032.md) | `CTE_IGNORED` | <> values contained in a block scope are ignored during compile time execution |
 | [E4033](E4033.md) | `CTOR_CLASS_DCOPY` | using a deep copy instead of a one level copy is prohibited when constructing class <> |
 | [E4034](E4034.md) | `CTOR_CLASS_STACK` | creating an instance of class <> on the stack is prohibited |
 | [E4035](E4035.md) | `CTOR_INFINITE_REDIRECTION` | infinite constructor redirection calls when calling <> |
@@ -190,14 +184,11 @@ deliberately carry no code, and have no page here.
 | [E4061](E4061.md) | `FIELD_METHOD_ALIAS` | method <> is a field method |
 | [E4062](E4062.md) | `FIELD_METHOD_ASSIGN_CONST` | field assign method must be mutable |
 | [E4063](E4063.md) | `FIELD_METHOD_ASSIGN_WITH_RETURN` | field assign method must not return a value |
-| [E4064](E4064.md) | `FIELD_METHOD_COLLISION` | field method <> cannot be overlapped by a method with the same name <> |
 | [E4065](E4065.md) | `FIELD_METHOD_MUTABLE_ALIAS` | field method <> is mutable |
 | [E4066](E4066.md) | `FIELD_METHOD_PARAMS` | field method cannot have more than one parameter |
 | [E4067](E4067.md) | `FORBID_DECO_FOR_LOOP` | decorators are forbidden for index iterator, on <> iteration |
 | [E4068](E4068.md) | `FORWARD_REFERENCE_AKA` | the name alias <> cannot be validated due to forward reference |
 | [E4069](E4069.md) | `FORWARD_REFERENCE_TYPE` | the type cannot be validated due to forward reference |
-| [E4070](E4070.md) | `FORWARD_REFERENCE_VALUE` | the value cannot be computed, as it depends on a forward reference |
-| [E4071](E4071.md) | `FORWARD_REFERENCE_VAR` | the type cannot be inferred, as it depends on a forward reference |
 | [E4072](E4072.md) | `FOR_LOOP_CPTR` | overriding the for loop operation on a class type <> |
 | [E4073](E4073.md) | `FUNCTION_TO_FPTR_ENTITY` | cannot create a function pointer, entities are not copiable |
 | [E4074](E4074.md) | `FUNCTION_TO_FPTR_RECORD` | cannot create a function pointer, it would enclose the record by reference |
@@ -224,7 +215,6 @@ deliberately carry no code, and have no page here.
 | [E4095](E4095.md) | `INCOMPATIBLE_TYPE` | incompatible types <> and <> |
 | [E4096](E4096.md) | `INCOMPATIBLE_VALUES` | incompatible values <> and <> |
 | [E4097](E4097.md) | `INCOMPLETE_TYPE` | the type <> is not complete |
-| [E4098](E4098.md) | `INCOMPLETE_TYPE_CLASS` | the type <> is not complete due to previous errors |
 | [E4099](E4099.md) | `INDEX_ASSIGN_NOT_MUTABLE` | index assignment of a value of type <> requires a mutable value |
 | [E4100](E4100.md) | `INFINITE_LOOP` | infinite loop with always true test is not allowed, rather use a loop construct |
 | [E4101](E4101.md) | `INHERIT_FINAL_CLASS` | the base class <> is marked as final |
@@ -258,7 +248,6 @@ deliberately carry no code, and have no page here.
 | [E4129](E4129.md) | `MISMATCH_DCOPY_EXPAND` | cannot copy an expand value, maybe dcopy and expand keywords are inverted? (expand dcopy V) |
 | [E4130](E4130.md) | `MISMATCH_DCOPY_LAZY` | cannot copy a lazy value, maybe dcopy and lazy keywords are inverted? (lazy dcopy V) |
 | [E4131](E4131.md) | `MISMATCH_TUPLE_ARITY` | mismatch tuple arity <> and <> |
-| [E4132](E4132.md) | `MULTIPLE_DECORATORS` | decorator <> is specified multiple times |
 | [E4133](E4133.md) | `MULTIPLE_FIELD_INIT` | field <> is initialized multiple times |
 | [E4134](E4134.md) | `MULTIPLE_NAMED_PARAM` | named parameter <> is set multiple times |
 | [E4135](E4135.md) | `MULTIPLE_SYMBOL_TYPES` | expression refers to multiple symbols that generate types |
@@ -290,7 +279,6 @@ deliberately carry no code, and have no page here.
 | [E4161](E4161.md) | `NOT_AN_ENTITY` | <> is not an entity type |
 | [E4162](E4162.md) | `NOT_A_TRAIT` | <> is not a trait |
 | [E4163](E4163.md) | `NOT_A_TUPLE` | <> is not a tuple type |
-| [E4164](E4164.md) | `NOT_AN_UNION` | <> is not a union type |
 | [E4165](E4165.md) | `NOT_MOVABLE` | type <> is not a movable type |
 | [E4166](E4166.md) | `NOT_UNSAFE` | an unsafe context is entered, but no unsafe operations are made |
 | [E4167](E4167.md) | `NO_COPY_EXIST` | no copy exists for type <> |
@@ -300,7 +288,6 @@ deliberately carry no code, and have no page here.
 | [E4171](E4171.md) | `NO_PARAMETER_NAMED` | no parameter is named <> |
 | [E4172](E4172.md) | `NO_SIZE_FORWARD_REF` | record or entity type <> has no size due to forward references |
 | [E4173](E4173.md) | `NO_SUPER_CLASS` | class <> has no ancestor |
-| [E4174](E4174.md) | `ONE_ITER_LOOP` | do while loop test is always false, the loop is always entered exactly once, so the branching construct is useless |
 | [E4175](E4175.md) | `OPTION_HAS_NO_ERROR` | option of type <> has no error |
 | [E4176](E4176.md) | `OPTION_HAS_NO_VALUE` | option of type <> has no value |
 | [E4177](E4177.md) | `OPTION_MATCHER` | option matcher <> only applies to option values not <> |
@@ -317,10 +304,8 @@ deliberately carry no code, and have no page here.
 | [E4188](E4188.md) | `OVERRIDE_NON_TRAIT_INSIDE` | cannot override a non trait method <> with <> inside impl |
 | [E4189](E4189.md) | `OVERRIDE_NOTHING` | method <> overrides nothing |
 | [E4190](E4190.md) | `OVERRIDE_NO_FIELD_BY_FIELD` | field method <> cannot override the non field method <> |
-| [E4191](E4191.md) | `OVERRIDE_PRIVATE` | cannot override private method <> |
 | [E4192](E4192.md) | `OVERRIDE_TRAIT_OUTSIDE` | cannot override trait method <> with <> outside impl |
 | [E4193](E4193.md) | `PATTERN_IS_REFUTABLE` | the pattern <> with value <> is refutable |
-| [E4194](E4194.md) | `PRAGMA_FIELD_NO_DEFAULT` | field <> from type <> has no default value |
 | [E4195](E4195.md) | `RANGE_ON_ARRAY_NO_COPY` | the index operator on <> with a dynamic operand of type <> is allowed only in the context of a copy statement |
 | [E4196](E4196.md) | `RECURSIVE_ANCESTOR` | ancestor cycle found when validating <> |
 | [E4197](E4197.md) | `RETURN_NO_FUNCTION` | return statement is not within a function |
@@ -341,7 +326,6 @@ deliberately carry no code, and have no page here.
 | [E4212](E4212.md) | `TOO_FEW_PARAMETERS` | <> parameters <> expected, but <> <> provided |
 | [E4213](E4213.md) | `TUPLE_AFFECT_OPERATOR` | tuple left affectation is only defined for the operator <> |
 | [E4214](E4214.md) | `TUPLE_ARITY_OVERFLOW` | tuple access out of bound(<>), tuple arity is <> |
-| [E4215](E4215.md) | `TUPLE_MATCHER` | tuple matcher only applies to tuple values not <> |
 | [E4216](E4216.md) | `TUPLE_PATTERN` | pattern <> only matches tuple values, not <> |
 | [E4217](E4217.md) | `TYPE_HAS_NO_FIELDINFO` | type <> has no fields |
 | [E4218](E4218.md) | `TYPE_HAS_NO_SIZE` | temporary type <> has no size |
@@ -361,15 +345,12 @@ deliberately carry no code, and have no page here.
 | [E4232](E4232.md) | `UNDEFINED_MACRO_CALL` | macro call is undefined for <> |
 | [E4233](E4233.md) | `UNDEFINED_REDIRECT_CALL_CTOR` | no constructor is callable with the parameters <> |
 | [E4234](E4234.md) | `UNDEFINED_RULE_MACRO` | macro symbol <> has no rule named <> |
-| [E4235](E4235.md) | `UNDEFINED_SUPER_CALL_CTOR` | no constructor of the super class is callable with the parameters <> |
 | [E4236](E4236.md) | `UNDEFINED_TEMPLATE_CALL` | undefined template call for <> with <> |
 | [E4237](E4237.md) | `UNDEFINED_UN_OP` | undefined operator <> for type <> |
 | [E4238](E4238.md) | `UNDEFINED_UN_OP_TOK` | undefined unary operator <> |
 | [E4239](E4239.md) | `UNDEF_CTE_FOR_LOOP_OPERATOR` | undefined cte for loop operator with <> iterator for type <> |
 | [E4240](E4240.md) | `UNDEF_DECORATOR_HERE` | decorator <> is not applicable in that context |
-| [E4241](E4241.md) | `UNDEF_DECORATOR_TEMPLATE` | decorator <> is not applicable in template specialization |
 | [E4242](E4242.md) | `UNDEF_DECORATOR_TYPE` | decorator <> is not applicable for types |
-| [E4243](E4243.md) | `UNDEF_DECORATOR_VALUE` | decorator <> is not applicable for values |
 | [E4244](E4244.md) | `UNDEF_FOR_LOOP_OPERATOR` | undefined for loop operator with <> iterator for type <> |
 | [E4245](E4245.md) | `UNDEF_VAR` | undefined symbol <> |
 | [E4246](E4246.md) | `UNECESSARY_ADDRESS_METHOD` | the creation of a delegate from a method has no effect |
@@ -380,8 +361,6 @@ deliberately carry no code, and have no page here.
 | [E4251](E4251.md) | `UNECESSARY_MOVE` | the move has no effect |
 | [E4252](E4252.md) | `UNECESSARY_REFERENCE` | referencing the value has no effect |
 | [E4253](E4253.md) | `UNINIT_FIELD` | the field <> has no initial value |
-| [E4254](E4254.md) | `UNION_CTOR_MULTIPLE_FIELDS` | constructor of the union type <> initializes multiple fields <> |
-| [E4255](E4255.md) | `UNION_CTOR_NO_FIELD` | constructor of the union type <> initializes no field |
 | [E4256](E4256.md) | `UNKNOWN_AT_COMPILE_TIME` | value of type <> is needed but unknown at compilation time |
 | [E4257](E4257.md) | `UNKNOWN_LENGTH_OF_EXPANSION` | unknown length of expansion for type <> |
 | [E4258](E4258.md) | `UNKNOWN_PRAGMA` | unknown __pragma expression <> |
@@ -405,7 +384,6 @@ deliberately carry no code, and have no page here.
 | [E4276](E4276.md) | `VAR_DECL_WITHOUT_VALUE` | var declared without value, when necessary |
 | [E4277](E4277.md) | `VAR_DECL_WITH_NOTHING` | var declaration must at least have a type or a value |
 | [E4278](E4278.md) | `VOID_VALUE` | void expression cannot be used as a value |
-| [E4279](E4279.md) | `VOID_VAR` | cannot create a variable of type void |
 | [E4280](E4280.md) | `WORKS_WITH_BOTH` | <> called with <> works with multiple candidates |
 | [E4281](E4281.md) | `DECLARE_VARIABLE_NO_FUNCTION` | var declaration <> outside a function context |
 | [E4282](E4282.md) | `NOT_SUPPORTED_IN` | not supported in version ymir <> |
@@ -424,4 +402,35 @@ deliberately carry no code, and have no page here.
 | [E5008](E5008.md) | `MALFORMED_BYTECODE_SYMBOL_TABLE` | malformed bytecode, symbol table invalid |
 | [E5009](E5009.md) | `MALFORMED_BYTECODE_LOCATION_TABLE` | malformed bytecode, location table invalid |
 | [E5010](E5010.md) | `MISMATCH_ARCH_POINTER_SIZE` | YIL byte file was created for a <> bits target, mismatch current target arch <> bits |
+
+## Retired
+
+These codes named messages that have since been deleted from the compiler.
+Nothing raises them today. They are listed so a code printed by an older compiler
+can still be looked up, and so neither the code nor the name is ever reused.
+
+| Code | Name | Message it named |
+|---|---|---|
+| [E2003](E2003.md) | `MULTIPLE_AUX_CSTRS` | multiple constructor redirects are not permitted |
+| [E2005](E2005.md) | `UNDEFINED_ATTRIBUTE` | undefined attribute <> |
+| [E2010](E2010.md) | `UNTERMINATED_BLOCK` | unterminated block |
+| [E2011](E2011.md) | `USED_AS_IDENTIFIER` | <> cannot be used as an identifier |
+| [E4025](E4025.md) | `CONFLIT_DECORATORS` | conflicting decorators <> and <> |
+| [E4032](E4032.md) | `CTE_IGNORED` | <> values contained in a block scope are ignored during compile time execution |
+| [E4064](E4064.md) | `FIELD_METHOD_COLLISION` | field method <> cannot be overlapped by a method with the same name <> |
+| [E4070](E4070.md) | `FORWARD_REFERENCE_VALUE` | the value cannot be computed, as it depends on a forward reference |
+| [E4071](E4071.md) | `FORWARD_REFERENCE_VAR` | the type cannot be inferred, as it depends on a forward reference |
+| [E4098](E4098.md) | `INCOMPLETE_TYPE_CLASS` | the type <> is not complete due to previous errors |
+| [E4132](E4132.md) | `MULTIPLE_DECORATORS` | decorator <> is specified multiple times |
+| [E4164](E4164.md) | `NOT_AN_UNION` | <> is not a union type |
+| [E4174](E4174.md) | `ONE_ITER_LOOP` | do while loop test is always false, the loop is always entered exactly once, so the branching construct is useless |
+| [E4191](E4191.md) | `OVERRIDE_PRIVATE` | cannot override private method <> |
+| [E4194](E4194.md) | `PRAGMA_FIELD_NO_DEFAULT` | field <> from type <> has no default value |
+| [E4215](E4215.md) | `TUPLE_MATCHER` | tuple matcher only applies to tuple values not <> |
+| [E4235](E4235.md) | `UNDEFINED_SUPER_CALL_CTOR` | no constructor of the super class is callable with the parameters <> |
+| [E4241](E4241.md) | `UNDEF_DECORATOR_TEMPLATE` | decorator <> is not applicable in template specialization |
+| [E4243](E4243.md) | `UNDEF_DECORATOR_VALUE` | decorator <> is not applicable for values |
+| [E4254](E4254.md) | `UNION_CTOR_MULTIPLE_FIELDS` | constructor of the union type <> initializes multiple fields <> |
+| [E4255](E4255.md) | `UNION_CTOR_NO_FIELD` | constructor of the union type <> initializes no field |
+| [E4279](E4279.md) | `VOID_VAR` | cannot create a variable of type void |
 
