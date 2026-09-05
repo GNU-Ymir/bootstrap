@@ -9,6 +9,11 @@ and compiled by the `gyc` GCC-based Ymir compiler. It parses Ymir source, perfor
 validation, and lowers the result to an intermediate language (YIL) for a backend compiler
 (GCC). This repo is the bootstrap frontend only — no backend/codegen lives here.
 
+## Issue tracking (Plane)
+
+Project **YMI**, (key `YMI`), workspace `ymir-bootstrap`. Use the plane MCP
+tools.
+
 ## Pull request titles
 
 PR titles must read `[YMI-XXX][kind] Log` — `YMI-XXX` is the Linear issue, and `[kind]` is
