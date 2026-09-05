@@ -29,6 +29,11 @@ check lives:
 | `E4xxx` | validation | `ValidateErrorMessage` -- `src/ymirc/semantic/validator/errors.yr` | 282 |
 | `E5xxx` | lowering (YIL) | `SerializeYILErrorMessage` -- `src/ymirc/lint/serialize/errors.yr` | 10 |
 
+Each page carries an example wherever a case in the suite raises the code: the
+snippet is quoted from `test_resources/`, so it is one the suite keeps compiling.
+`test_resources/diagnostics/` is the category dedicated to that -- one minimal
+case per code -- and `test/integration/diagnostics.yr` registers it.
+
 Messages that are not diagnostics of their own -- the context notes a diagnostic
 hangs under, such as "when validating ...", "candidate ...", "did you mean ..." --
 deliberately carry no code, and have no page here.
