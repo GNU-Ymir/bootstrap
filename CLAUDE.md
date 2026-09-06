@@ -101,19 +101,27 @@ corresponding golden file rather than special-casing the test.
 
 ### Regenerating a golden file
 
-Truncate the golden to empty, re-run the test, and the whole produced output comes back as
-added lines in the diff:
+**Every failing case writes what it actually produced to `/tmp/ymir_errors/`**, one file per
+case, named after its path with `/` replaced by `_`
+(`test_resources/<dir>/testN.err` → `/tmp/ymir_errors/test_resources_<dir>_testN.err`). That
+file is the golden the run would need, already free of the diff gutter and the ANSI codes, so
+regenerating one is a copy:
 
 ```sh
-: > test_resources/<dir>/testN.err
-./ymirc.test -f "integration::<module>*" 2>err.txt >/dev/null
-sed -e 's/\x1b\[[0-9;]*m//g' err.txt        # every produced line is now "+      | <content>"
+./ymirc.test -f "integration::<module>::*" >/dev/null 2>&1
+cp /tmp/ymir_errors/test_resources_<dir>_testN.err test_resources/<dir>/testN.err
 ```
 
-Strip the `+`/`| ` gutter to rebuild the file, then re-run to confirm `[SUCCESS]`. Truncating
-first matters: against a non-empty golden the diff elides unchanged regions as `...`, so you
-cannot reconstruct the full file from it. Read the resulting diff before committing it — the
+The same holds for a brand-new case: register it with an empty golden, run once, and copy.
+Do **not** reconstruct a golden by stripping the `+`/`| ` gutter out of the printed diff — a
+diff against a non-empty golden elides unchanged regions as `...`, so it cannot be rebuilt
+from that, and the produced file has no such gap.
+
+Re-run afterwards to confirm `[SUCCESS]`, and read the new golden before committing it — the
 point is to check the new behavior is what you intended, not to make the test go green.
+
+`test_resources/diagnostics/test17.err` fails on any checkout not rooted at `/bootstrap`: the
+golden embeds the absolute path of the file. It is unrelated to whatever you are changing.
 
 ### Creating a temporary throwaway test
 
