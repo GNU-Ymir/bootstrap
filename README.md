@@ -106,4 +106,20 @@ src/ymirc/
 
 test/            self-test suite sources
 test_resources/  inputs and golden output files used by the self-tests
+docs/errors/     one page per diagnostic code, indexed by docs/errors/README.md
 ```
+
+## Diagnostics
+
+Every user-facing diagnostic carries a stable code, printed next to its severity:
+
+```text
+Error[E4020] : class A has no method named foo
+ --> main.yr:(8,15)
+```
+
+The code is allocated once and never reused or renumbered, and it names the stage that
+raised it (`E1xxx` lexing, `E2xxx` parsing, `E3xxx` declaration, `E4xxx` validation,
+`E5xxx` lowering). [`docs/errors/`](docs/errors/README.md) has one page per code: what
+it means, an example, and how to fix it. The messages themselves live in one catalogue
+per stage (`src/ymirc/*/errors.yr`), where each entry pairs its code with its text.
