@@ -26,7 +26,7 @@ check lives:
 | `E1xxx` | lexing | `LexingErrorMessage` -- `src/ymirc/lexing/errors.yr` | 25 |
 | `E2xxx` | parsing | `SyntaxErrorMessage` -- `src/ymirc/syntax/errors.yr` | 7 |
 | `E3xxx` | declaration | `DeclareErrorMessage` -- `src/ymirc/semantic/declarator/errors.yr` | 34 |
-| `E4xxx` | validation | `ValidateErrorMessage` -- `src/ymirc/semantic/validator/errors.yr` | 264 |
+| `E4xxx` | validation | `ValidateErrorMessage` -- `src/ymirc/semantic/validator/errors.yr` | 265 |
 | `E5xxx` | lowering (YIL) | `SerializeYILErrorMessage` -- `src/ymirc/lint/serialize/errors.yr` | 10 |
 
 Each page carries an example wherever a case in the suite raises the code: the
@@ -387,6 +387,7 @@ deliberately carry no code, and have no page here.
 | [E4280](E4280.md) | `WORKS_WITH_BOTH` | <> called with <> works with multiple candidates |
 | [E4281](E4281.md) | `DECLARE_VARIABLE_NO_FUNCTION` | var declaration <> outside a function context |
 | [E4282](E4282.md) | `NOT_SUPPORTED_IN` | not supported in version ymir <> |
+| [E4283](E4283.md) | `DEFAULT_PARAM_BY_POSITION` | the parameter <> has a default value, it can only be passed by name |
 
 ## E5xxx -- lowering (YIL)
 
