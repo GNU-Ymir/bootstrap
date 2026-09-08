@@ -1,20 +1,21 @@
 /*
- * format — pretty-printing utilities for error locations.
+ * format — writing a laid out diagnostic to the terminal.
  *
- * This module provides all formatting routines used to display compiler
- * diagnostics with highlighted source excerpts. It handles:
+ * This module is the second half of the error renderer: it takes the
+ * `Diagnostic` that `ymirc::errors::snippet` produced and writes it, applying
+ * the styling on the way. It takes no layout decision of its own — every width
+ * it needs was counted on plain source text, before any escape sequence
+ * existed:
  *
- *   - single-location errors,
- *   - multi-location errors(e.g., matching parentheses),
- *   - EOF locations,
- *   - underline highlighting,
- *   - caret positioning,
- *   - tab-aware spacing,
- *   - line extraction from in-memory file content.
+ *   - a run of the excerpt knows its own width(`Piece::width`), so the caret
+ *     line is indented by columns without having to step over anything,
+ *   - the elision marker is written here and measured there, so the two cannot
+ *     disagree,
+ *   - a severity arrives as a severity, and the word and the color standing
+ *     for it are chosen here.
  *
- * All functions write directly into a Formatter stream and return it for
- * chaining. No file I/O is performed; the Word object is assumed to contain
- * the relevant slice of the file content.
+ * All functions write into a Formatter. No file I/O is performed; the source
+ * text was extracted when the diagnostic was laid out.
  *
  * <hr>
  *
@@ -47,49 +48,132 @@
 
 in format;
 
-use ymirc::lexing::word;
 use ymirc::utils::_;
-use ymirc::global::state;
+use ymirc::errors::{code, snippet};
 
-use std::{io, env, fs::path, stream};
+use std::{conv, env, io, stream};
+use std::fs::path;
 
 /**
- * Write the blank indent standing for a source excerpt, so that whatever is
- * written next lands under the column the excerpt ends at.
+ * Write a diagnostic node: its header, the excerpts it points at, and the
+ * location it cites when it has no excerpt.
  *
- * One space is written per *column* of `indent`, not per byte: the excerpt is
- * colored, and it is shortened with a marker that carries its own escapes, so
- * counting bytes puts the caret to the right of what it points at. Tabs are
- * written back as tabs, the terminal is the one deciding how wide they are.
+ * The sub notes of the node are not written here, they are diagnostics of
+ * their own, cf. ErrorMsg::format.
  *
  * @params:
  *   - stream: output formatter,
- *   - indent: the source text preceding the caret, only its width is used.
+ *   - diag:   the laid out diagnostic.
  */
-fn writeCaretIndent(dmut stream: &Formatter, indent: [c8]) {
-    let mut i = 0us;
-    while i < indent.len {
-        let j = skipAnsi(indent, i);
-        if (j != i) {
-            i = j;
-        } else {
-            if (indent[i] == '\t') {
-                stream:.write('\t');
-            } else if ((cast!u8(indent[i]) & 0xC0u8) != 0x80u8) {
-                stream:.write(' ');
-            }
+pub fn formatDiagnostic(dmut stream: &Formatter, diag: Diagnostic) {
+    formatHeader(alias stream, diag.header);
 
-            i += 1us;
-        }
+    for s in diag.snippets {
+        formatSnippet(alias stream, s);
+    }
+
+    match diag.inlineLoc {
+        Ok(l: InlineLoc) => { formatInlineLoc(alias stream, l); }
     }
 }
 
 /**
- * Write the diagnostics attached to a caret.
+ * Write the header of a diagnostic: what it is, the code identifying it, and
+ * what it says.
  *
- * The first one is written on the caret line itself, the following ones on a
- * line of their own, connected to the caret column, so that a list of them
- * reads as a single block hanging under the caret:
+ * The severity is what picks both the word and the color it is written in. A
+ * note carries no code, cf. Header.
+ */
+fn formatHeader(dmut stream: &Formatter, header: Header) {
+    if (header.withSeverity) {
+        match header.severity {
+            Severity::NOTE => { stream:.writef("%(b)", "Note"); }
+            Severity::WARNING => { stream:.writef("%(y)", "Warning"); }
+            _ => { stream:.writef("%(r)", "Error"); }
+        }
+
+        if (header.code != code::NO_CODE) {
+            stream:.writef("[%(B)]", code::codeStr(header.code));
+        }
+
+        if (stream.tags.withErrorIds) {
+            stream:.writef(" (#%(B))", header.id.to!{[c8], 36us} ());
+        }
+    }
+
+    stream:.writef(" : %", header.msg);
+}
+
+/**
+ * Write a source excerpt: the separator standing before it, its header, and
+ * its lines.
+ *
+ * An excerpt holding no line writes nothing but its separator - there is
+ * nothing to show of the location, but whatever it was separated from is still
+ * there.
+ */
+fn formatSnippet(dmut stream: &Formatter, snip: Snippet) {
+    match snip.gap {
+        Ok(padd: [c8]) => {
+            stream:.writef("\n%%...%", Colors::BOLD, padd, Colors::RESET);
+        }
+    }
+
+    if (snip.lines.len == 0us) return;
+
+    stream:.writef("\n% --> %:(%,%)%\n",
+                   Colors::BOLD,
+                   snip.file,
+                   snip.line,
+                   snip.col,
+                   Colors::RESET);
+
+    for l in snip.lines {
+        formatSourceLine(alias stream, l);
+    }
+}
+
+/**
+ * Write one line of an excerpt: the source itself, the caret line under it,
+ * and the messages hanging under the carets.
+ *
+ * The line was cut at its labels, so writing it is reading its runs
+ * alternately, and the caret line is the same walk with a blank standing for
+ * every run that is not labelled.
+ */
+fn formatSourceLine(dmut stream: &Formatter, line: SourceLine) {
+    stream:.writef("%% ┃ %", Colors::BOLD, line.gutter, Colors::RESET);
+
+    for i in 0us .. line.labels.len {
+        formatPiece(alias stream, line.gaps[i]);
+        stream:.write(Colors::UNDERLINE);
+        stream:.writef("%(y)", styledPiece(line.labels[i].text));
+        stream:.write(Colors::RESET);
+    }
+
+    formatPiece(alias stream, line.gaps[$ - 1us]);
+
+    if (!line.trailingNewline) stream:.write('\n');
+    stream:.writef("%% ╋ %", Colors::BOLD, line.padd, Colors::RESET);
+
+    for i in 0us .. line.labels.len {
+        let width = line.labels[i].text.width();
+        if (width != 0us) {
+            formatIndent(alias stream, line.gaps[i]);
+            stream:.write(center("", width, concat-> '^'));
+        }
+    }
+
+    formatLabelMessages(alias stream, line);
+}
+
+/**
+ * Write the messages the labels of a line carry, as a block hanging under the
+ * caret line.
+ *
+ * The first one lands on the caret line itself, the following ones on a line
+ * of their own, connected to the caret column, so that a list of them reads as
+ * a single block:
  *
  * ```text
  * 21  ┃     let _ = foo(true);
@@ -98,308 +182,120 @@ fn writeCaretIndent(dmut stream: &Formatter, indent: [c8]) {
  *     ┃                 ┗━ note: candidate test8::inner::foo(x: bool)-> i32
  * ```
  *
- * @params:
- *   - stream:   output formatter,
- *   - messages: the diagnostics to write, possibly none, each being its
- *               already colored label(note, error, warning) and its text,
- *   - padd:     the padding standing for the line number gutter,
- *   - indent:   the source text preceding the caret, only its width is used.
+ * Where the block hangs is `SourceLine::anchor`, decided when the line was
+ * laid out.
  */
-fn formatCaretMessages(dmut stream: &Formatter, messages: [([c8], [c8])], padd: [c8], indent: [c8], caretSize: usize) {
-    if (messages.len != 0us) {
-        stream:.write(' ');
-        stream:.writef(" %: %%%%", messages[0].0, Colors::RESET, Colors::BOLD, messages[0].1, Colors::RESET);
+fn formatLabelMessages(dmut stream: &Formatter, line: SourceLine) {
+    let mut msgs: [LabelMsg] = [];
+    for l in line.labels {
+        msgs ~= l.msgs;
+    }
 
-        for i in 1us .. messages.len {
-            stream:.write('\n');
-            stream:.writef("%% ┃ %", Colors::BOLD, padd, Colors::RESET);
-            writeCaretIndent(alias stream, indent);
+    if (msgs.len == 0us) return;
 
-            for _ in 1 .. caretSize {
-                stream:.write(' ');
-            }
+    stream:.write(' ');
+    formatOneMessage(alias stream, msgs[0]);
 
-            let connector = if (i == messages.len - 1us) { "┗━" } else { "┣━" };
-            stream:.writef("%%%", Colors::BOLD, connector, Colors::RESET);
-            stream:.writef(" %: %%%%", messages[i].0, Colors::RESET, Colors::BOLD, messages[i].1, Colors::RESET);
+    for i in 1us .. msgs.len {
+        stream:.write('\n');
+        stream:.writef("%% ┃ %", Colors::BOLD, line.padd, Colors::RESET);
+        formatIndent(alias stream, line.anchor);
+
+        for _ in 1us .. line.anchorWidth {
+            stream:.write(' ');
         }
+
+        let connector = if (i == msgs.len - 1us) { "┗━" } else { "┣━" };
+        stream:.writef("%%%", Colors::BOLD, connector, Colors::RESET);
+        formatOneMessage(alias stream, msgs[i]);
     }
 }
 
 /**
- * Format a single-location error.
+ * Write one message of a caret block: its severity, and what it says.
  *
- * Behavior:
- *   - prints:
- *       "<file>:<line>,<col>"
- *   - prints the source line with the error span underlined,
- *   - prints a caret line aligned with the error column,
- *   - writes the caret notes, cf. formatCaretMessages,
- *   - handles tabs correctly,
- *   - gracefully handles out-of-range spans,
- *   - ignores EOF locations.
- *
- * @params:
- *   - stream:   output formatter,
- *   - loc:      location to highlight,
- *   - messages: the notes to hang under the caret.
- *
- * @returns:
- *   - &Formatter
+ * It keeps its own severity there - "note", "error" or "warning" - a nested
+ * error written as "note" would silently be demoted to one.
  */
-pub fn formatLocation(dmut stream: &Formatter, loc: &Word, messages: [([c8], [c8])] = [])-> dmut &Formatter {
-    if (loc.isEof) {
-        return alias stream;
-    }
-
-    let line = getLineAtLoc(loc);
-    if (line.len == 0) return alias stream;
-
-    let leftLine = center(format("%", loc.line), 3u64);
-    let padd = center("", leftLine.len);
-    stream:.writef("\n% --> %:(%,%)%\n",
-                   Colors::BOLD,
-                   state::relativePath(loc.filename),
-                   loc.line,
-                   loc.col,
-                   Colors::RESET);
-
-    let col = cast!usize(loc.col);
-    let mut len = loc.len;
-    if (col > line.len || col + loc.len > line.len || loc.len == 0 || line[col - 1] != loc.str[0]) {
-        len = 1;
-    }
-
-    let (begin, wstr, between) = if (col <= line.len && col + len <= line.len) {
-        let begin = shorten(line[0 .. col - 1]);
-        let wstr = shorten(line[col - 1 .. col + len - 1]);
-        let between = shorten(line[col + len - 1 .. $]);
-        (begin, wstr, between)
-    } else {
-        (line, [], [])
+fn formatOneMessage(dmut stream: &Formatter, msg: LabelMsg) {
+    let label = match msg.severity {
+        Severity::WARNING => { Colors::YELLOW ~ "warning" }
+        Severity::ERROR => { Colors::RED ~ "error" }
+        _ => { Colors::BLUE ~ "note" }
     };
 
-    let wWidth = visibleWidth(wstr);
-    stream:.writef("%% ┃ %%%%(y)%%",
-                   Colors::BOLD, leftLine, Colors::RESET,
-                   begin,
-                   Colors::UNDERLINE,
-                   wstr,
-                   Colors::RESET,
-                   between);
-
-    if (line[$ - 1] != '\n') stream:.write('\n');
-    stream:.writef("%% ╋ %", Colors::BOLD, padd, Colors::RESET);
-
-    if (wWidth != 0) {
-        writeCaretIndent(alias stream, begin);
-        stream:.write(center("", wWidth, concat-> '^'));
+    let dmut text = copy Formatter();
+    text:.write(msg.text);
+    match msg.loc {
+        Ok(l: InlineLoc) => { formatInlineLoc(alias text, l); }
     }
 
-    formatCaretMessages(alias stream, messages, padd, if (wWidth != 0) { begin } else { "" }, wWidth);
-
-    return alias stream;
+    stream:.writef(" %: %%%%", label, Colors::RESET, Colors::BOLD, text[], Colors::RESET);
 }
 
 /**
- * Format an error spanning two different lines or files.
- *
- * Behavior:
- *   - prints the first location via formatLocation(),
- *   - prints an ellipsis line,
- *   - prints the second location via formatLocation().
- *
- * Each excerpt gets its own caret notes, a note hangs under the location it
- * points at, not systematically under the first one.
- *
- * Used for errors like:
- *   - mismatched parentheses across lines,
- *   - multi-line constructs with separate begin/end markers.
- */
-pub fn formatLocationTwoLines(dmut stream: &Formatter, begin: &Word, end: &Word, messages: [([c8], [c8])] = [], endMessages: [([c8], [c8])] = [])-> dmut &Formatter {
-    let leftLine = center(format("%", begin.line), 3);
-    let padd = center("", leftLine.len);
-
-    formatLocation(alias stream, begin, messages-> messages);
-    stream:.writef("\n%%...%", Colors::BOLD, padd, Colors::RESET);
-    formatLocation(alias stream, end, messages-> endMessages);
-
-    return alias stream;
-}
-
-/**
- * Format a compact location annotation without printing the source line.
+ * Write a compact location annotation, without the source line.
  *
  * Output example:
  *     " -- (<file>:<line>,<col>)"
  *
- * Used for inline error messages where the full excerpt is not required.
+ * Used for inline messages where the full excerpt is not required.
  */
-pub fn formatLocationNoLineReturn(dmut stream: &Formatter, begin: &Word)-> dmut &Formatter {
-    if (!begin.isEof) {
-        stream:.writef(" -- (%%:(%,%)%)",
-                       Colors::BOLD,
-                       state::relativePath(begin.filename),
-                       begin.line,
-                       begin.col,
-                       Colors::RESET);
-    }
-
-    return alias stream;
-}
-
-/**
- * Format an error spanning two locations on the same line.
- *
- * Behavior:
- *   - prints the file/line header,
- *   - prints the full line with two underlined spans,
- *   - prints a caret line with two caret groups,
- *   - handles tabs and multi-byte spans.
- *
- * Used for errors like:
- *   - mismatched delimiters on the same line,
- *   - invalid ranges,
- *   - incorrect slice boundaries.
- */
-pub fn formatLocationOneLine(dmut stream: &Formatter, begin: &Word, end: &Word, messages: [([c8], [c8])] = [])-> dmut &Formatter {
-    let line = getLineAtLoc(begin);
-    if (line.len == 0) return alias stream;
-
-    let leftLine = center(format("%", begin.line), 3);
-    let padd = center("", leftLine.len);
-    stream:.writef("\n% --> %:(%,%)%\n",
+fn formatInlineLoc(dmut stream: &Formatter, loc: InlineLoc) {
+    stream:.writef(" -- (%%:(%,%)%)",
                    Colors::BOLD,
-                   state::relativePath(begin.filename),
-                   begin.line,
-                   begin.col,
+                   loc.file,
+                   loc.line,
+                   loc.col,
                    Colors::RESET);
-
-    let col = cast!usize(begin.col);
-    let col2 = cast!usize(end.col);
-
-    let mut len = begin.len;
-    if (col > line.len || col + begin.len > line.len || begin.len == 0 || line[col - 1] != begin.str[0]) {
-        len = 1;
-    }
-
-    let mut len2 = end.len;
-    if (col2 > line.len || col2 + end.len > line.len || end.len == 0 || line[col2 - 1] != end.str[0]) {
-        len2 = 1;
-    }
-
-    let bstr = shorten(line[0 .. col - 1]);
-    let wstr = shorten(line[col - 1 .. col + len - 1]);
-    let between = shorten(line[col + len - 1 .. col2 - 1]);
-
-    let wstr2 = shorten(line[col2 - 1 .. col2 + len2 - 1]);
-    let estr = shorten(line[col2 + len2 - 1 .. $]);
-
-    let wWidth = visibleWidth(wstr);
-    let wWidth2 = visibleWidth(wstr2);
-    stream:.writef("%% ┃ %%%%(y)%%%%(y)%%",
-                   Colors::BOLD, leftLine, Colors::RESET,
-                   bstr,
-                   Colors::UNDERLINE,
-                   wstr,
-                   Colors::RESET,
-                   between,
-                   Colors::UNDERLINE,
-                   wstr2,
-                   Colors::RESET,
-                   estr);
-
-    if (estr.len == 0 || estr[$ - 1] != '\n') stream:.write('\n');
-
-    stream:.writef("%% ╋ %", Colors::BOLD, padd, Colors::RESET);
-    if wWidth != 0 {
-        writeCaretIndent(alias stream, bstr);
-        stream:.write(center("", wWidth, concat-> '^'));
-    }
-
-    if wWidth2 != 0 {
-        writeCaretIndent(alias stream, between);
-        stream:.write(center("", wWidth2, concat-> '^'));
-    }
-
-    formatCaretMessages(alias stream, messages, padd, if (wWidth != 0) { bstr } else { "" }, wWidth2);
-
-    return alias stream;
 }
 
 /**
- * Format a multi-location error.
- *
- * Dispatches to:
- *   - formatLocationTwoLines() if begin/end are on different lines/files,
- *   - formatLocation()         if end is before begin,
- *   - formatLocationOneLine()  otherwise.
- *
- * @params:
- *   - messages:    the notes hanging under the begin caret,
- *   - endMessages: the notes hanging under the end caret. Only the two lines
- *                  form draws two caret lines, the other ones write a single
- *                  one and both lists are hung under it.
+ * Write a run of the excerpt, the elision marker styled.
  */
-pub fn formatLocation(dmut stream: &Formatter, begin: &Word, end: &Word, messages: [([c8], [c8])] = [], endMessages: [([c8], [c8])] = [])-> dmut &Formatter {
-    if (begin.line != end.line || begin.filename != end.filename) {
-        formatLocationTwoLines(alias stream, begin, end, messages-> messages, endMessages-> endMessages);
-    } else if (end.col <= begin.col) {
-        formatLocation(alias stream, begin, messages-> messages ~ endMessages);
-    } else {
-        formatLocationOneLine(alias stream, begin, end, messages-> messages ~ endMessages);
-    }
-
-    alias stream
+fn formatPiece(dmut stream: &Formatter, piece: Piece) {
+    stream:.write(styledPiece(piece));
 }
 
 /**
- * Format an EOF location.
- *
- * Behavior:
- *   - prints:
- *       "<file>: EOF"
- *   - prints a placeholder line with "EOF" marker.
- *
- * Used when the parser reaches the end of file unexpectedly.
+ * @returns: a run of the excerpt as it is printed, elision marker included.
  */
-pub fn formatEof(dmut stream: &Formatter, loc: &Word)-> dmut &Formatter {
-    let leftLine = center(format("%", 0), 3);
-    let padd = center("", leftLine.len);
-    stream:.writef("\n% --> %%\n%% ┃ %\tEOF",
-                   Colors::BOLD,
-                   state::relativePath(loc.filename),
-                   Colors::RESET,
-                   Colors::BOLD,
-                   padd,
-                   Colors::RESET);
+fn styledPiece(piece: Piece)-> [c8] {
+    if (!piece.elided) return piece.head;
 
-    return alias stream;
+    piece.head ~ Colors::BOLD ~ ELISION ~ Colors::RESET ~ piece.tail
 }
 
 /**
- * Extract the full line of source text containing the given Word.
+ * Write the blank standing for a run of the excerpt, so that whatever is
+ * written next lands under the column that run ends at.
  *
- * Behavior:
- *   - returns the slice starting at loc.lineSeek up to the next '\n',
- *   - includes the trailing '\n' if present,
- *   - returns an empty string if fileContent is empty or lineSeek is out of range.
- *
- * No file I/O is performed; the Word must contain fileContent.
- *
- * @returns:
- *   - [c8]: the line slice.
+ * One space is written per *column*, not per byte: a multi byte character is
+ * one column, and the elision marker is five whatever the styling wraps it in.
+ * Tabs are written back as tabs, the terminal is the one deciding how wide
+ * they are.
  */
-pub fn getLineAtLoc(loc: &Word)-> [c8] {
-    if (loc.lineSeek >= loc.fileContent.len) return "";
+fn formatIndent(dmut stream: &Formatter, piece: Piece) {
+    formatBlank(alias stream, piece.head);
 
-    let res = loc.fileContent[loc.lineSeek .. $];
-    let mut max = 0;
-    for i in res {
-        if (i == '\n') return res[0 .. max + 1];
-        else
-            max += 1;
+    if (piece.elided) {
+        for _ in 0us .. ELISION.len {
+            stream:.write(' ');
+        }
     }
 
-    return res;
+    formatBlank(alias stream, piece.tail);
+}
+
+/**
+ * Write one blank per column of `txt`, tabs excepted.
+ */
+fn formatBlank(dmut stream: &Formatter, txt: [c8]) {
+    for i in 0us .. txt.len {
+        if (txt[i] == '\t') {
+            stream:.write('\t');
+        } else if ((cast!u8(txt[i]) & 0xC0u8) != 0x80u8) {
+            stream:.write(' ');
+        }
+    }
 }

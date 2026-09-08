@@ -1,0 +1,578 @@
+/*
+ * snippet — the shape of a diagnostic, between ErrorMsg and the terminal.
+ *
+ * A diagnostic is rendered in two steps: this module says *what* is printed,
+ * `ymirc::errors::format` says what it looks like. Nothing here writes a color
+ * escape, and nothing there decides a width:
+ *
+ *   - `Diagnostic` is one node of the report — its header, the source snippets
+ *     it points at, and the location a one-line node cites inline,
+ *   - `Snippet` is one excerpt: a file, the coordinates of its header, and the
+ *     source lines to show,
+ *   - `SourceLine` is one line already cut at its labelled spans, each run
+ *     shortened if it is too long, the elision *marked* rather than written,
+ *   - `Label` is one such span: what it covers, what it is, and the messages
+ *     hanging under its caret.
+ *
+ * The point of the split is that a column is a column here: a run carries no
+ * escape sequence, so `Piece::width` counts what a terminal shows without
+ * having to step over anything, and the caret alignment follows from it. The
+ * styling is applied when the runs are written, cf. `format::writePiece`.
+ *
+ * <hr>
+ *
+ * @Package: ymirc
+ * @Module: ymirc::errors::snippet
+ * @File: ymirc/errors/snippet.yr
+ * @Author(s):
+ *   - Emile Cadorel <ecadorel@gmail.com>
+ *
+ * @Created(YYYY-MM-DD): 2026-09-08
+ * @Copyright(C) 2021–2026 GNU-Ymir
+ * @License
+ *   ```text
+ *   This file is part of the Ymir language project.
+ *
+ *   Ymir is free software: you can redistribute it and/or modify it
+ *   under the terms of the GNU General Public License as published by
+ *   the Free Software Foundation, either version 3 of the License, or
+ *   (at your option) any later version.
+ *
+ *   Ymir is distributed in the hope that it will be useful,
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *   GNU General Public License for more details.
+ *
+ *   You should have received a copy of the GNU General Public License
+ *   along with Ymir.  If not, see <https://www.gnu.org/licenses/>.
+ *   ```
+ */
+
+in snippet;
+
+use ymirc::utils::_;
+use ymirc::global::state;
+use ymirc::lexing::word;
+
+/**
+ * The marker standing for the middle of a run that was too long to print.
+ *
+ * It is plain text, so it is five columns wide wherever it appears; the
+ * renderer is the one deciding it is written in bold.
+ */
+pub def ELISION = "[...]";
+
+/**
+ * The number of bytes past which a run of a source line is elided.
+ */
+pub def MAX_RUN = 100us;
+
+/**
+ * The minimum width of the line number cell.
+ */
+pub def GUTTER = 3us;
+
+/**
+ * The severity of a diagnostic, independent of the color it is written in.
+ */
+pub enum Severity
+| ERROR   = 0
+| WARNING = 1
+| NOTE    = 2;
+
+/**
+ * What a labelled span is to the diagnostic it belongs to.
+ *
+ * PRIMARY is the span the diagnostic is reported at, SECONDARY a span that
+ * explains it — the closing delimiter of an unbalanced pair, for instance.
+ *
+ * @warning
+ *   The renderer draws both of them the same way today, a run of `^` under the
+ *   span. Giving the secondary one a marker of its own is YMI-68's P2, and
+ *   what it needs is this distinction to have been recorded here rather than
+ *   lost on the way to the terminal.
+ */
+pub enum LabelKind
+| PRIMARY   = 0
+| SECONDARY = 1;
+
+/**
+ * A location cited inline, without an excerpt.
+ *
+ * The path is the one that is printed, already made relative to the package,
+ * so the renderer has no file system question left to ask.
+ */
+pub record InlineLoc {
+    pub let file: [c8];
+    pub let line: u64;
+    pub let col: u64;
+
+    pub self (file: [c8], line: u64, col: u64)
+        with file = file
+        , line = line
+        , col = col
+    {}
+}
+
+/**
+ * @returns: the location of `loc` as it is cited, none when it is EOF.
+ */
+pub fn inlineLocOf(loc: &Word)-> (InlineLoc)? {
+    if (loc.isEof) return none;
+
+    (InlineLoc(state::relativePath(loc.filename), loc.line, loc.col))?
+}
+
+/**
+ * A message hanging under the caret of a label.
+ *
+ * The severity is kept as such rather than as the word that stands for it: a
+ * nested error inlined under a caret keeps being an error, and the renderer is
+ * the one turning that into "error" and into the color it is written in.
+ */
+pub record LabelMsg {
+    pub let severity: Severity;
+    pub let text: [c8];
+    pub let loc: (InlineLoc)?;
+
+    pub self (severity: Severity, text: [c8], loc: (InlineLoc)? = none)
+        with severity = severity
+        , text = text
+        , loc = loc
+    {}
+}
+
+/**
+ * A run of source text as it is laid out.
+ *
+ * A run too long to print keeps its two ends and drops the middle. What is
+ * dropped is recorded, not replaced: `head` and `tail` are source, and the
+ * marker between them is written by the renderer. That is what makes `width`
+ * answerable without walking escape sequences.
+ */
+pub record Piece {
+    pub let head: [c8];
+    pub let tail: [c8];
+    pub let elided: bool;
+
+    pub self (head: [c8], tail: [c8] = "", elided: bool = false)
+        with head = head
+        , tail = tail
+        , elided = elided
+    {}
+
+    /**
+     * @returns: the number of columns the run takes once printed.
+     */
+    pub fn width(self)-> usize {
+        let mark = if (self.elided) { ELISION.len } else { 0us };
+
+        visibleWidth(self.head) + mark + visibleWidth(self.tail)
+    }
+}
+
+/**
+ * Cut a run of source text down to `max` bytes, marking the elision.
+ *
+ * @params:
+ *   - str: the run,
+ *   - max: the number of bytes past which it is cut.
+ *
+ * @returns:
+ *   - the run itself when it is short enough, its two ends otherwise.
+ */
+pub fn elide(str: [c8], max: usize = MAX_RUN)-> Piece {
+    if (str.len < max) return Piece(str);
+
+    let xIndex = max / 2us - (ELISION.len / 2us);
+    let yIndex = str.len - (max / 2us) + (ELISION.len - (ELISION.len / 2us));
+
+    Piece(str[0us .. xIndex], tail-> str[yIndex .. $], elided-> true)
+}
+
+/**
+ * A span of a source line to label, before the line is cut at it.
+ *
+ * The bounds are byte offsets in the line, `begin` included and `end`
+ * excluded.
+ */
+pub record Span {
+    pub let begin: usize;
+    pub let end: usize;
+    pub let kind: LabelKind;
+    pub let msgs: [LabelMsg];
+
+    pub self (begin: usize, end: usize, kind: LabelKind = LabelKind::PRIMARY, msgs: [LabelMsg] = [])
+        with begin = begin
+        , end = end
+        , kind = kind
+        , msgs = msgs
+    {}
+}
+
+/**
+ * A labelled span of a source line, once the line was cut at it.
+ */
+pub record Label {
+    pub let text: Piece;
+    pub let kind: LabelKind;
+    pub let msgs: [LabelMsg];
+
+    pub self (text: Piece, kind: LabelKind = LabelKind::PRIMARY, msgs: [LabelMsg] = [])
+        with text = text
+        , kind = kind
+        , msgs = msgs
+    {}
+}
+
+/**
+ * One line of an excerpt, cut into the runs its labels split it into.
+ *
+ * `gaps` holds one entry more than `labels`: `gaps[i]` is what is printed
+ * before `labels[i]`, and the last one what follows the last label. Reading
+ * them alternately gives the line back.
+ *
+ * `gutter` is the line number cell and `padd` a blank of the same width, the
+ * two cells every row of the excerpt starts with.
+ */
+pub record SourceLine {
+    pub let gaps: [Piece];
+    pub let labels: [Label];
+    pub let gutter: [c8];
+    pub let padd: [c8];
+
+    // True iif the source line carries its own line return
+    pub let trailingNewline: bool;
+
+    // The run the message block of the line is indented by, and the width of
+    // the caret it hangs under, cf. anchorOf
+    pub let anchor: Piece;
+    pub let anchorWidth: usize;
+
+    pub self (num: u64, gaps: [Piece], labels: [Label], trailingNewline: bool)
+        with gaps = gaps
+        , labels = labels
+        , gutter = center(format("%", num), GUTTER)
+        , padd = center("", center(format("%", num), GUTTER).len)
+        , trailingNewline = trailingNewline
+        , anchor = anchorOf(gaps, labels)
+        , anchorWidth = anchorWidthOf(labels)
+    {}
+}
+
+/**
+ * The run the message block of a line is indented by.
+ *
+ * The block hangs under the *last* caret of the line, but is indented by what
+ * precedes the *first* one - a line carrying two labels therefore gathers
+ * everything that was said about either of them under a single connector,
+ * placed under neither. Hanging each list under the label it belongs to is
+ * YMI-68's P2.
+ *
+ * A first span with no width to point at carries no caret either, so there is
+ * nothing to indent the block to and it starts at the gutter.
+ */
+fn anchorOf(gaps: [Piece], labels: [Label])-> Piece {
+    if (labels.len == 0us || labels[0].text.width() == 0us) return Piece("");
+
+    gaps[0]
+}
+
+/**
+ * The width of the caret the message block of a line hangs under, cf.
+ * anchorOf.
+ */
+fn anchorWidthOf(labels: [Label])-> usize {
+    if (labels.len == 0us) return 0us;
+
+    labels[$ - 1us].text.width()
+}
+
+/**
+ * One source excerpt: the file it comes from, the coordinates its header
+ * cites, and the lines to show.
+ *
+ * A snippet with no line renders nothing — the location was EOF, or the file
+ * content it points at is not there any more. It is kept in the list rather
+ * than dropped, because the separator that precedes it is written all the
+ * same.
+ */
+pub record Snippet {
+    pub let file: [c8];
+    pub let line: u64;
+    pub let col: u64;
+    pub let lines: [SourceLine];
+
+    // The blank of an "..." separator standing before this excerpt, none when
+    // it directly follows what precedes it
+    pub let gap: ([c8])?;
+
+    pub self (file: [c8], line: u64, col: u64, lines: [SourceLine], gap: ([c8])? = none)
+        with file = file
+        , line = line
+        , col = col
+        , lines = lines
+        , gap = gap
+    {}
+}
+
+/**
+ * The header of a diagnostic: what it is, and what it says.
+ */
+pub record Header {
+    pub let severity: Severity;
+
+    // The stable code of the diagnostic, NO_CODE when it carries none
+    pub let code: i32;
+
+    pub let msg: [c8];
+
+    // The per run deduplication key, printed under --with-error-ids
+    pub let id: usize;
+
+    // True iif the severity is written before the message
+    pub let withSeverity: bool;
+
+    pub self (severity: Severity, code: i32, msg: [c8], id: usize, withSeverity: bool)
+        with severity = severity
+        , code = code
+        , msg = msg
+        , id = id
+        , withSeverity = withSeverity
+    {}
+}
+
+/**
+ * One node of a diagnostic report, as it is going to be printed.
+ *
+ * Either it shows its source excerpts, or it is a one-line node citing its
+ * location inline — never both, so at most one of `snippets` and `inlineLoc`
+ * is filled.
+ *
+ * @info
+ *   The sub notes of the node are not in here: they are printed by recursing
+ *   into them, one `Diagnostic` per node. Flattening that recursion into
+ *   trailing notes hanging off a single report is YMI-68's P3.
+ */
+pub record Diagnostic {
+    pub let header: Header;
+    pub let snippets: [Snippet];
+    pub let inlineLoc: (InlineLoc)?;
+
+    pub self (header: Header, snippets: [Snippet] = [], inlineLoc: (InlineLoc)? = none)
+        with header = header
+        , snippets = snippets
+        , inlineLoc = inlineLoc
+    {}
+}
+
+/**
+ * A place in the source a diagnostic points at, before it is laid out.
+ *
+ * This is what the collect step produces, one per location the node carries.
+ * Whether two of them share an excerpt is decided by `layout`.
+ */
+pub record Mark {
+    pub let loc: &Word;
+    pub let kind: LabelKind;
+    pub let msgs: [LabelMsg];
+
+    pub self (loc: &Word, kind: LabelKind = LabelKind::PRIMARY, msgs: [LabelMsg] = [])
+        with loc = loc
+        , kind = kind
+        , msgs = msgs
+    {}
+}
+
+/*!
+ * ====================================================================================================
+ * ====================================================================================================
+ * =====================================         LAYOUT          ======================================
+ * ====================================================================================================
+ * ====================================================================================================
+ */
+
+/**
+ * Lay the places a diagnostic points at out into the excerpts to print.
+ *
+ * Two marks share an excerpt when they name the same line of the same file and
+ * the second one starts after the first, and get one each otherwise — the
+ * second then following an "..." separator, since nothing says the two lines
+ * are anywhere near each other.
+ *
+ * Two marks on one line that do *not* run left to right are laid out as the
+ * first one alone, carrying both message lists: there is no span between them
+ * to underline.
+ *
+ * @params:
+ *   - marks: the places the diagnostic points at, at most two of them today.
+ *
+ * @returns:
+ *   - the excerpts, in the order they are printed.
+ */
+pub fn layout(marks: [Mark])-> [Snippet] {
+    if (marks.len == 0us) return [];
+    if (marks.len == 1us) return copy [snippetOf(marks[0])];
+
+    let (b, e) = (marks[0], marks[1]);
+    if (b.loc.line != e.loc.line || b.loc.filename != e.loc.filename) {
+        let fst = snippetOf(b);
+        let separator = center("", center(format("%", b.loc.line), GUTTER).len);
+
+        return copy [fst, snippetOf(e, gap-> (separator)?)];
+    }
+
+    if (e.loc.col <= b.loc.col) {
+        return copy [snippetOf(Mark(b.loc, kind-> b.kind, msgs-> b.msgs ~ e.msgs))];
+    }
+
+    copy [pairSnippetOf(b, e)]
+}
+
+/**
+ * Lay a single place out into its excerpt.
+ *
+ * @params:
+ *   - m:   the place to show,
+ *   - gap: the separator standing before the excerpt, if any.
+ *
+ * @returns:
+ *   - the excerpt, holding no line when there is nothing to show of it.
+ */
+fn snippetOf(m: Mark, gap: ([c8])? = none)-> Snippet {
+    let loc = m.loc;
+    if (loc.isEof) return Snippet("", 0u64, 0u64, [], gap-> gap);
+
+    let line = getLineAtLoc(loc);
+    if (line.len == 0us) return Snippet("", 0u64, 0u64, [], gap-> gap);
+
+    let col = cast!usize(loc.col);
+    let len = spanLen(line, col, loc);
+
+    let lines = if (col <= line.len && col + len <= line.len) {
+        copy [cut(loc.line, line, copy [Span(col - 1us, col + len - 1us, kind-> m.kind, msgs-> m.msgs)],
+                  trailingNewline-> line[$ - 1us] == '\n')]
+    } else {
+        copy [outOfRange(loc.line, line, m)]
+    };
+
+    Snippet(state::relativePath(loc.filename), loc.line, loc.col, lines, gap-> gap)
+}
+
+/**
+ * Lay two places of the same line out into one excerpt carrying two labels.
+ *
+ * Both message lists hang under the first label, the way a single caret line
+ * carries everything that was said about it.
+ */
+fn pairSnippetOf(b: Mark, e: Mark)-> Snippet {
+    let line = getLineAtLoc(b.loc);
+    if (line.len == 0us) return Snippet("", 0u64, 0u64, []);
+
+    let col = cast!usize(b.loc.col);
+    let col2 = cast!usize(e.loc.col);
+    let len = spanLen(line, col, b.loc);
+    let len2 = spanLen(line, col2, e.loc);
+
+    let spans = copy [Span(col - 1us, col + len - 1us, kind-> b.kind, msgs-> b.msgs ~ e.msgs),
+                      Span(col2 - 1us, col2 + len2 - 1us, kind-> e.kind)];
+
+    // A second span reaching the end of the line covers the line return
+    // itself, so the excerpt already ends with one. This form has always asked
+    // the run that follows the span rather than the line, and answers that an
+    // empty run ends with nothing - the excerpt then comes out followed by a
+    // blank line, cf. test_resources/lexing/test14.out. Kept as it is, the
+    // point of this pass being that nothing moves; it goes with YMI-68's P2,
+    // which rewrites the excerpt anyway
+    let trailing = line[col2 + len2 - 1us .. $];
+
+    Snippet(state::relativePath(b.loc.filename), b.loc.line, b.loc.col,
+            copy [cut(b.loc.line, line, spans,
+                      trailingNewline-> (trailing.len != 0us && trailing[$ - 1us] == '\n'))])
+}
+
+/**
+ * The number of bytes of `line` a location covers.
+ *
+ * A location whose span does not fit the line it names, or does not start on
+ * the byte it says it does, is narrowed to a single byte: the excerpt is what
+ * the file holds, and a span disagreeing with it would be underlining
+ * something else.
+ */
+fn spanLen(line: [c8], col: usize, loc: &Word)-> usize {
+    if (col > line.len || col + loc.len > line.len || loc.len == 0us || line[col - 1us] != loc.str[0]) {
+        return 1us;
+    }
+
+    loc.len
+}
+
+/**
+ * The line of an excerpt whose span falls outside of it.
+ *
+ * The whole line is shown, unshortened, and the label covers nothing: there is
+ * no column to point at, so the caret line stays empty.
+ */
+fn outOfRange(num: u64, line: [c8], m: Mark)-> SourceLine {
+    SourceLine(num,
+               copy [Piece(line), Piece("")],
+               copy [Label(Piece(""), kind-> m.kind, msgs-> m.msgs)],
+               trailingNewline-> line[$ - 1us] == '\n')
+}
+
+/**
+ * Cut a source line at the given spans.
+ *
+ * @params:
+ *   - num:             the line number,
+ *   - line:            the line, its own line return included,
+ *   - spans:           the byte ranges to label, in order and non overlapping,
+ *   - trailingNewline: true iif the excerpt ends with a line return of its own,
+ *                      the renderer adding one when it does not.
+ *
+ * @returns:
+ *   - the line as the alternation of its unlabelled runs and its labels, each
+ *     run elided when it is too long to print.
+ */
+fn cut(num: u64, line: [c8], spans: [Span], trailingNewline: bool)-> SourceLine {
+    let mut gaps: [Piece] = [];
+    let mut labels: [Label] = [];
+    let mut at = 0us;
+
+    for s in spans {
+        gaps ~= [elide(line[at .. s.begin])];
+        labels ~= [Label(elide(line[s.begin .. s.end]), kind-> s.kind, msgs-> s.msgs)];
+        at = s.end;
+    }
+
+    gaps ~= [elide(line[at .. $])];
+
+    SourceLine(num, gaps, labels, trailingNewline-> trailingNewline)
+}
+
+/**
+ * Extract the full line of source text containing the given Word.
+ *
+ * Behavior:
+ *   - returns the slice starting at loc.lineSeek up to the next '\n',
+ *   - includes the trailing '\n' if present,
+ *   - returns an empty string if fileContent is empty or lineSeek is out of range.
+ *
+ * No file I/O is performed; the Word must contain fileContent.
+ *
+ * @returns:
+ *   - [c8]: the line slice.
+ */
+pub fn getLineAtLoc(loc: &Word)-> [c8] {
+    if (loc.lineSeek >= loc.fileContent.len) return "";
+
+    let res = loc.fileContent[loc.lineSeek .. $];
+    let mut max = 0;
+    for i in res {
+        if (i == '\n') return res[0 .. max + 1];
+        else
+            max += 1;
+    }
+
+    return res;
+}
