@@ -1,5 +1,5 @@
 /*
- * message — structured compiler diagnostics and hierarchical error reporting.
+ * message — structured compiler diagnostics, and the report they are printed as.
  *
  * This module defines the ErrorMsg class, the central diagnostic container used
  * throughout the compiler. ErrorMsg instances represent:
@@ -9,21 +9,25 @@
  *   - notes,
  *   - lists of errors,
  *   - multi-location spans,
- *   - nested diagnostic trees,
- *   - one-line and multi-line messages,
- *   - inline caret messages extracted from one-line notes.
- *
- * The formatter supports:
- *
- *   - multi-span location printing,
- *   - inline caret messages,
- *   - nested notes with depth suppression,
- *   - verbose and non-verbose modes,
- *   - stable error IDs,
- *   - stack-trace capture for debugging.
+ *   - context frames ("when validating X"),
+ *   - one-line and multi-line messages.
  *
  * ErrorMsg is the only type thrown by the compiler frontend and middle-end.
  * All diagnostics are normalized into this structure before printing.
+ *
+ * A thrown ErrorMsg is a *tree*, because a tree is what the throw sites build:
+ * a validator catches what it was told and rethrows it wrapped in what it was
+ * doing. It is not what a diagnostic *is*, and it is not printed as one. Before
+ * anything is written, `reports` flattens the tree into the failures it holds,
+ * each one carrying:
+ *
+ *   - the places it names, as labels of a shared excerpt, in source order,
+ *   - what it has to add and cannot point at, as trailing notes,
+ *   - the enclosing symbols it was reached through, as a trace at the bottom.
+ *
+ * So nothing recurses at print time and no source line is written twice.
+ * `ymirc::errors::snippet` is the shape that comes out, and
+ * `ymirc::errors::format` writes it.
  *
  * <hr>
  *
@@ -70,13 +74,25 @@ extern (C) fn _yrt_exc_resolve_stack_trace(trc: [*void])-> [c8];
 pub lazy dmut __GLOB_ERR_ID__: [usize] = copy [0us];
 pub lazy EMPTY_ERROR = copy ErrorMsg::list([]);
 
+/**
+ * The number of reports a run prints before it stops listing them.
+ *
+ * This caps the *breadth* of a diagnostic - how many independent failures are
+ * worth reading at once - which flattening does not address and does not make
+ * less useful: a compilation raising forty errors is one whose first error is
+ * what the reader has to fix. It is unrelated to the depth suppression YMI-71
+ * removed, which hid the explanation of an error the reader was already
+ * reading.
+ */
+def MAX_REPORTS = 3us;
+
 fn generateUniqErrorId()-> usize {
     __GLOB_ERR_ID__[0] += 1us;
     __GLOB_ERR_ID__[0]
 }
 
 /**
- * ErrorMsg — hierarchical diagnostic node.
+ * ErrorMsg — one node of a diagnostic, as the throw sites build it.
  *
  * Represents a compiler diagnostic with:
  *
@@ -86,12 +102,11 @@ fn generateUniqErrorId()-> usize {
  *   - severity flags(fatal, warning, note),
  *   - one-line formatting mode,
  *   - stable unique ID,
- *   - captured stack trace,
- *   - inverse depth for verbose suppression.
+ *   - captured stack trace.
  *
- * ErrorMsg instances form a tree. The root error is printed first, then its
- * notes, recursively. One-line notes may be extracted and displayed inline as
- * caret messages.
+ * ErrorMsg instances form a tree, which says how a diagnostic was built and not
+ * how it is printed: `reports` flattens it into the failures it holds before
+ * anything is written.
  *
  * ErrorMsg is the only exception type thrown by the compiler.
  */
@@ -137,8 +152,9 @@ pub class ErrorMsg over Exception {
     // True if print notes even if not verbose
     let _forceVerbose: bool = false;
 
-    // The inverse depth of the error
-    let mut _inverseDepth: u32 = 0;
+    // True iif the message says what was being validated rather than what went
+    // wrong, cf. code::Error::isContext
+    let _isContext: bool = false;
 
     /*!
      * ====================================================================================================
@@ -181,7 +197,6 @@ pub class ErrorMsg over Exception {
         , _forceVerbose = forceVerbose
     {
         self._movingTrace = self.super.trace;
-        self:.computeInverseDepth();
     }
 
     /**
@@ -213,9 +228,9 @@ pub class ErrorMsg over Exception {
         , _oneLine = oneLine
         , _id = generateUniqErrorId()
         , _forceVerbose = forceVerbose
+        , _isContext = msg.isContext
     {
         self._movingTrace = self.super.trace;
-        self:.computeInverseDepth();
     }
 
     /**
@@ -250,7 +265,6 @@ pub class ErrorMsg over Exception {
         , _id = generateUniqErrorId()
     {
         self._movingTrace = self.super.trace;
-        self:.computeInverseDepth();
     }
 
     /**
@@ -282,9 +296,9 @@ pub class ErrorMsg over Exception {
         , _oneLineWithLoc = withLoc
         , _isNote = true
         , _id = generateUniqErrorId()
+        , _isContext = msg.isContext
     {
         self._movingTrace = self.super.trace;
-        self:.computeInverseDepth();
     }
 
     /**
@@ -314,7 +328,6 @@ pub class ErrorMsg over Exception {
         , _id = generateUniqErrorId()
     {
         self._movingTrace = self.super.trace;
-        self:.computeInverseDepth();
     }
 
     /**
@@ -342,9 +355,9 @@ pub class ErrorMsg over Exception {
         , _oneLine = oneLine
         , _isWarning = true
         , _id = generateUniqErrorId()
+        , _isContext = msg.isContext
     {
         self._movingTrace = self.super.trace;
-        self:.computeInverseDepth();
     }
 
     /**
@@ -362,7 +375,6 @@ pub class ErrorMsg over Exception {
         , _id = generateUniqErrorId()
     {
         self._movingTrace = self.super.trace;
-        self:.computeInverseDepth();
     }
 
     /**
@@ -376,7 +388,8 @@ pub class ErrorMsg over Exception {
                  isNote: bool,
                  isWarning: bool,
                  isList: bool,
-                 code: i32)
+                 code: i32,
+                 isContext: bool)
 
         with _msg = msg
         , _code = code
@@ -388,9 +401,9 @@ pub class ErrorMsg over Exception {
         , _isWarning = isWarning
         , _isList = isList
         , _id = generateUniqErrorId()
+        , _isContext = isContext
     {
         self._movingTrace = self.super.trace;
-        self:.computeInverseDepth();
     }
 
     /*!
@@ -534,7 +547,7 @@ pub class ErrorMsg over Exception {
                              end-> self._end,
                              notes-> self._notes,
                              oneLine-> self._oneLine,
-                             msg-> code::Error(self._code, self._msg),
+                             msg-> code::Error(self._code, self._msg, isContext-> self._isContext),
                              forceVerbose-> self._forceVerbose)
     }
 
@@ -553,12 +566,12 @@ pub class ErrorMsg over Exception {
      */
     pub fn withNote(self, notes: [&ErrorMsg], alone: bool = false)-> &ErrorMsg {
         if !alone {
-            let dmut ret = copy ErrorMsg::all(self._begin, self._end, self._notes ~ notes, self._oneLine, self._msg, self._isNote, self._isWarning, self._isList, self._code);
+            let dmut ret = copy ErrorMsg::all(self._begin, self._end, self._notes ~ notes, self._oneLine, self._msg, self._isNote, self._isWarning, self._isList, self._code, self._isContext);
             ret._movingTrace = self._movingTrace;
             return ret;
         }
 
-        let dmut ret = copy ErrorMsg::all(self._begin, self._end, notes, self._oneLine, self._msg, self._isNote, self._isWarning, self._isList, self._code);
+        let dmut ret = copy ErrorMsg::all(self._begin, self._end, notes, self._oneLine, self._msg, self._isNote, self._isWarning, self._isList, self._code, self._isContext);
         ret._movingTrace = self._movingTrace;
         return ret;
     }
@@ -571,7 +584,7 @@ pub class ErrorMsg over Exception {
      *   A.subbingNote(D) => A-> [D-> [B, C]]
      */
     pub fn subbingNote(self, note: &ErrorMsg)-> &ErrorMsg {
-        let dmut ret = copy ErrorMsg::all(self._begin, self._end, copy [note.withNote(self._notes, alone-> true)], self._oneLine, self._msg, self._isNote, self._isWarning, self._isList, self._code);
+        let dmut ret = copy ErrorMsg::all(self._begin, self._end, copy [note.withNote(self._notes, alone-> true)], self._oneLine, self._msg, self._isNote, self._isWarning, self._isList, self._code, self._isContext);
         ret._movingTrace = self._movingTrace;
         return ret;
     }
@@ -583,13 +596,13 @@ pub class ErrorMsg over Exception {
      */
     pub fn appendNotes(self, notes: [&ErrorMsg])-> &ErrorMsg {
         if (self._notes.len == 0u64) {
-            let dmut ret = copy ErrorMsg::all(self._begin, self._end, notes, self._oneLine, self._msg, self._isNote, self._isWarning, self._isList, self._code);
+            let dmut ret = copy ErrorMsg::all(self._begin, self._end, notes, self._oneLine, self._msg, self._isNote, self._isWarning, self._isList, self._code, self._isContext);
             ret._movingTrace = self._movingTrace;
             return ret;
         }
 
         let aux = self._notes[0].appendNotes(notes);
-        let dmut ret =  copy ErrorMsg::all(self._begin, self._end, copy [aux] ~ self._notes[1us .. $], self._oneLine, self._msg, self._isNote, self._isWarning, self._isList, self._code);
+        let dmut ret =  copy ErrorMsg::all(self._begin, self._end, copy [aux] ~ self._notes[1us .. $], self._oneLine, self._msg, self._isNote, self._isWarning, self._isList, self._code, self._isContext);
         ret._movingTrace = self._movingTrace;
         return ret;
     }
@@ -597,102 +610,182 @@ pub class ErrorMsg over Exception {
     /*!
      * ====================================================================================================
      * ====================================================================================================
-     * =====================================          DEPTH          ======================================
+     * ====================================        FLATTENING        ======================================
      * ====================================================================================================
      * ====================================================================================================
      */
 
     /**
-     * Compute the inverse depth of the diagnostic tree.
+     * Flatten the diagnostic tree into the reports to print.     
      *
-     * Used to suppress deep notes in non-verbose mode.
+     * @params:
+     *   - trace: the frames this node was reached through, innermost first.
+     *
+     * @returns:
+     *   - the reports this node prints, in the order they are printed.
      */
-    fn computeInverseDepth(mut self) {
-        self._inverseDepth = 0;
-
-        let add = if self._isList { 0u32 } else { 1u32 };
-        for i in self._notes {
-            if i._inverseDepth + add > self._inverseDepth {
-                self._inverseDepth = i._inverseDepth + add;
+    fn reports(self, trace: [TraceFrame])-> [Diagnostic] {
+        if (self._isList) {
+            let mut res: [Diagnostic] = [];
+            for i in self._notes {
+                res ~= i.reports(trace);
             }
+
+            return res;
         }
+
+        if (self._isContext && self._notes.len != 0us) {
+            let inner = copy [TraceFrame(self._msg, loc-> inlineLocOf(self._begin))] ~ trace;
+            let mut res: [Diagnostic] = [];
+            for i in self._notes {
+                res ~= i.reports(inner);
+            }
+
+            return res;
+        }
+
+        copy [self.collect(trace)]
     }
 
     /**
-     * Extract the sub diagnostics the excerpt writes itself, rather than
-     * printing them as nodes of their own.
+     * Collect one failure and everything hanging under it into the report it
+     * prints.
      *
-     * One qualifies when it carries no sub note, and either is one-line, or
-     * points at one of the two locations the error points at. It keeps its own
-     * severity there, a nested error written as a note would silently be
-     * demoted to one.
-     *
-     * Where it lands depends on what it names. A note pointing at a location
-     * the error already shows hangs under that caret. One citing a place of
-     * its own becomes a *label* of the excerpt, at the line it names — that is
-     * YMI-70: `-- (test7.yr:(5,9))` asks the reader to go and open the file,
-     * which is the one thing the note was there to spare them. The coordinate
-     * survives only as the fallback for a place nothing can be shown of, cf.
-     * snippet::isShowable.
-     *
-     * @info
-     *   Every sub diagnostic that qualifies is taken, not only the first one.
-     *   A list of them - the candidates of an ambiguous call, for instance -
-     *   is written as a block hanging under the caret, cf.
-     *   format::formatLabelMessages. Inlining only the first would glue it to
-     *   the caret and leave its siblings below as plain notes, reading as if
-     *   it were of a different nature.
-     *
-     *   A note pointing at the end location hangs under the end excerpt, not
-     *   under the begin one. Both locations are sorted by source position at
-     *   construction, so the location an error was actually reported at ends
-     *   up being the second one about as often as the first, and hanging its
-     *   notes under the begin excerpt would point them at an unrelated line.
-     *
-     *   Nothing is inlined when the error has no excerpt to hang them under,
-     *   the caret messages would be dropped on printing.
+     * @params:
+     *   - trace: the frames this node was reached through, innermost first.
      *
      * @returns:
-     *   - .0: the diagnostics hanging under the begin caret, in the order they
-     *         were declared in,
-     *   - .1: the diagnostics hanging under the end caret, likewise,
-     *   - .2: the places the excerpt labels on their behalf, in no particular
-     *         order - snippet::layout is the one ordering them,
-     *   - .3: the notes left to print, never losing any.
+     *   - the node, and its whole subtree, as one report.
      */
-    fn getNoteListForFormat(self)-> ([LabelMsg], [LabelMsg], [Mark], [&ErrorMsg]) {
-        if (self._oneLine || self._begin.isEof || self._notes.len == 0) return ([], [], [], self._notes);
+    fn collect(self, trace: [TraceFrame])-> Diagnostic {
+        let header = Header(self.getSeverity(),
+                            if (self._isNote) { code::NO_CODE } else { self._code },
+                            self._msg,
+                            self._id,
+                            self._isNote || self._isWarning || self._msg != "");
 
         let mut caret: [LabelMsg] = [];
         let mut endCaret: [LabelMsg] = [];
         let mut marks: [Mark] = [];
-        let mut rest: [&ErrorMsg] = [];
+        let mut notes: [LabelMsg] = [];
+
+        let mut frames: [TraceFrame] = [];
         for i in self._notes {
-            let atBegin = i._begin.isSameLoc(self._begin);
-            let atEnd = !atBegin && !self._end.isEof && i._begin.isSameLoc(self._end);
-            let inlinable = i._oneLine || atBegin || atEnd;
+            let (msgs, m, n, f) = i.gather(false);
+            marks ~= m;
+            notes ~= n;
+            frames ~= f;
 
-            if (inlinable && i._notes.len == 0) {
-                let msg = LabelMsg(i.getSeverity(), i._msg);
+            let atEnd = !self._end.isEof
+                && !i._begin.isSameLoc(self._begin)
+                && i._begin.isSameLoc(self._end);
 
-                if (!atBegin && !atEnd && i._oneLineWithLoc && isShowable(i._begin)) {
-                    marks ~= [Mark(i._begin, kind-> LabelKind::SECONDARY, msgs-> copy [msg])];
-                } else if (atEnd) {
-                    endCaret ~= [msg];
-                } else {
-                    let mut loc: (InlineLoc)? = none;
-                    if (i._oneLineWithLoc) {
-                        loc = inlineLocOf(i._begin);
-                    }
-
-                    caret ~= [LabelMsg(msg.severity, msg.text, loc-> loc)];
-                }
-            } else {
-                rest ~= [i];
-            }
+            if (atEnd) { endCaret ~= msgs; } else { caret ~= msgs; }
         }
 
-        return (caret, endCaret, marks, rest);
+        if (self._oneLine) {
+            if (self._oneLineWithLoc && isShowable(self._begin)) {
+                let own = copy [Mark(self._begin, msgs-> caret ~ endCaret)];
+
+                return Diagnostic(header,
+                                  snippets-> layout(own ~ marks),
+                                  notes-> notes,
+                                  trace-> frames ~ trace);
+            }
+
+            let mut inline: (InlineLoc)? = none;
+            if (self._oneLineWithLoc) {
+                inline = inlineLocOf(self._begin);
+            }
+
+            // there is no caret to hang them under, so what was written there
+            // is written at the bottom instead rather than dropped
+            return Diagnostic(header,
+                              snippets-> layout(marks),
+                              inlineLoc-> inline,
+                              notes-> caret ~ endCaret ~ notes,
+                              trace-> frames ~ trace);
+        }
+
+        // An error running to EOF points at one place only
+        let own = if (self._end.isEof) {
+            copy [Mark(self._begin, msgs-> caret ~ endCaret)]
+        } else {
+            copy [Mark(self._begin, msgs-> caret),
+                  Mark(self._end, kind-> LabelKind::SECONDARY, msgs-> endCaret)]
+        };
+
+        Diagnostic(header, snippets-> layout(own ~ marks), notes-> notes, trace-> frames ~ trace)
+    }
+
+    /**
+     * Collect one node of a report's subtree, and its own subtree under it.
+     *     
+     * @params:
+     *   - underNote: true iif the nearest place this hangs under is a note that
+     *                became a label of the excerpt.
+     *
+     * @returns:
+     *   - .0: what it and its subtree leave for the caret of the caller,
+     *   - .1: the places it and its subtree label, in tree order - which is not
+     *         the order they are printed in, `snippet::layout` sorts them,
+     *   - .2: the notes it and its subtree leave for the bottom of the report,
+     *   - .3: the frames it and its subtree were reached through.
+     */
+    fn gather(self, underNote: bool)-> ([LabelMsg], [Mark], [LabelMsg], [TraceFrame]) {
+        let mut own: [LabelMsg] = [];
+        if (self._msg != "") {
+            own = copy [LabelMsg(self.getSeverity(), self._msg)];
+        }
+
+        // what this node is of the four, decided before its children are
+        // walked: they need to know whether they hang under a label of this
+        // node or under whatever this one hangs under
+        let folds = (self._oneLine && !self._oneLineWithLoc) || (underNote && own.len != 0us);
+        let labels = !self._isContext && !folds && isShowable(self._begin);
+
+        let childUnder = if (labels) { self._isNote } else { underNote };
+
+        let mut inline: [LabelMsg] = [];
+        let mut marks: [Mark] = [];
+        let mut notes: [LabelMsg] = [];
+        let mut frames: [TraceFrame] = [];
+
+        for i in self._notes {
+            let (ins, m, n, f) = i.gather(childUnder);
+            inline ~= ins;
+            marks ~= m;
+            notes ~= n;
+            frames ~= f;
+        }
+
+        // a context frame is a frame wherever it is found, cf. `reports`. One
+        // deeper than the failure was reached through the failure, so it is a
+        // deeper frame than the ones that led to the report itself
+        if (self._isContext) {
+            return (inline, marks, notes, frames ~ copy [TraceFrame(self._msg, loc-> inlineLocOf(self._begin))]);
+        }
+
+        if (folds) {
+            return (own ~ inline, marks, notes, frames);
+        }
+
+        if (labels) {
+            let mine = Mark(self._begin, kind-> LabelKind::SECONDARY, msgs-> own ~ inline);
+
+            return ([], copy [mine] ~ marks, notes, frames);
+        }
+
+        if (own.len != 0us) {
+            let mut loc: (InlineLoc)? = none;
+            if (self._oneLineWithLoc) {
+                loc = inlineLocOf(self._begin);
+            }
+
+            return (inline, marks, copy [LabelMsg(own[0].severity, own[0].text, loc-> loc)] ~ notes, frames);
+        }
+
+        (inline, marks, notes, frames)
     }
 
     /**
@@ -705,60 +798,6 @@ pub class ErrorMsg over Exception {
         Severity::ERROR
     }
 
-    /**
-     * Collect what this node prints: what it says, and the places it points
-     * at.
-     *
-     * Nothing is measured and nothing is styled here, the result says what the
-     * diagnostic is - a severity, a code, a message, and marks in the source.
-     * `snippet::layout` turns the marks into the excerpts to show, and
-     * `format::formatDiagnostic` writes them.
-     *
-     * @params:
-     *   - caretMessages:    the diagnostics hanging under the begin caret,
-     *   - endCaretMessages: the ones hanging under the end caret,
-     *   - extra:            the places the excerpt labels on behalf of a note.
-     *
-     * @returns:
-     *   - the node as it is going to be printed, its sub notes excepted.
-     */
-    fn collect(self, caretMessages: [LabelMsg], endCaretMessages: [LabelMsg], extra: [Mark])-> Diagnostic {
-        let header = Header(self.getSeverity(),
-                            if (self._isNote) { code::NO_CODE } else { self._code },
-                            self._msg,
-                            self._id,
-                            self._isNote || self._isWarning || self._msg != "");
-
-        if (self._oneLine) {
-            // a node worth citing a location is worth showing it, cf. YMI-70.
-            // The coordinate stays what is written when there is nothing to
-            // show of it - a synthesized location, or a file whose content was
-            // not kept
-            if (self._oneLineWithLoc && isShowable(self._begin)) {
-                return Diagnostic(header, snippets-> layout(copy [Mark(self._begin)]));
-            }
-
-            let mut inline: (InlineLoc)? = none;
-            if (self._oneLineWithLoc) {
-                inline = inlineLocOf(self._begin);
-            }
-
-            return Diagnostic(header, inlineLoc-> inline);
-        }
-
-        // An error running to EOF points at one place only, and a note of its
-        // own would have been sorted under the begin caret, cf.
-        // getNoteListForFormat
-        let marks = if (self._end.isEof) {
-            copy [Mark(self._begin, msgs-> caretMessages)]
-        } else {
-            copy [Mark(self._begin, msgs-> caretMessages),
-                  Mark(self._end, kind-> LabelKind::SECONDARY, msgs-> endCaretMessages)]
-        };
-
-        Diagnostic(header, snippets-> layout(marks ~ extra))
-    }
-
     /*!
      * ====================================================================================================
      * ====================================================================================================
@@ -767,150 +806,51 @@ pub class ErrorMsg over Exception {
      * ====================================================================================================
      */
 
-    /**
-     * Format a list of notes into the formatter.
-     *
-     * Handles:
-     *   - verbose suppression,
-     *   - multi-line vs one-line notes,
-     *   - indentation by depth,
-     *   - stable ordering,
-     *   - multi-span location printing.
-     *
-     * @returns:
-     *   - .0: true if multi-line notes were printed,
-     *   - .1: maximum line number among printed notes.
-     */
-    fn formatNotes(self, dmut stream: &Formatter, notes: [&ErrorMsg], depth: u32, root: bool = false)-> (bool, u64) {
-        let mut notOneLine = true;
-        let mut max_padd = 0u64;
-        let innerRoot = if (self._isList) { root } else { false };
-
-        let mut j = 0us;
-        let verbose = (global::state::isVerboseActive() || stream.tags.verbose || self._forceVerbose);
-        for  i in notes {
-            if (!verbose && j == 3us) {
-                stream:.write('\n'c8);
-                stream:.writef("%(b) : other errors in list, user -v or --verbose to show them", "Note");
-                stream:.write('\n'c8, ' 'c8);
-                break;
-            }
-
-            let dmut innerStream = copy Formatter::from(alias stream);
-            i.format(alias innerStream, root-> innerRoot, depth-> depth + 1);
-            notOneLine = !i._oneLine || i._notes.len != 0u64 || (i._oneLineWithLoc && isShowable(i._begin));
-
-            max_padd = i._begin.line;
-            if (i._end.line > max_padd) {
-                max_padd = i._end.line;
-            }
-
-            if (innerStream.hasWrittenSomeErrors() && innerStream[].len != 0) {
-                if (j != 0us) stream:.write('\n'c8);
-                stream:.write(innerStream[]);
-                stream:.wroteErrors(true);
-            }
-
-            if (innerStream[].len != 0us) j += 1us;
-        }
-
-        return (notOneLine, max_padd);
-    }
-
     impl Streamable;
     impl ErrorFormattable {
 
         /**
-         * Pretty-print the entire diagnostic tree.
+         * Print the whole diagnostic tree, flattened into its reports.
          *
          * Responsibilities:
-         *   - deduplicate repeated errors via ID tracking,
-         *   - handle verbose suppression,
-         *   - extract inline caret messages,
-         *   - print primary diagnostic,
-         *   - print notes recursively,
-         *   - draw closing tree connectors.
+         *   - flatten the tree into the failures it holds, cf. `reports`,
+         *   - deduplicate repeated failures via ID tracking,
+         *   - cap the number of them listed outside verbose mode,
+         *   - write each of them, cf. `format::formatDiagnostic`.
          *
          * This is the main entry point for diagnostic rendering.
          */
-        pub over format(self, dmut stream: &Formatter, root: bool, depth: u32 = 0) {
-            if (stream.hasWrittenError(self._id)) {
-                if (!root) {
+        pub over format(self, dmut stream: &Formatter, root: bool) {
+            let verbose = (global::state::isVerboseActive() || stream.tags.verbose || self._forceVerbose);
+
+            let mut written = 0us;
+            for r in self.reports([]) {
+                if (stream.hasWrittenError(r.header.id)) {
+                    if (written != 0us || !root) continue;
+
                     if (stream.tags.withErrorIds) {
-                        stream:.writef("%(b) : previous error(#%(B))", "Note", self._id.to!{[c8], 36us} ());
+                        stream:.writef("%(b) : previous error(#%(B))", "Note", r.header.id.to!{[c8], 36us} ());
                     } else {
                         stream:.writef("%(b) : previous error", "Note");
                     }
-                }
-                return;
-            }
 
-            let verbose = (global::state::isVerboseActive() || stream.tags.verbose || self._forceVerbose);
-
-            if (self._isList) {
-                self.formatNotes(alias stream, self._notes, root-> root, depth-> depth);
-                return;
-            }
-
-            else if (!verbose && (self._inverseDepth >= 4 && depth > 3) && !root) {
-                let dmut innerStream = copy Formatter::from(alias stream);
-                self.formatNotes(alias innerStream, self._notes, root-> false, depth);
-
-                if innerStream.hasWrittenSomeErrors() {
-                    if self._inverseDepth == 4 {
-                        stream:.writef("%(b) : deep errors, user -v or --verbose to show them", "Note");
-                        stream:.write('\n'c8, ' 'c8);
-                    }
-
-                    stream:.write(innerStream[]);
-                    stream:.wroteErrors(true);
+                    written += 1us;
+                    continue;
                 }
 
-                return;
-            }
-
-            stream:.registerError(self._id);
-            stream:.wroteErrors(true);
-
-
-            let (caretMessages, endCaretMessages, extraMarks, remainingNotes) = self.getNoteListForFormat();
-            let diag = self.collect(caretMessages, endCaretMessages, extraMarks);
-            formatDiagnostic(alias stream, diag);
-
-            // the sub notes are indented to the gutter of the excerpt they hang
-            // under, which is the one the widest line number of it needs
-            let padd = center("", gutterOf(diag.snippets));
-            let l = format("%% ┃ %", Colors::BOLD, padd, Colors::RESET);
-
-            stream:.entabing(txt-> l);
-            let (notOneLine, max_padd) = if (remainingNotes.len != 0us) {
-                let dmut innerStream = copy Formatter::from(alias stream);
-                let res = self.formatNotes(alias innerStream, remainingNotes, root-> false, depth);
-
-                if (root || innerStream.hasWrittenSomeErrors()) && innerStream[].len != 0 {
-                    stream:.write("\n");
-                    stream:.write(innerStream[]);
-                } else if root {
-                    stream:.writef("\n%(b) : previous errors", "Note");
+                if (!verbose && written == MAX_REPORTS) {
+                    stream:.write('\n'c8);
+                    stream:.writef("%(b) : other errors in list, user -v or --verbose to show them", "Note");
+                    break;
                 }
 
-                res
-            } else {
-                (false, 0u64)
-            };
-            stream:.detabing();
+                if (written != 0us) stream:.write('\n'c8);
 
-            if (remainingNotes.len != 0u64) {
-                let leftLine2 = center(format("%", max_padd), 3u64, concat-> '0');
-                let padd2 = center32(""s32, leftLine2.len, concat-> '━'c32);
+                stream:.registerError(r.header.id);
+                stream:.wroteErrors(true);
+                formatDiagnostic(alias stream, r);
 
-                if (notOneLine) {
-                    stream:.writef("\n%% ┗━%━┻━ %", Colors::BOLD, padd, padd2, Colors::RESET);
-                } else {
-                    stream:.writef("\n%% ┗━%━━ %", Colors::BOLD, padd, padd2, Colors::RESET);
-                }
-            } else if ((!self._oneLine || diag.snippets.len != 0us) && (!self._begin.isEof || !self._end.isEof)) {
-                stream:.writef("\n%% ┗━━━━━━━ %", Colors::BOLD, padd, padd, Colors::RESET);
+                written += 1us;
             }
         }
     }

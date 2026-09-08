@@ -142,7 +142,7 @@ pub fn inlineLocOf(loc: &Word)-> (InlineLoc)? {
  *
  * `loc` is the fallback of a message that names a place of its own and cannot
  * be shown there - the place is normally a label of the excerpt instead, cf.
- * ErrorMsg::getNoteListForFormat.
+ * ErrorMsg::gather.
  */
 pub record LabelMsg {
     pub let severity: Severity;
@@ -327,26 +327,59 @@ pub record Header {
 }
 
 /**
- * One node of a diagnostic report, as it is going to be printed.
+ * One frame of the context trace of a report.
+ *
+ * A frame says what was being validated, not what went wrong, so it carries no
+ * severity: the report it belongs to is the diagnostic, the frames are the
+ * path that reached it. It cites its location inline rather than showing it —
+ * a chain of them would otherwise drag one excerpt per enclosing symbol into a
+ * report about a single line.
+ */
+pub record TraceFrame {
+    pub let text: [c8];
+    pub let loc: (InlineLoc)?;
+
+    pub self (text: [c8], loc: (InlineLoc)? = none)
+        with text = text
+        , loc = loc
+    {}
+}
+
+/**
+ * One report, as it is going to be printed: what went wrong, where, what is
+ * worth adding, and how the compiler got there.
  *
  * Either it shows its source excerpts, or it is a one-line node citing its
  * location inline — never both, so at most one of `snippets` and `inlineLoc`
  * is filled.
  *
- * @info
- *   The sub notes of the node are not in here: they are printed by recursing
- *   into them, one `Diagnostic` per node. Flattening that recursion into
- *   trailing notes hanging off a single report is YMI-68's P3.
+ * There is no sub report: a diagnostic tree is flattened into a flat list of
+ * these before anything is written (`ErrorMsg::reports`), every place it names
+ * having become a label of an excerpt, a trailing note, or a frame of the
+ * trace. Nothing recurses at print time, so no source line is ever written
+ * twice.
  */
 pub record Diagnostic {
     pub let header: Header;
     pub let snippets: [Snippet];
     pub let inlineLoc: (InlineLoc)?;
 
-    pub self (header: Header, snippets: [Snippet] = [], inlineLoc: (InlineLoc)? = none)
+    // What the report adds and cannot point at, in the order it was declared in
+    pub let notes: [LabelMsg];
+
+    // What was being validated when it was raised, innermost frame first
+    pub let trace: [TraceFrame];
+
+    pub self (header: Header,
+              snippets: [Snippet] = [],
+              inlineLoc: (InlineLoc)? = none,
+              notes: [LabelMsg] = [],
+              trace: [TraceFrame] = [])
         with header = header
         , snippets = snippets
         , inlineLoc = inlineLoc
+        , notes = notes
+        , trace = trace
     {}
 }
 
@@ -381,10 +414,23 @@ pub record Mark {
 /**
  * Lay the places a diagnostic points at out into the excerpts to print.
  *
- * There is one excerpt per file, holding every place the diagnostic names in
- * that file, ordered by (line, col). The file of the first mark comes first —
- * the primary one, so the excerpt the reader starts on is the one the
- * diagnostic is reported in.
+ * A file yields at most two excerpts: the run of lines around the place the
+ * diagnostic is *reported* at, and everything else it names in that file. The
+ * first comes first, so the line the header cites is the line the reader lands
+ * on, and the declarations explaining it follow under a header of their own
+ * rather than above it.
+ *
+ * That split is what a single excerpt could not give. Lines are shown in source
+ * order, so a declaration written before the failing call is shown before it,
+ * and the reader met two "candidate" labels before reaching the caret that is
+ * the error - which is only marked by being a `^` rather than a `-`. Reordering
+ * the lines was not an option: an excerpt whose line numbers do not increase is
+ * not an excerpt. Splitting keeps both, at the cost of one `-->` line.
+ *
+ * Both excerpts of a file share one gutter width, so the file reads as one
+ * column across the split. The file of the first mark comes first — the primary
+ * one, so the excerpt the reader starts on is the one the diagnostic is
+ * reported in.
  *
  * A place nothing can be shown of — an EOF location, or a file whose content
  * is not loaded — is dropped rather than laid out empty: the coordinate alone
@@ -416,10 +462,65 @@ pub fn layout(marks: [Mark])-> [Snippet] {
             if (o.loc.filename == m.loc.filename) group ~= [o];
         }
 
-        res ~= [fileSnippet(group)];
+        let sorted = sortByPosition(group);
+        let width = gutterWidth(sorted[$ - 1us].loc.line);
+        let (head, rest) = splitAtPrimary(sorted);
+
+        if (head.len != 0us) res ~= [fileSnippet(head, width)];
+        if (rest.len != 0us) res ~= [fileSnippet(rest, width)];
     }
 
     res
+}
+
+/**
+ * Cut the places named in one file into the run holding the primary one and
+ * everything else.
+ *
+ * The run is the block of labelled lines around the primary that would have
+ * been printed without an "..." separator between them: a label near enough to
+ * the failure to be read with it stays with it, one far enough to need a
+ * separator is a place of its own and goes to the second excerpt.
+ *
+ * @params:
+ *   - sorted: the places named in that file, ordered by (line, col).
+ *
+ * @returns:
+ *   - .0: the run holding the primary place, empty when the file holds none,
+ *   - .1: everything else, in source order.
+ */
+fn splitAtPrimary(sorted: [Mark])-> ([Mark], [Mark]) {
+    let mut at = sorted.len;
+    for i in 0us .. sorted.len {
+        match sorted[i].kind {
+            LabelKind::PRIMARY => { at = i; break; }
+        }
+    }
+
+    if (at == sorted.len) return ([], sorted);
+
+    let mut lo = at;
+    while lo > 0us && isJoined(sorted[lo - 1us], sorted[lo]) {
+        lo -= 1us;
+    }
+
+    let mut hi = at;
+    while hi + 1us < sorted.len && isJoined(sorted[hi], sorted[hi + 1us]) {
+        hi += 1us;
+    }
+
+    (sorted[lo .. hi + 1us], sorted[0us .. lo] ~ sorted[hi + 1us .. $])
+}
+
+/**
+ * @returns:
+ *   true iif the two places are close enough to be shown in one excerpt, which
+ *   is the question `fileSnippet` asks before writing an "..." between them.
+ */
+fn isJoined(a: Mark, b: Mark)-> bool {
+    if (b.loc.line <= a.loc.line) return true;
+
+    b.loc.line - a.loc.line - 1u64 <= MAX_GAP
 }
 
 /**
@@ -454,12 +555,14 @@ fn seen(files: [[c8]], f: [c8])-> bool {
  * otherwise.
  *
  * @params:
- *   - marks: the places named in that file, at least one, all showable.
+ *   - marks: the places named in that file, at least one, all showable,
+ *   - width: the width of the line number cell, shared by every excerpt of the
+ *            file so that the two sides of a split read as one column.
  *
  * @returns:
  *   - the excerpt.
  */
-fn fileSnippet(marks: [Mark])-> Snippet {
+fn fileSnippet(marks: [Mark], width: usize)-> Snippet {
     let sorted = sortByPosition(marks);
 
     // the header cites the place the diagnostic is reported at, which is not
@@ -470,8 +573,6 @@ fn fileSnippet(marks: [Mark])-> Snippet {
             LabelKind::PRIMARY => { head = m; break; }
         }
     }
-
-    let width = gutterWidth(sorted[$ - 1us].loc.line);
 
     let mut lines: [SourceLine] = [];
     let mut prevLine = 0u64;
