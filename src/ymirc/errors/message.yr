@@ -619,12 +619,21 @@ pub class ErrorMsg over Exception {
     }
 
     /**
-     * Extract the sub diagnostics to write next to the caret.
+     * Extract the sub diagnostics the excerpt writes itself, rather than
+     * printing them as nodes of their own.
      *
-     * One goes there when it carries no sub note of its own, and either is
-     * one-line, or points at one of the two locations the error points at. It
-     * keeps its own severity there, a nested error written as a note would
-     * silently be demoted to one.
+     * One qualifies when it carries no sub note, and either is one-line, or
+     * points at one of the two locations the error points at. It keeps its own
+     * severity there, a nested error written as a note would silently be
+     * demoted to one.
+     *
+     * Where it lands depends on what it names. A note pointing at a location
+     * the error already shows hangs under that caret. One citing a place of
+     * its own becomes a *label* of the excerpt, at the line it names — that is
+     * YMI-70: `-- (test7.yr:(5,9))` asks the reader to go and open the file,
+     * which is the one thing the note was there to spare them. The coordinate
+     * survives only as the fallback for a place nothing can be shown of, cf.
+     * snippet::isShowable.
      *
      * @info
      *   Every sub diagnostic that qualifies is taken, not only the first one.
@@ -647,13 +656,16 @@ pub class ErrorMsg over Exception {
      *   - .0: the diagnostics hanging under the begin caret, in the order they
      *         were declared in,
      *   - .1: the diagnostics hanging under the end caret, likewise,
-     *   - .2: the notes left to print, never losing any.
+     *   - .2: the places the excerpt labels on their behalf, in no particular
+     *         order - snippet::layout is the one ordering them,
+     *   - .3: the notes left to print, never losing any.
      */
-    fn getNoteListForFormat(self)-> ([LabelMsg], [LabelMsg], [&ErrorMsg]) {
-        if (self._oneLine || self._begin.isEof || self._notes.len == 0) return ([], [], self._notes);
+    fn getNoteListForFormat(self)-> ([LabelMsg], [LabelMsg], [Mark], [&ErrorMsg]) {
+        if (self._oneLine || self._begin.isEof || self._notes.len == 0) return ([], [], [], self._notes);
 
         let mut caret: [LabelMsg] = [];
         let mut endCaret: [LabelMsg] = [];
+        let mut marks: [Mark] = [];
         let mut rest: [&ErrorMsg] = [];
         for i in self._notes {
             let atBegin = i._begin.isSameLoc(self._begin);
@@ -661,23 +673,26 @@ pub class ErrorMsg over Exception {
             let inlinable = i._oneLine || atBegin || atEnd;
 
             if (inlinable && i._notes.len == 0) {
-                let mut loc: (InlineLoc)? = none;
-                if (i._oneLineWithLoc) {
-                    loc = inlineLocOf(i._begin);
-                }
+                let msg = LabelMsg(i.getSeverity(), i._msg);
 
-                let msg = LabelMsg(i.getSeverity(), i._msg, loc-> loc);
-                if (atEnd) {
+                if (!atBegin && !atEnd && i._oneLineWithLoc && isShowable(i._begin)) {
+                    marks ~= [Mark(i._begin, kind-> LabelKind::SECONDARY, msgs-> copy [msg])];
+                } else if (atEnd) {
                     endCaret ~= [msg];
                 } else {
-                    caret ~= [msg];
+                    let mut loc: (InlineLoc)? = none;
+                    if (i._oneLineWithLoc) {
+                        loc = inlineLocOf(i._begin);
+                    }
+
+                    caret ~= [LabelMsg(msg.severity, msg.text, loc-> loc)];
                 }
             } else {
                 rest ~= [i];
             }
         }
 
-        return (caret, endCaret, rest);
+        return (caret, endCaret, marks, rest);
     }
 
     /**
@@ -701,12 +716,13 @@ pub class ErrorMsg over Exception {
      *
      * @params:
      *   - caretMessages:    the diagnostics hanging under the begin caret,
-     *   - endCaretMessages: the ones hanging under the end caret.
+     *   - endCaretMessages: the ones hanging under the end caret,
+     *   - extra:            the places the excerpt labels on behalf of a note.
      *
      * @returns:
      *   - the node as it is going to be printed, its sub notes excepted.
      */
-    fn collect(self, caretMessages: [LabelMsg], endCaretMessages: [LabelMsg])-> Diagnostic {
+    fn collect(self, caretMessages: [LabelMsg], endCaretMessages: [LabelMsg], extra: [Mark])-> Diagnostic {
         let header = Header(self.getSeverity(),
                             if (self._isNote) { code::NO_CODE } else { self._code },
                             self._msg,
@@ -714,6 +730,14 @@ pub class ErrorMsg over Exception {
                             self._isNote || self._isWarning || self._msg != "");
 
         if (self._oneLine) {
+            // a node worth citing a location is worth showing it, cf. YMI-70.
+            // The coordinate stays what is written when there is nothing to
+            // show of it - a synthesized location, or a file whose content was
+            // not kept
+            if (self._oneLineWithLoc && isShowable(self._begin)) {
+                return Diagnostic(header, snippets-> layout(copy [Mark(self._begin)]));
+            }
+
             let mut inline: (InlineLoc)? = none;
             if (self._oneLineWithLoc) {
                 inline = inlineLocOf(self._begin);
@@ -732,7 +756,7 @@ pub class ErrorMsg over Exception {
                   Mark(self._end, kind-> LabelKind::SECONDARY, msgs-> endCaretMessages)]
         };
 
-        Diagnostic(header, snippets-> layout(marks))
+        Diagnostic(header, snippets-> layout(marks ~ extra))
     }
 
     /*!
@@ -774,7 +798,7 @@ pub class ErrorMsg over Exception {
 
             let dmut innerStream = copy Formatter::from(alias stream);
             i.format(alias innerStream, root-> innerRoot, depth-> depth + 1);
-            notOneLine = !i._oneLine || i._notes.len != 0u64;
+            notOneLine = !i._oneLine || i._notes.len != 0u64 || (i._oneLineWithLoc && isShowable(i._begin));
 
             max_padd = i._begin.line;
             if (i._end.line > max_padd) {
@@ -849,12 +873,13 @@ pub class ErrorMsg over Exception {
             stream:.wroteErrors(true);
 
 
-            let (caretMessages, endCaretMessages, remainingNotes) = self.getNoteListForFormat();
-            formatDiagnostic(alias stream, self.collect(caretMessages, endCaretMessages));
+            let (caretMessages, endCaretMessages, extraMarks, remainingNotes) = self.getNoteListForFormat();
+            let diag = self.collect(caretMessages, endCaretMessages, extraMarks);
+            formatDiagnostic(alias stream, diag);
 
-            let max_line = if (self._end.isEof) { self._begin.line } else { self._end.line };
-            let leftLine = center(format("%", max_line), 3u64);
-            let padd = center("", leftLine.len);
+            // the sub notes are indented to the gutter of the excerpt they hang
+            // under, which is the one the widest line number of it needs
+            let padd = center("", gutterOf(diag.snippets));
             let l = format("%% ┃ %", Colors::BOLD, padd, Colors::RESET);
 
             stream:.entabing(txt-> l);
@@ -884,7 +909,7 @@ pub class ErrorMsg over Exception {
                 } else {
                     stream:.writef("\n%% ┗━%━━ %", Colors::BOLD, padd, padd2, Colors::RESET);
                 }
-            } else if (!self._oneLine && (!self._begin.isEof || !self._end.isEof)) {
+            } else if ((!self._oneLine || diag.snippets.len != 0us) && (!self._begin.isEof || !self._end.isEof)) {
                 stream:.writef("\n%% ┗━━━━━━━ %", Colors::BOLD, padd, padd, Colors::RESET);
             }
         }
