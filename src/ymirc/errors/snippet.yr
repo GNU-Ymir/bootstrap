@@ -73,6 +73,17 @@ pub def MAX_RUN = 100us;
 pub def GUTTER = 3us;
 
 /**
+ * The number of unlabelled lines an excerpt shows between two labelled ones
+ * before it elides them to an "..." separator.
+ *
+ * One. A single line of context costs exactly what the separator standing for
+ * it would, and reading it is worth more than reading "..."; two already cost
+ * more. This is the threshold rustc settles on, and the one YMI-68 sketched
+ * the target rendering with.
+ */
+pub def MAX_GAP = 1u64;
+
+/**
  * The severity of a diagnostic, independent of the color it is written in.
  */
 pub enum Severity
@@ -84,13 +95,12 @@ pub enum Severity
  * What a labelled span is to the diagnostic it belongs to.
  *
  * PRIMARY is the span the diagnostic is reported at, SECONDARY a span that
- * explains it — the closing delimiter of an unbalanced pair, for instance.
+ * explains it — the closing delimiter of an unbalanced pair, or the
+ * declaration a call does not match, for instance.
  *
- * @warning
- *   The renderer draws both of them the same way today, a run of `^` under the
- *   span. Giving the secondary one a marker of its own is YMI-68's P2, and
- *   what it needs is this distinction to have been recorded here rather than
- *   lost on the way to the terminal.
+ * The renderer underlines the first with `^` and the second with `-`, cf.
+ * format::formatSourceLine: a diagnostic points at one place and explains
+ * itself with the others, and the two read differently.
  */
 pub enum LabelKind
 | PRIMARY   = 0
@@ -129,6 +139,10 @@ pub fn inlineLocOf(loc: &Word)-> (InlineLoc)? {
  * The severity is kept as such rather than as the word that stands for it: a
  * nested error inlined under a caret keeps being an error, and the renderer is
  * the one turning that into "error" and into the color it is written in.
+ *
+ * `loc` is the fallback of a message that names a place of its own and cannot
+ * be shown there - the place is normally a label of the excerpt instead, cf.
+ * ErrorMsg::getNoteListForFormat.
  */
 pub record LabelMsg {
     pub let severity: Severity;
@@ -244,58 +258,29 @@ pub record SourceLine {
     // True iif the source line carries its own line return
     pub let trailingNewline: bool;
 
-    // The run the message block of the line is indented by, and the width of
-    // the caret it hangs under, cf. anchorOf
-    pub let anchor: Piece;
-    pub let anchorWidth: usize;
+    // True iif the lines standing between this one and the one above were
+    // dropped, the renderer writing an "..." separator in their place
+    pub let elided: bool;
 
-    pub self (num: u64, gaps: [Piece], labels: [Label], trailingNewline: bool)
+    pub self (num: u64, gaps: [Piece], labels: [Label], trailingNewline: bool, width: usize, elided: bool = false)
         with gaps = gaps
         , labels = labels
-        , gutter = center(format("%", num), GUTTER)
-        , padd = center("", center(format("%", num), GUTTER).len)
+        , gutter = center(format("%", num), width)
+        , padd = center("", width)
         , trailingNewline = trailingNewline
-        , anchor = anchorOf(gaps, labels)
-        , anchorWidth = anchorWidthOf(labels)
+        , elided = elided
     {}
-}
-
-/**
- * The run the message block of a line is indented by.
- *
- * The block hangs under the *last* caret of the line, but is indented by what
- * precedes the *first* one - a line carrying two labels therefore gathers
- * everything that was said about either of them under a single connector,
- * placed under neither. Hanging each list under the label it belongs to is
- * YMI-68's P2.
- *
- * A first span with no width to point at carries no caret either, so there is
- * nothing to indent the block to and it starts at the gutter.
- */
-fn anchorOf(gaps: [Piece], labels: [Label])-> Piece {
-    if (labels.len == 0us || labels[0].text.width() == 0us) return Piece("");
-
-    gaps[0]
-}
-
-/**
- * The width of the caret the message block of a line hangs under, cf.
- * anchorOf.
- */
-fn anchorWidthOf(labels: [Label])-> usize {
-    if (labels.len == 0us) return 0us;
-
-    labels[$ - 1us].text.width()
 }
 
 /**
  * One source excerpt: the file it comes from, the coordinates its header
  * cites, and the lines to show.
  *
- * A snippet with no line renders nothing — the location was EOF, or the file
- * content it points at is not there any more. It is kept in the list rather
- * than dropped, because the separator that precedes it is written all the
- * same.
+ * There is one per file a diagnostic points into, and every line it shows —
+ * labelled or context — is written under the same `width` wide gutter, so a
+ * column of the excerpt is a column of the file. The coordinates are the ones
+ * of the *primary* label, which is what the diagnostic is reported at,
+ * wherever that sits among the lines shown.
  */
 pub record Snippet {
     pub let file: [c8];
@@ -303,16 +288,15 @@ pub record Snippet {
     pub let col: u64;
     pub let lines: [SourceLine];
 
-    // The blank of an "..." separator standing before this excerpt, none when
-    // it directly follows what precedes it
-    pub let gap: ([c8])?;
+    // The width of the line number cell shared by every line of the excerpt
+    pub let width: usize;
 
-    pub self (file: [c8], line: u64, col: u64, lines: [SourceLine], gap: ([c8])? = none)
+    pub self (file: [c8], line: u64, col: u64, lines: [SourceLine], width: usize = GUTTER)
         with file = file
         , line = line
         , col = col
         , lines = lines
-        , gap = gap
+        , width = width
     {}
 }
 
@@ -369,8 +353,10 @@ pub record Diagnostic {
 /**
  * A place in the source a diagnostic points at, before it is laid out.
  *
- * This is what the collect step produces, one per location the node carries.
- * Whether two of them share an excerpt is decided by `layout`.
+ * This is what the collect step produces, one per location the node carries -
+ * its own two, and the one of every note that names a place of its own. Which
+ * excerpt each of them lands in, and in what order, is decided by `layout`:
+ * the throw site says what it points at, not how it is arranged.
  */
 pub record Mark {
     pub let loc: &Word;
@@ -395,100 +381,292 @@ pub record Mark {
 /**
  * Lay the places a diagnostic points at out into the excerpts to print.
  *
- * Two marks share an excerpt when they name the same line of the same file and
- * the second one starts after the first, and get one each otherwise — the
- * second then following an "..." separator, since nothing says the two lines
- * are anywhere near each other.
+ * There is one excerpt per file, holding every place the diagnostic names in
+ * that file, ordered by (line, col). The file of the first mark comes first —
+ * the primary one, so the excerpt the reader starts on is the one the
+ * diagnostic is reported in.
  *
- * Two marks on one line that do *not* run left to right are laid out as the
- * first one alone, carrying both message lists: there is no span between them
- * to underline.
+ * A place nothing can be shown of — an EOF location, or a file whose content
+ * is not loaded — is dropped rather than laid out empty: the coordinate alone
+ * is what YMI-70 set out to remove, and the caller keeps a way to cite it,
+ * cf. isShowable.
  *
  * @params:
- *   - marks: the places the diagnostic points at, at most two of them today.
+ *   - marks: the places the diagnostic points at, in no particular order.
  *
  * @returns:
  *   - the excerpts, in the order they are printed.
  */
 pub fn layout(marks: [Mark])-> [Snippet] {
-    if (marks.len == 0us) return [];
-    if (marks.len == 1us) return copy [snippetOf(marks[0])];
-
-    let (b, e) = (marks[0], marks[1]);
-    if (b.loc.line != e.loc.line || b.loc.filename != e.loc.filename) {
-        let fst = snippetOf(b);
-        let separator = center("", center(format("%", b.loc.line), GUTTER).len);
-
-        return copy [fst, snippetOf(e, gap-> (separator)?)];
+    let mut usable: [Mark] = [];
+    for m in marks {
+        if (isShowable(m.loc)) usable ~= [m];
     }
 
-    if (e.loc.col <= b.loc.col) {
-        return copy [snippetOf(Mark(b.loc, kind-> b.kind, msgs-> b.msgs ~ e.msgs))];
+    if (usable.len == 0us) return [];
+
+    let mut res: [Snippet] = [];
+    let mut done: [[c8]] = [];
+    for m in usable {
+        if (seen(done, m.loc.filename)) continue;
+        done ~= [m.loc.filename];
+
+        let mut group: [Mark] = [];
+        for o in usable {
+            if (o.loc.filename == m.loc.filename) group ~= [o];
+        }
+
+        res ~= [fileSnippet(group)];
     }
 
-    copy [pairSnippetOf(b, e)]
+    res
 }
 
 /**
- * Lay a single place out into its excerpt.
+ * @returns: true iif there is something to show of the given location.
+ */
+pub fn isShowable(loc: &Word)-> bool {
+    if (loc.isEof) return false;
+
+    getLineAtLoc(loc).len != 0us
+}
+
+/**
+ * @returns: true iif `f` is one of the file names already laid out.
+ */
+fn seen(files: [[c8]], f: [c8])-> bool {
+    for i in files {
+        if (i == f) return true;
+    }
+
+    false
+}
+
+/**
+ * Lay the places a diagnostic names in one file out into its excerpt.
+ *
+ * The marks are ordered by (line, col) first, so what the excerpt shows reads
+ * the way the file does whatever order the throw site built its notes in.
+ * Every mark naming the same line then shares that line, one label each.
+ *
+ * Two labelled lines that are not neighbours are joined by the lines between
+ * them when there are at most MAX_GAP of those, and separated by an "..."
+ * otherwise.
  *
  * @params:
- *   - m:   the place to show,
- *   - gap: the separator standing before the excerpt, if any.
+ *   - marks: the places named in that file, at least one, all showable.
  *
  * @returns:
- *   - the excerpt, holding no line when there is nothing to show of it.
+ *   - the excerpt.
  */
-fn snippetOf(m: Mark, gap: ([c8])? = none)-> Snippet {
-    let loc = m.loc;
-    if (loc.isEof) return Snippet("", 0u64, 0u64, [], gap-> gap);
+fn fileSnippet(marks: [Mark])-> Snippet {
+    let sorted = sortByPosition(marks);
 
-    let line = getLineAtLoc(loc);
-    if (line.len == 0us) return Snippet("", 0u64, 0u64, [], gap-> gap);
+    // the header cites the place the diagnostic is reported at, which is not
+    // necessarily the first line the excerpt shows
+    let mut head = sorted[0];
+    for m in sorted {
+        match m.kind {
+            LabelKind::PRIMARY => { head = m; break; }
+        }
+    }
 
-    let col = cast!usize(loc.col);
-    let len = spanLen(line, col, loc);
+    let width = gutterWidth(sorted[$ - 1us].loc.line);
 
-    let lines = if (col <= line.len && col + len <= line.len) {
-        copy [cut(loc.line, line, copy [Span(col - 1us, col + len - 1us, kind-> m.kind, msgs-> m.msgs)],
-                  trailingNewline-> line[$ - 1us] == '\n')]
-    } else {
-        copy [outOfRange(loc.line, line, m)]
-    };
+    let mut lines: [SourceLine] = [];
+    let mut prevLine = 0u64;
+    let mut prevSeek = 0us;
 
-    Snippet(state::relativePath(loc.filename), loc.line, loc.col, lines, gap-> gap)
+    // the content the lines between two labelled ones are read from, which is
+    // the one of the mark they are counted from rather than the one of the
+    // group: two words naming one file are not obliged to carry the same
+    // reading of it
+    let mut prevContent = "";
+
+    let mut i = 0us;
+    while i < sorted.len {
+        let num = sorted[i].loc.line;
+        let mut j = i;
+        while j < sorted.len && sorted[j].loc.line == num {
+            j += 1us;
+        }
+
+        let mut elided = false;
+        if (prevLine != 0u64 && num > prevLine + 1u64) {
+            if (num - prevLine - 1u64 <= MAX_GAP) {
+                let mut seek = prevSeek;
+                for c in prevLine + 1u64 .. num {
+                    let (next, txt) = lineAfter(prevContent, seek);
+                    seek = next;
+                    if (txt.len != 0us) lines ~= [contextLine(c, txt, width)];
+                }
+            } else {
+                elided = true;
+            }
+        }
+
+        lines ~= [labelledLine(sorted[i .. j], width, elided)];
+
+        prevLine = num;
+        prevSeek = sorted[i].loc.lineSeek;
+        prevContent = sorted[i].loc.fileContent;
+        i = j;
+    }
+
+    Snippet(state::relativePath(head.loc.filename), head.loc.line, head.loc.col, lines, width-> width)
 }
 
 /**
- * Lay two places of the same line out into one excerpt carrying two labels.
+ * Order the places named in one file by the position they name.
  *
- * Both message lists hang under the first label, the way a single caret line
- * carries everything that was said about it.
+ * Insertion sort, keeping the order the marks arrived in among equals: the
+ * primary one is built first, so it stays the first label of its line.
  */
-fn pairSnippetOf(b: Mark, e: Mark)-> Snippet {
-    let line = getLineAtLoc(b.loc);
-    if (line.len == 0us) return Snippet("", 0u64, 0u64, []);
+fn sortByPosition(marks: [Mark])-> [Mark] {
+    let mut res: [Mark] = [];
+    for m in marks {
+        let mut at = res.len;
+        while at > 0us && isAfter(res[at - 1us], m) {
+            at -= 1us;
+        }
 
-    let col = cast!usize(b.loc.col);
-    let col2 = cast!usize(e.loc.col);
-    let len = spanLen(line, col, b.loc);
-    let len2 = spanLen(line, col2, e.loc);
+        res = res[0us .. at] ~ [m] ~ res[at .. $];
+    }
 
-    let spans = copy [Span(col - 1us, col + len - 1us, kind-> b.kind, msgs-> b.msgs ~ e.msgs),
-                      Span(col2 - 1us, col2 + len2 - 1us, kind-> e.kind)];
+    res
+}
 
-    // A second span reaching the end of the line covers the line return
-    // itself, so the excerpt already ends with one. This form has always asked
-    // the run that follows the span rather than the line, and answers that an
-    // empty run ends with nothing - the excerpt then comes out followed by a
-    // blank line, cf. test_resources/lexing/test14.out. Kept as it is, the
-    // point of this pass being that nothing moves; it goes with YMI-68's P2,
-    // which rewrites the excerpt anyway
-    let trailing = line[col2 + len2 - 1us .. $];
+/**
+ * @returns: true iif `a` names a strictly later position than `b`.
+ */
+fn isAfter(a: Mark, b: Mark)-> bool {
+    if (a.loc.line != b.loc.line) return a.loc.line > b.loc.line;
 
-    Snippet(state::relativePath(b.loc.filename), b.loc.line, b.loc.col,
-            copy [cut(b.loc.line, line, spans,
-                      trailingNewline-> (trailing.len != 0us && trailing[$ - 1us] == '\n'))])
+    a.loc.col > b.loc.col
+}
+
+/**
+ * @returns: the width of the line number cell an excerpt reaching `max` needs.
+ */
+fn gutterWidth(max: u64)-> usize {
+    let str = format("%", max);
+    if (str.len > GUTTER) return str.len;
+
+    GUTTER
+}
+
+/**
+ * The line of `content` following the one that starts at `seek`.
+ *
+ * @returns:
+ *   - .0: where that line starts, the end of the content when there is none,
+ *   - .1: its text, its own line return included, empty when there is none.
+ */
+fn lineAfter(content: [c8], seek: usize)-> (usize, [c8]) {
+    let mut i = seek;
+    while i < content.len && content[i] != '\n' {
+        i += 1us;
+    }
+
+    if (i >= content.len) return (content.len, "");
+
+    let start = i + 1us;
+    let mut j = start;
+    while j < content.len && content[j] != '\n' {
+        j += 1us;
+    }
+
+    if (j < content.len) return (start, content[start .. j + 1us]);
+
+    (start, content[start .. $])
+}
+
+/**
+ * An unlabelled line of an excerpt, shown for the context it gives.
+ */
+fn contextLine(num: u64, line: [c8], width: usize)-> SourceLine {
+    SourceLine(num,
+               copy [elide(line)],
+               [],
+               trailingNewline-> line[$ - 1us] == '\n',
+               width-> width)
+}
+
+/**
+ * Lay every place naming one line out into that line of the excerpt.
+ *
+ * A mark whose span does not fit the line it names has nothing to underline,
+ * so it contributes its messages to the label preceding it rather than a label
+ * of its own — and the line comes out unlabelled when none of them fits, cf.
+ * outOfRange. Two spans that overlap are merged the same way: there is one run
+ * of source under them, so there is one caret.
+ *
+ * @params:
+ *   - marks:  the places naming that line, ordered by column,
+ *   - width:  the width of the line number cell of the excerpt,
+ *   - elided: true iif an "..." separator stands before the line.
+ */
+fn labelledLine(marks: [Mark], width: usize, elided: bool)-> SourceLine {
+    let line = getLineAtLoc(marks[0].loc);
+    let mut spans: [Span] = [];
+
+    for m in marks {
+        let col = cast!usize(m.loc.col);
+        let len = spanLen(line, col, m.loc);
+
+        if (col > line.len || col + len > line.len) {
+            spans = withMsgs(spans, m.msgs);
+            continue;
+        }
+
+        let begin = col - 1us;
+        if (spans.len != 0us && begin < spans[$ - 1us].end) {
+            spans = withMsgs(spans, m.msgs);
+            continue;
+        }
+
+        spans ~= [Span(begin, col + len - 1us, kind-> m.kind, msgs-> m.msgs)];
+    }
+
+    if (spans.len == 0us) return outOfRange(marks, line, width, elided);
+
+    cut(marks[0].loc.line, line, spans,
+        trailingNewline-> line[$ - 1us] == '\n',
+        width-> width,
+        elided-> elided)
+}
+
+/**
+ * @returns: the spans, the last of them carrying `msgs` as well.
+ */
+fn withMsgs(spans: [Span], msgs: [LabelMsg])-> [Span] {
+    if (msgs.len == 0us) return spans;
+    if (spans.len == 0us) return spans;
+
+    let last = spans[$ - 1us];
+
+    spans[0us .. $ - 1us] ~ [Span(last.begin, last.end, kind-> last.kind, msgs-> last.msgs ~ msgs)]
+}
+
+/**
+ * The line of an excerpt none of whose spans falls inside it.
+ *
+ * The whole line is shown, unshortened, and the label covers nothing: there is
+ * no column to point at, so the caret line stays empty and the messages hang
+ * at the gutter.
+ */
+fn outOfRange(marks: [Mark], line: [c8], width: usize, elided: bool)-> SourceLine {
+    let mut msgs: [LabelMsg] = [];
+    for m in marks {
+        msgs ~= m.msgs;
+    }
+
+    SourceLine(marks[0].loc.line,
+               copy [Piece(line), Piece("")],
+               copy [Label(Piece(""), kind-> marks[0].kind, msgs-> msgs)],
+               trailingNewline-> line[$ - 1us] == '\n',
+               width-> width,
+               elided-> elided)
 }
 
 /**
@@ -508,19 +686,6 @@ fn spanLen(line: [c8], col: usize, loc: &Word)-> usize {
 }
 
 /**
- * The line of an excerpt whose span falls outside of it.
- *
- * The whole line is shown, unshortened, and the label covers nothing: there is
- * no column to point at, so the caret line stays empty.
- */
-fn outOfRange(num: u64, line: [c8], m: Mark)-> SourceLine {
-    SourceLine(num,
-               copy [Piece(line), Piece("")],
-               copy [Label(Piece(""), kind-> m.kind, msgs-> m.msgs)],
-               trailingNewline-> line[$ - 1us] == '\n')
-}
-
-/**
  * Cut a source line at the given spans.
  *
  * @params:
@@ -528,13 +693,15 @@ fn outOfRange(num: u64, line: [c8], m: Mark)-> SourceLine {
  *   - line:            the line, its own line return included,
  *   - spans:           the byte ranges to label, in order and non overlapping,
  *   - trailingNewline: true iif the excerpt ends with a line return of its own,
- *                      the renderer adding one when it does not.
+ *                      the renderer adding one when it does not,
+ *   - width:           the width of the line number cell of the excerpt,
+ *   - elided:          true iif an "..." separator stands before the line.
  *
  * @returns:
  *   - the line as the alternation of its unlabelled runs and its labels, each
  *     run elided when it is too long to print.
  */
-fn cut(num: u64, line: [c8], spans: [Span], trailingNewline: bool)-> SourceLine {
+fn cut(num: u64, line: [c8], spans: [Span], trailingNewline: bool, width: usize, elided: bool)-> SourceLine {
     let mut gaps: [Piece] = [];
     let mut labels: [Label] = [];
     let mut at = 0us;
@@ -547,7 +714,22 @@ fn cut(num: u64, line: [c8], spans: [Span], trailingNewline: bool)-> SourceLine 
 
     gaps ~= [elide(line[at .. $])];
 
-    SourceLine(num, gaps, labels, trailingNewline-> trailingNewline)
+    SourceLine(num, gaps, labels, trailingNewline-> trailingNewline, width-> width, elided-> elided)
+}
+
+/**
+ * @returns:
+ *   the width of the line number cell the excerpts share, GUTTER when there is
+ *   none. This is what the report indents its sub notes by, so that they line
+ *   up with the excerpt they hang under.
+ */
+pub fn gutterOf(snippets: [Snippet])-> usize {
+    let mut res = GUTTER;
+    for s in snippets {
+        if (s.width > res) res = s.width;
+    }
+
+    res
 }
 
 /**
