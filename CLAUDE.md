@@ -24,6 +24,18 @@ notes are generated from these titles by `.github/scripts/changelog.sh`, one ent
 the format — no issue key, or a kind outside that list — is left out of the release notes
 entirely**; the skip is logged on stderr by the release job, but the change goes unannounced.
 
+## Policy
+
+Consice comment:
+- only describe what the functions do, not what the current work is adding
+- don't write comment inside a code unless it's absolutely necessary for understanding
+- a comment of more than 3 lines is generally too verbose
+
+Commit policy:
+- split work in logical commits
+- rewrite history when a new commit it modifying something that was introduced by another commit of the same branch
+- There's no need for tests to pass, and code to compile between commits as long as the last commit of the branch compiles and test succeed
+
 ## Build / run / test
 
 Build system is `gyllir` (config in `gyllir.toml`, compiler path points at a local `gyc` build).
@@ -98,6 +110,7 @@ When you change validator/semantic behavior, the golden `.sem`/`.err`/`.yil` fil
 source of truth for expected behavior — treat a diff against them as a real regression/fix
 signal, not just noise to silence. When behavior intentionally changes, regenerate/update the
 corresponding golden file rather than special-casing the test.
+
 
 ### Regenerating a golden file
 
@@ -185,162 +198,7 @@ The whole frontend is orchestrated by `Parser` (`src/ymirc/parser.yr`), in three
    finalizing types (`lint/expander`, `lint/optimizer`), and optionally serializing YIL
    (`lint/serialize`).
 
-   `lint/optimizer` is the pass pipeline: `Optimizer` (`optimizer/visitor.yr`) applies an
-   ordered list of `OptimizerPass`es to every frame — sweeping the whole list again while a
-   pass still reports having changed something (`MAX_PIPELINE_ROUNDS`), since the passes feed
-   each other in both directions and one sweep leaves work behind: dead code removes the
-   copies copy propagation left, and the straight-line runs it makes by folding the jumps are
-   runs copy propagation never saw. A round asks whether a pass's counters moved rather than
-   resetting them: they are cumulative, and are what `--fopt-stats` reports at the end.
-   `optimizer/cfg.yr` builds the per-frame
-   control flow graph, and `optimizer/verifier.yr` checks the well-formedness of a frame —
-   variables declared, labels defined and unique, affectations moving compatible widths,
-   `YILBeginCatch` inside a handler, calls covered by `YILFrame::refs`, non-void frames
-   returning. That last one reads the edges, not the blocks: an edge into the exit is
-   `EdgeKind::UNWIND` when what leaves the frame is an unwinding resuming past the finally
-   part that interrupted it (`cfg.yr`'s unwind copy of a `YILTryFinally`), and a frame left
-   that way returns nothing whatever its return type — demanding a return there reports a
-   correct frame as malformed. What it can rely on is that a path stops where control
-   stops: a call to a function `defuse.yr`'s `runtimeNeverReturns` names (`_yrt_exc_panic`,
-   `_yrt_exc_throw`) ends its block on nothing, control reappearing in a handler protecting
-   it or nowhere in the frame. That table is the only thing telling YIL a call never comes
-   back, so a new runtime helper that aborts or throws belongs in it: left out, it makes the
-   graph invent a path leaving it, and every analysis reads that path.
-   Verification runs on the raw expander output and again after every pass, so a
-   pass is only ever blamed for what it introduced; it is gated by `--fverify-yil` and is
-   always on in the test suite. YIL types are looser than they look — pointers, arrays and
-   pointer-wide integers are the same address, integer widths are the backend's business —
-   so the verifier compares storage classes, not types.
-
-   `optimizer/defuse.yr`, `optimizer/dataflow.yr` and `optimizer/analysis.yr` are the
-   dataflow framework the passes consume. `DefUse` says what one instruction reads and
-   writes, `dataflow.yr` is a worklist fixpoint solver parameterised by direction and meet,
-   and `FrameDataflow` (`analysis.yr`) instantiates it up to three times per frame: liveness
-   (backward, union), reaching definitions (forward, union) and available expressions
-   (forward, intersection). Only liveness is always solved — it is what `hasFacts` answers
-   from; the other two are asked for (`withReaching`/`withAvailable`), since solving one is
-   not free and `buildAvailable` alone enumerates every expression of the frame into an
-   `ExprTable`. Reading an analysis that was not solved panics rather than answering the empty
-   set, which reads as "nothing holds" and is a lie, not a conservative default. It also fills `BasicBlock::getGens()`/`getKills()`, the liveness
-   summary of every block. Two things it deliberately gets right, and that a change here must
-   keep: an address passed to a runtime function whose signature is in the `runtimeParamModes`
-   table is a *definition* when the callee writes the pointee (`_yrt_dup_slice(&YI_4, ...)`)
-   and a use when it reads it; and a variable whose address escaped is never killed by
-   anything but a direct assignment to it, every unknown call and every store through a
-   pointer only *may* write it. A third: an exception edge leaves from the *middle* of the
-   instruction closing its block, so what that block contributes on such an edge is its
-   `preGen`/`preKill` — the block minus that instruction — never its whole-block sets. A
-   forward analysis meets those at the top of the handler (`meetOf`), a backward one
-   transfers what the handler needs through them (`transferOf`), which is why a backward
-   analysis meets *after* the transfer instead of before: applying the closing instruction's
-   kill to what a handler reads reports dead a variable it reads.
-   `--fdump-dataflow=<frame>` writes the three analyses per block
-   to `<module>.<frame>.dataflow.txt`, naming the temporaries the way the YIL dump does so the
-   two can be read side by side. The `.df` goldens under `test_resources/dataflow/` are that
-   dump (`test/integration/dataflow.yr`, which also checks the fixpoint equations hold on
-   every frame of a sweep of packages, exception edges included).
-
-   `optimizer/copyprop.yr` is the first pass of the pipeline (`copy-prop`, `-O1`). It walks a
-   frame forward holding, per variable, the value it is known to hold, and does two things
-   with it: it renames a read of `x` to `y` after `x = y` (the copy itself survives until dead
-   code elimination lands), and it substitutes a compiler-generated temporary the frame
-   assigns once and reads once into that read, deleting the assignment (`YI_2 = a + 9;
-   return YI_2;` becomes `return a + 9;`). The environment is dropped at every label, jump and
-   handler boundary, so a substituted value is always written earlier on the same straight-line
-   run as its use, and dominance holds without a dominator tree. The two ends are not
-   necessarily in the same basic block — a call in a try region ends one in the middle of that
-   run, and the pass keeps its environment across it — the invariant to check a change against
-   is dominance, not same-block. Four rules keep it honest and must survive
-   any change: nothing is ever substituted under a `&` (which covers the runtime out
-   parameters and the address-taken variables at once), the left of an assignment is storage
-   rather than a value and is left alone, only a side-effect-free expression is coalesced
-   (no call, no read through a pointer, no indexing, no division), and nothing naming a
-   variable outside the frame's universe is moved — a reference to a global symbol carries the
-   id `0`, no write to it is ever recorded as a def, so nothing would invalidate a value that
-   reads it. A destination and its value
-   must also have the same type — YIL types are looser than the backend's, and moving a value
-   must not move that difference somewhere unchecked. The pass reruns over a frame while it
-   still changes something, since each transformation exposes the other.
-
-   `optimizer/dce.yr` is the second pass (`dead-code`, `-O1`), and the one that makes the
-   copies copy-prop leaves behind actually disappear. It does four things per round and
-   repeats the round until none of them fires: it deletes the instructions of every block no
-   path reaches, it deletes an assignment to a whole variable that is not live afterwards and
-   whose right hand side has no effect of its own (`_ = t._1;`), it folds the control flow (a
-   conditional jump on a literal or on twice the same label becomes a goto — keeping the
-   condition, as the `YILCall` that is what YIL calls a value evaluated as a statement, when
-   the frame evaluates it for its effect rather than for the branch — a goto into a
-   label that only jumps is retargeted to the end of that chain, a goto into the label right
-   after it is dropped, a label nothing names is dropped), and it drops the declaration of
-   every variable the body stopped naming. The four feed each other, which is why the round
-   repeats: folding a jump orphans a block, deleting a block unnames a label, deleting a store
-   unuses a variable.
-
-   Five things it must keep getting right. **A landing pad is a root of reachability**: a
-   handler is entered by the personality routine and never by a jump, so `CFG::deadBlocks` —
-   not `CFG::unreachableBlocks`, which answers the graph's question and is what the `.dot`
-   dump reports — seeds the walk from the entry *and* from every `YILTryCatch`/`YILTryFinally`
-   pad. Deciding a pad is dead is YMI-84's job, not this pass's. **A block the pad walk keeps
-   alive has no dataflow facts**: the solver runs over `CFG::reversePostOrder()`, which is
-   entry-rooted, so a pad protecting a region no path reaches is in the graph, not in the
-   solution, and `Solution::inOf`/`outOf` answer it the empty set — "no variable is live",
-   which is a lie, not a conservative default. `FrameDataflow::hasFacts` is the question to
-   ask before reading the facts of a block, and `dce.yr` skips the dead-store analysis of a
-   block that fails it. **The closing instruction of a block does not kill on the exception
-   edge**: it is the instruction an exception leaves from the middle of, so the backward walk
-   in `markDeadStores` puts back, after transferring it, whatever the handlers protecting the
-   block read — the instruction-at-a-time form of the `preGen`/`preKill` sets `transferOf`
-   applies on such an edge. Without it, `[x = <pure>, x = <throwing call>]` reports the first
-   store dead while the handler is exactly what reads it. **Only a whole variable is
-   ever stored-dead**: writing a field or an element leaves the rest alone, and a variable
-   whose address escaped is read by things that do not name it, so liveness has nothing to say
-   about either. **A read must be rooted in the frame to be removable**: a call, a
-   `YILBeginCatch`, a division and a dereference all stay, an index into a real array does
-   not. `YILFrame::refs` is deliberately *not* narrowed when an unreachable call goes: the
-   dependency files come out wider than needed, which costs a rebuild and never misses one,
-   whereas its entries are not only calls (typeinfos, vtables, globals) and dropping one of
-   those does go unnoticed. Block layout in reverse post order is not implemented: the YIL
-   body is a tree whose `YILTryCatch`/`YILTryFinally` nodes say which region an instruction is
-   protected by, so blocks cannot be reordered across them, and the fallthrough that layout
-   buys is what dropping the goto into the following label already gives.
-
-   The first two of those five are tested by `test/integration/dead_code.yr`, on frames built
-   by hand the way `integration::verifier` builds its own, and for the same reason: no source
-   program makes the expander produce either shape. It hoists every call into a temporary
-   written once, so a block never closes on a store to a variable a handler reads, and the
-   validator rejects every source shape whose protected region cannot throw (`nothing to
-   catch`, `failure guard cannot be used when guarding a scope that cannot throw`,
-   `unreachable statement`), so a pad is never left out of the solution. Both invariants are
-   therefore contracts with the framework rather than properties of anything compiled today —
-   a golden cannot state them, and dropping either one leaves the whole corpus green. The
-   condition kept across a folded branch is stated there too, and is latent for the same kind
-   of reason: the expander hoists every condition into a temporary, and copy propagation only
-   ever substitutes a pure value back into one, so the condition of a condjmp is pure in
-   everything the pipeline produces.
-
-   The pass is tied back to the tree by an ordinal. `CFG` numbers every instruction of the
-   body in preorder as it builds (`BasicBlock::getOrds()`, `NO_ORD` for the jumps the builder
-   synthesizes at a fallthrough), the pass decides about ranks on the graph, and the walk
-   rewriting the body counts exactly the same way to find the instruction again. A change to
-   the order `CFG::visit` walks the body in has to be mirrored in `dce::strip`. One subtree is
-   built twice: the finally part of a `YILTryFinally`, once for the region completing normally
-   and once for the unwinding leaving it. Every one of those copies is a region of its own, so
-   each gets its own map from label id to block — a label is what decides which block an
-   instruction lands in, and resolving two copies through one map hands them one block, which
-   then holds the same ordinal twice and votes twice on a liveness that merges paths that
-   never run together. One map per unwind copy is not enough: a `YILTryFinally` inside another
-   one's finally part is built once per copy of the enclosing part, the inner *normal* copy
-   included, which is why `visitTryFinally` saves the map and replaces it with an empty one
-   around every copy it builds under one. `integration::cfg` states it: no block holds a rank
-   twice, over a sweep that includes `scope_guards/test13.yr`, a guard inside a guard's body
-   whose own body holds a jump. Both copies are numbered from the same rank and the
-   walk resumes past the part at `nbOrdsList(finPart)`, never at wherever a copy left the
-   counter — either copy is skipped when nothing reaches it, and a rank counted one copy short
-   names another instruction from there on. A rank is therefore reachable from two blocks, and
-   removing it removes it from both paths, so a block only *votes* in `markDead`: a rank goes
-   when every block carrying it voted, since what the unwinding no longer needs may be exactly
-   what the normal path returns.
-
+   
 Cross-cutting: `src/ymirc/errors` (the `ErrorMsg` type and its pretty-printing/formatting —
 this is what both compiler diagnostics and `.err` golden files render through),
 `src/ymirc/global` (process-wide compiler state, versions, include dirs, debug/dump flags —

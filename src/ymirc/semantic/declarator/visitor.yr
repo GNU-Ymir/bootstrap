@@ -52,6 +52,7 @@
 in visitor;
 
 use ymirc::errors;
+use ymirc::errors::snippet::suggestion;
 use ymirc::global::{common, core_, state};
 use ymirc::lexing::{keys, tokens, word};
 use ymirc::semantic::symbol;
@@ -2873,9 +2874,10 @@ pub class Declarator {
      * enriched with suggestions for similarly named symbols.
      *
      * @params:
-     *   - loc:  the source location of the invalid access
-     *   - name: the name that was accessed
-     *   - sym:  the symbol in which the lookup was attempted
+     *   - loc:     the source location of the invalid access
+     *   - name:    the name that was accessed
+     *   - sym:     the symbol in which the lookup was attempted
+     *   - nameLoc: where the name itself was written, when `loc` is not it
      *
      * @returns:
      *   A fatal `ErrorMsg` describing the undefined or inaccessible symbol,
@@ -2895,40 +2897,94 @@ pub class Declarator {
      *
      *       “Unknown symbol ‘fop’. Did you mean: ‘foo’, ‘pop’?”
      *
-     *   For each suggested symbol, a note is added showing its location and
-     *   the module or scope it belongs to. Duplicate paths are filtered to
-     *   avoid redundant notes.
+     *   For each suggested symbol, a note is added showing the module or scope
+     *   it belongs to — or, when the name is a misspelling, the edit writing
+     *   that symbol's name over it, cf. `candidateNotes`. Duplicate paths are
+     *   filtered to avoid redundant notes.
      *
      */
-    pub fn createGlobalAccessError(self, loc: &Word, name: [c8], sym: &Symbol)-> &ErrorMsg {
-        let mut notes: [mut &ErrorMsg] = [];
+    pub fn createGlobalAccessError(self, loc: &Word, name: [c8], sym: &Symbol, nameLoc: &Word = EOF_WORD)-> &ErrorMsg {
         let mut syms = sym.getSymbols(name, protection-> Protection::PRIVATE)[];
 
         let mut msgFrom = DeclareErrorMessage::PRIVATE_IN_THIS_CONTEXT_FROM_MOD, mut msgNonFrom = DeclareErrorMessage::PRIVATE_IN_THIS_CONTEXT;
+        let mut typo = false;
         if (syms.len == 0us) { // if no symbol is named 'name', then maybe there is typo in the variable name
             syms = sym.getCloseSymbols(name, distance-> 2us)[]; // Get all the symbols whose names are close to 'name'
 
             // Change the error messages
             msgFrom = DeclareErrorMessage::MAYBE_WAS_MEANT_FROM_MOD;
             msgNonFrom = DeclareErrorMessage::MAYBE_WAS_MEANT;
+            typo = true;
         }
 
+        let notes = self.candidateNotes(syms, msgFrom, msgNonFrom,
+                                        misspelled-> self.misspelledWord(loc, nameLoc, name, typo));
+
+        // Not thrown, it will be thrown by the caller function
+        copy ErrorMsg::fatal(loc, format(DeclareErrorMessage::UNDEF_VAR, name), notes-> notes)
+    }
+
+    /**
+     * The word a typo suggestion replaces, none when there is nothing to
+     * replace.
+     *
+     * @params:
+     *   - loc:     where the failure is reported,
+     *   - nameLoc: where the caller says the name was written, EOF when it did
+     *              not say,
+     *   - name:    the name that was looked up,
+     *   - typo:    false when the candidates exist under that very name and
+     *              are only out of reach, in which case nothing is misspelled.
+     */
+    fn misspelledWord(self, loc: &Word, nameLoc: &Word, name: [c8], typo: bool)-> (&Word)? {
+        if (!typo) return none;
+
+        let w = if (nameLoc.isEof) { loc } else { nameLoc };
+        if (w.str != name) return none;
+
+        (w)?
+    }
+
+    /**
+     * The notes naming the symbols a failed lookup found instead of the one it
+     * was asked for.
+     *     
+     * @params:
+     *   - syms:       the candidates,
+     *   - msgFrom:    what a candidate declared under a parent says,
+     *   - msgNonFrom: what one declared at the root says,
+     *   - misspelled: the word the candidates are proposed in place of.
+     */
+    fn candidateNotes(self, syms: [&Symbol], msgFrom: errors::code::Error, msgNonFrom: errors::code::Error,
+                      misspelled: (&Word)? = none)-> [&ErrorMsg]
+    {
+        let mut notes: [mut &ErrorMsg] = [];
         let dmut used: [Path => ()] = copy [];
         for s in syms { // add the notes to the error
             let stdPath = s.path.asStdPath();
             if (stdPath !in used) {
                 let p = stdPath.parent().toStr(sep-> "::");
-                if (p.len != 0us) {
-                    notes ~= [copy ErrorMsg::note(s.loc, oneLine-> true, format(msgFrom, stdPath.file(), p))];
-                } else
-                    notes ~= [copy ErrorMsg::note(s.loc, oneLine-> true, format(msgNonFrom, stdPath.file()))];
+                let msg = if (p.len != 0us) {
+                    format(msgFrom, stdPath.file(), p)
+                } else {
+                    format(msgNonFrom, stdPath.file())
+                };
+
+                match misspelled {
+                    Ok(w: &Word) => {
+                        notes ~= [(copy ErrorMsg::note(s.loc, oneLine-> true, msg-> ""))
+                                      .withFix(Edit(w, replacement-> stdPath.file(), len-> w.len, msg-> msg))];
+                    }
+                    _ => {
+                        notes ~= [copy ErrorMsg::note(s.loc, oneLine-> true, msg)];
+                    }
+                }
 
                 used[stdPath] = ();
             }
         }
 
-        // Not thrown, it will be thrown by the caller function
-        copy ErrorMsg::fatal(loc, format(DeclareErrorMessage::UNDEF_VAR, name), notes-> notes)
+        notes
     }
 
     /**
@@ -2936,9 +2992,11 @@ pub class Declarator {
      * enriched with suggestions for similarly named local symbols.
      *
      * @params:
+     *   - loc:     the source location of the invalid access
      *   - name:    the name that was accessed
      *   - sym:     the symbol in which the lookup was performed
      *   - context: the symbol from which access is being evaluated
+     *   - nameLoc: where the name itself was written, when `loc` is not it
      *
      * @returns:
      *   A list of `ErrorMsg` notes describing inaccessible or potentially intended
@@ -2955,18 +3013,18 @@ pub class Declarator {
      *   used for typo-recovery diagnostics, allowing the compiler to suggest
      *   likely intended names when a local lookup fails.
      *
-     *   For each suggested symbol, a note is added showing its location and the
-     *   module or scope it belongs to. Duplicate paths are filtered to avoid
-     *   redundant notes. The resulting list is returned to be attached to a
-     *   higher-level error message by the caller.
+     *   For each suggested symbol, a note is added showing the module or scope
+     *   it belongs to — or, when the name is a misspelling, the edit writing
+     *   that symbol's name over it, cf. `candidateNotes`. Duplicate paths are
+     *   filtered to avoid redundant notes. The resulting list is returned to be
+     *   attached to a higher-level error message by the caller.
      *
      */
-    pub fn createLocalAccessError(self, _: &Word, name: [c8], sym: &Symbol, context: &Symbol)-> [&ErrorMsg] {
-        let mut notes: [mut &ErrorMsg] = [];
-
+    pub fn createLocalAccessError(self, loc: &Word, name: [c8], sym: &Symbol, context: &Symbol, nameLoc: &Word = EOF_WORD)-> [&ErrorMsg] {
         // Search all the local symbols with the same name but that are not accessible
         let mut syms = sym.getLocalSymbols(name, protection-> Protection::PRIVATE)[];
         let mut msgFrom = DeclareErrorMessage::PRIVATE_IN_THIS_CONTEXT_FROM_MOD, mut msgNonFrom = DeclareErrorMessage::PRIVATE_IN_THIS_CONTEXT;
+        let mut typo = false;
         if (syms.len == 0us) { // if no symbol is named 'name', then maybe there is typo in the variable name
             let contextProt = self.getProtectionFromContext(context, sym);
             syms = sym.getCloseLocalSymbols(name, distance-> 2us, protection-> contextProt)[]; // Get all the local symbols whose names are close to 'name'
@@ -2974,23 +3032,11 @@ pub class Declarator {
             // Change the error messages
             msgFrom = DeclareErrorMessage::MAYBE_WAS_MEANT_FROM_MOD;
             msgNonFrom = DeclareErrorMessage::MAYBE_WAS_MEANT;
+            typo = true;
         }
 
-        let dmut used: [Path => ()] = copy [];
-        for s in syms { // add the notes to the error
-            let stdPath = s.path.asStdPath();
-            if (stdPath !in used) {
-                let p = stdPath.parent().toStr(sep-> "::");
-                if (p.len != 0us) {
-                    notes ~= [copy ErrorMsg::note(s.loc, oneLine-> true, format(msgFrom, stdPath.file(), p))];
-                } else
-                    notes ~= [copy ErrorMsg::note(s.loc, oneLine-> true, format(msgNonFrom, stdPath.file()))];
-
-                used[stdPath] = ();
-            }
-        }
-
-        notes
+        self.candidateNotes(syms, msgFrom, msgNonFrom,
+                            misspelled-> self.misspelledWord(loc, nameLoc, name, typo))
     }
 
     /*!
