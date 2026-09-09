@@ -1,0 +1,233 @@
+/*
+ * Declares the ReadContext class, which records the source files a module read
+ * at compile time.
+ *
+ * A compile time value(an enum member, a `def` constant, an aliased type) is
+ * folded at its use site and referenced by no YIL symbol, so the module
+ * declaring it never appears in the dependency file of its readers. This
+ * context collects, while validation runs, the declaration site of every symbol
+ * a name resolution reached, and attributes it to the module being validated.
+ *
+ * <hr>
+ *
+ * @Package: ymirc
+ * @Module: ymirc::semantic::validator::context::reads
+ * @File: ymirc/semantic/validator/context/reads.yr
+ * @Author(s):
+ *   - Emile Cadorel <ecadorel@gmail.com>
+ *
+ * @Created(YYYY-MM-DD): 2026-09-09
+ * @Copyright(C) 2021–2026 GNU-Ymir
+ * @License
+ *   ```text
+ *   This file is part of the Ymir language project.
+ *
+ *   Ymir is free software: you can redistribute it and/or modify it
+ *   under the terms of the GNU General Public License as published by
+ *   the Free Software Foundation, either version 3 of the License, or
+ *   (at your option) any later version.
+ *
+ *   Ymir is distributed in the hope that it will be useful,
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *   GNU General Public License for more details.
+ *
+ *   You should have received a copy of the GNU General Public License
+ *   along with Ymir.  If not, see <https://www.gnu.org/licenses/>.
+ *   ```
+ */
+
+in reads;
+
+use ymirc::semantic::symbol;
+use ymirc::utils::list;
+
+use std::fs::path;
+
+/**
+ * The compile time reads of a single entity being validated, a module or a
+ * compile time symbol.
+ */
+@final
+pub class ReadFrame {
+
+    /// The entity the files are recorded for
+    pub let key: [c8];
+
+    /// True if the entity is a module
+    pub let isModule: bool;
+
+    /// The source files read while validating the entity
+    let dmut _files: [Path => ()] = copy [];
+
+    /**
+     * @params:
+     *    - key: the path of the entity
+     *    - isModule: true iif the entity is a module
+     * */
+    pub self (key: [c8], isModule: bool)
+        with key = key
+        , isModule = isModule
+    {}
+
+    /**
+     * Record a source file as read by the entity
+     * */
+    pub fn insert(mut self, file: Path) {
+        self._files[file] = ();
+    }
+
+    /**
+     * @returns: the source files read by the entity
+     * */
+    @field
+    pub fn files(self)-> [Path => ()] {
+        self._files
+    }
+}
+
+/**
+ * ReadContext collects the compile time reads of the modules of a package.
+ *
+ * A read is the declaration file of a symbol a name resolution reached. It is
+ * attributed to the innermost module being validated, so that a module reading
+ * a folded constant depends on the module declaring it.
+ *
+ * Reading a compile time symbol also reads whatever that symbol read itself: a
+ * `def` aliasing an enum of a third module is validated once and cached, so
+ * only its first reader would otherwise see that module. Those reads are kept
+ * per symbol and replayed for every later reader.
+ *
+ * Nothing is recorded until a module is entered, which the validator only does
+ * when dependency dumping is active.
+ */
+@final
+pub class ReadContext {
+
+    /// Stack of entities currently being validated, innermost last
+    let dmut _frames: &List!{dmut &ReadFrame} = copy List!{dmut &ReadFrame} ();
+
+    /// Source files read by each validated module
+    let dmut _modules: [Path => [Path => ()]] = copy [];
+
+    /// Source files read by each validated compile time symbol
+    let dmut _symbols: [[c8] => [Path => ()]] = copy [];
+
+    /**
+     * Creates a new empty ReadContext.
+     */
+    pub self () {}
+
+    /**
+     * Enter the validation of a module, the reads are attributed to it from now on
+     * @params:
+     *    - path: the path of the module, relative to the package directory
+     * */
+    pub fn enterModule(mut self, path: Path) {
+        self._frames:.push(copy ReadFrame(path.toStr(), true));
+    }
+
+    /**
+     * Exit the validation of a module, and keep what it read
+     * @params:
+     *    - path: the path passed to enterModule
+     * */
+    pub fn exitModule(mut self, path: Path) {
+        if (self._frames.len == 0us) return;
+
+        let files = self._frames.back.files;
+        self._frames:.pop();
+
+        let dmut acc = if let Ok(dmut a) = alias self._modules[path] {
+            alias a
+        } else {
+            copy []
+        };
+
+        for f, _ in files {
+            acc[f] = ();
+        }
+
+        self._modules[path] = alias acc;
+    }
+
+    /**
+     * Enter the validation of a compile time symbol, whose reads are replayed for
+     * every module reading it
+     * @info: does nothing when no module was entered
+     * @params:
+     *    - key: the path of the symbol
+     * */
+    pub fn enterSymbol(mut self, key: [c8]) {
+        if (self._frames.len == 0us) return;
+
+        self._frames:.push(copy ReadFrame(key, false));
+    }
+
+    /**
+     * Exit the validation of a compile time symbol, and keep what it read
+     * */
+    pub fn exitSymbol(mut self) {
+        if (self._frames.len == 0us) return;
+
+        let frame = self._frames.back;
+        if (frame.isModule) return;
+
+        self._frames:.pop();
+
+        let dmut acc = if let Ok(dmut a) = alias self._symbols[frame.key] {
+            alias a
+        } else {
+            copy []
+        };
+
+        for f, _ in frame.files {
+            acc[f] = ();
+        }
+
+        self._symbols[frame.key] = alias acc;
+    }
+
+    /**
+     * Record the declaration file of every symbol a name resolution reached
+     * @params:
+     *    - syms: the symbols the resolution reached, losing candidates included, as a
+     *      change in their module can change the resolution
+     * */
+    pub fn insert(mut self, syms: [&Symbol]) {
+        if (self._frames.len == 0us) return;
+
+        for s in syms {
+            if (s.loc.filename != "") {
+                self:.addFile(Path(s.loc.filename).stripExtension());
+            }
+
+            if let Ok(files) = self._symbols[s.path.toStr()] {
+                for f, _ in files {
+                    self:.addFile(f);
+                }
+            }
+        }
+    }
+
+    /**
+     * @returns: the source files read by each validated module
+     * */
+    @field
+    pub fn modules(self)-> [Path => [Path => ()]] {
+        self._modules
+    }
+
+    /**
+     * Add a file to the innermost frames, up to the module being validated
+     * @info: a module does not read what its submodules read, the walk stops there
+     * */
+    fn addFile(mut self, file: Path) {
+        for i in 0us .. self._frames.len {
+            let dmut frame = alias self._frames:[self._frames.len - 1us - i];
+            frame:.insert(file);
+
+            if (frame.isModule) break;
+        }
+    }
+}
