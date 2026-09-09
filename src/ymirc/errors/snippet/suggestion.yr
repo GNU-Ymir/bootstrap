@@ -2,11 +2,11 @@
  * snippet::suggestion — the edit a diagnostic proposes, and the pair of lines
  * it prints as.
  *
- * A suggestion is an edit and not a sentence: an `Edit` is a span plus the
- * text replacing it, which is what an LSP quick fix consumes, and a `Fix` is
- * that edit already applied to the line it edits. The `+` line is produced
- * here and nowhere else, cf. `applyEdit` — a rendering written alongside an
- * edit is a rendering that can disagree with it.
+ * A suggestion is an edit and not a sentence: an `Edit` is one or two spans
+ * and the text replacing each, which is what an LSP quick fix consumes, and a
+ * `Fix` is that edit already applied to the line it edits. The `+` line is
+ * produced here and nowhere else, cf. `applyEdit` — a rendering written
+ * alongside an edit is a rendering that can disagree with it.
  *
  * <hr>
  *
@@ -46,20 +46,14 @@ use ymirc::errors::snippet::{label, utils};
 use ymirc::errors::code;
 
 /**
- * The edit a diagnostic proposes, before it is laid out.
- *
- * A suggestion is an edit and not a sentence: `loc` says where it applies and
- * `len` how many bytes of the source it replaces — zero for an insertion — so
- * what it proposes can be *applied* rather than only read. That is what an LSP
- * quick fix consumes, and it is what the `-`/`+` pair is derived from: the
- * rendering restates nothing, cf. `applyEdit`.
+ * One splice of an edit: a span of the source, and the text standing in for it.
  *
  * The span is anchored on a word, so it is one of two things: the empty span
  * before that word, or the word itself. Nothing else is something the location
- * can vouch for, and an edit disagreeing with what the file holds is dropped
+ * can vouch for, and a splice disagreeing with what the file holds is dropped
  * rather than applied, cf. `applyEdit`.
  */
-pub record Edit {
+pub record Splice {
     pub let loc: &Word;
 
     // The number of bytes of `loc` the replacement stands in for, 0 for an
@@ -68,13 +62,32 @@ pub record Edit {
 
     pub let replacement: [c8];
 
+    pub self (loc: &Word, replacement: [c8], len: usize = 0us)
+        with loc = loc
+        , len = len
+        , replacement = replacement
+    {}
+}
+
+/**
+ * The edit a diagnostic proposes, before it is laid out.
+ *
+ * An edit is an edit and not a sentence: its splices say where it applies and
+ * what stands in for what, so what it proposes can be *applied* rather than
+ * only read. That is what an LSP quick fix consumes, and it is what the
+ * `-`/`+` pair is derived from: the rendering restates nothing, cf.
+ * `applyEdit`.
+ *
+ */
+pub record Edit {
+    // Where the edit applies and what it writes there, in no particular order
+    pub let splices: [Splice];
+
     // What the edit achieves, printed as the "help:" line above the pair
     pub let msg: [c8];
 
     pub self (loc: &Word, replacement: [c8], msg: [c8], len: usize = 0us)
-        with loc = loc
-        , len = len
-        , replacement = replacement
+        with splices = copy [Splice(loc, replacement-> replacement, len-> len)]
         , msg = msg
     {}
 
@@ -87,9 +100,24 @@ pub record Edit {
      * site hand over the catalogue entry it was already formatting.
      */
     pub self (loc: &Word, replacement: [c8], msg: code::Error, len: usize = 0us)
-        with loc = loc
-        , len = len
-        , replacement = replacement
+        with splices = copy [Splice(loc, replacement-> replacement, len-> len)]
+        , msg = msg.msg
+    {}
+
+    /**
+     * The edit writing each of two words where the other one is.
+     *
+     */
+    pub self (fst: &Word, snd: &Word, msg: [c8])
+        with splices = copy [Splice(fst, replacement-> snd.str, len-> fst.len),
+                             Splice(snd, replacement-> fst.str, len-> snd.len)]
+        , msg = msg
+    {}
+
+    /// The same edit, from a catalogue message, cf. the single word ctor.
+    pub self (fst: &Word, snd: &Word, msg: code::Error)
+        with splices = copy [Splice(fst, replacement-> snd.str, len-> fst.len),
+                             Splice(snd, replacement-> fst.str, len-> snd.len)]
         , msg = msg.msg
     {}
 }
@@ -97,13 +125,6 @@ pub record Edit {
 /**
  * A proposed edit, as the pair of lines it is printed as.
  *
- * Both lines come out of the edit — `before` is the source line and `after`
- * the same line with the replacement spliced in — so the two can differ by
- * exactly what the edit does and by nothing else.
- *
- * Neither is elided, which is the one place an excerpt run and a suggestion
- * part ways: the point of the pair is that the `+` line is the line to write,
- * and a line with its middle dropped is not one.
  */
 pub record Fix {
     pub let msg: [c8];
@@ -126,28 +147,34 @@ pub record Fix {
 }
 
 /**
+ * How many pairs one report prints, the rest of what it proposes staying
+ * prose.
+ *
+ */
+pub def MAX_FIXES = 3us;
+
+/**
  * Lay the edits a diagnostic proposes out into the pairs of lines they print
  * as.
- *
- * An edit that cannot be applied keeps its message: what it says is worth
- * reading whether or not the pair showing it can be built, and dropping it
- * would turn a throw site bug into a diagnostic that says less than the one it
- * replaced. It comes back as a trailing note instead — the prose form the
- * suggestion had before it carried a span.
- *
+ * 
  * @params:
  *   - edits: the edits, in the order they were proposed,
  *   - width: the width of the line number cell of the report.
  *
  * @returns:
- *   - .0: the pairs, in that same order,
- *   - .1: what the edits that could not be applied say.
+ *   - .0: the pairs, in that same order, at most MAX_FIXES of them,
+ *   - .1: what the edits that were not printed as a pair say.
  */
 pub fn layoutFixes(edits: [Edit], width: usize)-> ([Fix], [LabelMsg]) {
     let mut fixes: [Fix] = [];
     let mut notes: [LabelMsg] = [];
 
     for e in edits {
+        if (fixes.len == MAX_FIXES) {
+            notes ~= [LabelMsg(Severity::NOTE, e.msg)];
+            continue;
+        }
+
         match applyEdit(e, width-> width) {
             Ok(f: Fix) => { fixes ~= [f]; }
             _ => { notes ~= [LabelMsg(Severity::NOTE, e.msg)]; }
@@ -160,16 +187,6 @@ pub fn layoutFixes(edits: [Edit], width: usize)-> ([Fix], [LabelMsg]) {
 /**
  * Splice an edit into the line it applies to.
  *
- * The `+` line is produced here and nowhere else. An edit whose rendering is
- * written next to it is an edit whose rendering can disagree with it, and a
- * suggestion the reader cannot trust to be the edit is a sentence again.
- *
- * An edit is refused rather than applied approximately when there is nothing
- * to show of its location, when its span runs past the line it names, or when
- * the bytes it claims to replace are not the ones the line holds — the same
- * disagreement `spanLen` narrows a caret on, answered the same way: the file
- * wins.
- *
  * @params:
  *   - e:     the edit,
  *   - width: the width of the line number cell of the report.
@@ -177,23 +194,59 @@ pub fn layoutFixes(edits: [Edit], width: usize)-> ([Fix], [LabelMsg]) {
  * @returns: the pair of lines, none when the edit cannot be applied.
  */
 pub fn applyEdit(e: Edit, width: usize)-> (Fix)? {
-    if (!isShowable(e.loc)) return none;
+    if (e.splices.len == 0us) return none;
 
-    let line = withoutNewline(getLineAtLoc(e.loc));
-    let col = cast!usize(e.loc.col);
-    if (col == 0us || col - 1us + e.len > line.len) return none;
+    let anchor = e.splices[0].loc;
+    if (!isShowable(anchor)) return none;
 
-    let begin = col - 1us;
+    let line = withoutNewline(getLineAtLoc(anchor));
 
-    // an edit is anchored on a word, so a span of its own is the word itself:
-    // one that says otherwise is pointing at something the file does not hold
-    if (e.len != 0us && (e.len != e.loc.len || line[begin .. begin + e.len] != e.loc.str)) {
-        return none;
+    // right to left, so a splice lands at the column the source line puts it at
+    let ordered = sortedByColumn(e.splices);
+    let mut after = line;
+    let mut lastBegin = line.len + 1us;
+
+    for s in ordered {
+        if (s.loc.filename != anchor.filename || s.loc.lineSeek != anchor.lineSeek) return none;
+
+        let col = cast!usize(s.loc.col);
+        if (col == 0us || col - 1us + s.len > line.len) return none;
+
+        let begin = col - 1us;
+
+        // a splice is anchored on a word, so a span of its own is the word
+        // itself: one that says otherwise is pointing at something the file
+        // does not hold
+        if (s.len != 0us && (s.len != s.loc.len || line[begin .. begin + s.len] != s.loc.str)) {
+            return none;
+        }
+
+        // two splices over the same bytes are two edits of one region
+        if (begin + s.len > lastBegin) return none;
+        lastBegin = begin;
+
+        after = after[0us .. begin] ~ s.replacement ~ after[begin + s.len .. $];
     }
 
-    (Fix(e.msg,
-         e.loc.line,
-         line,
-         line[0us .. begin] ~ e.replacement ~ line[begin + e.len .. $],
-         width-> width))?
+    (Fix(e.msg, anchor.line, line, after, width-> width))?
+}
+
+/**
+ * The splices of an edit, from the last column to the first.
+ *
+ * An edit holds two of them at most, so this is an insertion sort and not a
+ * merge one.
+ */
+fn sortedByColumn(splices: [Splice])-> [Splice] {
+    let mut res: [Splice] = [];
+    for s in splices {
+        let mut i = 0us;
+        while i < res.len && res[i].loc.col > s.loc.col {
+            i += 1us;
+        }
+
+        res = res[0us .. i] ~ [s] ~ res[i .. $];
+    }
+
+    res
 }
