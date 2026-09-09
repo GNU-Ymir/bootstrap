@@ -35,6 +35,8 @@ Commit policy:
 - split work in logical commits
 - rewrite history when a new commit it modifying something that was introduced by another commit of the same branch
 - There's no need for tests to pass, and code to compile between commits as long as the last commit of the branch compiles and test succeed
+- don't add co-authors
+- commit message are just one line long
 
 ## Build / run / test
 

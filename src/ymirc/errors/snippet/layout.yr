@@ -79,6 +79,11 @@ pub def MAX_GAP = 1u64;
  * is what YMI-70 set out to remove, and the caller keeps a way to cite it,
  * cf. isShowable.
  *
+ * A place whose location crosses lines is a region rather than a caret: its two
+ * ends are labelled and the lines between them carried by a margin column, cf.
+ * cutSpans. A file holding one is never split, so that the whole of the region is
+ * read under one header.
+ *
  * @params:
  *   - marks: the places the diagnostic points at, in no particular order.
  *
@@ -104,15 +109,156 @@ pub fn layout(marks: [Mark])-> [Snippet] {
             if (o.loc.filename == m.loc.filename) group ~= [o];
         }
 
-        let sorted = sortByPosition(group);
+        let regions = regionsOf(group);
+        let sorted = sortByPosition(cutSpans(group));
         let width = gutterWidth(sorted[$ - 1us].loc.line);
+
+        // an excerpt showing a region shows the whole of it: splitting it
+        // would leave the arm opening the region in one excerpt and the one
+        // closing it in another, which is no longer a region
+        if (regions.len != 0us) {
+            res ~= [fileSnippet(sorted, regions, width)];
+            continue;
+        }
+
         let (head, rest) = splitAtPrimary(sorted);
 
-        if (head.len != 0us) res ~= [fileSnippet(head, width)];
-        if (rest.len != 0us) res ~= [fileSnippet(rest, width)];
+        if (head.len != 0us) res ~= [fileSnippet(head, regions, width)];
+        if (rest.len != 0us) res ~= [fileSnippet(rest, regions, width)];
     }
 
     res
+}
+
+/**
+ * The run of lines one span crossing lines covers, both ends included.
+ */
+record Region {
+    pub let from: u64;
+    pub let to: u64;
+
+    pub self (from: u64, to: u64)
+        with from = from
+        , to = to
+    {}
+}
+
+/**
+ * Cut every place whose location crosses lines into the two ends of the region
+ * it covers.
+ *
+ * What is labelled of such a place is its first byte and its last one - the
+ * lines between them are carried by the margin column instead, cf. MarginKind.
+ * The messages hang at the closing end, which is where the reader comes out of
+ * the region.
+ *
+ * A place whose closing end cannot be shown keeps its opening one and stops
+ * being a region: an excerpt only ever draws what it has the source of.
+ */
+fn cutSpans(marks: [Mark])-> [Mark] {
+    let mut res: [Mark] = [];
+    for m in marks {
+        if (!isMultiLine(m.loc)) {
+            res ~= [m];
+            continue;
+        }
+
+        let close = spanClose(m.loc);
+        if (!isShowable(close)) {
+            res ~= [Mark(spanOpen(m.loc), kind-> m.kind, msgs-> m.msgs)];
+            continue;
+        }
+
+        let kind = regionKind(marks, m, close);
+
+        res ~= [Mark(spanOpen(m.loc), kind-> kind),
+                Mark(close, kind-> kind, msgs-> m.msgs)];
+    }
+
+    res
+}
+
+/**
+ * The way the two ends of a region are underlined.
+ *
+ * Both of them the same way, or the region reads as two unrelated places rather
+ * than as one - and one end merging with a place of another kind that happens
+ * to sit there would be enough to break it, cf. labelledLine.
+ *
+ * It is primary as soon as the diagnostic is reported at one of its ends: the
+ * place named there is the region, and the one byte caret standing at the same
+ * spot is that place said less precisely.
+ */
+fn regionKind(marks: [Mark], region: Mark, close: &Word)-> LabelKind {
+    match region.kind {
+        LabelKind::PRIMARY => { return LabelKind::PRIMARY; }
+    }
+
+    for o in marks {
+        match o.kind {
+            LabelKind::PRIMARY => {
+                if (o.loc.isSameLoc(region.loc) || o.loc.isSameLoc(close)) {
+                    return LabelKind::PRIMARY;
+                }
+            }
+        }
+    }
+
+    LabelKind::SECONDARY
+}
+
+/**
+ * The runs of lines the places named in one file cover.
+ *
+ * Two regions that overlap are merged: they are drawn in one margin column, so
+ * two of them open at once would be two bars the reader has to tell apart for
+ * nothing - the excerpt already shows what each end points at.
+ *
+ * @returns:
+ *   - the regions, in source order, none of them overlapping another.
+ */
+fn regionsOf(marks: [Mark])-> [Region] {
+    let mut res: [Region] = [];
+    for m in marks {
+        if (!isMultiLine(m.loc)) continue;
+
+        let close = spanClose(m.loc);
+        if (!isShowable(close)) continue;
+
+        let mut at = res.len;
+        while at > 0us && res[at - 1us].from > m.loc.line {
+            at -= 1us;
+        }
+
+        res = res[0us .. at] ~ [Region(m.loc.line, close.line)] ~ res[at .. $];
+    }
+
+    let mut merged: [Region] = [];
+    for r in res {
+        if (merged.len != 0us && merged[$ - 1us].to >= r.from) {
+            let last = merged[$ - 1us];
+            let to = if (last.to > r.to) { last.to } else { r.to };
+            merged = merged[0us .. $ - 1us] ~ [Region(last.from, to)];
+            continue;
+        }
+
+        merged ~= [r];
+    }
+
+    merged
+}
+
+/**
+ * @returns: where the given line sits in the regions of its excerpt.
+ */
+fn marginAt(regions: [Region], num: u64)-> MarginKind {
+    for r in regions {
+        if (num == r.from) return MarginKind::OPEN;
+        if (num == r.to) return MarginKind::CLOSE;
+        if (num > r.from && num < r.to) return MarginKind::INNER;
+    }
+
+    MarginKind::NONE
 }
 
 /**
@@ -188,14 +334,16 @@ fn seen(files: [[c8]], f: [c8])-> bool {
  * otherwise.
  *
  * @params:
- *   - marks: the places named in that file, at least one, all showable,
- *   - width: the width of the line number cell, shared by every excerpt of the
- *            file so that the two sides of a split read as one column.
+ *   - marks:   the places named in that file, at least one, all showable, the
+ *              regions among them already cut into their two ends,
+ *   - regions: the runs of lines those regions cover,
+ *   - width:   the width of the line number cell, shared by every excerpt of the
+ *              file so that the two sides of a split read as one column.
  *
  * @returns:
  *   - the excerpt.
  */
-fn fileSnippet(marks: [Mark], width: usize)-> Snippet {
+fn fileSnippet(marks: [Mark], regions: [Region], width: usize)-> Snippet {
     let sorted = sortByPosition(marks);
 
     // the header cites the place the diagnostic is reported at, which is not
@@ -232,14 +380,14 @@ fn fileSnippet(marks: [Mark], width: usize)-> Snippet {
                 for c in prevLine + 1u64 .. num {
                     let (next, txt) = lineAfter(prevContent, seek);
                     seek = next;
-                    if (txt.len != 0us) lines ~= [contextLine(c, txt, width)];
+                    if (txt.len != 0us) lines ~= [contextLine(c, txt, width, marginAt(regions, c))];
                 }
             } else {
                 elided = true;
             }
         }
 
-        lines ~= [labelledLine(sorted[i .. j], width, elided)];
+        lines ~= [labelledLine(sorted[i .. j], width, elided, marginAt(regions, num))];
 
         prevLine = num;
         prevSeek = sorted[i].loc.lineSeek;
@@ -280,14 +428,16 @@ fn isAfter(a: Mark, b: Mark)-> bool {
 }
 
 /**
- * An unlabelled line of an excerpt, shown for the context it gives.
+ * An unlabelled line of an excerpt, shown for the context it gives, or carried
+ * by the margin column when it stands inside a region.
  */
-fn contextLine(num: u64, line: [c8], width: usize)-> SourceLine {
+fn contextLine(num: u64, line: [c8], width: usize, margin: MarginKind)-> SourceLine {
     SourceLine(num,
                copy [elide(line)],
                [],
                trailingNewline-> line[$ - 1us] == '\n',
-               width-> width)
+               width-> width,
+               margin-> margin)
 }
 
 /**
@@ -302,9 +452,10 @@ fn contextLine(num: u64, line: [c8], width: usize)-> SourceLine {
  * @params:
  *   - marks:  the places naming that line, ordered by column,
  *   - width:  the width of the line number cell of the excerpt,
- *   - elided: true iif an "..." separator stands before the line.
+ *   - elided: true iif an "..." separator stands before the line,
+ *   - margin: where the line sits in the regions of the excerpt.
  */
-fn labelledLine(marks: [Mark], width: usize, elided: bool)-> SourceLine {
+fn labelledLine(marks: [Mark], width: usize, elided: bool, margin: MarginKind)-> SourceLine {
     let line = getLineAtLoc(marks[0].loc);
     let mut spans: [Span] = [];
 
@@ -312,7 +463,7 @@ fn labelledLine(marks: [Mark], width: usize, elided: bool)-> SourceLine {
         let col = cast!usize(m.loc.col);
         let len = spanLen(line, col, m.loc);
 
-        if (col > line.len || col + len > line.len) {
+        if (col > line.len || col + len - 1us > line.len) {
             spans = withMsgs(spans, m.msgs);
             continue;
         }
@@ -326,12 +477,13 @@ fn labelledLine(marks: [Mark], width: usize, elided: bool)-> SourceLine {
         spans ~= [Span(begin, col + len - 1us, kind-> m.kind, msgs-> m.msgs)];
     }
 
-    if (spans.len == 0us) return outOfRange(marks, line, width, elided);
+    if (spans.len == 0us) return outOfRange(marks, line, width, elided, margin);
 
     cut(marks[0].loc.line, line, spans,
         trailingNewline-> line[$ - 1us] == '\n',
         width-> width,
-        elided-> elided)
+        elided-> elided,
+        margin-> margin)
 }
 
 /**
@@ -353,7 +505,7 @@ fn withMsgs(spans: [Span], msgs: [LabelMsg])-> [Span] {
  * no column to point at, so the caret line stays empty and the messages hang
  * at the gutter.
  */
-fn outOfRange(marks: [Mark], line: [c8], width: usize, elided: bool)-> SourceLine {
+fn outOfRange(marks: [Mark], line: [c8], width: usize, elided: bool, margin: MarginKind)-> SourceLine {
     let mut msgs: [LabelMsg] = [];
     for m in marks {
         msgs ~= m.msgs;
@@ -364,7 +516,8 @@ fn outOfRange(marks: [Mark], line: [c8], width: usize, elided: bool)-> SourceLin
                copy [Label(Piece(""), kind-> marks[0].kind, msgs-> msgs)],
                trailingNewline-> line[$ - 1us] == '\n',
                width-> width,
-               elided-> elided)
+               elided-> elided,
+               margin-> margin)
 }
 
 /**
@@ -393,13 +546,14 @@ fn spanLen(line: [c8], col: usize, loc: &Word)-> usize {
  *   - trailingNewline: true iif the excerpt ends with a line return of its own,
  *                      the renderer adding one when it does not,
  *   - width:           the width of the line number cell of the excerpt,
- *   - elided:          true iif an "..." separator stands before the line.
+ *   - elided:          true iif an "..." separator stands before the line,
+ *   - margin:          where the line sits in the regions of the excerpt.
  *
  * @returns:
  *   - the line as the alternation of its unlabelled runs and its labels, each
  *     run elided when it is too long to print.
  */
-fn cut(num: u64, line: [c8], spans: [Span], trailingNewline: bool, width: usize, elided: bool)-> SourceLine {
+fn cut(num: u64, line: [c8], spans: [Span], trailingNewline: bool, width: usize, elided: bool, margin: MarginKind)-> SourceLine {
     let mut gaps: [Piece] = [];
     let mut labels: [Label] = [];
     let mut at = 0us;
@@ -412,5 +566,5 @@ fn cut(num: u64, line: [c8], spans: [Span], trailingNewline: bool, width: usize,
 
     gaps ~= [elide(line[at .. $])];
 
-    SourceLine(num, gaps, labels, trailingNewline-> trailingNewline, width-> width, elided-> elided)
+    SourceLine(num, gaps, labels, trailingNewline-> trailingNewline, width-> width, elided-> elided, margin-> margin)
 }
