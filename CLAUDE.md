@@ -100,6 +100,11 @@ Either way, each case:
    - `testN.yil.opt` — the same dump after the optimizer ran. A case carrying this file is
      compiled at `-O1` instead of `-O0`; absent, no pass runs. This is where a pass is
      regression tested, one case per pass under `test_resources/optimizer/`.
+   - `testN.warn` — expected formatted dump of the warnings reported without aborting the
+     compilation. A case carrying this file is compiled in **debug mode**, the only mode in
+     which a warning is reported instead of thrown; absent, a warning is fatal as any other
+     error. Compared whether or not the case compiles, so a case can carry both a `.warn`
+     and an `.err`. `test_resources/warnings/` is the directory dedicated to it.
 
 If a case has *no* golden file at all, the only assertion is "compilation raised no error" —
 and when it does raise one, the full formatted error is printed to stderr. That makes a
