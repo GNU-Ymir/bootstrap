@@ -1,0 +1,199 @@
+/*
+ * snippet::suggestion — the edit a diagnostic proposes, and the pair of lines
+ * it prints as.
+ *
+ * A suggestion is an edit and not a sentence: an `Edit` is a span plus the
+ * text replacing it, which is what an LSP quick fix consumes, and a `Fix` is
+ * that edit already applied to the line it edits. The `+` line is produced
+ * here and nowhere else, cf. `applyEdit` — a rendering written alongside an
+ * edit is a rendering that can disagree with it.
+ *
+ * <hr>
+ *
+ * @Package: ymirc
+ * @Module: ymirc::errors::snippet::suggestion
+ * @File: ymirc/errors/snippet/suggestion.yr
+ * @Author(s):
+ *   - Emile Cadorel <ecadorel@gmail.com>
+ *
+ * @Created(YYYY-MM-DD): 2026-09-08
+ * @Copyright(C) 2021–2026 GNU-Ymir
+ * @License
+ *   ```text
+ *   This file is part of the Ymir language project.
+ *
+ *   Ymir is free software: you can redistribute it and/or modify it
+ *   under the terms of the GNU General Public License as published by
+ *   the Free Software Foundation, either version 3 of the License, or
+ *   (at your option) any later version.
+ *
+ *   Ymir is distributed in the hope that it will be useful,
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *   GNU General Public License for more details.
+ *
+ *   You should have received a copy of the GNU General Public License
+ *   along with Ymir.  If not, see <https://www.gnu.org/licenses/>.
+ *   ```
+ */
+
+in suggestion;
+
+use ymirc::utils::_;
+use ymirc::lexing::word;
+
+use ymirc::errors::snippet::{label, utils};
+use ymirc::errors::code;
+
+/**
+ * The edit a diagnostic proposes, before it is laid out.
+ *
+ * A suggestion is an edit and not a sentence: `loc` says where it applies and
+ * `len` how many bytes of the source it replaces — zero for an insertion — so
+ * what it proposes can be *applied* rather than only read. That is what an LSP
+ * quick fix consumes, and it is what the `-`/`+` pair is derived from: the
+ * rendering restates nothing, cf. `applyEdit`.
+ *
+ * The span is anchored on a word, so it is one of two things: the empty span
+ * before that word, or the word itself. Nothing else is something the location
+ * can vouch for, and an edit disagreeing with what the file holds is dropped
+ * rather than applied, cf. `applyEdit`.
+ */
+pub record Edit {
+    pub let loc: &Word;
+
+    // The number of bytes of `loc` the replacement stands in for, 0 for an
+    // insertion before it
+    pub let len: usize;
+
+    pub let replacement: [c8];
+
+    // What the edit achieves, printed as the "help:" line above the pair
+    pub let msg: [c8];
+
+    pub self (loc: &Word, replacement: [c8], msg: [c8], len: usize = 0us)
+        with loc = loc
+        , len = len
+        , replacement = replacement
+        , msg = msg
+    {}
+
+    /**
+     * Build an edit from a catalogue message.
+     *
+     * A suggestion is not a failure of its own, so the code the entry may
+     * carry is deliberately dropped: only the diagnostic the edit fixes is
+     * codified. Same rule as ErrorMsg::note, and same reason — it lets a throw
+     * site hand over the catalogue entry it was already formatting.
+     */
+    pub self (loc: &Word, replacement: [c8], msg: code::Error, len: usize = 0us)
+        with loc = loc
+        , len = len
+        , replacement = replacement
+        , msg = msg.msg
+    {}
+}
+
+/**
+ * A proposed edit, as the pair of lines it is printed as.
+ *
+ * Both lines come out of the edit — `before` is the source line and `after`
+ * the same line with the replacement spliced in — so the two can differ by
+ * exactly what the edit does and by nothing else.
+ *
+ * Neither is elided, which is the one place an excerpt run and a suggestion
+ * part ways: the point of the pair is that the `+` line is the line to write,
+ * and a line with its middle dropped is not one.
+ */
+pub record Fix {
+    pub let msg: [c8];
+
+    // The line number cell, and a blank of the same width, shared with the
+    // excerpts of the report so the pair reads under the same column
+    pub let gutter: [c8];
+    pub let padd: [c8];
+
+    pub let before: [c8];
+    pub let after: [c8];
+
+    pub self (msg: [c8], num: u64, before: [c8], after: [c8], width: usize)
+        with msg = msg
+        , gutter = center(format("%", num), width)
+        , padd = center("", width)
+        , before = before
+        , after = after
+    {}
+}
+
+/**
+ * Lay the edits a diagnostic proposes out into the pairs of lines they print
+ * as.
+ *
+ * An edit that cannot be applied keeps its message: what it says is worth
+ * reading whether or not the pair showing it can be built, and dropping it
+ * would turn a throw site bug into a diagnostic that says less than the one it
+ * replaced. It comes back as a trailing note instead — the prose form the
+ * suggestion had before it carried a span.
+ *
+ * @params:
+ *   - edits: the edits, in the order they were proposed,
+ *   - width: the width of the line number cell of the report.
+ *
+ * @returns:
+ *   - .0: the pairs, in that same order,
+ *   - .1: what the edits that could not be applied say.
+ */
+pub fn layoutFixes(edits: [Edit], width: usize)-> ([Fix], [LabelMsg]) {
+    let mut fixes: [Fix] = [];
+    let mut notes: [LabelMsg] = [];
+
+    for e in edits {
+        match applyEdit(e, width-> width) {
+            Ok(f: Fix) => { fixes ~= [f]; }
+            _ => { notes ~= [LabelMsg(Severity::NOTE, e.msg)]; }
+        }
+    }
+
+    (fixes, notes)
+}
+
+/**
+ * Splice an edit into the line it applies to.
+ *
+ * The `+` line is produced here and nowhere else. An edit whose rendering is
+ * written next to it is an edit whose rendering can disagree with it, and a
+ * suggestion the reader cannot trust to be the edit is a sentence again.
+ *
+ * An edit is refused rather than applied approximately when there is nothing
+ * to show of its location, when its span runs past the line it names, or when
+ * the bytes it claims to replace are not the ones the line holds — the same
+ * disagreement `spanLen` narrows a caret on, answered the same way: the file
+ * wins.
+ *
+ * @params:
+ *   - e:     the edit,
+ *   - width: the width of the line number cell of the report.
+ *
+ * @returns: the pair of lines, none when the edit cannot be applied.
+ */
+pub fn applyEdit(e: Edit, width: usize)-> (Fix)? {
+    if (!isShowable(e.loc)) return none;
+
+    let line = withoutNewline(getLineAtLoc(e.loc));
+    let col = cast!usize(e.loc.col);
+    if (col == 0us || col - 1us + e.len > line.len) return none;
+
+    let begin = col - 1us;
+
+    // an edit is anchored on a word, so a span of its own is the word itself:
+    // one that says otherwise is pointing at something the file does not hold
+    if (e.len != 0us && (e.len != e.loc.len || line[begin .. begin + e.len] != e.loc.str)) {
+        return none;
+    }
+
+    (Fix(e.msg,
+         e.loc.line,
+         line,
+         line[0us .. begin] ~ e.replacement ~ line[begin + e.len .. $],
+         width-> width))?
+}

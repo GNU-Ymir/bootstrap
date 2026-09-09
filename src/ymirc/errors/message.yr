@@ -61,7 +61,7 @@
 in message;
 
 use ymirc::utils::_;
-use ymirc::errors::{code, format, snippet, utils};
+use ymirc::errors::{code, format, snippet::_, utils};
 use ymirc::global::state;
 use ymirc::lexing::word;
 
@@ -155,6 +155,11 @@ pub class ErrorMsg over Exception {
     // True iif the message says what was being validated rather than what went
     // wrong, cf. code::Error::isContext
     let _isContext: bool = false;
+
+    // The edit this node proposes, none when it proposes nothing. Set after
+    // construction the way the stack trace is, so that a throw site adds one
+    // to whatever it was already building, cf. `withFix`
+    let mut _fix: (Edit)? = none;
 
     /*!
      * ====================================================================================================
@@ -543,12 +548,15 @@ pub class ErrorMsg over Exception {
      *   - verbose flag.
      */
     pub fn asFatal(self)-> &ErrorMsg {
-        copy ErrorMsg::fatal(self._begin,
-                             end-> self._end,
-                             notes-> self._notes,
-                             oneLine-> self._oneLine,
-                             msg-> code::Error(self._code, self._msg, isContext-> self._isContext),
-                             forceVerbose-> self._forceVerbose)
+        let dmut ret = copy ErrorMsg::fatal(self._begin,
+                                            end-> self._end,
+                                            notes-> self._notes,
+                                            oneLine-> self._oneLine,
+                                            msg-> code::Error(self._code, self._msg, isContext-> self._isContext),
+                                            forceVerbose-> self._forceVerbose);
+        ret._fix = self._fix;
+
+        return ret;
     }
 
     /*!
@@ -568,11 +576,32 @@ pub class ErrorMsg over Exception {
         if !alone {
             let dmut ret = copy ErrorMsg::all(self._begin, self._end, self._notes ~ notes, self._oneLine, self._msg, self._isNote, self._isWarning, self._isList, self._code, self._isContext);
             ret._movingTrace = self._movingTrace;
+            ret._fix = self._fix;
             return ret;
         }
 
         let dmut ret = copy ErrorMsg::all(self._begin, self._end, notes, self._oneLine, self._msg, self._isNote, self._isWarning, self._isList, self._code, self._isContext);
         ret._movingTrace = self._movingTrace;
+        ret._fix = self._fix;
+        return ret;
+    }
+
+    /**
+     * Return a new diagnostic proposing the given edit.
+     *
+     * A node carries at most one, and the last one set wins: a throw site
+     * proposing two different fixes for one failure is a throw site that has
+     * not decided which it means.
+     *
+     * The message of the edit is what the "help:" line says, so a prose
+     * suggestion becoming a structured one moves its sentence here rather than
+     * keeping a note of its own — the two would say the same thing twice.
+     */
+    pub fn withFix(self, fix: Edit)-> &ErrorMsg {
+        let dmut ret = copy ErrorMsg::all(self._begin, self._end, self._notes, self._oneLine, self._msg, self._isNote, self._isWarning, self._isList, self._code, self._isContext);
+        ret._movingTrace = self._movingTrace;
+        ret._fix = (fix)?;
+
         return ret;
     }
 
@@ -586,6 +615,7 @@ pub class ErrorMsg over Exception {
     pub fn subbingNote(self, note: &ErrorMsg)-> &ErrorMsg {
         let dmut ret = copy ErrorMsg::all(self._begin, self._end, copy [note.withNote(self._notes, alone-> true)], self._oneLine, self._msg, self._isNote, self._isWarning, self._isList, self._code, self._isContext);
         ret._movingTrace = self._movingTrace;
+        ret._fix = self._fix;
         return ret;
     }
 
@@ -598,12 +628,14 @@ pub class ErrorMsg over Exception {
         if (self._notes.len == 0u64) {
             let dmut ret = copy ErrorMsg::all(self._begin, self._end, notes, self._oneLine, self._msg, self._isNote, self._isWarning, self._isList, self._code, self._isContext);
             ret._movingTrace = self._movingTrace;
+            ret._fix = self._fix;
             return ret;
         }
 
         let aux = self._notes[0].appendNotes(notes);
         let dmut ret =  copy ErrorMsg::all(self._begin, self._end, copy [aux] ~ self._notes[1us .. $], self._oneLine, self._msg, self._isNote, self._isWarning, self._isList, self._code, self._isContext);
         ret._movingTrace = self._movingTrace;
+        ret._fix = self._fix;
         return ret;
     }
 
@@ -683,13 +715,20 @@ pub class ErrorMsg over Exception {
             if (atEnd) { endCaret ~= msgs; } else { caret ~= msgs; }
         }
 
+        // the pairs are written under the gutter the excerpts share, so what
+        // they show lines up with what the excerpt showed of the same line
+        let edits = self.gatherFixes();
+
         if (self._oneLine) {
             if (self._oneLineWithLoc && isShowable(self._begin)) {
                 let own = copy [Mark(self._begin, msgs-> caret ~ endCaret)];
+                let snips = layout(own ~ marks);
+                let (fixes, unfit) = layoutFixes(edits, gutterOf(snips));
 
                 return Diagnostic(header,
-                                  snippets-> layout(own ~ marks),
-                                  notes-> notes,
+                                  snippets-> snips,
+                                  notes-> notes ~ unfit,
+                                  fixes-> fixes,
                                   trace-> frames ~ trace);
             }
 
@@ -698,12 +737,16 @@ pub class ErrorMsg over Exception {
                 inline = inlineLocOf(self._begin);
             }
 
+            let snips = layout(marks);
+            let (fixes, unfit) = layoutFixes(edits, gutterOf(snips));
+
             // there is no caret to hang them under, so what was written there
             // is written at the bottom instead rather than dropped
             return Diagnostic(header,
-                              snippets-> layout(marks),
+                              snippets-> snips,
                               inlineLoc-> inline,
-                              notes-> caret ~ endCaret ~ notes,
+                              notes-> caret ~ endCaret ~ notes ~ unfit,
+                              fixes-> fixes,
                               trace-> frames ~ trace);
         }
 
@@ -715,7 +758,32 @@ pub class ErrorMsg over Exception {
                   Mark(self._end, kind-> LabelKind::SECONDARY, msgs-> endCaret)]
         };
 
-        Diagnostic(header, snippets-> layout(own ~ marks), notes-> notes, trace-> frames ~ trace)
+        let snips = layout(own ~ marks);
+        let (fixes, unfit) = layoutFixes(edits, gutterOf(snips));
+
+        Diagnostic(header, snippets-> snips, notes-> notes ~ unfit, fixes-> fixes, trace-> frames ~ trace)
+    }
+
+    /**
+     * Collect the edits this node and its subtree propose.
+     *
+     * A suggestion belongs to the failure and not to the node that happened to
+     * carry it: a throw site attaches the fix at whatever depth suits what it
+     * is building, and one report is where the whole subtree ends up, cf.
+     * `collect`. A node the tree is split at — a list, or a context frame with
+     * notes under it — is never one a fix is attached to, cf. `reports`.
+     */
+    fn gatherFixes(self)-> [Edit] {
+        let mut res: [Edit] = [];
+        match self._fix {
+            Ok(e: Edit) => { res ~= [e]; }
+        }
+
+        for i in self._notes {
+            res ~= i.gatherFixes();
+        }
+
+        res
     }
 
     /**

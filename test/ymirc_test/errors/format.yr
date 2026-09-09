@@ -1,4 +1,5 @@
 use ymirc::errors;
+use ymirc::errors::snippet::suggestion;
 use ymirc::lexing::word;
 use ymirc::utils::_;
 
@@ -617,4 +618,199 @@ __test the_reason_a_note_gives_hangs_under_that_note {
     let said = lineWith(ls, "why it failed");
     assert(contains(said, "┃") && !contains(said, "╋"),
            format("the reason is not a message of a caret :\n%", renderText(err)));
+}
+
+/**
+ * ======================================================================
+ * ======================     SUGGESTIONS      ==========================
+ * ======================================================================
+ */
+
+/**
+ * @returns: 'str' as a terminal shows it, escape sequences dropped
+ * */
+fn plain(str: [c8])-> [c8] {
+    let mut res = "";
+    let mut i = 0us;
+    while i < str.len {
+        let j = skipAnsi(str, i);
+        if (j != i) { i = j; }
+        else {
+            res = res ~ str[i .. i + 1us];
+            i += 1us;
+        }
+    }
+
+    res
+}
+
+/**
+ * @returns: the character standing in the "┃" cell of a row of a report, none
+ *           for a row that has no line number cell
+ *
+ * A row of a suggestion is an excerpt row whose bar is a "-" or a "+", so this
+ * is the whole of what tells the two apart. The bar is three bytes and the two
+ * markers are one, and only their first byte is read here, which is enough:
+ * neither of them starts a multi byte character
+ * */
+fn rowMark(str: [c8])-> (c8)? {
+    let mut i = 0us;
+    while i < str.len {
+        let j = skipAnsi(str, i);
+        if (j != i) { i = j; }
+        else if (str[i] == ' ') { i += 1us; }
+        else break;
+    }
+
+    let mut some = false;
+    while i < str.len && str[i] >= '0' && str[i] <= '9' {
+        some = true;
+        i += 1us;
+    }
+
+    if (!some) return none;
+
+    while i < str.len {
+        let j = skipAnsi(str, i);
+        if (j != i) { i = j; }
+        else if (str[i] == ' ') { i += 1us; }
+        else break;
+    }
+
+    if (i >= str.len) return none;
+
+    (str[i])?
+}
+
+/**
+ * @returns: the row of a rendered report carrying the given diff marker, empty
+ *           when it has none
+ * */
+fn diffRow(ls: [[c8]], marker: c8)-> [c8] {
+    for l in ls {
+        match rowMark(l) {
+            Ok(m: c8) => { if (m == marker) return l; }
+        }
+    }
+
+    ""
+}
+
+/**
+ * @returns: true iif the row ends on 'txt', once its styling is dropped
+ * */
+fn rowShows(row: [c8], txt: [c8])-> bool {
+    let str = plain(row);
+    if (str.len < txt.len) return false;
+
+    str[str.len - txt.len .. $] == txt
+}
+
+/**
+ * @returns: a report on the last 'c' of 'content', proposing an edit there
+ * */
+fn withEdit(content: [c8], c: c8, replacement: [c8], len: usize = 0us)-> &ErrorMsg {
+    let w = at(content, c);
+
+    (copy ErrorMsg::fatal(w, msg-> "e")).withFix(Edit(w, replacement-> replacement, msg-> "do that", len-> len))
+}
+
+__test the_pair_is_the_edit_applied_to_the_line {
+    // the point of YMI-72: the "+" row is the source line with the replacement
+    // spliced in at the span, and nothing else. Nobody writes it - a sentence
+    // saying what to do is not something a quick fix can apply, and a rendering
+    // written next to the edit can disagree with it
+    let src = "let x = 1; let y = @;";
+    let w = at(PLAIN, '@'c8);
+    let col = cast!{usize}(w.col);
+    let after = src[0us .. col - 1us] ~ "copy " ~ src[col - 1us .. $];
+
+    let ls = render(withEdit(PLAIN, '@'c8, "copy "));
+    let minus = diffRow(ls, '-'c8);
+    let plus = diffRow(ls, '+'c8);
+
+    assert(minus != "" && plus != "",
+           format("the report has no pair of lines :\n%", renderText(withEdit(PLAIN, '@'c8, "copy "))));
+    assert(rowShows(minus, src), format("the '-' row is %, expected %", plain(minus), src));
+    assert(rowShows(plus, after), format("the '+' row is %, expected %", plain(plus), after));
+}
+
+__test the_pair_names_the_line_it_edits {
+    // both rows carry the number of the line they show, so a fix reads under
+    // the excerpt as one more thing said about that line
+    let content = numbered(12u64);
+    let w = atLine(content, "a.yr", 7u64);
+    let err = (copy ErrorMsg::fatal(atLine(content, "a.yr", 7u64), msg-> "e"))
+        .withFix(Edit(w, replacement-> "mut ", msg-> "do that"));
+
+    let ls = render(err);
+
+    assert(format("%", rowNumber(diffRow(ls, '-'c8))) == "Ok(7)",
+           format("the '-' row names % :\n%", rowNumber(diffRow(ls, '-'c8)), renderText(err)));
+    assert(format("%", rowNumber(diffRow(ls, '+'c8))) == "Ok(7)",
+           format("the '+' row names % :\n%", rowNumber(diffRow(ls, '+'c8)), renderText(err)));
+    assert(rowShows(diffRow(ls, '+'c8), "let mut l7 = 7;"),
+           format("the '+' row is % :\n%", plain(diffRow(ls, '+'c8)), renderText(err)));
+}
+
+__test an_edit_standing_in_for_a_word_replaces_it {
+    // a span of its own, and not only the empty one before the word: the
+    // replacement takes the place of what the word covers
+    let ls = render(withEdit(PLAIN, '@'c8, "42", len-> 1us));
+
+    assert(rowShows(diffRow(ls, '+'c8), "let x = 1; let y = 42;"),
+           format("the '+' row is % :\n%", plain(diffRow(ls, '+'c8)),
+                  renderText(withEdit(PLAIN, '@'c8, "42", len-> 1us))));
+}
+
+__test an_edit_that_cannot_be_applied_keeps_what_it_says {
+    // a span running past the line it names is a throw site bug, and dropping
+    // the suggestion would answer it by saying less than the prose form said.
+    // The sentence comes back as a trailing note instead
+    let w = at(PLAIN, '@'c8);
+    let far = copy LocWord(str-> w.str, filename-> w.filename, fileContent-> w.fileContent,
+                           line-> 1u64, col-> 900u64, seek-> w.seek, lineSeek-> 0us);
+
+    let err = (copy ErrorMsg::fatal(at(PLAIN, '@'c8), msg-> "e"))
+        .withFix(Edit(far, replacement-> "copy ", msg-> "do that"));
+    let ls = render(err);
+
+    assert(diffRow(ls, '-'c8) == "" && diffRow(ls, '+'c8) == "",
+           format("an edit that does not fit was applied :\n%", renderText(err)));
+
+    let said = lineWith(ls, "do that");
+    assert(contains(said, "=") && !contains(said, "┃"),
+           format("what the edit says was lost :\n%", renderText(err)));
+}
+
+__test an_edit_disagreeing_with_the_line_is_refused {
+    // the word says it covers a '@' and the line holds a '1' there. The excerpt
+    // is what the file holds, so replacing those bytes would be replacing
+    // something else, cf. snippet::applyEdit
+    let w = at(PLAIN, '@'c8);
+    let off = copy LocWord(str-> w.str, filename-> w.filename, fileContent-> w.fileContent,
+                           line-> 1u64, col-> 9u64, seek-> w.seek, lineSeek-> 0us);
+
+    let err = (copy ErrorMsg::fatal(at(PLAIN, '@'c8), msg-> "e"))
+        .withFix(Edit(off, replacement-> "42", msg-> "do that", len-> 1us));
+    let ls = render(err);
+
+    assert(diffRow(ls, '+'c8) == "",
+           format("an edit disagreeing with the line was applied :\n%", renderText(err)));
+}
+
+__test a_suggestion_hanging_under_a_note_reaches_the_report {
+    // a throw site attaches the fix at whatever depth suits what it is
+    // building, and the report is where the whole subtree ends up: a note that
+    // became a label of the excerpt still proposes its edit
+    let content = numbered(12u64);
+    let w = atLine(content, "a.yr", 9u64);
+    let note = (copy ErrorMsg::note(w, msg-> "n", oneLine-> true, withLoc-> true))
+        .withFix(Edit(w, replacement-> "mut ", msg-> "do that"));
+
+    let err = copy ErrorMsg::fatal(atLine(content, "a.yr", 5u64), msg-> "e", notes-> copy [note]);
+    let ls = render(err);
+
+    assert(rowShows(diffRow(ls, '+'c8), "let mut l9 = 9;"),
+           format("the edit of the note did not reach the report :\n%", renderText(err)));
 }
