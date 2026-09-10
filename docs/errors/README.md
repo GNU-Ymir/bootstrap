@@ -24,9 +24,9 @@ check lives:
 | Range | Stage | Catalogue | Live codes |
 |---|---|---|---|
 | `E1xxx` | lexing | `LexingErrorMessage` -- `src/ymirc/lexing/errors.yr` | 25 |
-| `E2xxx` | parsing | `SyntaxErrorMessage` -- `src/ymirc/syntax/errors.yr` | 7 |
-| `E3xxx` | declaration | `DeclareErrorMessage` -- `src/ymirc/semantic/declarator/errors.yr` | 34 |
-| `E4xxx` | validation | `ValidateErrorMessage` -- `src/ymirc/semantic/validator/errors.yr` | 265 |
+| `E2xxx` | parsing | `SyntaxErrorMessage` -- `src/ymirc/syntax/errors.yr` | 9 |
+| `E3xxx` | declaration | `DeclareErrorMessage` -- `src/ymirc/semantic/declarator/errors.yr` | 36 |
+| `E4xxx` | validation | `ValidateErrorMessage` -- `src/ymirc/semantic/validator/errors.yr` | 264 |
 | `E5xxx` | lowering (YIL) | `SerializeYILErrorMessage` -- `src/ymirc/lint/serialize/errors.yr` | 10 |
 
 Each page carries an example wherever a case in the suite raises the code: the
@@ -79,6 +79,8 @@ deliberately carry no code, and have no page here.
 | [E2007](E2007.md) | `UNEXPECTED` | unexpected <> |
 | [E2008](E2008.md) | `UNEXPECTED_ATTRIBUTES` | unexpected attribute list <> |
 | [E2009](E2009.md) | `UNEXPECTED_BUT_LST` | read <>, but expected <> |
+| [E2012](E2012.md) | `MOVE_NAMED_CTOR_PARAMS` | a named move ctor requires an argument list |
+| [E2013](E2013.md) | `MOVE_MISSING_OPERAND` | missing the value moved by the operator |
 
 ## E3xxx -- declaration
 
@@ -118,6 +120,8 @@ deliberately carry no code, and have no page here.
 | [E3032](E3032.md) | `UNEXPECTED_IN_MODULE` | unexpected declaration |
 | [E3033](E3033.md) | `UNEXPECTED_IN_TRAIT` | unexpected declaration inside a trait |
 | [E3034](E3034.md) | `WRONG_MODULE_NAME` | module <> must be defined in a file named <> |
+| [E3035](E3035.md) | `EXCLUSIVE_MOVE_ATTRIBUTES` | a ctor cannot be both no_move and only_move |
+| [E3036](E3036.md) | `MOVE_ATTRIBUTE_NO_ENTITY` | custom attribute <> may only be applied to the ctor of an entity |
 
 ## E4xxx -- validation
 
@@ -284,7 +288,6 @@ deliberately carry no code, and have no page here.
 | [E4167](E4167.md) | `NO_COPY_EXIST` | no copy exists for type <> |
 | [E4168](E4168.md) | `NO_CTOR_FOUND` | no constructor found for class <> |
 | [E4169](E4169.md) | `NO_CTOR_FOUND_NAME` | no constructor named <> found for class <> |
-| [E4170](E4170.md) | `NO_DEFAULT_CTOR_MOVE_STRUCT` | type <> is an entity, but has no default ctor self() |
 | [E4171](E4171.md) | `NO_PARAMETER_NAMED` | no parameter is named <> |
 | [E4172](E4172.md) | `NO_SIZE_FORWARD_REF` | record or entity type <> has no size due to forward references |
 | [E4173](E4173.md) | `NO_SUPER_CLASS` | class <> has no ancestor |
@@ -424,6 +427,7 @@ can still be looked up, and so neither the code nor the name is ever reused.
 | [E4098](E4098.md) | `INCOMPLETE_TYPE_CLASS` | the type <> is not complete due to previous errors |
 | [E4132](E4132.md) | `MULTIPLE_DECORATORS` | decorator <> is specified multiple times |
 | [E4164](E4164.md) | `NOT_AN_UNION` | <> is not a union type |
+| [E4170](E4170.md) | `NO_DEFAULT_CTOR_MOVE_STRUCT` | type <> is an entity, but has no default ctor self() |
 | [E4174](E4174.md) | `ONE_ITER_LOOP` | do while loop test is always false, the loop is always entered exactly once, so the branching construct is useless |
 | [E4191](E4191.md) | `OVERRIDE_PRIVATE` | cannot override private method <> |
 | [E4194](E4194.md) | `PRAGMA_FIELD_NO_DEFAULT` | field <> from type <> has no default value |
