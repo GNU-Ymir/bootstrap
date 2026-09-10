@@ -67,8 +67,8 @@ use std::{io, stream};
  *   - generate a UnitTestGenerator for execution,
  *   - assign a unique path to each unittest based on its module index.
  *
- * Unittests behave like zero-argument functions evaluated at runtime,
- * but with no return value and no attributes.
+ * Unittests behave like functions evaluated at runtime with no return value. They
+ * take no parameter, unless a `@parameters` attribute says what they are run with.
  */
 pub mod UnittestValidation {
 
@@ -100,8 +100,19 @@ pub mod UnittestValidation {
 
         let mut errors: (&ErrorMsg)? = none;
         let mut body: &Value = UNIT_VALUE;
+        let mut params: [&ProtoVarDeclValue] = [];
+        let mut provider: &Value = UNIT_VALUE;
         {
-            body = ValueValidation::validate(alias context, sym.decl.body);
+            let (provider_, params_, preamble) = UnittestValidation::validateParameters(alias context, sym.decl);
+            provider = provider_;
+            params = params_;
+
+            let content = ValueValidation::validate(alias context, sym.decl.body);
+            body = if preamble.len == 0us {
+                content
+            } else {
+                copy BlockValue(sym.decl.body.loc, VOID_TYPE, preamble ~ [content])
+            };
         } catch {
             err => {
                 errors = (err)?;
@@ -129,8 +140,166 @@ pub mod UnittestValidation {
             sym.path
         };
 
-        let gen = copy UnitTestGenerator(sym.loc, path, body);
+        let gen = copy UnitTestGenerator(sym.loc, path, body,
+                                         params-> params,
+                                         provider-> provider);
         context:.insertGenerator(alias sym, gen);
+    }
+
+    /**
+     * Validate the parameter list of a unittest and the `@parameters` attribute feeding it.
+     *
+     * The test is called once per element of the slice the attribute produces, with
+     * that slice and the index of the element, so its parameters are declared as
+     * locals unwrapped from that element in front of the original body.
+     *
+     * @params:
+     *   - context: validation context
+     *   - decl:    the unittest declaration
+     *
+     * @returns:
+     *   - .0: the value producing the parameter sets(UNIT_VALUE if the test takes none)
+     *   - .1: the parameters of the test frame(empty if the test takes none)
+     *   - .2: the declaration of the parameters, to run in front of the body
+     *
+     * @throws:
+     *   - ErrorMsg if the test and the `@parameters` attribute disagree, or if the
+     *     produced values do not match the declared parameters
+     */
+    fn validateParameters(dmut context: &ValidationContext, decl: &UnitTestDecl)-> (&Value, [&ProtoVarDeclValue], [&Value])
+        throws ErrorMsg
+    {
+        for a in decl.attrs if a.attr == Attributes::PARAMETERS {
+            return UnittestValidation::validateParameterized(alias context, decl, a);
+        }
+
+        if decl.params.len != 0us {
+            throw copy ErrorMsg::fatal(decl.params[0].loc, format(ValidateErrorMessage::UNITTEST_PARAMS_NO_PROVIDER));
+        }
+
+        return (UNIT_VALUE, [], []);
+    }
+
+    /**
+     * Validate a unittest fed by a `@parameters` attribute.
+     *
+     * @params:
+     *   - context: validation context
+     *   - decl:    the unittest declaration
+     *   - param:   the `@parameters` attribute of the test
+     *
+     * @returns: cf. `validateParameters`
+     *
+     * @throws:
+     *   - ErrorMsg if the test takes no parameter, or if the produced values do not
+     *     match the ones it takes
+     */
+    fn validateParameterized(dmut context: &ValidationContext, decl: &UnitTestDecl, param: AttributeWord)-> (&Value, [&ProtoVarDeclValue], [&Value])
+        throws ErrorMsg
+    {
+        if decl.params.len == 0us {
+            throw copy ErrorMsg::fatal(param.loc, format(ValidateErrorMessage::UNITTEST_PROVIDER_NO_PARAMS));
+        }
+
+        let provider = ValueValidation::validate(alias context, param.args[0]);
+        TypeVerification::verifyCompleteWithValue(param.args[0].loc, provider.type, provider, construct-> true);
+
+        let sliceType = match provider.type {
+            s: &SliceType => { s }
+            _ => {
+                throw copy ErrorMsg::fatal(param.args[0].loc, format(ValidateErrorMessage::UNITTEST_PROVIDER_NOT_A_SLICE, provider.type));
+            }
+        };
+
+        let paramsDecl = copy ProtoVarDeclValue(param.loc.locate(UnitTestKeys::PARAMS), sliceType, UNIT_VALUE,
+                                                isMutable-> false,
+                                                isReference-> false,
+                                                isLazy-> false,
+                                                isSelf-> false,
+                                                nbConsume-> 1u32,
+                                                isForcedNamed-> false);
+
+        let indexDecl = copy ProtoVarDeclValue(param.loc.locate(UnitTestKeys::INDEX), USIZE_TYPE, UNIT_VALUE,
+                                               isMutable-> false,
+                                               isReference-> false,
+                                               isLazy-> false,
+                                               isSelf-> false,
+                                               nbConsume-> 1u32,
+                                               isForcedNamed-> false);
+
+        let elem: &Value = copy SliceAccessValue(param.loc, sliceType.value,
+                                                 VariableCreation::createVarFromDecl(paramsDecl),
+                                                 VariableCreation::createVarFromDecl(indexDecl));
+
+        let preamble = UnittestValidation::validateParamDecls(alias context, decl, param, sliceType.value, elem);
+
+        return (provider, copy [paramsDecl, indexDecl], preamble);
+    }
+
+    /**
+     * Validate the declaration of the parameters of a unittest.
+     *
+     * A test taking a single parameter is fed the element itself, one taking several is
+     * fed a tuple of that arity, unwrapped field by field. Every parameter is validated
+     * before the body is, so a parameter the parameter sets cannot fill reports on its
+     * own rather than through everything the body does with it.
+     *
+     * @params:
+     *   - context:  validation context
+     *   - decl:     the unittest declaration
+     *   - param:    the `@parameters` attribute producing the parameter sets
+     *   - elemType: the type of a parameter set
+     *   - elem:     the parameter set the test is called with
+     *
+     * @returns:
+     *   - the declaration of each parameter, in the order the test takes them
+     *
+     * @throws:
+     *   - ErrorMsg if a parameter set cannot fill the parameters of the test
+     */
+    fn validateParamDecls(dmut context: &ValidationContext, decl: &UnitTestDecl, param: AttributeWord, elemType: &Type, elem: &Value)-> [&Value]
+        throws ErrorMsg
+    {
+        let mut values: [&Value] = [];
+        if decl.params.len == 1us {
+            values = copy [elem];
+        } else {
+            let tu = match elemType {
+                t: &TupleType if t.inners.len == decl.params.len => { t }
+                _ => {
+                    throw copy ErrorMsg::fatal(decl.params[0].loc,
+                                               end-> param.loc,
+                                               format(ValidateErrorMessage::UNITTEST_PARAMS_ARITY, elemType, decl.params.len));
+                }
+            };
+
+            values = copy [copy TupleFieldAccessValue(decl.params[i].loc, tu.inners[i], elem, i) for i in 0us .. tu.inners.len];
+        }
+
+        let mut result: [&Value] = [];
+        let mut errors: [&ErrorMsg] = [];
+        for i, p in decl.params {
+            {
+                let vdecl = copy VarDeclExpr(loc-> p.loc,
+                                             name-> p.name,
+                                             value-> copy ValueWrapperExpr(p.loc, values[i]),
+                                             type-> p.type,
+                                             isMutOrDmut-> EOF_WORD,
+                                             isLazyOrRef-> EOF_WORD);
+
+                result ~= [ValueValidation::validate(alias context, vdecl)];
+            } catch {
+                err => {
+                    errors ~= [err];
+                }
+            }
+        }
+
+        if errors.len != 0us {
+            throw copy ErrorMsg::list(errors);
+        }
+
+        return result;
     }
 
 }
