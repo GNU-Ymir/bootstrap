@@ -24,9 +24,9 @@ check lives:
 | Range | Stage | Catalogue | Live codes |
 |---|---|---|---|
 | `E1xxx` | lexing | `LexingErrorMessage` -- `src/ymirc/lexing/errors.yr` | 25 |
-| `E2xxx` | parsing | `SyntaxErrorMessage` -- `src/ymirc/syntax/errors.yr` | 9 |
-| `E3xxx` | declaration | `DeclareErrorMessage` -- `src/ymirc/semantic/declarator/errors.yr` | 36 |
-| `E4xxx` | validation | `ValidateErrorMessage` -- `src/ymirc/semantic/validator/errors.yr` | 264 |
+| `E2xxx` | parsing | `SyntaxErrorMessage` -- `src/ymirc/syntax/errors.yr` | 11 |
+| `E3xxx` | declaration | `DeclareErrorMessage` -- `src/ymirc/semantic/declarator/errors.yr` | 37 |
+| `E4xxx` | validation | `ValidateErrorMessage` -- `src/ymirc/semantic/validator/errors.yr` | 270 |
 | `E5xxx` | lowering (YIL) | `SerializeYILErrorMessage` -- `src/ymirc/lint/serialize/errors.yr` | 10 |
 
 Each page carries an example wherever a case in the suite raises the code: the
@@ -81,6 +81,8 @@ deliberately carry no code, and have no page here.
 | [E2009](E2009.md) | `UNEXPECTED_BUT_LST` | read <>, but expected <> |
 | [E2012](E2012.md) | `MOVE_NAMED_CTOR_PARAMS` | a named move ctor requires an argument list |
 | [E2013](E2013.md) | `MOVE_MISSING_OPERAND` | missing the value moved by the operator |
+| [E2014](E2014.md) | `ATTRIBUTE_WITHOUT_ARGS` | attribute <> takes no argument |
+| [E2015](E2015.md) | `ATTRIBUTE_ARITY` | attribute <> takes <> argument(s), but <> were given |
 
 ## E3xxx -- declaration
 
@@ -122,6 +124,7 @@ deliberately carry no code, and have no page here.
 | [E3034](E3034.md) | `WRONG_MODULE_NAME` | module <> must be defined in a file named <> |
 | [E3035](E3035.md) | `EXCLUSIVE_MOVE_ATTRIBUTES` | a ctor cannot be both no_move and only_move |
 | [E3036](E3036.md) | `MOVE_ATTRIBUTE_NO_ENTITY` | custom attribute <> may only be applied to the ctor of an entity |
+| [E3037](E3037.md) | `UNDEFINED_ATTRIBUTE_FOR_UNITTEST` | custom attribute <> is not valid on unit tests |
 
 ## E4xxx -- validation
 
@@ -391,6 +394,10 @@ deliberately carry no code, and have no page here.
 | [E4281](E4281.md) | `DECLARE_VARIABLE_NO_FUNCTION` | var declaration <> outside a function context |
 | [E4282](E4282.md) | `NOT_SUPPORTED_IN` | not supported in version ymir <> |
 | [E4283](E4283.md) | `DEFAULT_PARAM_BY_POSITION` | the parameter <> has a default value, it can only be passed by name |
+| [E4286](E4286.md) | `UNITTEST_PARAMS_NO_PROVIDER` | a unit test taking parameters must produce them with the parameters attribute |
+| [E4287](E4287.md) | `UNITTEST_PROVIDER_NO_PARAMS` | the parameters attribute produces values for a unit test that takes no parameter |
+| [E4288](E4288.md) | `UNITTEST_PROVIDER_NOT_A_SLICE` | the parameters of a unit test are produced as <>, but a slice was expected |
+| [E4289](E4289.md) | `UNITTEST_PARAMS_ARITY` | the parameters of a unit test are produced as <>, but the test takes <> parameters |
 
 ## E5xxx -- lowering (YIL)
 
