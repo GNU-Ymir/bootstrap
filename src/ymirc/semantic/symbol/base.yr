@@ -45,6 +45,7 @@ use std::{fs::path, stream};
 
 use ymirc::semantic::generator;
 use ymirc::utils::string;
+use ymirc::global::state;
 
 
 /**
@@ -128,6 +129,12 @@ pub class Symbol {
 
         // The record of what each use declaration imported, and of what was reached through it
         let dmut _imports: [&ImportInfo] = [];
+
+        // The symbols a lookup from inside this symbol found, by name, for a public and
+        // for a private lookup, and the state of the symbol tables they were found
+        // against(cf. state::symbolTableGeneration)
+        let dmut _lookups: [[[c8] => [&Symbol]]] = [];
+        let mut _lookupGen: usize = 0;
 
         // The content table of the symbol
         let dmut _table: &Table;
@@ -310,6 +317,7 @@ pub class Symbol {
      */
     @final
     pub fn useModule(mut self, _: Path, dmut sym: &Symbol) {
+        state::symbolTableChanged();
         self._used ~= [alias sym];
     }
 
@@ -321,6 +329,7 @@ pub class Symbol {
      */
     @final
     pub fn setUsedCore(mut self, dmut cores: [&Symbol]) {
+        state::symbolTableChanged();
         self._coreModules = alias cores;
     }
 
@@ -403,6 +412,7 @@ pub class Symbol {
      */
     @final
     pub fn insertUseAlias(mut self, dmut sym: &Symbol) {
+        state::symbolTableChanged();
         sym:.setReferent(alias self);
         self._useAliases ~= [alias sym];
     }
@@ -415,6 +425,7 @@ pub class Symbol {
      */
     @final
     pub fn insertImport(mut self, dmut imp: &ImportInfo) {
+        state::symbolTableChanged();
         self._imports ~= [alias imp];
     }
 
@@ -610,41 +621,71 @@ pub class Symbol {
      * Returns either immutable or mutable symbol lists depending on overload.
      */
     pub fn getSymbols(mut self, name: [c8], protection: Protection = Protection::PUBLIC, fromUsed: bool = false, dmut res: &SymbolList = copy SymbolList())-> dmut &SymbolList {
-        if let Ok(dmut x) = alias self._referent {
-            // We don't use the use statement of parent module, if it is another file than self
-            x:.getSymbols(name, protection-> protection, fromUsed-> (fromUsed || !x.inSameFile(self)), res-> alias res);
-        }
-
-        if (fromUsed)
-            self:.getSymbolsInTable(name, protection-> protection, syms-> alias res);
-        else {
-            self:.getSymbolsInTable(name, protection-> Protection::PRIVATE, syms-> alias res);
-
-            // 'res' holds exactly what the lookup can name here without a `use` of this
-            // scope, which is what tells an import that earned a candidate from one that
-            // only repeats a name the scope already had
-            if (self.hasUncreditedImports()) {
-                self:.recordOfferedImports(name, protection);
-            }
-
-            for i in 0us .. self._useAliases.len {
-                if (self._useAliases[i].loc.str == name) { res:.insert(alias self._useAliases[i]); }
-            }
-
-            for i in 0us .. self._used.len {
-                let dmut module = alias(self._used[i]);
-                module:.getSymbols(name, protection-> protection, fromUsed-> true, res-> alias res);
-            }
-
-            for i in 0us .. self._coreModules.len  {
-                let dmut module = alias(self._coreModules[i]);
-                module:.getSymbols(name, protection-> protection, fromUsed-> true, res-> alias res);
-            }
-        }
+        let dmut found = self:.reach(name, protection, fromUsed, keep-> false);
+        for i in 0us .. found.len { res:.insert(alias found[i]); }
 
         alias res
     }
 
+    /**
+     * @returns the symbols named 'name' a lookup through this symbol reaches,
+     *          memoized iif 'keep', as they are in a scope enclosing the one a lookup
+     *          starts from: that scope is shared by every lookup made inside it.
+     */
+    @final
+    prv fn reach(mut self, name: [c8], protection: Protection, fromUsed: bool, keep: bool)-> dmut [&Symbol] {
+        // crediting the imports of this scope is a side effect of resolving 'name'
+        // through it, and is owed whether or not the symbols are already known
+        if (!fromUsed && self.hasUncreditedImports()) {
+            self:.recordOfferedImports(name, protection);
+        }
+
+        let mode = if (protection == Protection::PUBLIC) { 0us } else { 1us };
+        if (!fromUsed && self._lookupGen == state::symbolTableGeneration()) {
+            if let Ok(dmut hit) = alias self._lookups[mode][name] { return alias hit; }
+        }
+
+        let dmut own = copy SymbolList();
+        if let Ok(dmut x) = alias self._referent {
+            // We don't use the use statement of parent module, if it is another file than self
+            let throughUse = fromUsed || !x.inSameFile(self);
+            let dmut up = x:.reach(name, protection, throughUse, keep-> !throughUse);
+            for i in 0us .. up.len { own:.insert(alias up[i]); }
+        }
+
+        if (fromUsed)
+            self:.getSymbolsInTable(name, protection-> protection, syms-> alias own);
+        else {
+            self:.getSymbolsInTable(name, protection-> Protection::PRIVATE, syms-> alias own);
+
+            for i in 0us .. self._useAliases.len {
+                if (self._useAliases[i].loc.str == name) { own:.insert(alias self._useAliases[i]); }
+            }
+
+            for i in 0us .. self._used.len {
+                let dmut used = self._used[i]:.reach(name, protection, true, keep-> false);
+                for j in 0us .. used.len { own:.insert(alias used[j]); }
+            }
+
+            for i in 0us .. self._coreModules.len  {
+                let dmut core = self._coreModules[i]:.reach(name, protection, true, keep-> false);
+                for j in 0us .. core.len { own:.insert(alias core[j]); }
+            }
+        }
+
+        let dmut found = own:[];
+        if (keep && !fromUsed) {
+            let gen = state::symbolTableGeneration();
+            if (self._lookupGen != gen) { // what was kept was found against other tables
+                self._lookups = copy [copy [], copy []];
+                self._lookupGen = gen;
+            }
+
+            self._lookups[mode][name] = alias found;
+        }
+
+        alias found
+    }
 
     /**
      * Look up symbols whose names are within a Levenshtein distance.
@@ -824,6 +865,7 @@ pub class Symbol {
      * Set the parent symbol and recompute the full name.
      */
     pub fn setReferent(mut self, dmut parent: &Symbol) {
+        state::symbolTableChanged();
         self._referent = (alias parent)?;
         self._fullName = self.computeFullName();
     }
@@ -848,6 +890,7 @@ pub class Symbol {
      *
      */
     pub fn setFromTemplate(mut self, mapper: TemplateMapper) {
+        state::symbolTableChanged();
         self._isWeak = true;
 
         self._templateMapper = mapper?;
