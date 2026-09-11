@@ -36,6 +36,7 @@ in base;
 use ymirc::lexing::{word, tokens, keys};
 use ymirc::syntax::declaration::{module, block};
 
+use ymirc::semantic::symbol::import_;
 use ymirc::semantic::template_;
 
 use ymirc::utils::{format, comparison};
@@ -45,6 +46,20 @@ use std::{fs::path, stream};
 use ymirc::semantic::generator;
 use ymirc::utils::string;
 
+
+/**
+ * @params:
+ *    - lst: a list of symbols
+ *    - sym: the symbol to look for
+ * @returns: true iif 'lst' contains 'sym'
+ */
+fn holds(lst: [&Symbol], sym: &Symbol)-> bool {
+    for s in lst {
+        if (s is sym) return true;
+    }
+
+    false
+}
 
 /**
  * Base class for all symbols.
@@ -110,6 +125,9 @@ pub class Symbol {
 
         // The scopes bound by a named use, visible only from inside this symbol(set during declaration)
         let mut _useAliases: [dmut &Symbol] = [];
+
+        // The record of what each use declaration imported, and of what was reached through it
+        let dmut _imports: [&ImportInfo] = [];
 
         // The content table of the symbol
         let dmut _table: &Table;
@@ -225,6 +243,15 @@ pub class Symbol {
     @final
     pub fn getUseAliases(mut self)-> dmut[&Symbol] {
         alias self._useAliases
+    }
+
+    /**
+     * @returns the record of the modules imported by each `use` declaration of
+     * this symbol, and of the ones a name resolution reached.
+     */
+    @{final, field}
+    pub fn imports(self)-> [&ImportInfo] {
+        self._imports
     }
 
     /**
@@ -380,6 +407,131 @@ pub class Symbol {
         self._useAliases ~= [alias sym];
     }
 
+    /**
+     * Register what a `use` declaration of this symbol imported.
+     *
+     * The record is only read back once validation is over, to report the
+     * imports no name resolution ever went through.
+     */
+    @final
+    pub fn insertImport(mut self, dmut imp: &ImportInfo) {
+        self._imports ~= [alias imp];
+    }
+
+    /**
+     * @returns true iif a `use` of this scope is still to be credited.
+     *
+     * Recording what the imports of a scope offer costs nothing once they are
+     * all credited, which is what this guards.
+     */
+    @final
+    pub fn hasUncreditedImports(self)-> bool {
+        for imp in self._imports {
+            if (!imp.isFullyUsed) return true;
+        }
+
+        false
+    }
+
+    /**
+     * Record what each `use` of this scope offers to the resolution of 'name',
+     * beyond what the scope could already name.
+     *
+     * @params:
+     *   - name:       the name being resolved
+     *   - protection: the protection the lookup is made with
+     *
+     * A candidate the scope can name with no `use` at all needs no import, and one a
+     * core module declares is implicitly there, so neither credits an import. The
+     * rest are only *offered*: an import is credited when one of them is selected,
+     * never for merely having offered it.
+     *
+     * @info: an import that is already credited is skipped, so this costs nothing
+     * once the imports of a scope are all accounted for
+     */
+    @final
+    pub fn recordOfferedImports(mut self, name: [c8], protection: Protection) {
+        let dmut reachable = copy ImutSymbolList();
+        self.getSymbolsWithoutImports(name, protection, alias reachable);
+
+        for i in 0us .. self._imports.len {
+            let dmut imp = alias (self._imports[i]);
+            if (imp.isFullyUsed) continue;
+
+            for j in 0us .. imp.modules.len {
+                let m = imp.modules[j];
+                if (holds(self._useAliases, m)) { // a named use is reached through the name it binds
+                    if (m.loc.str == name) { imp:.offer(m); }
+                    continue;
+                }
+
+                let dmut own = copy ImutSymbolList();
+                m.getSymbols(name, protection-> protection, fromUsed-> true, res-> alias own);
+                for c in own[] {
+                    if (reachable.contains(c)) continue;
+                    if (self.isDeclaredInCore(c)) continue;
+
+                    imp:.offer(c);
+                }
+            }
+        }
+    }
+
+    /**
+     * Credit the `use` declarations of this scope, and of the enclosing ones up
+     * to the file boundary, that offered the selected symbol 'sym'.
+     *
+     * The walk stops at the file boundary because a lookup stops using the `use`
+     * declarations of a parent declared elsewhere.
+     */
+    @final
+    pub fn markSelectedImport(mut self, sym: &Symbol) {
+        for i in 0us .. self._imports.len {
+            let dmut imp = alias (self._imports[i]);
+            imp:.markSelected(sym);
+        }
+
+        if let Ok(dmut x) = alias self._referent {
+            if (x.inSameFile(self)) {
+                x:.markSelectedImport(sym);
+            }
+        }
+    }
+
+    /**
+     * Collect the symbols named 'name' that this scope reaches without a single
+     * `use` declaration: its own table, and the tables of the enclosing scopes.
+     *
+     * This is getSymbols without its import steps. It cannot be replaced by the
+     * candidates a real lookup holds before searching the imports of this scope:
+     * an enclosing scope searches its own imports and core modules first, and those
+     * reach the root of the foreign packages through their referent, so the name of
+     * every package made available with `-I` is in there.
+     */
+    @final
+    fn getSymbolsWithoutImports(self, name: [c8], protection: Protection, dmut res: &ImutSymbolList, fromUsed: bool = false) {
+        match self._referent {
+            Ok(x: &Symbol) => {
+                x.getSymbolsWithoutImports(name, protection, alias res, fromUsed-> (fromUsed || !x.inSameFile(self)));
+            }
+        }
+
+        if (fromUsed) self.getSymbolsInTable(name, protection-> protection, syms-> alias res);
+        else self.getSymbolsInTable(name, protection-> Protection::PRIVATE, syms-> alias res);
+    }
+
+    /**
+     * @returns true iif 'sym' is declared in a core module implicitly used here.
+     */
+    @final
+    fn isDeclaredInCore(self, sym: &Symbol)-> bool {
+        for m in self._coreModules {
+            if (declares(m, sym)) return true;
+        }
+
+        false
+    }
+
     /*!
      * ====================================================================================================
      * ====================================================================================================
@@ -467,6 +619,14 @@ pub class Symbol {
             self:.getSymbolsInTable(name, protection-> protection, syms-> alias res);
         else {
             self:.getSymbolsInTable(name, protection-> Protection::PRIVATE, syms-> alias res);
+
+            // 'res' holds exactly what the lookup can name here without a `use` of this
+            // scope, which is what tells an import that earned a candidate from one that
+            // only repeats a name the scope already had
+            if (self.hasUncreditedImports()) {
+                self:.recordOfferedImports(name, protection);
+            }
+
             for i in 0us .. self._useAliases.len {
                 if (self._useAliases[i].loc.str == name) { res:.insert(alias self._useAliases[i]); }
             }
