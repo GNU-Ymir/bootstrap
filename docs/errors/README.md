@@ -25,7 +25,7 @@ check lives:
 |---|---|---|---|
 | `E1xxx` | lexing | `LexingErrorMessage` -- `src/ymirc/lexing/errors.yr` | 25 |
 | `E2xxx` | parsing | `SyntaxErrorMessage` -- `src/ymirc/syntax/errors.yr` | 11 |
-| `E3xxx` | declaration | `DeclareErrorMessage` -- `src/ymirc/semantic/declarator/errors.yr` | 37 |
+| `E3xxx` | declaration | `DeclareErrorMessage` -- `src/ymirc/semantic/declarator/errors.yr` | 39 |
 | `E4xxx` | validation | `ValidateErrorMessage` -- `src/ymirc/semantic/validator/errors.yr` | 270 |
 | `E5xxx` | lowering (YIL) | `SerializeYILErrorMessage` -- `src/ymirc/lint/serialize/errors.yr` | 10 |
 
@@ -125,6 +125,8 @@ deliberately carry no code, and have no page here.
 | [E3035](E3035.md) | `EXCLUSIVE_MOVE_ATTRIBUTES` | a ctor cannot be both no_move and only_move |
 | [E3036](E3036.md) | `MOVE_ATTRIBUTE_NO_ENTITY` | custom attribute <> may only be applied to the ctor of an entity |
 | [E3037](E3037.md) | `UNDEFINED_ATTRIBUTE_FOR_UNITTEST` | custom attribute <> is not valid on unit tests |
+| [E3038](E3038.md) | `UNUSED_USE` | no symbol is resolved through the use of <> |
+| [E3039](E3039.md) | `SINGLE_WILDCARD_USE` | only <> is resolved through the use of <> |
 
 ## E4xxx -- validation
 
