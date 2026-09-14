@@ -324,7 +324,6 @@ deliberately carry no code, and have no page here.
 | [E4239](E4239.md) | `UNDEF_CTE_FOR_LOOP_OPERATOR` | undefined cte for loop operator with <> iterator for type <> |
 | [E4240](E4240.md) | `UNDEF_DECORATOR_HERE` | decorator <> is not applicable in that context |
 | [E4244](E4244.md) | `UNDEF_FOR_LOOP_OPERATOR` | undefined for loop operator with <> iterator for type <> |
-| [E4245](E4245.md) | `UNDEF_VAR` | undefined symbol <> |
 | [E4246](E4246.md) | `UNECESSARY_ADDRESS_METHOD` | the creation of a delegate from a method has no effect |
 | [E4247](E4247.md) | `UNECESSARY_ALIAS` | aliasing the value of type <> to create a constant borrowing is prohibited |
 | [E4248](E4248.md) | `UNECESSARY_ALIAS_CPTR_LOOP` | aliasing the value of type <> to call begin and end iterator constant methods is useless |
@@ -361,6 +360,7 @@ deliberately carry no code, and have no page here.
 | [E4287](E4287.md) | `UNITTEST_PROVIDER_NO_PARAMS` | the parameters attribute produces values for a unit test that takes no parameter |
 | [E4288](E4288.md) | `UNITTEST_PROVIDER_NOT_A_SLICE` | the parameters of a unit test are produced as <>, but a slice was expected |
 | [E4289](E4289.md) | `UNITTEST_PARAMS_ARITY` | the parameters of a unit test are produced as <>, but the test takes <> parameters |
+| [E4290](E4290.md) | `UNUSABLE_SYMBOLS` | none of the symbols <> can be used as a value |
 
 ## E5xxx -- lowering (YIL)
 
@@ -443,6 +443,7 @@ ever reused.
 | [E4241](E4241.md) | `UNDEF_DECORATOR_TEMPLATE` | decorator <> is not applicable in template specialization |
 | [E4242](E4242.md) | `UNDEF_DECORATOR_TYPE` | decorator <> is not applicable for types |
 | [E4243](E4243.md) | `UNDEF_DECORATOR_VALUE` | decorator <> is not applicable for values |
+| [E4245](E4245.md) | `UNDEF_VAR` | undefined symbol <> |
 | [E4254](E4254.md) | `UNION_CTOR_MULTIPLE_FIELDS` | constructor of the union type <> initializes multiple fields <> |
 | [E4255](E4255.md) | `UNION_CTOR_NO_FIELD` | constructor of the union type <> initializes no field |
 | [E4274](E4274.md) | `USE_AS_VALUE_TEMPLATE` | template specialization expected a value not the type <> |
