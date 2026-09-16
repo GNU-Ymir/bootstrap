@@ -59,7 +59,13 @@ Build system is `gyllir` (config in `gyllir.toml`, compiler path points at a loc
 
 - The filter matches the **test module path**, not the resource directory, and the trailing
   `::*` is required. `integration::class_ops::*` works; neither `integration::class_ops` nor
-  `integration::class_ops*` matches anything.
+  `integration::class_ops*` matches anything. A submodule is one segment deeper, so
+  `integration::for_loops::*::*` is what reaches its tests.
+- A serie of cases is one parameterized `__test`, registered as one test per case named
+  `<test>[<k>]` — so `-f "integration::class_ops::class_operators[5]"` runs that single case,
+  and `--resume` re-runs only the cases that failed. **`k` is the position in the parameter
+  list, not the number in the file name**: with the usual `[i for i in 1 ... N]`, `[0]` is
+  `test1.yr`.
 - **A filter that matches nothing prints nothing and exits 0.** Empty output means "no test
   ran", never "everything passed". Always confirm you see `[SUCCESS] : integration::<module>…`.
 - The module name often differs from the resource directory — e.g. `test_resources/lit_class/operators`
@@ -78,8 +84,16 @@ Test categories live under `test/integration/`: `test/integration.yr` lists them
 Those blocks call, from `test/integration/utils.yr`, either:
 
 - `utils::registerTest("test_resources/<dir>/testN.yr")` — a single case, or
-- `utils::registerTests("test_resources/<dir>", lo, hi)` — cases `test<lo>.yr` … `test<hi>.yr`,
-  contiguous; each case runs even if an earlier one fails, and all failures are reported together.
+- `utils::registerCase("test_resources/<dir>", i)` — the case `test<i>.yr` of a numbered serie.
+  A serie is one parameterized `__test`, so that every case is a test of its own, run,
+  selected and resumed independently:
+
+  ```
+  @parameters(copy [i for i in 1 ... 24])
+  __test type_aliases (i: i32) {
+      utils::registerCase ("test_resources/aka", i);
+  }
+  ```
 
 Either way, each case:
 
@@ -157,12 +171,13 @@ To exercise the compiler on an ad-hoc snippet (there is no runnable binary to do
    use ymirc::utils::_;
    use utils;
 
-   __test {
-       utils::registerTests ("test_resources/tmpcheck", 1, N);
+   @parameters(copy [i for i in 1 ... N])
+   __test cases (i: i32) {
+       utils::registerCase ("test_resources/tmpcheck", i);
    }
    ```
 3. Add `mod ::tmpcheck;` to `test/integration.yr`.
-4. `gyllir test --dry` then `./ymirc.test -f "integration::tmpcheck*" 2>err.txt`.
+4. `gyllir test --dry` then `./ymirc.test -f "integration::tmpcheck::*" 2>err.txt`.
 
 Probe *both* directions of whatever you are testing (the accepted form and the rejected one),
 and prefer cases whose outcome is observable in the type system — e.g. give two overloads

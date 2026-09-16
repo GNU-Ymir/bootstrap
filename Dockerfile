@@ -77,11 +77,12 @@ FROM toolchain AS build
 WORKDIR /bootstrap
 COPY . .
 
-# __YMIR_VERSION__ is read from the source instead of being hardcoded, so a bump there can
-# never silently leave the tests compiling against a stdlib installed under the old version.
-RUN YMIR_STDLIB_VERSION="$(sed -nE 's/^pub lazy MIDGARD_VERSION[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p' src/ymirc/global/common.yr)" \
+# Read from YMIR_VERSION rather than from the MIDGARD_VERSION constant it is rewritten into:
+# tools/set-version.sh does that rewrite as a pre-build command, so common.yr still carries the
+# previous value here and linking from it would install the stdlib under the wrong version.
+RUN YMIR_STDLIB_VERSION="$(sed -nE 's/^MIDGARD_VERSION=([0-9]+\.[0-9]+).*/\1/p' YMIR_VERSION)" \
     && test -n "$YMIR_STDLIB_VERSION" || \
-       (echo "could not read __YMIR_VERSION__ from src/ymirc/global/common.yr" >&2 && exit 1) \
+       (echo "could not read MIDGARD_VERSION from YMIR_VERSION" >&2 && exit 1) \
     && mkdir -p /usr/include/ymir \
     && ln -sfn /opt/ymir-stdlib "/usr/include/ymir/${YMIR_STDLIB_VERSION}"
 
