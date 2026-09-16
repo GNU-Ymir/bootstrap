@@ -1,0 +1,155 @@
+/*
+ * Implements semantic validation for list comprehensions over a generator.
+ *
+ * <hr>
+ *
+ * @Package: ymirc
+ * @Module: ymirc::semantic::validator::value::compose::slicefor::yield_
+ * @File: ymirc/semantic/validator/value/compose/slicefor/yield_.yr
+ * @Author(s):
+ *   - Emile Cadorel <ecadorel@gmail.com>
+ *
+ * @Created(YYYY-MM-DD): 2026-09-16
+ * @Copyright(C) 2021–2026 GNU-Ymir
+ * @License
+ *   ```text
+ *   This file is part of the Ymir language project.
+ *
+ *   Ymir is free software: you can redistribute it and/or modify it
+ *   under the terms of the GNU General Public License as published by
+ *   the Free Software Foundation, either version 3 of the License, or
+ *   (at your option) any later version.
+ *
+ *   Ymir is distributed in the hope that it will be useful,
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *   GNU General Public License for more details.
+ *
+ *   You should have received a copy of the GNU General Public License
+ *   along with Ymir.  If not, see <https://www.gnu.org/licenses/>.
+ *   ```
+ */
+
+in yield_;
+
+use ymirc::errors;
+use ymirc::errors::snippet::suggestion;
+use ymirc::lexing::word;
+use ymirc::semantic::generator::type::native;
+use ymirc::semantic::generator::value::_;
+use ymirc::syntax::expression::compose;
+use ymirc::utils::format;
+
+/**
+ * YieldListComprValidation module
+ *
+ * A list comprehension over a generator cannot know its length in advance: it
+ * must run in copy-mode, and appends each value as the generator yields it.
+ */
+pub mod YieldListComprValidation {
+
+    /**
+     * Validate a list comprehension applied to a generator.
+     *
+     * @params:
+     *   - context:   validation context
+     *   - generator: the generator handle being iterated
+     *   - yieldType: the type of the generator
+     *   - floop:     the SliceForAllocatorExpr describing the comprehension
+     *   - inCopy:    whether the comprehension is evaluated in copy-mode
+     *   - byAlias:   whether the generator is iterated by alias
+     *
+     * @returns:
+     *   - (the resulting list comprehension value, whether the alias was used)
+     *
+     * @throws:
+     *   - ErrorMsg if tuple-mode is used, or not in copy-mode
+     *   - ErrorMsg if the validation of the comprehension fails
+     */
+    pub fn validate(dmut context: &ValidationContext,
+                    generator:    &Value,
+                    yieldType:    &YieldType,
+                    floop:        &SliceForAllocatorExpr,
+                    inCopy:       bool,
+                    byAlias:      bool)-> (&Value, bool)
+        throws ErrorMsg
+    {
+        if floop.isTuple {
+            throw copy ErrorMsg::fatal(floop.iter.loc, format(ValidateErrorMessage::LIST_COMPR_SIZE_CTE, yieldType));
+        } else if !inCopy {
+            throw (copy ErrorMsg::fatal(floop.iter.loc, format(ValidateErrorMessage::LIST_COMPR_SIZE_CTE, yieldType)))
+                .withFix(Edit(floop.loc, replacement-> "copy ",
+                              msg-> format(ValidateErrorMessage::ENCLOSE_COPY_LST)));
+        }
+
+        let loc = floop.loc;
+        let mut errors: (&ErrorMsg)? = none;
+
+        context:.enterBlock();
+        let result = {
+            YieldListComprValidation::validateInnerLoop(alias context, loc, generator, yieldType, floop, byAlias)
+        } catch {
+            err => {
+                errors = (err)?;
+                (UNIT_VALUE, false)
+            }
+        };
+
+        {
+            context:.quitBlock(warnUnused-> (!errors.hasValue));
+        } catch {
+            err => {
+                errors = (err)?;
+            }
+        }
+
+        if let Ok(err) = errors {
+            throw err;
+        }
+
+        return result;
+    }
+
+    /**
+     * Build the loop appending each yielded value to the result.
+     *
+     * @returns:
+     *   - (the resulting list comprehension value wrapped in CopierValue, whether the alias was used)
+     */
+    fn validateInnerLoop(dmut context: &ValidationContext,
+                         loc:          &Word,
+                         generator:    &Value,
+                         yieldType:    &YieldType,
+                         floop:        &SliceForAllocatorExpr,
+                         byAlias:      bool)-> (&Value, bool)
+        throws ErrorMsg
+    {
+        let mut outerLoop: [&Value] = [];
+        let mut innerLoop: [&Value] = [];
+        let (test, usedAlias) = YieldForLoopValidation::validateLoopVar(alias context, loc, generator, yieldType, floop.vars,
+                                                                        byAlias,
+                                                                        ref innerLoop,
+                                                                        ref outerLoop);
+
+        let resInnerValue = ValueValidation::validate(alias context, floop.value);
+        let resInnerType = TypeInference::inferImplicitMutability(resInnerValue.type, resInnerValue);
+        let (resultDecl, resultVref, resultType) = SliceForComposeValidation::validateResultValueDeclNoLen(loc, resInnerType);
+
+        let sliceVal = ValueCreation::createSliceFromSingleValue(loc, resInnerValue,
+                                                                 mutable-> resInnerType.isMutable);
+
+        innerLoop ~= [copy SliceAppendValue(loc, resultType, resultVref, sliceVal)];
+
+        let blk = copy BlockValue(loc, VOID_TYPE, innerLoop);
+        let lp = copy LoopValue(loc, VOID_TYPE, test, blk);
+
+        outerLoop ~= [resultDecl, lp, resultVref];
+
+        let outBlk = copy BlockValue(loc, resultType, outerLoop);
+        let lstBlk = copy ListComprValue(loc, resultType, outBlk);
+
+        return (copy CopierValue(loc, resultType, lstBlk,
+                                 isDone-> true),
+                usedAlias);
+    }
+}
