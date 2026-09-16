@@ -34,9 +34,9 @@ in array;
 
 
 use ymirc::errors;
-use ymirc::semantic::generator::value;
-use ymirc::semantic::generator::type::native;
-use ymirc::syntax::expression::control;
+use ymirc::lexing::keys;
+use ymirc::semantic::generator::{type::_, value::_};
+use ymirc::syntax::expression::_;
 use ymirc::utils::format;
 
 /**
@@ -44,8 +44,19 @@ use ymirc::utils::format;
  *
  * Provides semantic validation for `for` loops iterating over arrays.
  *
- * Ymir does not iterate arrays directly. Instead, arrays are converted into
- * slice aliases, and iteration is delegated to SliceForLoopValidation.
+ * At runtime, Ymir does not iterate arrays directly. Instead, arrays are
+ * converted into slice aliases, and iteration is delegated to
+ * SliceForLoopValidation.
+ *
+ * In `cte` mode, the length of the array being known statically, the loop is
+ * unrolled into one block per element.
+ *
+ * Supports:
+ *   - Single-variable iteration:
+ *         cte for e in array { ... }
+ *
+ *   - Dual-variable iteration(index + element):
+ *         cte for i, e in array { ... }
  *
  */
 pub mod ArrayForLoopValidation {
@@ -94,5 +105,271 @@ pub mod ArrayForLoopValidation {
         }
 
         panic;
+    }
+
+    /**
+     * Validate a compile-time(`cte`) `for` loop iterating over an array.
+     *
+     * The length of the array being a compile-time constant, the loop is
+     * unrolled into one block per element, each binding the iterator variables
+     * to the element at a constant index.
+     *
+     * @params:
+     *   - context:   validation context
+     *   - array:     array value being iterated
+     *   - arrayType: static type of the array
+     *   - floop:     for-loop expression
+     *
+     * @returns:
+     *   A BlockValue containing all the unrolled iteration blocks.
+     *
+     * @throws:
+     *   ErrorMsg if the array element type is void, if the iterator count is
+     *   unsupported, or if the number of iterations exceeds the cte limit.
+     */
+    pub fn validateCte(dmut context: &ValidationContext,
+                       array:        &Value,
+                       arrayType:    &ArrayType,
+                       floop:        &ForLoopExpr)-> &Value
+        throws ErrorMsg
+    {
+        if arrayType.value of VoidType {
+            throw copy ErrorMsg::fatal(array.loc,
+                                       end-> floop.loc,
+                                       format(ValidateErrorMessage::UNDEF_CTE_FOR_LOOP_OPERATOR, floop.vars.len, arrayType));
+        }
+
+        if floop.vars.len != 1 && floop.vars.len != 2 {
+            throw copy ErrorMsg::fatal(floop.loc, format(ValidateErrorMessage::UNDEF_CTE_FOR_LOOP_OPERATOR, floop.vars.len, arrayType));
+        }
+
+        if arrayType.len > global::state::maxCteLoopIter() {
+            throw copy ErrorMsg::fatal(floop.loc,
+                                       format(ValidateErrorMessage::MAX_LOOP_ITERATIONS, arrayType.len, global::state::maxCteLoopIter()));
+        }
+
+        if floop.vars.len == 1 {
+            return ArrayForLoopValidation::validateCteIteration(alias context, array, arrayType, floop, floop.vars[0], none);
+        }
+
+        return ArrayForLoopValidation::validateCteIteration(alias context, array, arrayType, floop, floop.vars[1], (floop.vars[0])?);
+    }
+
+    /**
+     * Validate the unrolled iteration over every element of the array.
+     *
+     * A value that is not a variable is bound to a declaration shared by every
+     * iteration, so that it is evaluated only once.
+     *
+     * @params:
+     *   - context:   validation context
+     *   - array:     array value
+     *   - arrayType: array type
+     *   - floop:     for-loop expression
+     *   - elemIter:  element iterator declaration
+     *   - indexIter: optional index iterator declaration
+     *
+     * @returns:
+     *   The unrolled loop, preceded by the declaration of the iterated value
+     *   when that value is not a variable.
+     */
+    fn validateCteIteration(dmut context: &ValidationContext,
+                            array:        &Value,
+                            arrayType:    &ArrayType,
+                            floop:        &ForLoopExpr,
+                            elemIter:     &VarDeclExpr,
+                            indexIter:    (&VarDeclExpr)?)-> &Value
+        throws ErrorMsg
+    {
+        let loc = floop.loc;
+        let mut errors: (&ErrorMsg)? = none;
+        let mut content: [&Value] = [];
+
+        // a variable is iterated as it is, so that every iteration reads the array
+        // itself, and not a copy taken before the loop
+        let mut pre: [&Value] = [];
+        let arrayVref = match array {
+            v: &VarRefValue => { v }
+            _ => {
+                let decl = copy VarDeclValue(array.loc.locate(ForLoopKeys::VALUE), arrayType, array,
+                                             isMutable-> false);
+                pre ~= [decl];
+                VariableCreation::createVarFromDecl(decl, canCte-> false)
+            }
+        };
+
+        context:.enterLoop();
+        context:.setCurrentLoopType(copy VoidType(loc));
+        context:.enterBlock();
+        {
+            for i in 0us .. arrayType.len {
+                content ~= [ArrayForLoopValidation::validateCteInnerLoop(alias context, i, elemIter, indexIter, arrayVref, arrayType, floop.block)];
+            }
+        } catch {
+            err => {
+                errors = (err)?;
+            }
+        }
+
+        {
+            context:.quitLoop();
+            context:.quitBlock(warnUnused-> (!errors.hasValue));
+        } catch {
+            err => {
+                errors = (err)?;
+            }
+        }
+
+        if let Ok(err) = errors {
+            throw err;
+        }
+
+        let inner = copy BlockValue(loc, VOID_TYPE, content);
+        let lp = copy LoopValue(loc, VOID_TYPE, UNIT_VALUE, inner,
+                                isCteFor-> true);
+
+        if pre.len == 0us {
+            return lp;
+        }
+
+        return copy BlockValue(loc, VOID_TYPE, pre ~ [lp]);
+    }
+
+    /**
+     * Validate a single unrolled iteration of the array loop.
+     *
+     * @params:
+     *   - context:   validation context
+     *   - i:         index of the iterated element
+     *   - elemIter:  element iterator declaration
+     *   - indexIter: optional index iterator declaration
+     *   - arrayVref: VarRefValue referencing the iterated array
+     *   - arrayType: array type
+     *   - blk:       loop body expression
+     *
+     * @returns:
+     *   A BlockValue declaring the iterator variables, followed by the body.
+     */
+    fn validateCteInnerLoop(dmut context: &ValidationContext,
+                            i:            usize,
+                            elemIter:     &VarDeclExpr,
+                            indexIter:    (&VarDeclExpr)?,
+                            arrayVref:    &VarRefValue,
+                            arrayType:    &ArrayType,
+                            blk:          &Expression)-> &BlockValue
+        throws ErrorMsg
+    {
+        let mut errors: (&ErrorMsg)? = none;
+        let mut pre: [&Value] = [];
+        let mut inner: &Value = UNIT_VALUE;
+
+        context:.enterBlock();
+        {
+            if let Ok(vdecl: &VarDeclExpr) = indexIter {
+                let indexVal = copy IntValue(vdecl.loc, USIZE_TYPE, i);
+                let (indexDecl, insertIndex) = ForLoopValidation::validateIndexIterDecl(alias context, vdecl.loc, vdecl, arrayType,
+                                                                                        value-> indexVal,
+                                                                                        isMutable-> false,
+                                                                                        canCte-> true);
+                if insertIndex {
+                    context:.insertLocal(indexDecl.loc, indexDecl.name, indexDecl);
+                }
+
+                pre ~= [indexDecl];
+            }
+
+            let (elemDecl, insert) = ArrayForLoopValidation::validateCteIterDecl(alias context, elemIter, i, arrayVref, arrayType);
+            if insert {
+                context:.insertLocal(elemDecl.loc, elemDecl.name, elemDecl);
+            }
+
+            pre ~= [elemDecl];
+            inner = ValueValidation::validate(alias context, blk);
+        } catch {
+            err => {
+                errors = (err)?;
+            }
+        }
+
+        {
+            context:.quitBlock(warnUnused-> (!errors.hasValue));
+        } catch {
+            err => {
+                errors = (err)?;
+            }
+        }
+
+        if let Ok(err) = errors {
+            throw err;
+        }
+
+        return copy BlockValue(blk.loc, copy VoidType(blk.loc), pre ~ [inner]);
+    }
+
+    /**
+     * Validate the element iterator declaration of an unrolled iteration.
+     *
+     * @params:
+     *   - context:   validation context
+     *   - vdecl:     element iterator declaration
+     *   - i:         index of the iterated element
+     *   - arrayVref: VarRefValue referencing the iterated array
+     *   - arrayType: array type
+     *
+     * @returns:
+     *   (declValue, insert)
+     *     - declValue: VarDeclValue of the element iterator
+     *     - insert:    whether to insert the variable into the local scope
+     */
+    fn validateCteIterDecl(dmut context: &ValidationContext,
+                           vdecl:        &VarDeclExpr,
+                           i:            usize,
+                           arrayVref:    &VarRefValue,
+                           arrayType:    &ArrayType)-> (&VarDeclValue, bool)
+        throws ErrorMsg
+    {
+        let innerType = arrayType.value;
+
+        let vtype = if (vdecl.type !of EmptyExpr) {
+            let vtype = TypeValidation::validateForVarDecl(alias context, vdecl.type, vdecl,
+                                                           canBeRef-> true,
+                                                           canBeLazy-> false);
+            TypeVerification::verifyCompatible(vdecl.type.loc, arrayVref.loc, vtype, innerType);
+            vtype
+        } else {
+            TypeValidation::validateForVarDecl(alias context, copy TypeWrapperExpr(arrayVref.loc, innerType), vdecl,
+                                               canBeRef-> true,
+                                               canBeLazy-> false)
+        };
+
+        TypeVerification::verifyMutableIterator(vdecl.isMutOrDmut, vtype, isRef-> vdecl.isRef);
+
+        let index = copy IntValue(vdecl.loc, USIZE_TYPE, i);
+        let arrAcc = context.cteInterpret:.reduce(copy ArrayAccessValue(arrayVref.loc, innerType, arrayVref, index));
+        let iterValue = TypeInference::inferValueForType(alias context, vdecl.loc, arrAcc, vtype,
+                                                         byReference-> vdecl.isRef);
+
+        let access = if (vdecl.isRef && iterValue.isLvalue) {
+            copy ReferencerValue(vdecl.loc, iterValue.type, iterValue, isMutable-> false)
+        } else {
+            iterValue
+        };
+
+        MemoryVerification::verifyMemoryOwner(vdecl.loc, vtype, access,
+                                              construct-> true,
+                                              byReference-> vdecl.isRef);
+
+        let (name, insert) = if vdecl.name == Keys::UNDER {
+            (vdecl.name.locate(ForLoopKeys::ITER), false)
+        } else {
+            (vdecl.name, true)
+        };
+
+        let decl = copy VarDeclValue(name, vtype, access,
+                                     isMutable-> (vdecl.isMutable || vdecl.isDeeplyMutable),
+                                     isReference-> vdecl.isRef,
+                                     isIterator-> true);
+
+        return (decl, insert);
     }
 }
