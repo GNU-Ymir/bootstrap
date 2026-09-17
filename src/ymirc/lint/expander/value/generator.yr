@@ -1,0 +1,304 @@
+/*
+ * Lowers the frame of a generator into a state machine.
+ *
+ * <hr>
+ *
+ * @Package: ymirc
+ * @Module: ymirc::lint::expander::value::generator
+ * @File: ymirc/lint/expander/value/generator.yr
+ * @Author(s):
+ *   - Emile Cadorel <ecadorel@gmail.com>
+ *
+ * @Created(YYYY-MM-DD): 2026-09-16
+ * @Copyright(C) 2021–2026 GNU-Ymir
+ * @License
+ *   ```text
+ *   This file is part of the Ymir language project.
+ *
+ *   Ymir is free software: you can redistribute it and/or modify it
+ *   under the terms of the GNU General Public License as published by
+ *   the Free Software Foundation, either version 3 of the License, or
+ *   (at your option) any later version.
+ *
+ *   Ymir is distributed in the hope that it will be useful,
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *   GNU General Public License for more details.
+ *
+ *   You should have received a copy of the GNU General Public License
+ *   along with Ymir.  If not, see <https://www.gnu.org/licenses/>.
+ *   ```
+ */
+
+in generator;
+
+use ymirc::global::core_;
+use ymirc::lexing::{keys, word};
+use ymirc::lint::node::_;
+use ymirc::lint::expander::value::_;
+use ymirc::semantic::generator::_;
+use ymirc::semantic::generator::type::native;
+use ymirc::semantic::generator::value::_;
+
+/**
+ * The states of a generator frame, a state above DONE resumes the body after a yield.
+ */
+enum GeneratorStates
+| START = 0us
+| DONE  = 1us;
+
+/**
+ * Expands a generator into two frames:
+ *
+ *   - the function called by the user, that allocates the frame of the
+ *     generator, stores its parameters and returns the handle `{frame, &resume}`,
+ *   - the function resuming the body up to its next yield: `resume (frame, out)-> bool`.
+ *
+ * Every variable of the resume function is a field of the frame, the resume
+ * function thus has no local, and suspending the body is only a return, whose
+ * resumption is a jump dispatched on the state of the frame.
+ */
+pub mod GeneratorExpander {
+
+    /**
+     * Finalize the frame of a generator into its create and resume frames.
+     *
+     * @params:
+     *   - context: the expansion context
+     *   - frame:   the frame generator node, of kind GENERATOR
+     */
+    pub fn finalizeGenerator(dmut context: &Expander, frame: &FrameGenerator) {
+        let yieldType = if let y: &YieldType = frame.retType { y } else { panic; };
+        let dmut tuple = context.typeExpander:.createEmptyTuple();
+        let framePtr = context.typeExpander:.finalizePointer(tuple);
+
+        GeneratorExpander::finalizeResumeFrame(alias context, frame, yieldType, alias tuple, framePtr);
+        GeneratorExpander::finalizeCreateFrame(alias context, frame, tuple, framePtr);
+    }
+
+    /**
+     * Finalize a yield: store the value, record the state resuming after it, and return.
+     *
+     * @returns:
+     *   - &YILValue: always YIL_UNIT_VALUE
+     */
+    pub fn finalizeYield(dmut context: &Expander, y: &YieldValue, ref mut list: StmtList)-> &YILValue {
+        let value = ValueExpander::finalize(alias context, y.value, ref list, asLeft-> false);
+        let resume = copy YILLabel(y.loc, "resume", context:.generateLblId());
+
+        let dmut gen = context:.getGenerator();
+        gen.resumes ~= [resume];
+
+        let valueType = if let p: &YILPointer = gen.out.type { p.inner } else { panic; };
+        OperatorExpander::finalizeAffect(y.loc, copy YILUnrefValue(y.loc, valueType, gen.out), value, ref list);
+
+        let state = copy YILFieldValue(y.loc, YIL_UINT_32, gen.frame, GeneratorKeys::STATE);
+        list:.append(copy YILAffect(y.loc, state, copy YILIntValue(y.loc, YIL_UINT_32, cast!usize (GeneratorStates::DONE) + gen.resumes.len)));
+        list:.append(copy YILReturn(y.loc, copy YILIntValue(y.loc, YIL_UINT_8, 1us)));
+        list:.append(resume);
+
+        return YIL_UNIT_VALUE;
+    }
+
+    /**
+     * Finalize a return inside a generator, that ends the generator.
+     *
+     * @returns:
+     *   - &YILValue: always YIL_UNIT_VALUE
+     */
+    pub fn finalizeReturn(dmut context: &Expander, r: &ReturnValue, ref mut list: StmtList)-> &YILValue {
+        ValueExpander::finalize(alias context, r.value, ref list, asLeft-> false);
+        list:.append(copy YILGoto(r.loc, context:.getGenerator().done));
+
+        return YIL_UNIT_VALUE;
+    }
+
+    /**
+     * Finalize the resumption of a generator: `(g.func)(g.closure, &out)`.
+     *
+     * @returns:
+     *   - &YILValue: the call, true iff a value was yielded
+     */
+    pub fn finalizeNext(dmut context: &Expander, n: &YieldNextValue, ref mut list: StmtList)-> &YILValue {
+        let gen = ValueExpander::finalize(alias context, n.generator, ref list, asLeft-> false);
+        let out = ValueExpander::finalize(alias context, n.out, ref list, asLeft-> true);
+        let outAddr = MemoryExpander::createAddress(alias context, out, context.typeExpander:.finalizePointer(out.type), ref list);
+
+        let func = copy YILFieldValue(n.loc, YIL_PTR_VOID, gen, DelegateKeys::FUNC);
+        let closure = copy YILFieldValue(n.loc, YIL_PTR_VOID, gen, DelegateKeys::CLOSURE);
+
+        return copy YILPtrCallValue(n.loc, YIL_UINT_8, func, copy [closure, outAddr]);
+    }
+
+    /**
+     * Finalize the function resuming a generator.
+     *
+     * @info: the fields of `tuple` are complete once this function returns.
+     */
+    fn finalizeResumeFrame(dmut context: &Expander, frame: &FrameGenerator, yieldType: &YieldType, dmut tuple: &YILTuple, framePtr: &YILPointer) {
+        let name = Mangler::mangleResumeFrame(frame);
+        let enterCoverage = FrameExpander::isCoverageFrame(frame);
+        let FRAME_INFO = Mangler::mangleCoverageFrameInfo(frame);
+
+        let frameAddr = copy YILAddrValue(EOF_WORD, YIL_PTR_VOID, copy YILVar(EOF_WORD, name, YIL_VOID, 0us));
+        let frameCoverAddr = if enterCoverage {
+            copy YILAddrValue(EOF_WORD, YIL_PTR_VOID, copy YILVar(EOF_WORD, FRAME_INFO, YIL_VOID, 0us))
+        } else { YIL_UNIT_VALUE };
+
+        context:.enterSymbol();
+        context:.enterFrame(frame.name.toStr(), frameAddr-> frameAddr, frameCoverAddr-> frameCoverAddr);
+        context:.enterBlock();
+
+        let outType = context.typeExpander:.finalizePointer(context:.finalizeType(yieldType.retType));
+        let frameId = context:.generateVarId();
+        let outId = context:.generateVarId();
+
+        let params = copy [copy YILVarDecl(frame.loc, GeneratorKeys::FRAME, framePtr, frameId),
+                           copy YILVarDecl(frame.loc, GeneratorKeys::OUT, outType, outId)];
+
+        let frameRef = copy YILUnrefValue(frame.loc, tuple, copy YILVar(frame.loc, GeneratorKeys::FRAME, framePtr, frameId));
+        let outRef = copy YILVar(frame.loc, GeneratorKeys::OUT, outType, outId);
+        let done = copy YILLabel(frame.loc, "done", context:.generateLblId());
+
+        context:.enterGenerator(frameRef, alias tuple, outRef, done);
+
+        let state = context:.declareGeneratorField(frame.loc, GeneratorKeys::STATE, YIL_UINT_32);
+        for p in frame.params {
+            let field = context:.declareGeneratorField(p.loc, p.loc.str, context:.finalizeType(p.type));
+            context:.registerVariable(p.uniqId, field);
+        }
+
+        let mut body = StmtList();
+        ValueExpander::finalize(alias context, frame.body, ref body, asLeft-> false);
+        body:.append(done);
+        body:.append(copy YILAffect(frame.loc, state, copy YILIntValue(frame.loc, YIL_UINT_32, cast!usize (GeneratorStates::DONE))));
+        body:.append(copy YILReturn(frame.loc, copy YILIntValue(frame.loc, YIL_UINT_8, 0us)));
+
+        let gen = context:.exitGenerator();
+        tuple.inners = gen.types;
+        tuple.fieldNames = gen.names;
+        context.typeExpander:.registerTuple(tuple);
+
+        let mut list = StmtList();
+        GeneratorExpander::finalizeDispatch(alias context, frame.loc, state, gen, ref list);
+        list:.append(body);
+
+        let mut instr: &YILInstr = copy YILBlock(frame.loc, list[]);
+        if enterCoverage {
+            instr = FrameExpander::finalizeCoverage(alias context, frame, instr, frameAddr, frameCoverAddr);
+        }
+
+        context:.exitBlock();
+        context:.exitFrame();
+        let touching = context:.exitSymbol();
+
+        let final = copy YILFrame(frame.loc,
+                                  frame.implLoc,
+                                  name,
+                                  params,
+                                  YIL_UINT_8,
+                                  body-> instr,
+                                  isWeak-> frame.isWeak,
+                                  refs-> touching);
+
+        if (frame.isWeak) {
+            context:.insertWeak(name, final);
+        } else {
+            context:.insertSymbol(name, final);
+        }
+    }
+
+    /**
+     * Emit the jumps resuming the body where the state of the frame says, the body
+     * starts right after them in the START state.
+     *
+     * @params:
+     *   - state: the state field of the frame
+     *   - gen:   the generator frame, whose resume labels are all known
+     */
+    fn finalizeDispatch(dmut context: &Expander, loc: &Word, state: &YILValue, gen: &GeneratorFrame, ref mut list: StmtList) {
+        let targets = copy [gen.done] ~ gen.resumes;
+        for i, target in targets {
+            let next = copy YILLabel(loc, "next", context:.generateLblId());
+            let test = copy YILBinaryValue(loc, YIL_UINT_8, BinaryOperators::DEQUAL, state,
+                                           copy YILIntValue(loc, YIL_UINT_32, cast!usize (GeneratorStates::DONE) + i));
+
+            list:.append(copy YILCondJmp(loc, test, target, next));
+            list:.append(next);
+        }
+    }
+
+    /**
+     * Finalize the function creating a generator: it allocates the frame, stores the
+     * parameters in it, and returns the handle pairing the frame and the resume function.
+     *
+     * @params:
+     *   - tuple: the complete type of the frame
+     */
+    fn finalizeCreateFrame(dmut context: &Expander, frame: &FrameGenerator, tuple: &YILTuple, framePtr: &YILPointer) {
+        let name = Mangler::mangle(frame);
+        let resumeName = Mangler::mangleResumeFrame(frame);
+        let loc = frame.loc;
+        let mut list = StmtList();
+
+        context:.enterSymbol();
+        context:.enterFrame(frame.name.toStr());
+        context:.enterBlock();
+
+        let mut params: [&YILVarDecl] = [];
+        let mut args: [&YILVar] = [];
+        for p in frame.params {
+            let varId = context:.generateVarId();
+            let type = context:.finalizeType(p.type);
+            params ~= [copy YILVarDecl(p.loc, p.loc.str, type, varId)];
+            args ~= [copy YILVar(p.loc, p.loc.str, type, varId)];
+        }
+
+        let sliceType = context.typeExpander:.finalizeSlice(YIL_UINT_8);
+        let (slice, sliceAddr) = ValueExpander::createVarForBlock(alias context, loc, NONE_TYPE, sliceType, ref list,
+                                                                  getAddr-> true);
+
+        list:.append(copy YILCall(loc, copy YILNameCallValue(loc, YIL_VOID, YRuntimeFuncs::ALLOC_NO_SET_SLICE,
+                                                             copy [sliceAddr,
+                                                                   copy YILIntValue(loc, YIL_UINT_MAX, 1us),
+                                                                   copy YILIntValue(loc, YIL_UINT_MAX, tuple.size)])));
+
+        let data = copy YILFieldValue(loc, context.typeExpander:.finalizePointer(YIL_UINT_8), slice, SliceKeys::PTR);
+        let (framePtrVar, _) = ValueExpander::createVarForBlock(alias context, loc, NONE_TYPE, framePtr, ref list,
+                                                                withValue-> copy YILCastValue(loc, framePtr, data));
+        let frameRef = copy YILUnrefValue(loc, tuple, framePtrVar);
+
+        list:.append(copy YILAffect(loc, copy YILFieldValue(loc, YIL_UINT_32, frameRef, GeneratorKeys::STATE),
+                                    copy YILIntValue(loc, YIL_UINT_32, cast!usize (GeneratorStates::START))));
+        for arg in args {
+            list:.append(copy YILAffect(arg.loc, copy YILFieldValue(arg.loc, arg.type, frameRef, arg.name), arg));
+        }
+
+        context:.registerTouchSym(resumeName, frame.implLoc);
+        let resume = copy YILAddrValue(loc, YIL_PTR_VOID, copy YILVar(loc, resumeName, YIL_VOID, 0us));
+        let handle = copy YILTupleValue(loc, context.typeExpander:.finalizeDelegate(),
+                                        copy [copy YILCastValue(loc, YIL_PTR_VOID, framePtrVar), resume],
+                                        fieldNames-> copy [DelegateKeys::CLOSURE, DelegateKeys::FUNC]);
+
+        list:.append(copy YILReturn(loc, handle));
+
+        context:.exitBlock();
+        context:.exitFrame();
+        let touching = context:.exitSymbol();
+
+        let final = copy YILFrame(loc,
+                                  frame.implLoc,
+                                  name,
+                                  params,
+                                  context:.finalizeType(frame.retType),
+                                  body-> copy YILBlock(loc, list[]),
+                                  isWeak-> frame.isWeak,
+                                  refs-> touching);
+
+        if (frame.isWeak) {
+            context:.insertWeak(name, final);
+        } else {
+            context:.insertSymbol(name, final);
+        }
+    }
+}

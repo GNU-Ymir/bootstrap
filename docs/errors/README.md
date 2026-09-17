@@ -26,7 +26,7 @@ check lives:
 | `E1xxx` | lexing | `LexingErrorMessage` -- `src/ymirc/lexing/errors.yr` | 24 |
 | `E2xxx` | parsing | `SyntaxErrorMessage` -- `src/ymirc/syntax/errors.yr` | 11 |
 | `E3xxx` | declaration | `DeclareErrorMessage` -- `src/ymirc/semantic/declarator/errors.yr` | 33 |
-| `E4xxx` | validation | `ValidateErrorMessage` -- `src/ymirc/semantic/validator/errors.yr` | 236 |
+| `E4xxx` | validation | `ValidateErrorMessage` -- `src/ymirc/semantic/validator/errors.yr` | 243 |
 | `E5xxx` | lowering (YIL) | `SerializeYILErrorMessage` -- `src/ymirc/lint/serialize/errors.yr` | 10 |
 
 Each page carries an example wherever a case in the suite raises the code: the
@@ -361,6 +361,13 @@ deliberately carry no code, and have no page here.
 | [E4288](E4288.md) | `UNITTEST_PROVIDER_NOT_A_SLICE` | the parameters of a unit test are produced as <>, but a slice was expected |
 | [E4289](E4289.md) | `UNITTEST_PARAMS_ARITY` | the parameters of a unit test are produced as <>, but the test takes <> parameters |
 | [E4290](E4290.md) | `UNUSABLE_SYMBOLS` | none of the symbols <> can be used as a value |
+| [E4291](E4291.md) | `YIELD_NO_GENERATOR` | yield statement is not within a generator |
+| [E4292](E4292.md) | `YIELD_NO_VALUE` | a yield statement must yield a value of type <> |
+| [E4293](E4293.md) | `YIELD_PROTECTED_REGION` | cannot yield inside a try block, a catch or a scope guard |
+| [E4294](E4294.md) | `RETURN_VALUE_GENERATOR` | a generator cannot return a value, its values are yielded |
+| [E4295](E4295.md) | `GENERATOR_THROWS` | a generator cannot throw exceptions |
+| [E4296](E4296.md) | `GENERATOR_PARAM` | the parameter <> of a generator cannot be declared <> |
+| [E4297](E4297.md) | `GENERATOR_MOVABLE` | a generator cannot hold a value of type <>, which has a destructor |
 
 ## E5xxx -- lowering (YIL)
 
