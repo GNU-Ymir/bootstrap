@@ -370,6 +370,7 @@ deliberately carry no code, and have no page here.
 | [E4296](E4296.md) | `GENERATOR_PARAM` | the parameter <> of a generator cannot be declared <> |
 | [E4297](E4297.md) | `GENERATOR_MOVABLE` | a generator cannot hold a value of type <>, which has a destructor |
 | [E4298](E4298.md) | `FAKE_METHOD_CALL` | the method <> is not a value, it can only be called |
+| [E4299](E4299.md) | `YIELD_IN_NO_GENERATOR` | yield in expects a generator, not a value of type <> |
 
 ## E5xxx -- lowering (YIL)
 
