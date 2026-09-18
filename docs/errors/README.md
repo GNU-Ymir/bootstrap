@@ -138,7 +138,7 @@ deliberately carry no code, and have no page here.
 | [E4012](E4012.md) | `CATCH_NOTHING` | catching pattern of type <> catches no exception |
 | [E4013](E4013.md) | `CATCH_PATTERN_MULT_OR_VDECL` | the pattern of a catch scope guard must start with a variable declaration or a field deconstructor |
 | [E4014](E4014.md) | `CLASS_ALIAS_FIELD` | class alias operator :. is not usable to access fields |
-| [E4015](E4015.md) | `CLASS_ALIAS_FIELD_NO_CLASS` | alias operator :. is only usable on class, record, entity or map types, not <> |
+| [E4015](E4015.md) | `CLASS_ALIAS_FIELD_NO_CLASS` | alias operator :. is only usable on class, record, entity, map or generator types, not <> |
 | [E4016](E4016.md) | `CLASS_ALIAS_INDEX_NO_CLASS` | class alias operator :[ is only usable on class, record or entity types, not <> |
 | [E4017](E4017.md) | `CLASS_FIELD_NOT_VALIDATED_YET` | field <> has not yet been validated |
 | [E4018](E4018.md) | `CLASS_NOT_IMPL` | class type <> does not implement trait <> |
@@ -368,6 +368,7 @@ deliberately carry no code, and have no page here.
 | [E4295](E4295.md) | `GENERATOR_THROWS` | a generator cannot throw exceptions |
 | [E4296](E4296.md) | `GENERATOR_PARAM` | the parameter <> of a generator cannot be declared <> |
 | [E4297](E4297.md) | `GENERATOR_MOVABLE` | a generator cannot hold a value of type <>, which has a destructor |
+| [E4298](E4298.md) | `FAKE_METHOD_CALL` | the method <> is not a value, it can only be called |
 
 ## E5xxx -- lowering (YIL)
 
