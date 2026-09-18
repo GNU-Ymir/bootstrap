@@ -371,6 +371,8 @@ deliberately carry no code, and have no page here.
 | [E4297](E4297.md) | `GENERATOR_MOVABLE` | a generator cannot hold a value of type <>, which has a destructor |
 | [E4298](E4298.md) | `FAKE_METHOD_CALL` | the method <> is not a value, it can only be called |
 | [E4299](E4299.md) | `YIELD_IN_NO_GENERATOR` | yield in expects a generator, not a value of type <> |
+| [E4300](E4300.md) | `UNECESSARY_GENERATOR_COPY` | copying a generator comprehension has no effect |
+| [E4301](E4301.md) | `GENERATOR_COMPR_EXIT` | cannot <> out of the element of a generator comprehension |
 
 ## E5xxx -- lowering (YIL)
 
