@@ -1,0 +1,213 @@
+/*
+ * Implements semantic validation for map comprehensions iterating over a slice.
+ *
+ * This module handles:
+ *   - validating the element and index iterator variables,
+ *   - constructing the loop inserting a pair at each iteration,
+ *   - propagating the aliasing rules of the iterated slice.
+ *
+ * <hr>
+ *
+ * @Package: ymirc
+ * @Module: ymirc::semantic::validator::value::compose::mapfor::slice
+ * @File: ymirc/semantic/validator/value/compose/mapfor/slice.yr
+ * @Author(s):
+ *   - Emile Cadorel <ecadorel@gmail.com>
+ *
+ * @Created(YYYY-MM-DD): 2026-09-18
+ * @Copyright(C) 2021–2026 GNU-Ymir
+ * @License
+ *   ```text
+ *   This file is part of the Ymir language project.
+ *
+ *   Ymir is free software: you can redistribute it and/or modify it
+ *   under the terms of the GNU General Public License as published by
+ *   the Free Software Foundation, either version 3 of the License, or
+ *   (at your option) any later version.
+ *
+ *   Ymir is distributed in the hope that it will be useful,
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *   GNU General Public License for more details.
+ *
+ *   You should have received a copy of the GNU General Public License
+ *   along with Ymir.  If not, see <https://www.gnu.org/licenses/>.
+ *   ```
+ */
+
+
+in slice;
+
+use ymirc::errors;
+use ymirc::lexing::{keys, word};
+use ymirc::semantic::generator::{type::native, value::_};
+use ymirc::syntax::expression::_;
+use ymirc::utils::format;
+
+/**
+ * SliceMapComprValidation module
+ *
+ * Provides semantic validation for map comprehensions applied to slices. The
+ * slice is iterated by index, and the pair produced at each iteration is
+ * inserted in the constructed map.
+ */
+pub mod SliceMapComprValidation {
+
+    /**
+     * Validate a map comprehension applied to a slice.
+     *
+     * @params:
+     *   - context:    validation context
+     *   - slice:      the slice value being iterated
+     *   - sliceType:  the type of the slice
+     *   - floop:      the MapForAllocatorExpr describing the comprehension
+     *   - byAlias:    whether aliasing is permitted
+     *
+     * @returns:
+     *   - (value, usedAlias): the resulting comprehension value and alias usage flag
+     *
+     * @throws:
+     *   - ErrorMsg if the number of iterator variables is invalid
+     */
+    pub fn validate(dmut context: &ValidationContext,
+                    slice:        &Value,
+                    sliceType:    &SliceType,
+                    floop:        &MapForAllocatorExpr,
+                    byAlias:      bool)-> (&Value, bool)
+        throws ErrorMsg
+    {
+        if floop.vars.len == 1 {
+            return SliceMapComprValidation::validateIteration(alias context, slice, sliceType, floop, floop.vars[0], none,
+                                                              byAlias-> byAlias);
+        }
+
+        if floop.vars.len == 2 {
+            return SliceMapComprValidation::validateIteration(alias context, slice, sliceType, floop, floop.vars[1], (floop.vars[0])?,
+                                                              byAlias-> byAlias);
+        }
+
+        throw copy ErrorMsg::fatal(floop.loc, format(ValidateErrorMessage::UNDEF_FOR_LOOP_OPERATOR, floop.vars.len, sliceType));
+    }
+
+    /**
+     * Validate a single iteration of a slice map comprehension.
+     *
+     * @params:
+     *   - context:    validation context
+     *   - slice:      the slice value
+     *   - sliceType:  the slice type
+     *   - floop:      the comprehension expression
+     *   - elemIter:   element iterator variable
+     *   - indexIter:  optional index iterator variable
+     *   - byAlias:    aliasing flag
+     *
+     * @returns:
+     *   - (value, usedAlias)
+     *
+     * @throws:
+     *   - ErrorMsg if validation fails inside the comprehension
+     */
+    fn validateIteration(dmut context: &ValidationContext,
+                         slice:        &Value,
+                         sliceType:    &SliceType,
+                         floop:        &MapForAllocatorExpr,
+                         elemIter:     &VarDeclExpr,
+                         indexIter:    (&VarDeclExpr)?,
+                         byAlias:      bool)-> (&Value, bool)
+        throws ErrorMsg
+    {
+        let mut errors: (&ErrorMsg)? = none;
+        let loc = floop.loc;
+        let mut result: &Value = UNIT_VALUE;
+        let mut usedAlias = false;
+
+        context:.enterBlock();
+        {
+            let sliceDecl = copy VarDeclValue(slice.loc.locate(ForLoopKeys::VALUE ~ "_init"), sliceType, slice, isMutable-> false);
+            let sliceVref = VariableCreation::createVarFromDecl(sliceDecl, canCte-> false);
+
+            let len = {
+                let bi = context.cteInterpret:.computeInt(copy StructFieldAccessValue(loc, USIZE_TYPE, slice, SliceKeys::LEN));
+                copy IntValue(loc, USIZE_TYPE, bi)
+            } catch {
+                _ => {
+                    context.cteInterpret:.reduce(copy StructFieldAccessValue(loc, USIZE_TYPE, sliceVref, SliceKeys::LEN))
+                }
+            };
+
+            let (lp, mapDecl, mapVref, mapType, usedAlias_) = SliceMapComprValidation::validateInnerLoop(alias context, loc, sliceVref, sliceType, floop, elemIter, indexIter, len,
+                                                                                                        byAlias-> byAlias);
+
+            result = MapForComposeValidation::validateResult(loc, mapType, copy [sliceDecl, mapDecl, lp, mapVref]);
+            usedAlias = usedAlias_;
+        } catch {
+            err => {
+                errors = (err)?;
+            }
+        }
+
+        {
+            context:.quitBlock(warnUnused-> !(errors.hasValue));
+        } catch {
+            err => {
+                errors = (err)?;
+            }
+        }
+
+        if let Ok(err) = errors {
+            throw err;
+        }
+
+        return (result, usedAlias);
+    }
+
+    /**
+     * Build the loop inserting a pair at each index of the slice.
+     *
+     * @params:
+     *   - context:    validation context
+     *   - loc:        source location
+     *   - sliceVref:  reference to the slice
+     *   - sliceType:  type of the slice
+     *   - floop:      comprehension expression
+     *   - elemIter:   element iterator
+     *   - indexIter:  optional index iterator
+     *   - len:        slice length
+     *   - byAlias:    aliasing flag
+     *
+     * @returns:
+     *   - (loopBlock, mapDecl, mapVref, mapType, usedAlias)
+     *
+     * @throws:
+     *   - ErrorMsg if iterator validation or loop construction fails
+     */
+    fn validateInnerLoop(dmut context: &ValidationContext,
+                         loc:          &Word,
+                         sliceVref:    &VarRefValue,
+                         sliceType:    &SliceType,
+                         floop:        &MapForAllocatorExpr,
+                         elemIter:     &VarDeclExpr,
+                         indexIter:    (&VarDeclExpr)?,
+                         len:          &Value,
+                         byAlias:      bool)-> (&Value, &VarDeclValue, &VarRefValue, &MapType, bool)
+        throws ErrorMsg
+    {
+        let (indexVref, indexDecl, elemDecl, _, usedAlias) = SliceForLoopValidation::validateIteratorVars(alias context, sliceVref.loc, sliceVref, sliceType, elemIter, indexIter,
+                                                                                                         byMutRef-> false,
+                                                                                                         byAlias-> byAlias);
+
+        let (mapDecl, mapVref, insert, mapType) = MapForComposeValidation::validateInnerInsert(alias context, floop);
+
+        let one = TypeInference::inferValueForType(alias context, indexVref.loc, copy IntValue(loc, USIZE_TYPE, 1), indexVref.type,
+                                                   byReference-> false);
+
+        let test = copy CmpIntOperatorValue(loc, BinaryOperators::INF, indexVref, len);
+        let increment = copy AffectValue(loc, indexVref.type, indexVref,
+                                         copy MathIntOperatorValue(loc, indexVref.type, BinaryOperators::PLUS, indexVref, one));
+
+        let blk = copy BlockValue(loc, VOID_TYPE, copy [elemDecl, insert, increment]);
+        let lp = copy LoopValue(loc, VOID_TYPE, test, blk);
+
+        return (copy BlockValue(loc, VOID_TYPE, copy [indexDecl, lp]), mapDecl, mapVref, mapType, usedAlias);
+    }
+}

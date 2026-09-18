@@ -1,0 +1,238 @@
+/*
+ * Implements semantic validation for map comprehensions iterating over a tuple.
+ *
+ * A tuple is iterated at compile time: the pair is validated once per element,
+ * and the insertions are unrolled in the constructed map.
+ *
+ * <hr>
+ *
+ * @Package: ymirc
+ * @Module: ymirc::semantic::validator::value::compose::mapfor::tuple
+ * @File: ymirc/semantic/validator/value/compose/mapfor/tuple.yr
+ * @Author(s):
+ *   - Emile Cadorel <ecadorel@gmail.com>
+ *
+ * @Created(YYYY-MM-DD): 2026-09-18
+ * @Copyright(C) 2021–2026 GNU-Ymir
+ * @License
+ *   ```text
+ *   This file is part of the Ymir language project.
+ *
+ *   Ymir is free software: you can redistribute it and/or modify it
+ *   under the terms of the GNU General Public License as published by
+ *   the Free Software Foundation, either version 3 of the License, or
+ *   (at your option) any later version.
+ *
+ *   Ymir is distributed in the hope that it will be useful,
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *   GNU General Public License for more details.
+ *
+ *   You should have received a copy of the GNU General Public License
+ *   along with Ymir.  If not, see <https://www.gnu.org/licenses/>.
+ *   ```
+ */
+
+
+in tuple;
+
+use ymirc::errors;
+
+use ymirc::semantic::generator::{type::_, value::_};
+use ymirc::syntax::expression::_;
+use ymirc::utils::format;
+
+/**
+ * TupleMapComprValidation module
+ *
+ * Provides semantic validation for map comprehensions applied to tuples. The
+ * key and the value are validated once per element of the tuple, and their
+ * types are unified into the type of the constructed map, exactly as the
+ * entries of a map literal are.
+ */
+pub mod TupleMapComprValidation {
+
+    /**
+     * Validate a map comprehension applied to a tuple.
+     *
+     * @params:
+     *   - context:    validation context
+     *   - tuple:      the tuple value being iterated
+     *   - tupleType:  the type of the tuple
+     *   - floop:      the MapForAllocatorExpr describing the comprehension
+     *   - byAlias:    whether aliasing is permitted
+     *
+     * @returns:
+     *   - (value, usedAlias): the resulting comprehension value and alias usage flag
+     *
+     * @throws:
+     *   - ErrorMsg if the number of iterator variables is invalid
+     */
+    pub fn validate(dmut context: &ValidationContext,
+                    tuple:        &Value,
+                    tupleType:    &TupleType,
+                    floop:        &MapForAllocatorExpr,
+                    byAlias:      bool)-> (&Value, bool)
+        throws ErrorMsg
+    {
+        if floop.vars.len == 1 {
+            return TupleMapComprValidation::validateIteration(alias context, tuple, tupleType, floop, floop.vars[0], none,
+                                                              byAlias-> byAlias);
+        }
+
+        if floop.vars.len == 2 {
+            return TupleMapComprValidation::validateIteration(alias context, tuple, tupleType, floop, floop.vars[1], (floop.vars[0])?,
+                                                              byAlias-> byAlias);
+        }
+
+        throw copy ErrorMsg::fatal(floop.loc, format(ValidateErrorMessage::UNDEF_FOR_LOOP_OPERATOR, floop.vars.len, tupleType));
+    }
+
+    /**
+     * Unroll the comprehension over the elements of the tuple.
+     *
+     * Steps:
+     *   1. Validate the pair produced by each element of the tuple.
+     *   2. Unify the types of the keys and of the values.
+     *   3. Create the map, and insert every pair in it.
+     *
+     * @params:
+     *   - context:    validation context
+     *   - tuple:      the tuple value
+     *   - tupleType:  the tuple type
+     *   - floop:      comprehension expression
+     *   - elemIter:   element iterator variable
+     *   - indexIter:  optional index iterator variable
+     *   - byAlias:    aliasing flag
+     *
+     * @returns:
+     *   - (value, usedAlias)
+     *
+     * @throws:
+     *   - ErrorMsg if any iteration fails, or if the pairs have no common type
+     */
+    fn validateIteration(dmut context: &ValidationContext,
+                         tuple:        &Value,
+                         tupleType:    &TupleType,
+                         floop:        &MapForAllocatorExpr,
+                         elemIter:     &VarDeclExpr,
+                         indexIter:    (&VarDeclExpr)?,
+                         byAlias:      bool)-> (&Value, bool)
+        throws ErrorMsg
+    {
+        let loc = floop.loc;
+        let mut pres: [[&Value]] = [];
+        let mut keys: [&Value] = [];
+        let mut values: [&Value] = [];
+        let mut keyType: &Type = NONE_TYPE;
+        let mut valueType: &Type = NONE_TYPE;
+        let mut usedAlias = false;
+
+        for i in 0us .. tupleType.inners.len {
+            let (pre, key, value, usedAlias_) = TupleMapComprValidation::validateInnerLoop(alias context, i, tuple, tupleType, floop, elemIter, indexIter,
+                                                                                           byAlias-> byAlias);
+
+            keyType = SliceComposeValidation::addArrayType(alias context, key, keyType, ref keys);
+            valueType = SliceComposeValidation::addArrayType(alias context, value, valueType, ref values);
+            pres ~= [pre];
+            usedAlias = (usedAlias || usedAlias_);
+        }
+
+        let mapType = MapForComposeValidation::validateResultType(alias context, loc, keyType, valueType);
+        let (mapDecl, mapVref) = MapForComposeValidation::validateResultValueDecl(loc, mapType);
+
+        let mut content: [&Value] = copy [mapDecl];
+        for i, pre in pres {
+            let insert = copy MapInsertValue(loc, VOID_TYPE, mapVref, keys[i], values[i]);
+            content ~= [copy BlockValue(loc, VOID_TYPE, pre ~ [insert])];
+        }
+
+        return (MapForComposeValidation::validateResult(loc, mapType, content ~ [mapVref]), usedAlias);
+    }
+
+    /**
+     * Validate the pair produced by one element of the tuple.
+     *
+     * The iterator variables are bound to the element at the index `i`, and are
+     * returned along with the pair so that the insertion can be built once the
+     * type of the map is known.
+     *
+     * @params:
+     *   - context:    validation context
+     *   - i:          index of the element in the tuple
+     *   - tuple:      the tuple value
+     *   - tupleType:  the tuple type
+     *   - floop:      comprehension expression
+     *   - elemIter:   element iterator variable
+     *   - indexIter:  optional index iterator variable
+     *   - byAlias:    aliasing flag
+     *
+     * @returns:
+     *   - (declarations of the iterators, key, value, usedAlias)
+     *
+     * @throws:
+     *   - ErrorMsg if the iterators or the pair are invalid
+     */
+    fn validateInnerLoop(dmut context: &ValidationContext,
+                         i:            usize,
+                         tuple:        &Value,
+                         tupleType:    &TupleType,
+                         floop:        &MapForAllocatorExpr,
+                         elemIter:     &VarDeclExpr,
+                         indexIter:    (&VarDeclExpr)?,
+                         byAlias:      bool)-> ([&Value], &Value, &Value, bool)
+        throws ErrorMsg
+    {
+        let mut errors: (&ErrorMsg)? = none;
+        let mut pre: [&Value] = [];
+        let mut key: &Value = UNIT_VALUE;
+        let mut value: &Value = UNIT_VALUE;
+        let mut usedAlias = false;
+
+        context:.enterBlock();
+        {
+            if let Ok(vdecl: &VarDeclExpr) = indexIter {
+                let (indexDecl, insertIndex) = ForLoopValidation::validateIndexIterDecl(alias context, vdecl.loc, vdecl, tupleType,
+                                                                                        value-> copy IntValue(vdecl.loc, USIZE_TYPE, i),
+                                                                                        isMutable-> false,
+                                                                                        canCte-> true);
+                if insertIndex {
+                    context:.insertLocal(indexDecl.loc, indexDecl.name, indexDecl);
+                }
+
+                pre ~= [indexDecl];
+            }
+
+            let (elemDecl, insert, _, usedAlias_) = TupleForLoopValidation::validateIterDecl(alias context, elemIter, i, tuple, tupleType,
+                                                                                              byMutRef-> false,
+                                                                                              byAlias-> byAlias);
+            if insert {
+                context:.insertLocal(elemIter.loc, elemIter.name.str, elemDecl);
+            }
+
+            pre ~= [elemDecl];
+            usedAlias = usedAlias_;
+
+            key = ValueValidation::validate(alias context, floop.key);
+            value = ValueValidation::validate(alias context, floop.value);
+        } catch {
+            err => {
+                errors = (err)?;
+            }
+        }
+
+        {
+            context:.quitBlock(warnUnused-> !(errors.hasValue));
+        } catch {
+            err => {
+                errors = (err)?;
+            }
+        }
+
+        if let Ok(err) = errors {
+            throw err;
+        }
+
+        return (pre, key, value, usedAlias);
+    }
+}

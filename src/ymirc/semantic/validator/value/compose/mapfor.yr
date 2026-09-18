@@ -1,17 +1,9 @@
 /*
- * Implements semantic validation for `mapfor` comprehension/allocator
- * expressions.
+ * Implements semantic validation for map list comprehensions.
  *
- * This module currently acts as a placeholder: the syntactic form is
- * recognized by the parser, but semantic validation and construction of
- * the resulting map value are not yet implemented.
- *
- * Once completed, this module will handle:
- *   - type inference for key/value expressions inside a `mapfor`,
- *   - validation of iteration sources,
- *   - construction of the resulting MapType and MapValue,
- *   - and enforcement of mutability and aliasing rules.
-
+ * This module dispatches the comprehension on the type of the iterated value,
+ * and provides the construction of the map collecting the key/value pairs,
+ * shared by every iterable.
  *
  * <hr>
  *
@@ -45,46 +37,266 @@
 in mapfor;
 
 use ymirc::errors;
-use ymirc::global::common;
-use ymirc::semantic::generator::value;
+use ymirc::errors::snippet::suggestion;
+use ymirc::lexing::{keys, word};
+use ymirc::semantic::generator::{type::_, value::_};
+use ymirc::semantic::validator::value::compose::mapfor::_;
 use ymirc::syntax::expression::compose;
 use ymirc::utils::format;
 
+/*!
+ * ====================================================================================================
+ * ====================================================================================================
+ * ====================================          SUBMODS          =====================================
+ * ====================================================================================================
+ * ====================================================================================================
+ */
+
+mod ::array;
+mod ::class_;
+mod ::map;
+mod ::range;
+mod ::slice;
+mod ::tuple;
+mod ::yield_;
+
+/*!
+ * ====================================================================================================
+ * ====================================================================================================
+ * ======================================          ROOT          ======================================
+ * ====================================================================================================
+ * ====================================================================================================
+ */
 
 /**
  * MapForComposeValidation module
  *
- * Provides semantic validation for `mapfor` allocator expressions. At present,
- * this construct is parsed but not semantically supported. Any attempt to
- * validate a `mapfor` expression results in a fatal error.
+ * Central dispatcher for map comprehension validation. This module:
  *
+ *   - unwraps alias/reference wrappers around the iterable,
+ *   - enforces semantic rules(no by-reference iteration, alias usage, copy),
+ *   - forwards validation to the appropriate submodule:
+ *       * ArrayMapComprValidation
+ *       * SliceMapComprValidation
+ *       * MapMapComprValidation
+ *       * TupleMapComprValidation
+ *       * RangeMapComprValidation
+ *       * ClassMapComprValidation
+ *       * YieldMapComprValidation
+ *   - creates the map collecting the pairs produced by the iteration.
+ *
+ * A map is always allocated on the heap, so unlike a slice comprehension a map
+ * comprehension has no compile time length to compute, and is only valid when
+ * enclosed in a `copy` operator.
  */
 pub mod MapForComposeValidation {
 
     /**
-     * Validate a `mapfor` allocator expression.
-     *
-     * This function is a placeholder: `mapfor` expressions are recognized
-     * syntactically but not yet implemented semantically. Any invocation of
-     * this validator results in a fatal error indicating that the feature is
-     * not supported in the current Ymir version.
+     * Validate a map comprehension by dispatching to the correct submodule.
      *
      * @params:
      *   - context: validation context
-     *   - f:       the MapForAllocatorExpr representing the `mapfor` construct
+     *   - floop:   the MapForAllocatorExpr describing the comprehension
      *
      * @returns:
-     *   - never returns; always throws
+     *   - the resulting comprehension value
      *
      * @throws:
-     *   - ErrorMsg indicating that `mapfor` expressions are not supported
+     *   - ErrorMsg if by-reference iteration is attempted
+     *   - ErrorMsg if the iterable type is unsupported
+     *   - ErrorMsg if aliasing is unnecessary
+     *   - ErrorMsg if the comprehension is not enclosed in a copy operator
      */
-    pub fn validate(dmut context: &ValidationContext, f: &MapForAllocatorExpr)-> &Value
+    pub fn validate(dmut context: &ValidationContext, floop: &MapForAllocatorExpr)-> &Value
         throws ErrorMsg
     {
-        context;
-        f;
+        let inCopy = context.isInCopy(floop);
+        let inDeepCopy = context.isInDeepCopy();
+        let mValue = ValueCreation::createEnumUnwrap(ValueValidation::validate(alias context, floop.iter));
+        let (byMutRef, byAlias, fVal) = match mValue {
+            r: &ReferencerValue => { (r.isMutable, false, r.value) }
+            a: &AliaserValue => { (false, true, a.value) }
+            _ => { (false, false, mValue) }
+        };
 
-        throw copy ErrorMsg::fatal(f.loc, format(ValidateErrorMessage::NOT_SUPPORTED_IN, __YMIR_VERSION__));
+        // just like a slice comprehension, iterating by reference has no
+        // meaning, the iterated value is never modified by the comprehension
+        if (byMutRef) {
+            throw copy ErrorMsg::fatal(mValue.loc, format(ValidateErrorMessage::UNECESSARY_REFERENCE));
+        }
+
+        let (res, usedAlias) = match fVal.type {
+            a: &ArrayType => {
+                ArrayMapComprValidation::validate(alias context, fVal, a, floop, byAlias-> byAlias)
+            }
+            s: &SliceType => {
+                SliceMapComprValidation::validate(alias context, fVal, s, floop, byAlias-> byAlias)
+            }
+            m: &MapType => {
+                MapMapComprValidation::validate(alias context, fVal, m, floop, byAlias-> byAlias)
+            }
+            t: &TupleType => {
+                TupleMapComprValidation::validate(alias context, fVal, t, floop, byAlias-> byAlias)
+            }
+            c: &ClassPtrType => {
+                (ClassMapComprValidation::validate(alias context, fVal, c, floop,
+                                                   byAlias-> byAlias,
+                                                   aliasLoc-> mValue.loc),
+                 true)
+            }
+            r: &RangeType => {
+                (RangeMapComprValidation::validate(alias context, fVal, r, floop), false)
+            }
+            y: &YieldType => {
+                YieldMapComprValidation::validate(alias context, fVal, y, floop, byAlias-> byAlias)
+            }
+            _ => {
+                throw copy ErrorMsg::fatal(floop.loc, format(ValidateErrorMessage::UNDEF_FOR_LOOP_OPERATOR, floop.vars.len, mValue.type));
+            }
+        };
+
+        if byAlias && !usedAlias {
+            throw copy ErrorMsg::fatal(mValue.loc, format(ValidateErrorMessage::UNECESSARY_ALIAS, mValue.type));
+        }
+
+        MapForComposeValidation::verifyCopyContext(context, floop, res.type, inCopy-> inCopy, inDeepCopy-> inDeepCopy);
+
+        res
+    }
+
+    /**
+     * Verify that the comprehension is enclosed in a simple copy operator.
+     *
+     * @params:
+     *   - context:    validation context
+     *   - floop:      the comprehension expression
+     *   - mapType:    the type of the constructed map
+     *   - inCopy:     true iff the comprehension is the content of a copy operator
+     *   - inDeepCopy: true iff that copy operator is a deep copy
+     *
+     * @throws:
+     *   - ErrorMsg if the comprehension is deeply copied, or not copied at all
+     */
+    fn verifyCopyContext(context: &ValidationContext, floop: &MapForAllocatorExpr, mapType: &Type, inCopy: bool, inDeepCopy: bool)
+        throws ErrorMsg
+    {
+        if (inCopy && inDeepCopy) { // dcopy [x => x for x in 0 .. 2], is prohibited
+            let dcopyLoc = context.getCopyExpr().loc;
+            throw (copy ErrorMsg::fatal(floop.loc, format(ValidateErrorMessage::CTOR_MAP_DCOPY, mapType)))
+                .withFix(Edit(dcopyLoc, replacement-> Keys::COPY, len-> dcopyLoc.len,
+                              msg-> format(ValidateErrorMessage::SIMPLE_COPY_DCOPY_REPLACE)));
+        }
+
+        if (!inCopy) { // [x => x for x in 0 .. 2] must be placed inside a copy op
+            throw (copy ErrorMsg::fatal(floop.loc, format(ValidateErrorMessage::CTOR_MAP_STACK, mapType)))
+                .withFix(Edit(floop.loc, replacement-> "copy ",
+                              msg-> format(ValidateErrorMessage::ENCLOSE_COPY_LST)));
+        }
+    }
+
+    /**
+     * Validate the key and the value of the comprehension, and create the map
+     * collecting them.
+     *
+     * The type of the map is infered from the pair produced by the first
+     * iteration, exactly as the type of a map literal is infered from its
+     * first entry.
+     *
+     * @params:
+     *   - context: validation context
+     *   - floop:   the comprehension expression
+     *
+     * @returns:
+     *   - (mapDecl, mapVref, insert, mapType)
+     *
+     * @throws:
+     *   - ErrorMsg if the key or the value is invalid, or has no typeinfo
+     */
+    pub fn validateInnerInsert(dmut context: &ValidationContext, floop: &MapForAllocatorExpr)-> (&VarDeclValue, &VarRefValue, &Value, &MapType)
+        throws ErrorMsg
+    {
+        let loc = floop.loc;
+        let mut keys: [&Value] = [];
+        let mut values: [&Value] = [];
+
+        let key = ValueValidation::validate(alias context, floop.key);
+        let keyType = SliceComposeValidation::addArrayType(alias context, key, NONE_TYPE, ref keys);
+
+        let value = ValueValidation::validate(alias context, floop.value);
+        let valueType = SliceComposeValidation::addArrayType(alias context, value, NONE_TYPE, ref values);
+
+        let mapType = MapForComposeValidation::validateResultType(alias context, loc, keyType, valueType);
+        let (mapDecl, mapVref) = MapForComposeValidation::validateResultValueDecl(loc, mapType);
+
+        return (mapDecl, mapVref, copy MapInsertValue(loc, VOID_TYPE, mapVref, keys[0], values[0]), mapType);
+    }
+
+    /**
+     * Create the type of the map constructed by the comprehension, and
+     * register its typeinfo.
+     *
+     * @params:
+     *   - context:   validation context
+     *   - loc:       source location
+     *   - keyType:   the type of the key produced at each iteration
+     *   - valueType: the type of the value produced at each iteration
+     *
+     * @returns:
+     *   - the type of the constructed map
+     *
+     * @throws:
+     *   - ErrorMsg if the typeinfo of the map cannot be created
+     */
+    pub fn validateResultType(dmut context: &ValidationContext, loc: &Word, keyType: &Type, valueType: &Type)-> &MapType
+        throws ErrorMsg
+    {
+        let mapType = copy MapType(loc, keyType.clone(0u32), valueType, isMutable-> true);
+        {
+            TypeCreation::createMapTypeInfo(alias context, loc, mapType);
+        } catch {
+            err: &ErrorMsg => {
+                throw err.withNote(copy [copy ErrorMsg::note(loc, format(ValidateErrorMessage::VALIDATING))]);
+            }
+        }
+
+        return mapType;
+    }
+
+    /**
+     * Create the declaration of the map collecting the pairs, initialized with
+     * an empty map.
+     *
+     * @params:
+     *   - loc:     source location
+     *   - mapType: the type of the constructed map
+     *
+     * @returns:
+     *   - (mapDecl, mapVref)
+     */
+    pub fn validateResultValueDecl(loc: &Word, mapType: &MapType)-> (&VarDeclValue, &VarRefValue) {
+        let noKey: [&Value] = [];
+        let noValue: [&Value] = [];
+        let empty = copy MapValue(loc, mapType, noKey, noValue);
+        let mapDecl = copy VarDeclValue(loc.locate(ForLoopKeys::VALUE), mapType, empty, isMutable-> true);
+
+        return (mapDecl, VariableCreation::createVarFromDecl(mapDecl, canCte-> false));
+    }
+
+    /**
+     * Assemble the block of the comprehension into its final value.
+     *
+     * @params:
+     *   - loc:     source location
+     *   - mapType: the type of the constructed map
+     *   - values:  the content of the block, ending with the reference to the map
+     *
+     * @returns:
+     *   - the comprehension, wrapped in the copy that constructed it
+     */
+    pub fn validateResult(loc: &Word, mapType: &MapType, values: [&Value])-> &Value {
+        let blk = copy BlockValue(loc, mapType, values);
+        let lst = copy ListComprValue(loc, mapType, blk);
+
+        return copy CopierValue(loc, mapType, lst, isDone-> true);
     }
 }

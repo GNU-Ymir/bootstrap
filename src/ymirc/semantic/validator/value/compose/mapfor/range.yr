@@ -1,0 +1,166 @@
+/*
+ * Implements semantic validation for map comprehensions iterating over a range.
+ *
+ * The number of iterations of the range is computed as for a `for` loop, and a
+ * pair is inserted in the constructed map at each iteration. Unlike a slice
+ * comprehension, that number does not have to be known at compile time, the map
+ * being always allocated on the heap.
+ *
+ * <hr>
+ *
+ * @Package: ymirc
+ * @Module: ymirc::semantic::validator::value::compose::mapfor::range
+ * @File: ymirc/semantic/validator/value/compose/mapfor/range.yr
+ * @Author(s):
+ *   - Emile Cadorel <ecadorel@gmail.com>
+ *
+ * @Created(YYYY-MM-DD): 2026-09-18
+ * @Copyright(C) 2021–2026 GNU-Ymir
+ * @License
+ *   ```text
+ *   This file is part of the Ymir language project.
+ *
+ *   Ymir is free software: you can redistribute it and/or modify it
+ *   under the terms of the GNU General Public License as published by
+ *   the Free Software Foundation, either version 3 of the License, or
+ *   (at your option) any later version.
+ *
+ *   Ymir is distributed in the hope that it will be useful,
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *   GNU General Public License for more details.
+ *
+ *   You should have received a copy of the GNU General Public License
+ *   along with Ymir.  If not, see <https://www.gnu.org/licenses/>.
+ *   ```
+ */
+
+
+in range;
+
+use ymirc::errors;
+use ymirc::lexing::keys;
+use ymirc::semantic::interpret;
+use ymirc::semantic::generator::{type::native, value::_};
+use ymirc::syntax::expression::compose;
+use ymirc::utils::format;
+
+/**
+ * RangeMapComprValidation module
+ *
+ * Provides semantic validation for map comprehensions applied to ranges.
+ */
+pub mod RangeMapComprValidation {
+
+    /**
+     * Validate a map comprehension applied to a range.
+     *
+     * @params:
+     *   - context:    validation context
+     *   - range:      the range value being iterated
+     *   - rangeType:  the type of the range
+     *   - floop:      the MapForAllocatorExpr describing the comprehension
+     *
+     * @returns:
+     *   - the resulting comprehension value
+     *
+     * @throws:
+     *   - ErrorMsg if the number of iterator variables is invalid
+     *   - ErrorMsg if validation fails inside the comprehension
+     */
+    pub fn validate(dmut context: &ValidationContext,
+                    range:        &Value,
+                    rangeType:    &RangeType,
+                    floop:        &MapForAllocatorExpr)-> &Value
+        throws ErrorMsg
+    {
+        if floop.vars.len != 1 {
+            throw copy ErrorMsg::fatal(floop.loc, format(ValidateErrorMessage::UNDEF_FOR_LOOP_OPERATOR, floop.vars.len, rangeType));
+        }
+
+        let mut errors: (&ErrorMsg)? = none;
+        context:.enterBlock();
+        let result = {
+            RangeMapComprValidation::validateInnerLoop(alias context, range, rangeType, floop)
+        } catch {
+            err => {
+                errors = (err)?;
+                UNIT_VALUE
+            }
+        };
+
+        {
+            context:.quitBlock(warnUnused-> !(errors.hasValue));
+        } catch {
+            err => {
+                errors = (err)?;
+            }
+        }
+
+        if let Ok(err) = errors {
+            throw err;
+        }
+
+        return result;
+    }
+
+    /**
+     * Build the loop inserting a pair at each iteration of the range.
+     *
+     * Steps:
+     *   1. Declare the iteration counter, and compute the number of iterations.
+     *   2. Bind the iterator variable of the range.
+     *   3. Validate the pair, and create the map collecting it.
+     *   4. Build the loop body: index update, insertion, increment.
+     *
+     * @params:
+     *   - context:    validation context
+     *   - range:      the range value
+     *   - rangeType:  the range type
+     *   - floop:      comprehension expression
+     *
+     * @returns:
+     *   - the resulting comprehension value
+     *
+     * @throws:
+     *   - ErrorMsg if iterator validation or loop construction fails
+     */
+    fn validateInnerLoop(dmut context: &ValidationContext,
+                         range:        &Value,
+                         rangeType:    &RangeType,
+                         floop:        &MapForAllocatorExpr)-> &Value
+        throws ErrorMsg
+    {
+        let loc = floop.loc;
+        let (fst, scd, step, contains) = ValueCreation::createRangeUnwrap(alias context, range, rangeType, reduce-> true);
+        let nbIteration = RangeInterpret::reduceLen(alias context.cteInterpret, loc, fst, scd, step, contains);
+
+        let iterDecl = copy VarDeclValue(loc.locate(ForLoopKeys::ITER), USIZE_TYPE, copy IntValue(loc, USIZE_TYPE, 0),
+                                         isMutable-> true);
+        let iterVref = VariableCreation::createVarFromDecl(iterDecl, canCte-> false, isIterator-> true);
+        let mut decls: [&VarDeclValue] = copy [iterDecl];
+
+        let nbIterVref = if (context.cteInterpret.isCte(nbIteration)) {
+            nbIteration
+        } else {
+            let nbIterDecl = copy VarDeclValue(loc.locate(ForLoopKeys::NB_ITER), USIZE_TYPE, nbIteration,
+                                               isMutable-> false);
+            decls ~= [nbIterDecl];
+            VariableCreation::createVarFromDecl(nbIterDecl, canCte-> true)
+        };
+
+        let (indexVref, indexDecl, _) = RangeForLoopValidation::validateIteratorVar(alias context, loc, rangeType, floop.vars[0],
+                                                                                    isMutable-> true);
+
+        let (mapDecl, mapVref, insert, mapType) = MapForComposeValidation::validateInnerInsert(alias context, floop);
+
+        let (increment, setIndex, test) = RangeForLoopValidation::validateIncrement(alias context, loc, iterVref, nbIterVref, indexVref, fst, step);
+        let blk = copy BlockValue(loc, VOID_TYPE, copy [setIndex, insert, increment]);
+        let lp = copy LoopValue(loc, VOID_TYPE, test, blk);
+
+        decls ~= [indexDecl, mapDecl];
+
+        let values: [&Value] = decls;
+        return MapForComposeValidation::validateResult(loc, mapType, values ~ [lp, mapVref]);
+    }
+}

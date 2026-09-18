@@ -33,6 +33,13 @@ Consice comment:
 
 Commit policy:
 - split work in logical commits
+- a commit is one piece: one module, or one behavior. A feature spread over several modules is
+  one commit per module, never a single commit adding them all
+- order the commits like the pipeline they touch: chore, then syntax, then sem, then tests, then
+  docs
+- a commit never uses what a later one declares, even though compilation within the branch is
+  not required: what is shared comes before what uses it, and a dispatch comes after everything
+  it dispatches to
 - rewrite history when a new commit it modifying something that was introduced by another commit of the same branch
 - There's no need for tests to pass, and code to compile between commits as long as the last commit of the branch compiles and test succeed
 - don't add co-authors
