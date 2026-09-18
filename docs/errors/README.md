@@ -368,6 +368,7 @@ deliberately carry no code, and have no page here.
 | [E4295](E4295.md) | `GENERATOR_THROWS` | a generator cannot throw exceptions |
 | [E4296](E4296.md) | `GENERATOR_PARAM` | the parameter <> of a generator cannot be declared <> |
 | [E4297](E4297.md) | `GENERATOR_MOVABLE` | a generator cannot hold a value of type <>, which has a destructor |
+| [E4298](E4298.md) | `FAKE_METHOD_CALL` | the method <> is not a value, it can only be called |
 
 ## E5xxx -- lowering (YIL)
 
