@@ -26,7 +26,7 @@ check lives:
 | `E1xxx` | lexing | `LexingErrorMessage` -- `src/ymirc/lexing/errors.yr` | 24 |
 | `E2xxx` | parsing | `SyntaxErrorMessage` -- `src/ymirc/syntax/errors.yr` | 11 |
 | `E3xxx` | declaration | `DeclareErrorMessage` -- `src/ymirc/semantic/declarator/errors.yr` | 34 |
-| `E4xxx` | validation | `ValidateErrorMessage` -- `src/ymirc/semantic/validator/errors.yr` | 243 |
+| `E4xxx` | validation | `ValidateErrorMessage` -- `src/ymirc/semantic/validator/errors.yr` | 247 |
 | `E5xxx` | lowering (YIL) | `SerializeYILErrorMessage` -- `src/ymirc/lint/serialize/errors.yr` | 10 |
 
 Each page carries an example wherever a case in the suite raises the code: the
@@ -357,6 +357,8 @@ deliberately carry no code, and have no page here.
 | [E4281](E4281.md) | `DECLARE_VARIABLE_NO_FUNCTION` | var declaration <> outside a function context |
 | [E4282](E4282.md) | `NOT_SUPPORTED_IN` | not supported in version ymir <> |
 | [E4283](E4283.md) | `DEFAULT_PARAM_BY_POSITION` | the parameter <> has a default value, it can only be passed by name |
+| [E4284](E4284.md) | `NAMED_PARAM_BY_POSITION` | the parameter <> can only be passed by name |
+| [E4285](E4285.md) | `NAMED_PARAM_WITH_DEFAULT` | parameter with a default value cannot be marked <>, it can already only be passed by name |
 | [E4286](E4286.md) | `UNITTEST_PARAMS_NO_PROVIDER` | a unit test taking parameters must produce them with the parameters attribute |
 | [E4287](E4287.md) | `UNITTEST_PROVIDER_NO_PARAMS` | the parameters attribute produces values for a unit test that takes no parameter |
 | [E4288](E4288.md) | `UNITTEST_PROVIDER_NOT_A_SLICE` | the parameters of a unit test are produced as <>, but a slice was expected |
