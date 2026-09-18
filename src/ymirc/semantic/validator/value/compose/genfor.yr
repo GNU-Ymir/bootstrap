@@ -1,0 +1,250 @@
+/*
+ * Implements semantic validation for generator comprehensions.
+ *
+ * <hr>
+ *
+ * @Package: ymirc
+ * @Module: ymirc::semantic::validator::value::compose::genfor
+ * @File: ymirc/semantic/validator/value/compose/genfor.yr
+ * @Author(s):
+ *   - Emile Cadorel <ecadorel@gmail.com>
+ *
+ * @Created(YYYY-MM-DD): 2026-09-18
+ * @Copyright(C) 2021–2026 GNU-Ymir
+ * @License
+ *   ```text
+ *   This file is part of the Ymir language project.
+ *
+ *   Ymir is free software: you can redistribute it and/or modify it
+ *   under the terms of the GNU General Public License as published by
+ *   the Free Software Foundation, either version 3 of the License, or
+ *   (at your option) any later version.
+ *
+ *   Ymir is distributed in the hope that it will be useful,
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *   GNU General Public License for more details.
+ *
+ *   You should have received a copy of the GNU General Public License
+ *   along with Ymir.  If not, see <https://www.gnu.org/licenses/>.
+ *   ```
+ */
+
+in genfor;
+
+use ymirc::errors;
+use ymirc::lexing::{keys, word};
+use ymirc::semantic::generator::{_, type::_, value::_};
+use ymirc::semantic::symbol;
+use ymirc::syntax::expression::{_, compose};
+use ymirc::utils::format;
+
+/**
+ * GeneratorComprValidation module
+ *
+ * A generator comprehension `(yield x for x in it)` is an anonymous generator:
+ *
+ *   - `it` is evaluated once, where the comprehension is, and passed to the generator,
+ *   - its body is `for x in it { yield x; }`, the yielded type is the type of `x`,
+ *   - what the element uses from the enclosing frame is captured by copy, as in a closure.
+ *
+ * The comprehension is the call creating the generator.
+ */
+pub mod GeneratorComprValidation {
+
+    /**
+     * Validate a generator comprehension.
+     *
+     * @params:
+     *   - context: validation context
+     *   - floop:   the comprehension, whose isYield is true
+     *
+     * @returns:
+     *   - the call creating the generator
+     *
+     * @throws:
+     *   - ErrorMsg if the comprehension is copied, iterates by reference, or its body is invalid
+     */
+    pub fn validate(dmut context: &ValidationContext, floop: &SliceForAllocatorExpr)-> &Value
+        throws ErrorMsg
+    {
+        if GeneratorComprValidation::isCopied(context.getCopyExpr(), floop) {
+            throw copy ErrorMsg::fatal(floop.loc, ValidateErrorMessage::UNECESSARY_GENERATOR_COPY);
+        }
+
+        let mValue = ValueCreation::createEnumUnwrap(ValueValidation::validate(alias context, floop.iter));
+        if let r: &ReferencerValue = mValue {
+            throw copy ErrorMsg::fatal(r.loc, format(ValidateErrorMessage::UNECESSARY_REFERENCE));
+        }
+
+        let iterParam = if let a: &AliaserValue = mValue {
+            GeneratorComprValidation::createParam(floop.iter.loc, a.value.type, isMutable-> true)
+        } else {
+            GeneratorComprValidation::createParam(floop.iter.loc, mValue.type.clone(0u32), isMutable-> false)
+        };
+
+        let iterRef = VariableCreation::createVarFromDecl(iterParam);
+        let iter: &Value = if mValue of AliaserValue {
+            copy AliaserValue(mValue.loc, iterRef.type, iterRef)
+        } else {
+            iterRef
+        };
+
+        let body = copy ForLoopExpr(floop.forLoc, EOF_WORD, floop.vars,
+                                    copy ValueWrapperExpr(floop.iter.loc, iter),
+                                    copy YieldExpr(floop.value.loc, floop.value));
+
+        let name = context.referent.path.push(format("_%_%", floop.loc.line, floop.loc.col));
+        let index = context.getCurrentClosingIndex();
+        let refId = value::generateUniqID();
+        let mut errors: (&ErrorMsg)? = none;
+        let mut result: &Value = UNIT_VALUE;
+
+        context:.enterForeign(isLambda-> true, isFnBody-> true, classRef-> context.getCurrentClassReferent());
+        context:.enterBlock();
+        context:.enterGeneratorCompr();
+        context:.enterClosure(floop.loc, refId, index);
+        {
+            let bodyValue = {
+                ValueValidation::validate(alias context, body)
+            } catch {
+                err => {
+                    context:.exitClosure();
+                    throw err;
+                }
+            };
+
+            let closure = context:.exitClosure();
+            let yieldType = GeneratorComprValidation::verifyBody(floop, context.getYieldType(), bodyValue);
+
+            result = GeneratorComprValidation::createFrame(alias context, floop, name, closure, iterParam, mValue,
+                                                           yieldType, bodyValue);
+        } catch {
+            err => {
+                errors = err?;
+            }
+        }
+
+        {
+            context:.quitBlock(warnUnused-> !(errors.hasValue));
+        } catch {
+            err => {
+                errors = (err)?;
+            }
+        }
+
+        context:.exitForeign();
+
+        if let Ok(err) = errors {
+            throw err;
+        }
+
+        return result;
+    }
+
+    /**
+     * @params:
+     *   - copier: the expression performing the innermost copy, EMPTY_EXPR outside a copy
+     *   - floop:  the comprehension
+     *
+     * @returns: true iff the copy applies to the comprehension itself, and not to a value
+     *           merely holding it, whose copy does have an effect
+     */
+    fn isCopied(copier: &Expression, floop: &SliceForAllocatorExpr)-> bool {
+        match copier {
+            cp: &CopyExpr => { return GeneratorComprValidation::isCopied(cp.content, floop); }
+            t: &TryExpr   => { return GeneratorComprValidation::isCopied(t.value, floop); }
+        }
+
+        copier is floop
+    }
+
+    /**
+     * Declare a parameter of the generator of a comprehension.
+     */
+    fn createParam(loc: &Word, type: &Type, isMutable: bool)-> &ProtoVarDeclValue {
+        copy ProtoVarDeclValue(loc.locate(GeneratorKeys::ITERATED), type, UNIT_VALUE,
+                               isMutable-> isMutable,
+                               isReference-> false,
+                               isLazy-> false,
+                               isSelf-> false,
+                               nbConsume-> 1,
+                               isForcedNamed-> false)
+    }
+
+    /**
+     * Verify the body of the generator of a comprehension.
+     *
+     * @returns:
+     *   - the type the generator yields
+     *
+     * @throws:
+     *   - ErrorMsg if the element is void, or the body throws
+     */
+    fn verifyBody(floop: &SliceForAllocatorExpr, yieldType: &Type, body: &Value)-> &Type
+        throws ErrorMsg
+    {
+        if yieldType of VoidType {
+            throw copy ErrorMsg::fatal(floop.value.loc, ValidateErrorMessage::VOID_VALUE);
+        }
+
+        if body.throwers.len != 0us {
+            let mut list = copy [copy ErrorMsg::note(it.loc, format("%", it.type)) for it in body.throwers];
+            throw copy ErrorMsg::fatal(floop.loc, ValidateErrorMessage::GENERATOR_THROWS, notes-> list);
+        }
+
+        yieldType
+    }
+
+    /**
+     * Create the frame of the generator of a comprehension, and the call creating it.
+     *
+     * The frame takes the captured values as its first parameter, when there are any, as
+     * a closure does but by value, so they are stored in the frame of the generator, and
+     * the iterated value as its last.
+     *
+     * @params:
+     *   - name:      the name of the generator
+     *   - closure:   the values captured by the element
+     *   - iterParam: the parameter receiving the iterated value
+     *   - iterValue: the iterated value
+     *   - yieldType: the type the generator yields
+     *   - body:      the validated body of the generator
+     *
+     * @returns:
+     *   - the call creating the generator
+     */
+    fn createFrame(dmut context: &ValidationContext,
+                   floop:        &SliceForAllocatorExpr,
+                   name:         &SymbolPath,
+                   closure:      &ClosureType,
+                   iterParam:    &ProtoVarDeclValue,
+                   iterValue:    &Value,
+                   yieldType:    &Type,
+                   body:         &Value)-> &Value
+        throws ErrorMsg
+    {
+        let retType = copy YieldType(floop.loc, yieldType, isMutable-> false);
+        let (params, args) = if closure.types.len != 0us {
+            let closureType = copy TupleType(closure.loc, closure.types, isMutable-> false);
+            let closureParam = copy ProtoVarDeclValue(closure.loc.locate("#{CLOSURE-VARREF}"), closureType, uniqId-> closure.refId);
+            let closureValue = copy TupleValue(closure.loc, closureType, closure.values);
+
+            (copy [closureParam, iterParam], copy [closureValue, iterValue])
+        } else {
+            (copy [iterParam], copy [iterValue])
+        };
+
+        let frame = copy FrameGenerator(floop.loc, floop.loc, name,
+                                        params-> params,
+                                        retType,
+                                        body,
+                                        FrameKind::GENERATOR,
+                                        isWeak-> true);
+
+        LambdaCreation::insertGenerator(alias context, frame);
+
+        let proto = copy NamePrototypeValue(floop.loc, floop.loc, name, params, retType);
+        return copy PrototypeCallValue(floop.loc, retType, proto, args);
+    }
+}
