@@ -361,7 +361,7 @@ deliberately carry no code, and have no page here.
 | [E4285](E4285.md) | `NAMED_PARAM_WITH_DEFAULT` | parameter with a default value cannot be marked <>, it can already only be passed by name |
 | [E4286](E4286.md) | `UNITTEST_PARAMS_NO_PROVIDER` | a unit test taking parameters must produce them with the parameters attribute |
 | [E4287](E4287.md) | `UNITTEST_PROVIDER_NO_PARAMS` | the parameters attribute produces values for a unit test that takes no parameter |
-| [E4288](E4288.md) | `UNITTEST_PROVIDER_NOT_A_SLICE` | the parameters of a unit test are produced as <>, but a slice was expected |
+| [E4288](E4288.md) | `UNITTEST_PROVIDER_NOT_A_GENERATOR` | the parameters of a unit test are produced as <>, but a generator was expected |
 | [E4289](E4289.md) | `UNITTEST_PARAMS_ARITY` | the parameters of a unit test are produced as <>, but the test takes <> parameters |
 | [E4290](E4290.md) | `UNUSABLE_SYMBOLS` | none of the symbols <> can be used as a value |
 | [E4291](E4291.md) | `YIELD_NO_GENERATOR` | yield statement is not within a generator |
