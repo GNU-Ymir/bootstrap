@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1
 
 # Nothing in the Ymir toolchain is built from source here, everything is downloaded as a
-# prebuilt release asset:
+# prebuilt release asset, but the stdlib sources, taken from a git tag:
 #   - `gyc`, the GCC-based Ymir compiler ymirc is compiled with (github.com/GNU-Ymir/gymir),
 #   - `gyllir`, the build tool driving it (github.com/GNU-Ymir/Gyllir),
 #   - the `midgard` standard library sources the test suite compiles against
@@ -15,29 +15,26 @@
 #     --build-arg GYC_ASSET="gyc-${GCC_MAJOR}_${YMIR_BOOTSTRAP_VERSION}_amd64.deb" \
 #     --build-arg GYLLIR_RELEASE_TAG="${GYLLIR_VERSION}" \
 #     --build-arg GYLLIR_ASSET="gyllir_${GYLLIR_VERSION}_amd64.deb" \
-#     --build-arg MIDGARD_RELEASE_TAG="${MIDGARD_VERSION}" \
-#     --build-arg MIDGARD_ASSET="midgard-${MIDGARD_VERSION}-src.zip" \
+#     --build-arg MIDGARD_TAG="${MIDGARD_VERSION}" \
 #     .
 ARG GYC_RELEASE_TAG
 ARG GYC_ASSET
 ARG GYLLIR_RELEASE_TAG
 ARG GYLLIR_ASSET
-ARG MIDGARD_RELEASE_TAG
-ARG MIDGARD_ASSET
+ARG MIDGARD_TAG
 
 FROM ubuntu:26.04 AS toolchain
 ARG GYC_RELEASE_TAG
 ARG GYC_ASSET
 ARG GYLLIR_RELEASE_TAG
 ARG GYLLIR_ASSET
-ARG MIDGARD_RELEASE_TAG
-ARG MIDGARD_ASSET
+ARG MIDGARD_TAG
 ENV DEBIAN_FRONTEND=noninteractive
 
 RUN test -n "$GYC_RELEASE_TAG" && test -n "$GYC_ASSET" \
     && test -n "$GYLLIR_RELEASE_TAG" && test -n "$GYLLIR_ASSET" \
-    && test -n "$MIDGARD_RELEASE_TAG" && test -n "$MIDGARD_ASSET" || \
-    (echo "GYC_RELEASE_TAG, GYC_ASSET, GYLLIR_RELEASE_TAG, GYLLIR_ASSET, MIDGARD_RELEASE_TAG and MIDGARD_ASSET build-args are required - see YMIR_VERSION" >&2 && exit 1)
+    && test -n "$MIDGARD_TAG" || \
+    (echo "GYC_RELEASE_TAG, GYC_ASSET, GYLLIR_RELEASE_TAG, GYLLIR_ASSET and MIDGARD_TAG build-args are required - see YMIR_VERSION" >&2 && exit 1)
 
 # gmp/mpfr are the compile-time arbitrary-precision arithmetic libraries ymirc links against
 # (`libraries = ["gmp", "mpfr"]` in gyllir.toml). zip is only needed by the `package` stage
@@ -61,14 +58,14 @@ RUN gyc --version && command -v gyllir
 
 # The stdlib sources the *test suite* needs: every test_resources/*.yr compiled through ymirc
 # loads the external package from <prefix>/include/ymir/<version> (see
-# ymirc::global::state). Staged version-agnostically here so the download stays cached; the
-# build stage below links it under the exact version ymirc asks for.
-RUN curl -fsSL -o /tmp/midgard-src.zip \
-        "https://github.com/GNU-Ymir/yruntime/releases/download/${MIDGARD_RELEASE_TAG}/${MIDGARD_ASSET}" \
-    && unzip -q /tmp/midgard-src.zip -d /tmp/midgard-src \
-    && mkdir -p /opt/ymir-stdlib \
+# ymirc::global::state), i.e. the `midgard/` directory of the yruntime tree at MIDGARD_TAG.
+# Staged version-agnostically here so the download stays cached; the build stage below links
+# it under the exact version ymirc asks for.
+RUN mkdir -p /tmp/midgard-src /opt/ymir-stdlib \
+    && curl -fsSL "https://github.com/GNU-Ymir/yruntime/archive/refs/tags/${MIDGARD_TAG}.tar.gz" \
+       | tar -xz -C /tmp/midgard-src --strip-components=1 \
     && cp -r /tmp/midgard-src/midgard/. /opt/ymir-stdlib/ \
-    && rm -rf /tmp/midgard-src.zip /tmp/midgard-src
+    && rm -rf /tmp/midgard-src
 
 # Compiles libymirc.a (debug) and, with `test --dry`, the ./ymirc.test unittest executable
 # without running it - the `test` stage below (and the CI workflow, which needs to tee the
