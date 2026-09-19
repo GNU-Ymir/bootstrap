@@ -26,7 +26,7 @@ check lives:
 | `E1xxx` | lexing | `LexingErrorMessage` -- `src/ymirc/lexing/errors.yr` | 24 |
 | `E2xxx` | parsing | `SyntaxErrorMessage` -- `src/ymirc/syntax/errors.yr` | 11 |
 | `E3xxx` | declaration | `DeclareErrorMessage` -- `src/ymirc/semantic/declarator/errors.yr` | 34 |
-| `E4xxx` | validation | `ValidateErrorMessage` -- `src/ymirc/semantic/validator/errors.yr` | 251 |
+| `E4xxx` | validation | `ValidateErrorMessage` -- `src/ymirc/semantic/validator/errors.yr` | 252 |
 | `E5xxx` | lowering (YIL) | `SerializeYILErrorMessage` -- `src/ymirc/lint/serialize/errors.yr` | 10 |
 
 Each page carries an example wherever a case in the suite raises the code: the
@@ -377,6 +377,7 @@ deliberately carry no code, and have no page here.
 | [E4301](E4301.md) | `GENERATOR_COMPR_EXIT` | cannot <> out of the element of a generator comprehension |
 | [E4302](E4302.md) | `LIST_COMPR_FILTER_SIZE` | the size of a list comprehension filtered by if is not determinable at compile time |
 | [E4303](E4303.md) | `LIST_COMPR_FILTER_CTE` | the filter of the list comprehension, constructed from type <>, must be determinable at compile time |
+| [E4304](E4304.md) | `TYPEOF_UNTYPED` | <> has no type of its own, it takes the type of what it is assigned to |
 
 ## E5xxx -- lowering (YIL)
 
