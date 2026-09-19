@@ -45,6 +45,17 @@ Commit policy:
 - don't add co-authors
 - commit message are just one line long
 
+Before committing, run `tools/yr-optimize-imports.sh`: it rewrites the `use` block of every
+`.yr` file under `src/` and `test/` the branch changed into its canonical form — nested groups
+merged, duplicates dropped, roots sorted with `std` last. With no argument it finds those files
+itself, it is idempotent, and it rewrites nothing when a file is already tidy (so it never bumps
+an mtime and never makes `gyllir` recompile an untouched tree). It never touches
+`test_resources/`, whose files are compiler inputs. It shells out to yr-mode's
+`yr-optimize-imports`, so it needs `emacs` and `~/.elisp/yr-mode.el` (override with
+`YR_MODE_EL`). It can reorder imports the branch never wrote, in a file the branch did touch —
+that is the canonical form, keep it. **Rebuild after it: dropping or merging a `use` can break
+compilation**, so the run belongs before the final `gyllir test`, not after.
+
 ## Build / run / test
 
 Build system is `gyllir` (config in `gyllir.toml`, compiler path points at a local `gyc` build).
