@@ -237,6 +237,7 @@ pub mod SliceListComprValidation {
                             byAlias:      bool)-> (&Value, bool)
         throws ErrorMsg
     {
+        SliceForComposeValidation::verifyFilterCopyContext(floop, inCopy-> inCopy);
         if !inCopy {
             SliceForComposeValidation::computeCteLen(alias context, floop.iter.loc, len,
                                                      fromType-> sliceType,
@@ -313,7 +314,8 @@ pub mod SliceListComprValidation {
                                                                                                           byAlias-> byAlias);
 
         let innerValue = ValueValidation::validate(alias context, floop.value);
-        if innerValue.isFullLiteral {
+        let filter = SliceForComposeValidation::validateFilter(alias context, floop.filter);
+        if innerValue.isFullLiteral && !filter.hasValue {
             let mut result: &Value = UNIT_VALUE;
             if inCopy {
                 result = SliceComposeValidation::validateDynamicAlloc(alias context, loc, innerValue, len);
@@ -328,18 +330,18 @@ pub mod SliceListComprValidation {
         let one = TypeInference::inferValueForType(alias context, indexVref.loc, copy IntValue(loc, USIZE_TYPE, 1), indexVref.type,
                                                    byReference-> false);
 
-        let (resultDecl, resultVRef, resultAccess, resultType) = {
-            SliceForComposeValidation::validateResultValueDecl(alias context, loc, innerType, indexVref, len,
-                                                               fromType-> sliceType,
-                                                               inCopy-> inCopy)
+        let (resultDecl, resultVRef, collect, resultType) = {
+            SliceForComposeValidation::validateCollect(alias context, loc, innerType, innerValue, indexVref, len,
+                                                       fromType-> sliceType,
+                                                       inCopy-> inCopy,
+                                                       filter-> filter)
         };
 
         let test = copy CmpIntOperatorValue(loc, BinaryOperators::INF, indexVref, len);
         let increment = copy AffectValue(loc, indexVref.type, indexVref,
                                          copy MathIntOperatorValue(loc, indexVref.type, BinaryOperators::PLUS, indexVref, one));
 
-        let set = copy AffectValue(loc, resultAccess.type, resultAccess, innerValue);
-        let blk = copy BlockValue(loc, VOID_TYPE, copy [elemDecl, set, increment]);
+        let blk = copy BlockValue(loc, VOID_TYPE, copy [elemDecl, collect, increment]);
         let lp = copy LoopValue(loc, VOID_TYPE, test, blk);
 
         let retLp = copy BlockValue(loc, VOID_TYPE, copy [indexDecl, lp]);
@@ -403,15 +405,11 @@ pub mod SliceListComprValidation {
                                                                fromType-> sliceType,
                                                                forTuple-> true);
 
-        let (indexDecl, indexVref) = SliceListComprValidation::validateIndexDeclForTuple(alias context, sliceType, elemIter, indexIter);
-
         let mut index = copy BigInt(0);
         while (index < tabSize) {
             context:.enterBlock();
-            let (currValue, usedAlias_) = {
-                let indexI = TypeInference::inferValueForType(alias context, indexVref.loc, copy IntValue(loc, USIZE_TYPE, index), indexVref.type,
-                                                              byReference-> false);
-                let currIndex = copy AffectValue(loc, indexVref.type, indexVref, indexI);
+            let (currValue, usedAlias_, keep) = {
+                let (indexDecl, indexVref) = SliceListComprValidation::validateIndexDeclForTuple(alias context, sliceType, elemIter, indexIter, index);
                 let (elem, insert, _, usedAlias_) = SliceForLoopValidation::validateElemDecl(alias context, elemIter, sliceVref, sliceType, indexVref,
                                                                                              byMutRef-> false,
                                                                                              byAlias-> byAlias);
@@ -420,12 +418,14 @@ pub mod SliceListComprValidation {
                 }
 
                 let value = ValueValidation::validate(alias context, floop.value);
-                let blk = copy BlockValue(loc, value.type, copy[currIndex, elem, value]);
-                (blk, usedAlias_)
+                let filter = SliceForComposeValidation::validateFilter(alias context, floop.filter);
+                let keep = SliceForComposeValidation::computeFilter(alias context, filter, fromType-> sliceType);
+                let blk = copy BlockValue(loc, value.type, copy[indexDecl, elem, value]);
+                (blk, usedAlias_, keep)
             } catch {
                 err => {
                     errors = (err)?;
-                    (UNIT_VALUE, false)
+                    (UNIT_VALUE, false, false)
                 }
             };
 
@@ -441,31 +441,36 @@ pub mod SliceListComprValidation {
                 throw err;
             }
 
-            TupleComposeValidation::addTupleType(currValue, ref innerLoop, ref types);
+            if keep {
+                TupleComposeValidation::addTupleType(currValue, ref innerLoop, ref types);
+            }
+
             index += 1;
             usedAlias = usedAlias || usedAlias_;
         }
 
         let tupleType = copy TupleType(loc, types, isMutable-> true);
         let tupleValue = copy TupleValue(loc, tupleType, innerLoop);
-        outerLoop ~= [sliceDecl, indexDecl, tupleValue];
+        outerLoop ~= [sliceDecl, tupleValue];
 
         let blk = copy BlockValue(loc, tupleType, outerLoop);
         return (blk, usedAlias);
     }
 
     /**
-     * Validate or synthesize the index iterator for tuple-mode comprehensions.
+     * Validate or synthesize the index iterator of one iteration of a tuple-mode
+     * comprehension.
      *
-     * Ensures that an index variable exists(creating one if omitted),
-     * validates its declaration, inserts it into the local scope when needed,
-     * and returns both the declaration and its VarRefValue.
+     * The iteration is unrolled, so the index is declared once per element and holds
+     * a compile time literal, which is what lets the filter of the comprehension be
+     * computed.
      *
      * @params:
      *   - context:    validation context
      *   - sliceType:  type of the slice
      *   - elemIter:   element iterator
      *   - indexIter:  optional index iterator
+     *   - index:      the index of the current iteration
      *
      * @returns:
      *   - (indexDecl, indexVref)
@@ -476,7 +481,8 @@ pub mod SliceListComprValidation {
     fn validateIndexDeclForTuple(dmut context: &ValidationContext,
                                  sliceType:    &SliceType,
                                  elemIter:     &VarDeclExpr,
-                                 indexIter:    (&VarDeclExpr)?)-> (&VarDeclValue, &VarRefValue)
+                                 indexIter:    (&VarDeclExpr)?,
+                                 index:        &BigInt)-> (&VarDeclValue, &VarRefValue)
         throws ErrorMsg
     {
         let indexIterVdecl = if let Ok(vdecl) = indexIter {
@@ -486,10 +492,11 @@ pub mod SliceListComprValidation {
         };
 
         let (indexDecl, insertIndex) = ForLoopValidation::validateIndexIterDecl(alias context, indexIterVdecl.loc, indexIterVdecl, sliceType,
-                                                                                value-> copy IntValue(indexIterVdecl.loc, USIZE_TYPE, 0),
-                                                                                canCte-> false);
+                                                                                value-> copy IntValue(indexIterVdecl.loc, USIZE_TYPE, index),
+                                                                                isMutable-> false,
+                                                                                canCte-> true);
 
-        let indexVref = VariableCreation::createVarFromDecl(indexDecl, canCte-> false, isIterator-> true);
+        let indexVref = VariableCreation::createVarFromDecl(indexDecl, canCte-> true, isIterator-> true);
 
         if insertIndex {
             context:.insertLocal(indexDecl.loc, indexDecl.name, indexDecl);
