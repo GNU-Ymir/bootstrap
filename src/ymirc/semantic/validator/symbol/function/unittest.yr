@@ -45,11 +45,10 @@
 in unittest;
 
 use ymirc::errors;
-use ymirc::lexing::{keys, word};
+use ymirc::lexing::{keys, tokens, word};
 use ymirc::semantic::symbol;
 use ymirc::semantic::generator::{_, type::_, value::_};
-use ymirc::syntax::declaration::_;
-use ymirc::syntax::expression::instruction;
+use ymirc::syntax::{declaration::_, expression::_, expression::instruction};
 use ymirc::utils::format;
 
 
@@ -147,16 +146,16 @@ pub mod UnittestValidation {
     /**
      * Validate the parameter list of a unittest and the `@parameters` attribute feeding it.
      *
-     * The test is called once per element of the slice the attribute produces, with
-     * that slice and the index of the element, so its parameters are declared as
-     * locals unwrapped from that element in front of the original body.
+     * The test is called once per parameter set the attribute yields, with a pointer to a
+     * copy of that set, so its parameters are declared as locals unwrapped from the
+     * pointed set in front of the original body.
      *
      * @params:
      *   - context: validation context
      *   - decl:    the unittest declaration
      *
      * @returns:
-     *   - .0: the value producing the parameter sets(UNIT_VALUE if the test takes none)
+     *   - .0: the generator yielding the parameter sets(UNIT_VALUE if the test takes none)
      *   - .1: the parameters of the test frame(empty if the test takes none)
      *   - .2: the declaration of the parameters, to run in front of the body
      *
@@ -202,14 +201,15 @@ pub mod UnittestValidation {
         let provider = ValueValidation::validate(alias context, param.args[0]);
         TypeVerification::verifyCompleteWithValue(param.args[0].loc, provider.type, provider, construct-> true);
 
-        let sliceType = match provider.type {
-            s: &SliceType => { s }
-            _ => {
-                throw copy ErrorMsg::fatal(param.args[0].loc, format(ValidateErrorMessage::UNITTEST_PROVIDER_NOT_A_SLICE, provider.type));
-            }
-        };
+        if provider.type !of YieldType {
+            throw copy ErrorMsg::fatal(param.args[0].loc, format(ValidateErrorMessage::UNITTEST_PROVIDER_NOT_A_GENERATOR, provider.type));
+        }
 
-        let paramsDecl = copy ProtoVarDeclValue(param.loc.locate(UnitTestKeys::PARAMS), sliceType, UNIT_VALUE,
+        let boxed = UnittestValidation::createBoxedProvider(alias context, param, provider);
+        let boxType = if let y: &YieldType = boxed.type { y.retType } else { panic; };
+        let setType = if let p: &PointerType = boxType { p.inners[0] } else { panic; };
+
+        let paramsDecl = copy ProtoVarDeclValue(param.loc.locate(UnitTestKeys::PARAMS), boxType, UNIT_VALUE,
                                                 isMutable-> false,
                                                 isReference-> false,
                                                 isLazy-> false,
@@ -217,21 +217,45 @@ pub mod UnittestValidation {
                                                 nbConsume-> 1u32,
                                                 isForcedNamed-> false);
 
-        let indexDecl = copy ProtoVarDeclValue(param.loc.locate(UnitTestKeys::INDEX), USIZE_TYPE, UNIT_VALUE,
-                                               isMutable-> false,
-                                               isReference-> false,
-                                               isLazy-> false,
-                                               isSelf-> false,
-                                               nbConsume-> 1u32,
-                                               isForcedNamed-> false);
+        let elem: &Value = copy DereferencerValue(param.loc, setType, VariableCreation::createVarFromDecl(paramsDecl));
+        let preamble = UnittestValidation::validateParamDecls(alias context, decl, param, setType, elem);
 
-        let elem: &Value = copy SliceAccessValue(param.loc, sliceType.value,
-                                                 VariableCreation::createVarFromDecl(paramsDecl),
-                                                 VariableCreation::createVarFromDecl(indexDecl));
+        return (boxed, copy [paramsDecl], preamble);
+    }
 
-        let preamble = UnittestValidation::validateParamDecls(alias context, decl, param, sliceType.value, elem);
+    /**
+     * Wrap the generator of the parameter sets into one yielding a pointer to a GC copy
+     * of each set, `(yield (copy [s]).ptr for s in provider)`, so the runner handles the
+     * sets of every test alike, whatever their type.
+     *
+     * @params:
+     *   - context:  validation context
+     *   - param:    the `@parameters` attribute producing the parameter sets
+     *   - provider: the generator of the parameter sets
+     *
+     * @returns: the wrapping generator, of type `yield-> *T`
+     */
+    fn createBoxedProvider(dmut context: &ValidationContext, param: AttributeWord, provider: &Value)-> &Value
+        throws ErrorMsg
+    {
+        let loc = param.args[0].loc;
+        let set = loc.locate(UnitTestKeys::SET);
+        let var = copy VarDeclExpr(loc-> set,
+                                   name-> set,
+                                   isLazyOrRef-> EOF_WORD,
+                                   isMutOrDmut-> EOF_WORD,
+                                   type-> EMPTY_EXPR,
+                                   value-> EMPTY_EXPR);
 
-        return (provider, copy [paramsDecl, indexDecl], preamble);
+        let box = copy BinaryExpr(loc.locate(Tokens::DOT),
+                                  copy CopyExpr(loc, copy ListExpr(loc, loc, copy [copy VarExpr(set, isQuoted-> false)], isArray-> true), isDeep-> false),
+                                  copy VarExpr(loc.locate(SliceKeys::PTR), isQuoted-> false));
+
+        let compr = copy SliceForAllocatorExpr(param.loc, param.loc, box, copy [var], copy ValueWrapperExpr(loc, provider),
+                                               isArray-> false,
+                                               isYield-> true);
+
+        ValueValidation::validate(alias context, compr)
     }
 
     /**
