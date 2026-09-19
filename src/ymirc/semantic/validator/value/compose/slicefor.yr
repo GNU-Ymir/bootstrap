@@ -40,12 +40,14 @@
 
 in slicefor;
 
-use ymirc::{errors, global};
+use ymirc::global;
+use ymirc::errors;
+use ymirc::errors::snippet::suggestion;
 use ymirc::lexing::{keys, word};
 use ymirc::semantic::interpret;
 use ymirc::semantic::generator::{type::_, value::_};
 use ymirc::semantic::validator::value::compose::slicefor::_;
-use ymirc::syntax::expression::compose;
+use ymirc::syntax::expression::{compose, empty};
 use ymirc::utils::{bigint, format};
 
 /*!
@@ -88,7 +90,10 @@ mod ::yield_;
  *       * RangeListComprValidation
  *       * ClassListComprValidation
  *   - provides helper functions for allocating result containers,
- *   - computes compile-time lengths for static array allocation.
+ *   - computes compile-time lengths for static array allocation,
+ *   - validates the `if` filter of the comprehension, and collects only the values it
+ *     keeps: appended to a slice when the iteration runs, dropped from the result when
+ *     the iteration is unrolled at compile time.
  *
  * It is the root entry point for all list-comprehension semantics.
  */
@@ -287,5 +292,212 @@ pub mod SliceForComposeValidation {
 
         IntInterpret::verifyOverflow(len.loc, USIZE_TYPE, size);
         return size;
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * =====================================          FILTER          =====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Validate the filter of a comprehension, in the scope binding its iteration
+     * variables.
+     *
+     * @params:
+     *   - context: validation context
+     *   - filter:  the test of the filter, EMPTY_EXPR when the comprehension has none
+     *
+     * @returns:
+     *   - the test selecting the iterations producing a value, none when there is no filter
+     *
+     * @throws:
+     *   - ErrorMsg if the test is invalid, or is not a boolean
+     */
+    pub fn validateFilter(dmut context: &ValidationContext, filter: &Expression)-> (&Value)?
+        throws ErrorMsg
+    {
+        if filter of EmptyExpr {
+            return none;
+        }
+
+        return SliceForComposeValidation::verifyFilter(alias context, (ValueValidation::validate(alias context, filter))?);
+    }
+
+    /**
+     * Verify that the test of a filter, already validated in the scope binding the
+     * iteration variables, is a boolean, and reduce it.
+     *
+     * @params:
+     *   - context: validation context
+     *   - test:    the validated test, none when the comprehension has no filter
+     *
+     * @returns:
+     *   - the reduced test, none when the comprehension has no filter
+     *
+     * @throws:
+     *   - ErrorMsg if the test is not a boolean
+     */
+    pub fn verifyFilter(dmut context: &ValidationContext, test: (&Value)?)-> (&Value)?
+        throws ErrorMsg
+    {
+        if let Ok(value) = test {
+            let reduced = context.cteInterpret:.reduce(value);
+            TypeVerification::verifyCompatible(reduced.loc, EOF_WORD, reduced.type, BOOL_TYPE);
+
+            return (reduced)?;
+        }
+
+        return none;
+    }
+
+    /**
+     * Verify that a filtered comprehension is enclosed in a simple copy operator.
+     *
+     * The values a filter keeps are only known once the iteration ran, so the result
+     * cannot be an array allocated on the stack.
+     *
+     * @params:
+     *   - floop:  the comprehension expression
+     *   - inCopy: whether the comprehension is evaluated in copy-mode
+     *
+     * @throws:
+     *   - ErrorMsg if the comprehension is filtered, and is not in copy-mode
+     */
+    pub fn verifyFilterCopyContext(floop: &SliceForAllocatorExpr, inCopy: bool)
+        throws ErrorMsg
+    {
+        if (inCopy || floop.filter of EmptyExpr) return;
+
+        throw (copy ErrorMsg::fatal(floop.filter.loc, format(ValidateErrorMessage::LIST_COMPR_FILTER_SIZE)))
+            .withFix(Edit(floop.loc, replacement-> "copy ",
+                          msg-> format(ValidateErrorMessage::ENCLOSE_COPY_LST)));
+    }
+
+    /**
+     * Compute the filter of a comprehension whose iteration is unrolled at compile
+     * time, and whose result thus has a compile time length.
+     *
+     * @params:
+     *   - context:  validation context
+     *   - filter:   the test selecting the iterations producing a value, none to keep them all
+     *   - fromType: the type of the iterable being iterated
+     *
+     * @returns:
+     *   - true iff the current iteration produces a value
+     *
+     * @throws:
+     *   - ErrorMsg if the test is not determinable at compile time
+     */
+    pub fn computeFilter(dmut context: &ValidationContext, filter: (&Value)?, fromType: &Type)-> bool
+        throws ErrorMsg
+    {
+        if let Ok(test) = filter {
+            let keep = {
+                context.cteInterpret:.computeBool(test)
+            } catch {
+                err: &ErrorMsg => {
+                    throw copy ErrorMsg::fatal(test.loc, format(ValidateErrorMessage::LIST_COMPR_FILTER_CTE, fromType),
+                                               notes-> copy [err]);
+                }
+            };
+
+            return keep;
+        }
+
+        return true;
+    }
+
+    /**
+     * Create the result variable declaration of a list comprehension, and the
+     * instruction collecting the value produced by one iteration.
+     *
+     * Without a filter the result has the length of the iteration, and each value is
+     * stored at the index of its iteration. With one, that length is unknown, so the
+     * result starts empty and a value is appended when the filter keeps it.
+     *
+     * @params:
+     *   - context:    validation context
+     *   - loc:        source location
+     *   - innerType:  type of each element in the result
+     *   - innerValue: the value produced by one iteration
+     *   - indexVref:  reference to the loop index variable
+     *   - len:        number of iterations
+     *   - fromType:   type of the iterable being iterated
+     *   - inCopy:     whether the comprehension is in copy-mode
+     *   - filter:     the test selecting the iterations producing a value
+     *
+     * @returns:
+     *   - (resultDecl, resultVref, collect, resultType)
+     *
+     * @throws:
+     *   - ErrorMsg if the result cannot be allocated
+     */
+    pub fn validateCollect(dmut context: &ValidationContext,
+                           loc:          &Word,
+                           innerType:    &Type,
+                           innerValue:   &Value,
+                           indexVref:    &VarRefValue,
+                           len:          &Value,
+                           fromType:     &Type,
+                           inCopy:       bool,
+                           filter:       (&Value)?)-> (&VarDeclValue, &VarRefValue, &Value, &Type)
+        throws ErrorMsg
+    {
+        if (filter.hasValue) {
+            let (resultDecl, resultVref, sliceType) = SliceForComposeValidation::validateResultValueDeclNoLen(loc, innerType);
+            let append = SliceForComposeValidation::createAppend(loc, sliceType, resultVref, innerValue, innerType, filter);
+            let resultType: &Type = sliceType;
+
+            return (resultDecl, resultVref, append, resultType);
+        }
+
+        let (resultDecl, resultVref, resultAccess, resultType) = {
+            SliceForComposeValidation::validateResultValueDecl(alias context, loc, innerType, indexVref, len,
+                                                              fromType-> fromType,
+                                                              inCopy-> inCopy)
+        };
+
+        let set: &Value = copy AffectValue(loc, resultAccess.type, resultAccess, innerValue);
+        return (resultDecl, resultVref, set, resultType);
+    }
+
+    /**
+     * Create the append collecting the value produced by one iteration into a result
+     * whose length is not known in advance.
+     *
+     * @params:
+     *   - loc:        source location
+     *   - resultType: type of the result collecting the values
+     *   - resultVref: reference to the result variable
+     *   - innerValue: the value produced by one iteration
+     *   - innerType:  type of the value produced by one iteration
+     *   - filter:     the test selecting the iterations producing a value, none to keep them all
+     *
+     * @returns:
+     *   - the append, guarded by the filter when there is one
+     *
+     * @throws:
+     *   - ErrorMsg if the value cannot be turned into a slice
+     */
+    pub fn createAppend(loc:        &Word,
+                        resultType: &Type,
+                        resultVref: &VarRefValue,
+                        innerValue: &Value,
+                        innerType:  &Type,
+                        filter:     (&Value)?)-> &Value
+        throws ErrorMsg
+    {
+        let sliceVal = ValueCreation::createSliceFromSingleValue(loc, innerValue,
+                                                                mutable-> innerType.isMutable);
+        let append: &Value = copy SliceAppendValue(loc, resultType, resultVref, sliceVal);
+
+        if let Ok(test) = filter {
+            return copy ConditionalValue(loc, VOID_TYPE, test-> test, thenv-> append, elsev-> UNIT_VALUE);
+        }
+
+        return append;
     }
 }
