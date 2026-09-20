@@ -1,0 +1,693 @@
+/*
+ * Declares DestructorElisionPass, the pass removing the exception scaffolding a
+ * frame does not need and the destructor scheduling that schedules nothing.
+ *
+ * The pass does two things:
+ *
+ *   - it collapses a try/finally whose finally part executes nothing, and one
+ *     whose try part can neither throw nor leave the region any other way than
+ *     by falling off its end: the finally is then only ever reached on the
+ *     normal path, and appending it to the try part says the same thing without
+ *     a landing pad;
+ *   - it removes a destructor block guarding a destructor that does nothing.
+ *
+ * The two feed each other: the finally part of a frame holds the destructor
+ * blocks of its locals, and one whose blocks are all removed executes nothing.
+ *
+ * What makes this worth a pass is what a `YILTryFinally` costs the backend: it
+ * emits a landing pad and an unwind table for it, pins the values it protects
+ * in memory across the region, and blocks most of what the other passes would
+ * do to the instructions inside it.
+ *
+ * <hr>
+ *
+ * @Package: ymirc
+ * @Module: ymirc::lint::optimizer::elision
+ * @File: ymirc/lint/optimizer/elision.yr
+ * @Author(s):
+ *   - Emile Cadorel <ecadorel@gmail.com>
+ *
+ * @Created(YYYY-MM-DD): 2026-09-20
+ * @Copyright(C) 2021–2026 GNU-Ymir
+ * @License
+ *   ```text
+ *   This file is part of the Ymir language project.
+ *
+ *   Ymir is free software: you can redistribute it and/or modify it
+ *   under the terms of the GNU General Public License as published by
+ *   the Free Software Foundation, either version 3 of the License, or
+ *   (at your option) any later version.
+ *
+ *   Ymir is distributed in the hope that it will be useful,
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *   GNU General Public License for more details.
+ *
+ *   You should have received a copy of the GNU General Public License
+ *   along with Ymir.  If not, see <https://www.gnu.org/licenses/>.
+ *   ```
+ */
+
+in elision;
+
+use ymirc::lexing::keys;
+use ymirc::lint::node::{_, global::_, instr::_, type::_, value::_};
+use ymirc::lint::optimizer::pass_;
+
+/**
+ * The number of times the pass walks a frame before giving up on a fixpoint.
+ * */
+def MAX_ROUNDS = 4us;
+
+/**
+ * The name a call through a pointer is summarized by.
+ *
+ * It is not a mangled name, so it is never the name of a frame of the module,
+ * and a frame making such a call is therefore one calling something the module
+ * does not define -- which is exactly what the summary has to say about it.
+ * */
+def UNKNOWN_CALLEE = "";
+
+/**
+ * The number of instructions the block scheduling one destructor holds.
+ * */
+def DESTROY_BLOCK_LEN = 5us;
+
+/**
+ * The pass removing the landing pads and the destructor scheduling a frame does
+ * not need.
+ * */
+@final
+pub class DestructorElisionPass over OptimizerPass {
+
+    // The names of the frames of the module that cannot let an exception escape
+    let mut _noThrow: [[c8] => mut ()] = copy [];
+
+    // The names of the frames of the module whose body executes nothing
+    let mut _empty: [[c8] => mut ()] = copy [];
+
+    // True iif the walk of the frame changed something
+    let mut _changed: bool = false;
+
+    pub self ()
+        with super ("dtor-elision", 1u32)
+    {}
+
+    /**
+     * Summarize the module the pass is about to be applied to.
+     *
+     * Two things are taken from it: the frames that cannot throw, and the frames
+     * that do nothing. Both are questions about a callee, and a YIL call names
+     * its callee and nothing else.
+     *
+     * @params:
+     *    - nodes: the nodes of the module
+     * */
+    pub over prepare(mut self, nodes: [&YILSymbol]) {
+        let mut callees: [[c8] => mut [[c8] => ()]] = copy [];
+        self._noThrow = copy [];
+        self._empty = copy [];
+
+        for n in nodes {
+            match n {
+                f: &YILFrame => {
+                    let mut names: [[c8] => mut ()] = copy [];
+                    collectCalls(f.body, ref names);
+                    callees[f.name] = names;
+
+                    if (isInert(copy [f.body])) { self._empty[f.name] = (); }
+                }
+            }
+        }
+
+        self:.solveThrows(callees);
+    }
+
+    /**
+     * Remove the landing pads and the destructor blocks the frame does not need.
+     *
+     * @params:
+     *    - frame: the frame to transform
+     * @returns: the transformed frame, or `frame` itself when nothing moved
+     * */
+    pub over apply(mut self, frame: &YILFrame)-> &YILFrame {
+        let mut current = frame;
+        let mut round = 0us;
+
+        while round < MAX_ROUNDS {
+            self._changed = false;
+
+            let body = self:.rewriteOne(current.body);
+            if (!self._changed) break;
+
+            current = current.withBody(body);
+            round += 1us;
+        }
+
+        current
+    }
+
+    /*!
+     * ================================================================================
+     * ================================================================================
+     * ===========================          SUMMARY          ==========================
+     * ================================================================================
+     * ================================================================================
+     */
+
+    /**
+     * Fill `_noThrow` with the frames of the module that cannot let an exception
+     * escape.
+     *
+     * The fixpoint is the least one: every frame starts as one that cannot
+     * throw, a frame calling something the module does not define is the first
+     * one to stop being one -- `_yrt_exc_throw` and every panicking runtime
+     * entry point are such names, so nothing has to be said about them by hand
+     * -- and the property is then propagated up the call graph until a round
+     * adds nobody. Starting there rather than at "everything throws" is what
+     * makes a recursive frame terminate on the answer its callees give rather
+     * than on itself.
+     *
+     * A frame of another module is not in the list, so a call to it counts as a
+     * call to something unknown. This is what keeps the summary sound without a
+     * summary file: the declared `throws` clause of the callee would say more,
+     * but it does not cover the exceptions a runtime check raises, and a frame
+     * that declares nothing still unwinds when one fires.
+     *
+     * @params:
+     *    - callees: the names every frame of the module calls
+     * */
+    fn solveThrows(mut self, callees: [[c8] => [[c8] => ()]]) {
+        let mut throwing: [[c8] => mut ()] = copy [];
+
+        for name, names in callees {
+            for callee, _ in names {
+                if (callee in callees) continue;
+
+                throwing[name] = ();
+                break;
+            }
+        }
+
+        loop {
+            let mut added = false;
+            for name, names in callees {
+                if (name in throwing) continue;
+
+                for callee, _ in names {
+                    if (callee in throwing) {
+                        throwing[name] = ();
+                        added = true;
+                        break;
+                    }
+                }
+            }
+
+            if (!added) break;
+        }
+
+        for name, _ in callees {
+            if (name in throwing) continue;
+
+            self._noThrow[name] = ();
+        }
+    }
+
+    /*!
+     * ================================================================================
+     * ================================================================================
+     * ===========================          REWRITE          ==========================
+     * ================================================================================
+     * ================================================================================
+     */
+
+    /**
+     * Rewrite the body of the frame, which is never itself removable.
+     * */
+    fn rewriteOne(mut self, instr: &YILInstr)-> &YILInstr {
+        let res = self:.rewrite(instr);
+        if (res.len == 1us) { return res[0]; }
+
+        copy YILBlock(instr.loc, res)
+    }
+
+    /**
+     * Rewrite an instruction.
+     *
+     * @returns: what it becomes, empty when it is removed, several instructions
+     * when a collapsed try/finally is spliced into the list holding it
+     *
+     * A collapsed region is spliced rather than wrapped in a block of its own:
+     * the passes reading a straight line read a list, and the point of removing
+     * the landing pad is that what it protected is now one.
+     * */
+    fn rewrite(mut self, instr: &YILInstr)-> [&YILInstr] {
+        match instr {
+            b: &YILBlock => {
+                if (self.isNoopDestroy(b)) {
+                    self:.count("destructor blocks removed");
+                    self._changed = true;
+
+                    return [];
+                }
+
+                let res: &YILInstr = copy YILBlock(b.loc, self:.rewriteList(b.instrs));
+                return copy [res];
+            }
+            t: &YILTryCatch => {
+                let res: &YILInstr = copy YILTryCatch(t.loc, t.catchType,
+                                                      self:.rewriteList(t.tryPart),
+                                                      self:.rewriteList(t.catchPart));
+                return copy [res];
+            }
+            t: &YILTryFinally => {
+                return self:.collapse(t);
+            }
+        }
+
+        copy [instr]
+    }
+
+    /**
+     * Rewrite a list of instructions, dropping the ones the pass removed.
+     * */
+    fn rewriteList(mut self, instrs: [&YILInstr])-> [&YILInstr] {
+        let mut res: [mut &YILInstr] = [];
+        for i in instrs {
+            res ~= self:.rewrite(i);
+        }
+
+        res
+    }
+
+    /**
+     * Rewrite a try/finally, collapsing it when the frame does not need it.
+     *
+     * Two things make the finally part reachable only on the normal path: being
+     * a part that executes nothing, and protecting a region that can only be
+     * left by falling off its end. Either way appending it to the region says
+     * what the try/finally said, without a pad.
+     *
+     * The declarations and the labels of the part that is collapsed are kept
+     * where they were: a label is named by a jump that is still there, and
+     * removing it is the dead code pass' business, on the ground that nothing
+     * names it rather than on the ground that it does nothing.
+     *
+     * @returns: the rewritten instruction
+     * */
+    fn collapse(mut self, t: &YILTryFinally)-> [&YILInstr] {
+        let tryPart = self:.rewriteList(t.tryPart);
+        let finPart = self:.rewriteList(t.finPart);
+
+        if (isInert(finPart) || (!self.canThrowList(tryPart) && !hasEscapingExit(tryPart))) {
+            self:.count("try/finally removed");
+            self._changed = true;
+
+            return tryPart ~ finPart;
+        }
+
+        let res: &YILInstr = copy YILTryFinally(t.loc, tryPart, finPart);
+        copy [res]
+    }
+
+    /*!
+     * ================================================================================
+     * ================================================================================
+     * ==========================          DESTROY          ===========================
+     * ================================================================================
+     * ================================================================================
+     */
+
+    /**
+     * @params:
+     *    - b: a block of the frame
+     * @returns: true iif the block schedules a destructor that does nothing
+     *
+     * The block the expander registers for a local is recognized by its shape:
+     * it tests the liveness flag of the instance, calls its destructor, clears
+     * the flag and joins. It is dropped whole rather than emptied, because what
+     * is left of it once the call is gone is a test and a store on a field
+     * nothing else of the frame reads.
+     *
+     * The two labels go with it, so the jump testing the flag is required to be
+     * the one naming them: a label named from outside would be left dangling.
+     *
+     * Clearing the flag is what a later block scheduling the same instance
+     * reads, and dropping the store can therefore only leave such a block
+     * believing the instance is still alive -- which makes it call the very
+     * destructor this one found empty.
+     * */
+    fn isNoopDestroy(self, b: &YILBlock)-> bool {
+        if (b.instrs.len != DESTROY_BLOCK_LEN) return false;
+        if (!jumpsWithin(b.instrs[0], b.instrs[1], b.instrs[4])) return false;
+
+        let tested = setTest(b.instrs[0]);
+        let cleared = setClear(b.instrs[3]);
+
+        match (tested, cleared) {
+            (Ok(a: _), Ok(c: _)) => {
+                if (a != c) return false;
+            }
+            _ => { return false; }
+        }
+
+        self.isCallToEmpty(b.instrs[2])
+    }
+
+    /**
+     * @returns: true iif the instruction is a call to a frame of the module that
+     * executes nothing
+     *
+     * The arguments are required to be removable: not making the call at all is
+     * only the same as making it when evaluating what it is passed was not the
+     * point.
+     * */
+    fn isCallToEmpty(self, instr: &YILInstr)-> bool {
+        match instr {
+            c: &YILCall => {
+                match c.content {
+                    n: &YILNameCallValue => {
+                        if (!(n.funcName in self._empty)) return false;
+                        for p in n.params {
+                            if (!dce::isPure(p)) return false;
+                        }
+
+                        return true;
+                    }
+                }
+            }
+        }
+
+        false
+    }
+
+    /*!
+     * ================================================================================
+     * ================================================================================
+     * ===========================          THROWS          ===========================
+     * ================================================================================
+     * ================================================================================
+     */
+
+    /**
+     * @returns: true iif one of the instructions can leave the frame through an
+     * exception
+     *
+     * A handler nested in the region is not read as one: it catches what its own
+     * region throws and it may rethrow it, and telling the two apart is a
+     * question about the type the handler selects on, which is not what decides
+     * whether the region around it needs a pad.
+     * */
+    fn canThrowList(self, instrs: [&YILInstr])-> bool {
+        for i in instrs {
+            if (self.canThrowInstr(i)) return true;
+        }
+
+        false
+    }
+
+    /**
+     * @returns: true iif the instruction can leave the frame through an exception
+     * */
+    fn canThrowInstr(self, instr: &YILInstr)-> bool {
+        match instr {
+            a: &YILAffect => { return self.canThrowValue(a.left) || self.canThrowValue(a.right); }
+            c: &YILCall => { return self.canThrowValue(c.content); }
+            r: &YILReturn => { return self.canThrowValue(r.value); }
+            c: &YILCondJmp => { return self.canThrowValue(c.cond); }
+            b: &YILBlock => { return self.canThrowList(b.instrs); }
+            t: &YILTryCatch => { return self.canThrowList(t.tryPart) || self.canThrowList(t.catchPart); }
+            t: &YILTryFinally => { return self.canThrowList(t.tryPart) || self.canThrowList(t.finPart); }
+        }
+
+        false
+    }
+
+    /**
+     * @returns: true iif evaluating the value can leave the frame through an
+     * exception
+     *
+     * Only a call can: everything else is either a leaf or built from values
+     * that are asked in turn. A call through a pointer is one to a frame the
+     * module cannot name, and a call by name to a frame the summary does not
+     * hold is one to a frame of another module.
+     * */
+    fn canThrowValue(self, value: &YILValue)-> bool {
+        match value {
+            n: &YILNameCallValue => {
+                if (!(n.funcName in self._noThrow)) return true;
+
+                return self.canThrowAny(n.params);
+            }
+            _: &YILPtrCallValue => { return true; }
+            a: &YILArrayAccessValue => { return self.canThrowValue(a.value) || self.canThrowValue(a.index); }
+            a: &YILAddrValue => { return self.canThrowValue(a.value); }
+            a: &YILArrayValue => { return self.canThrowAny(a.value); }
+            b: &YILBinaryValue => { return self.canThrowValue(b.left) || self.canThrowValue(b.right); }
+            c: &YILCastValue => { return self.canThrowValue(c.value); }
+            f: &YILFieldValue => { return self.canThrowValue(f.tuple); }
+            t: &YILTupleValue => { return self.canThrowAny(t.values); }
+            u: &YILUnaryValue => { return self.canThrowValue(u.left); }
+            u: &YILUnrefValue => { return self.canThrowValue(u.value); }
+        }
+
+        false
+    }
+
+    /**
+     * @returns: true iif evaluating one of the values can throw
+     * */
+    fn canThrowAny(self, values: [&YILValue])-> bool {
+        for v in values {
+            if (self.canThrowValue(v)) return true;
+        }
+
+        false
+    }
+
+}
+
+/*!
+ * ================================================================================
+ * ================================================================================
+ * ============================          EXITS          ===========================
+ * ================================================================================
+ * ================================================================================
+ */
+
+/**
+ * @params:
+ *    - instrs: the instructions of a protected region
+ * @returns: true iif the region can be left other than by falling off its end
+ *
+ * This is the half of the question the throw summary does not answer. A finally
+ * part runs on every way out of the region it protects, a `return` and a jump
+ * leaving it included, and appending it to the region would make those two skip
+ * it.
+ *
+ * A jump into the region from outside is not one of them: the instructions stay
+ * where they are and in the order they were in, so a path entering in the middle
+ * still falls into the appended part the way it fell into the finally.
+ * */
+fn hasEscapingExit(instrs: [&YILInstr])-> bool {
+    let mut defined: [usize => mut ()] = copy [];
+    for i in instrs { collectLabels(i, ref defined); }
+
+    for i in instrs {
+        if (exits(i, defined)) return true;
+    }
+
+    false
+}
+
+/**
+ * @params:
+ *    - instr:   an instruction of the region
+ *    - defined: the labels the region defines
+ * @returns: true iif the instruction can leave the region
+ * */
+fn exits(instr: &YILInstr, defined: [usize => ()])-> bool {
+    match instr {
+        b: &YILBlock => {
+            for i in b.instrs { if (exits(i, defined)) return true; }
+        }
+        t: &YILTryCatch => {
+            for i in t.tryPart { if (exits(i, defined)) return true; }
+            for i in t.catchPart { if (exits(i, defined)) return true; }
+        }
+        t: &YILTryFinally => {
+            for i in t.tryPart { if (exits(i, defined)) return true; }
+            for i in t.finPart { if (exits(i, defined)) return true; }
+        }
+        _: &YILReturn => { return true; }
+        g: &YILGoto => { return !(g.label.id in defined); }
+        c: &YILCondJmp => { return !(c.then.id in defined) || !(c.else_.id in defined); }
+    }
+
+    false
+}
+
+/**
+ * Collect the identifier of every label an instruction defines.
+ * */
+fn collectLabels(instr: &YILInstr, ref mut res: [usize => mut ()]) {
+    match instr {
+        b: &YILBlock => { for i in b.instrs { collectLabels(i, ref res); } }
+        t: &YILTryCatch => {
+            for i in t.tryPart { collectLabels(i, ref res); }
+            for i in t.catchPart { collectLabels(i, ref res); }
+        }
+        t: &YILTryFinally => {
+            for i in t.tryPart { collectLabels(i, ref res); }
+            for i in t.finPart { collectLabels(i, ref res); }
+        }
+        l: &YILLabel => { res[l.id] = (); }
+    }
+}
+
+/*!
+ * ================================================================================
+ * ================================================================================
+ * ============================          CALLS          ===========================
+ * ================================================================================
+ * ================================================================================
+ */
+
+/**
+ * Collect the name of every frame an instruction calls.
+ *
+ * A call through a pointer is collected as `UNKNOWN_CALLEE`, which is never the
+ * name of a frame, so the summary reads it as the call to another module it is.
+ * */
+fn collectCalls(instr: &YILInstr, ref mut res: [[c8] => mut ()]) {
+    match instr {
+        b: &YILBlock => { for i in b.instrs { collectCalls(i, ref res); } }
+        t: &YILTryCatch => {
+            for i in t.tryPart { collectCalls(i, ref res); }
+            for i in t.catchPart { collectCalls(i, ref res); }
+        }
+        t: &YILTryFinally => {
+            for i in t.tryPart { collectCalls(i, ref res); }
+            for i in t.finPart { collectCalls(i, ref res); }
+        }
+        a: &YILAffect => { collectCallsValue(a.left, ref res); collectCallsValue(a.right, ref res); }
+        c: &YILCall => { collectCallsValue(c.content, ref res); }
+        r: &YILReturn => { collectCallsValue(r.value, ref res); }
+        c: &YILCondJmp => { collectCallsValue(c.cond, ref res); }
+    }
+}
+
+/**
+ * Collect the name of every frame a value calls.
+ * */
+fn collectCallsValue(value: &YILValue, ref mut res: [[c8] => mut ()]) {
+    match value {
+        n: &YILNameCallValue => {
+            res[n.funcName] = ();
+            for p in n.params { collectCallsValue(p, ref res); }
+        }
+        p: &YILPtrCallValue => {
+            res[UNKNOWN_CALLEE] = ();
+            collectCallsValue(p.funcPtr, ref res);
+            for i in p.params { collectCallsValue(i, ref res); }
+        }
+        a: &YILArrayAccessValue => { collectCallsValue(a.value, ref res); collectCallsValue(a.index, ref res); }
+        a: &YILAddrValue => { collectCallsValue(a.value, ref res); }
+        a: &YILArrayValue => { for v in a.value { collectCallsValue(v, ref res); } }
+        b: &YILBinaryValue => { collectCallsValue(b.left, ref res); collectCallsValue(b.right, ref res); }
+        c: &YILCastValue => { collectCallsValue(c.value, ref res); }
+        f: &YILFieldValue => { collectCallsValue(f.tuple, ref res); }
+        t: &YILTupleValue => { for v in t.values { collectCallsValue(v, ref res); } }
+        u: &YILUnaryValue => { collectCallsValue(u.left, ref res); }
+        u: &YILUnrefValue => { collectCallsValue(u.value, ref res); }
+    }
+}
+
+/*!
+ * ================================================================================
+ * ================================================================================
+ * ============================          SHAPE          ===========================
+ * ================================================================================
+ * ================================================================================
+ */
+
+/**
+ * @params:
+ *    - instrs: a list of instructions
+ * @returns: true iif executing them does nothing
+ *
+ * A declaration is not an instruction the backend emits anything for, and a
+ * label is a name rather than a thing to do: a part holding those and nothing
+ * else is a part the frame does not execute.
+ * */
+fn isInert(instrs: [&YILInstr])-> bool {
+    for i in instrs {
+        match i {
+            _: &YILVarDecl => {}
+            _: &YILLabel => {}
+            b: &YILBlock => { if (!isInert(b.instrs)) return false; }
+            _ => { return false; }
+        }
+    }
+
+    true
+}
+
+/**
+ * @params:
+ *    - instr: the first instruction of a block
+ *    - onSet: the instruction the block runs when the flag is set
+ *    - join:  the instruction the block joins at
+ * @returns: true iif the instruction is a jump naming those two labels
+ *
+ * A block naming its own labels is one that can be dropped whole.
+ * */
+fn jumpsWithin(instr: &YILInstr, onSet: &YILInstr, join: &YILInstr)-> bool {
+    match (onSet, join) {
+        (s: &YILLabel, j: &YILLabel) => {
+            match instr {
+                c: &YILCondJmp => { return c.then.id == s.id && c.else_.id == j.id; }
+            }
+        }
+    }
+
+    false
+}
+
+/**
+ * @params:
+ *    - instr: an instruction
+ * @returns: the liveness flag the instruction tests, if it is a jump on one
+ * */
+fn setTest(instr: &YILInstr)-> (&YILValue)? {
+    match instr {
+        c: &YILCondJmp => {
+            match c.cond {
+                f: &YILFieldValue => {
+                    if (f.name == ClassKeys::SET) { return c.cond?; }
+                }
+            }
+        }
+    }
+
+    none
+}
+
+/**
+ * @params:
+ *    - instr: an instruction
+ * @returns: the liveness flag the instruction clears, if it is a store clearing one
+ * */
+fn setClear(instr: &YILInstr)-> (&YILValue)? {
+    match instr {
+        a: &YILAffect => {
+            match (a.left, a.right) {
+                (f: &YILFieldValue, i: &YILIntValue) => {
+                    if (f.name == ClassKeys::SET && i.value == 0) { return a.left?; }
+                }
+            }
+        }
+    }
+
+    none
+}
