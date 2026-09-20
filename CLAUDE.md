@@ -82,7 +82,7 @@ Build system is `gyllir` (config in `gyllir.toml`, compiler path points at a loc
 - A serie of cases is one parameterized `__test`, registered as one test per case named
   `<test>[<k>]` — so `-f "integration::class_ops::class_operators[5]"` runs that single case,
   and `--resume` re-runs only the cases that failed. **`k` is the position in the parameter
-  list, not the number in the file name**: with the usual `[i for i in 1 ... N]`, `[0]` is
+  list, not the number in the file name**: with the usual `utils::range (1, N)`, `[0]` is
   `test1.yr`.
 - **A filter that matches nothing prints nothing and exits 0.** Empty output means "no test
   ran", never "everything passed". Always confirm you see `[SUCCESS] : integration::<module>…`.
@@ -104,14 +104,18 @@ Those blocks call, from `test/integration/utils.yr`, either:
 - `utils::registerTest("test_resources/<dir>/testN.yr")` — a single case, or
 - `utils::registerCase("test_resources/<dir>", i)` — the case `test<i>.yr` of a numbered serie.
   A serie is one parameterized `__test`, so that every case is a test of its own, run,
-  selected and resumed independently:
+  selected and resumed independently. `@parameters` takes a **generator**, not a slice:
+  `utils::range` (also from `test/integration/utils.yr`) yields both of its bounds included.
 
   ```
-  @parameters(copy [i for i in 1 ... 24])
+  @parameters(utils::range (1, 24))
   __test type_aliases (i: i32) {
       utils::registerCase ("test_resources/aka", i);
   }
   ```
+
+  A slice there — `copy [i for i in 1 ... 24]` — is rejected with `E4288 the parameters of a
+  unit test are produced as mut [mut i32], but a generator was expected`.
 
 Either way, each case:
 
@@ -189,13 +193,17 @@ To exercise the compiler on an ad-hoc snippet (there is no runnable binary to do
    use ymirc::utils::_;
    use utils;
 
-   @parameters(copy [i for i in 1 ... N])
+   @parameters(utils::range (1, N))
    __test cases (i: i32) {
        utils::registerCase ("test_resources/tmpcheck", i);
    }
    ```
 3. Add `mod ::tmpcheck;` to `test/integration.yr`.
-4. `gyllir test --dry` then `./ymirc.test -f "integration::tmpcheck::*" 2>err.txt`.
+4. `gyllir test --dry` then `./ymirc.test -f "integration::tmpcheck::*" 2>err.txt`. **Check the
+   build really succeeded**: a compile error in the new module is printed near the top of the
+   `gyllir` output, which then keeps going and leaves the previous `ymirc.test` in place — the
+   filter matches nothing, prints nothing and exits 0, which looks exactly like a passing run.
+   `./ymirc.test -l | grep tmpcheck` says whether the module registered at all.
 
 Probe *both* directions of whatever you are testing (the accepted form and the rejected one),
 and prefer cases whose outcome is observable in the type system — e.g. give two overloads
