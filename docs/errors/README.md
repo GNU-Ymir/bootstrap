@@ -26,7 +26,7 @@ check lives:
 | `E1xxx` | lexing | `LexingErrorMessage` -- `src/ymirc/lexing/errors.yr` | 24 |
 | `E2xxx` | parsing | `SyntaxErrorMessage` -- `src/ymirc/syntax/errors.yr` | 11 |
 | `E3xxx` | declaration | `DeclareErrorMessage` -- `src/ymirc/semantic/declarator/errors.yr` | 34 |
-| `E4xxx` | validation | `ValidateErrorMessage` -- `src/ymirc/semantic/validator/errors.yr` | 252 |
+| `E4xxx` | validation | `ValidateErrorMessage` -- `src/ymirc/semantic/validator/errors.yr` | 253 |
 | `E5xxx` | lowering (YIL) | `SerializeYILErrorMessage` -- `src/ymirc/lint/serialize/errors.yr` | 10 |
 
 Each page carries an example wherever a case in the suite raises the code: the
@@ -252,6 +252,7 @@ deliberately carry no code, and have no page here.
 | [E4143](E4143.md) | `NEVER_ENTERED_LOOP` | loop test is always false, loop is never entered |
 | [E4144](E4144.md) | `NON_ABSTRACT_NOT_COMPLETE` | class <> is not abstract but has empty methods |
 | [E4145](E4145.md) | `NOTHING_TO_CATCH` | nothing to catch |
+| [E4305](E4305.md) | `NO_ENCLOSING_PRAGMA` | __pragma <> is not enclosed in a <> |
 | [E4146](E4146.md) | `NOT_ALIASABLE` | <> is not an aliasable type |
 | [E4147](E4147.md) | `NOT_ANCESTOR` | <> is not an ancestor type of <> |
 | [E4149](E4149.md) | `NOT_AN_EXCEPTION_CLASS` | class type <> does not inherit from exception type <> |
