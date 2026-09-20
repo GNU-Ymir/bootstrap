@@ -1,0 +1,219 @@
+in elision;
+
+use ymirc::utils::_;
+use ymirc::lexing::word;
+use ymirc::lint::optimizer;
+use ymirc::lint::node::{_, global::_, instr::_, type::_, value::_};
+
+use std::io;
+use std::fs::path;
+
+/**
+ * The destructor elision pass over the shapes that decide whether a landing pad
+ * is needed.
+ *
+ * Two of them are what the pass is for, and the other two are what it must not
+ * do. The frames are built by hand, the way `integration::dead_code` does for
+ * the same reason: whether a call can throw is a question about the frame
+ * defining the callee, so stating it means handing the pass a module of several
+ * frames, and whether a `return` inside a protected region stops the collapse
+ * means putting one there -- which is a shape the validator has its own reasons
+ * to refuse from source.
+ *
+ * What a compilation produces is stated by the goldens of
+ * `test_resources/optimizer/`, where test16 to test18 are the three answers the
+ * pass gives a class destructor.
+ * */
+
+/**
+ * Build a void frame of a given name around a body.
+ * */
+fn frame(name: [c8], body: [&YILInstr], refs: [[c8] => Path] = copy [])-> &YILFrame {
+    copy YILFrame(EOF_WORD, EOF_WORD, name,
+                  [],
+                  YIL_VOID,
+                  body-> copy YILBlock(EOF_WORD, body),
+                  refs-> refs)
+}
+
+/**
+ * Run the elision pass over a module, and check it left well formed frames.
+ *
+ * @params:
+ *    - nodes: the frames of the module, the one to look at first
+ * @returns: the transformation of the first frame
+ * */
+fn optimized(nodes: [&YILSymbol])-> &YILFrame
+    throws AssertError
+{
+    let dmut pass = copy DestructorElisionPass();
+    pass:.prepare(nodes);
+
+    let mut res: [&YILFrame] = [];
+    for n in nodes {
+        if let f: &YILFrame = n {
+            let opt = pass:.apply(f);
+            res ~= copy [opt];
+
+            let dmut ver = copy Verifier(pass-> "dtor-elision");
+            {
+                ver:.verify(opt);
+            } catch {
+                err: &ymirc::errors::ErrorMsg => {
+                    throw copy AssertError(format("the pass left a malformed frame :\n%\n%", opt, err));
+                }
+            }
+        }
+    }
+
+    if (res.len == 0us) { throw copy AssertError("no frame to optimize"); }
+
+    res[0]
+}
+
+/**
+ * @returns: true iif the instruction holds a try/finally
+ * */
+fn hasPad(instr: &YILInstr)-> bool {
+    match instr {
+        b: &YILBlock => { for i in b.instrs { if (hasPad(i)) return true; } }
+        t: &YILTryCatch => {
+            for i in t.tryPart { if (hasPad(i)) return true; }
+            for i in t.catchPart { if (hasPad(i)) return true; }
+        }
+        _: &YILTryFinally => { return true; }
+    }
+
+    false
+}
+
+/**
+ * @returns: true iif the instruction still holds the needle
+ * */
+fn holds(instr: &YILInstr, needle: &YILInstr)-> bool {
+    if (instr == needle) return true;
+
+    match instr {
+        b: &YILBlock => { for i in b.instrs { if (holds(i, needle)) return true; } }
+        t: &YILTryCatch => {
+            for i in t.tryPart { if (holds(i, needle)) return true; }
+            for i in t.catchPart { if (holds(i, needle)) return true; }
+        }
+        t: &YILTryFinally => {
+            for i in t.tryPart { if (holds(i, needle)) return true; }
+            for i in t.finPart { if (holds(i, needle)) return true; }
+        }
+    }
+
+    false
+}
+
+/**
+ * The variable every case stores into, and the store it makes.
+ * */
+fn store(id: usize, value: i32)-> (&YILValue, &YILInstr) {
+    let v : &YILValue = copy YILVar(EOF_WORD, "x", YIL_SINT_32, id);
+
+    (v, copy YILAffect(EOF_WORD, v, copy YILIntValue(EOF_WORD, YIL_SINT_32, value)))
+}
+
+__test a_region_that_cannot_throw_loses_its_pad {
+    // nothing the region does can throw and nothing leaves it other than by
+    // falling off its end, so the finally part is only ever reached on the
+    // normal path and appending it to the region says the same thing
+    let (_, protectedStore) = store(1us, 1);
+    let (_, guard) = store(2us, 2);
+
+    let body: [&YILInstr] = copy [copy YILVarDecl(EOF_WORD, "x", YIL_SINT_32, 1us),
+                                  copy YILVarDecl(EOF_WORD, "y", YIL_SINT_32, 2us),
+                                  copy YILTryFinally(EOF_WORD, copy [protectedStore], copy [guard])];
+
+    let res = optimized(copy [frame("_Y4test3fooFZv", body)]);
+    assert (!hasPad(res.body), format("the pad the region does not need was kept :\n%", res));
+    assert (holds(res.body, protectedStore) && holds(res.body, guard),
+            format("collapsing the pad lost what it held :\n%", res));
+}
+
+__test a_return_in_the_protected_region_keeps_the_pad {
+    // the finally part runs on every way out of the region, a `return`
+    // included: appending it to the region would make the return skip it, which
+    // for a frame whose guards are its destructors is the leak this pass exists
+    // not to introduce
+    let (_, protectedStore) = store(1us, 1);
+    let (_, guard) = store(2us, 2);
+
+    let leave: &YILInstr = copy YILReturn(EOF_WORD, copy YILUnit(EOF_WORD, YIL_VOID));
+    let body: [&YILInstr] = copy [copy YILVarDecl(EOF_WORD, "x", YIL_SINT_32, 1us),
+                                  copy YILVarDecl(EOF_WORD, "y", YIL_SINT_32, 2us),
+                                  copy YILTryFinally(EOF_WORD, copy [protectedStore, leave], copy [guard])];
+
+    let res = optimized(copy [frame("_Y4test3fooFZv", body)]);
+    assert (hasPad(res.body), format("the pad the return needs was removed :\n%", res));
+}
+
+__test a_jump_out_of_the_protected_region_keeps_the_pad {
+    // a jump leaving the region is the other way out the finally part runs on,
+    // and the label it names being outside the region is the whole of what says
+    // so
+    let (_, protectedStore) = store(1us, 1);
+    let (_, guard) = store(2us, 2);
+
+    let out : &YILLabel = copy YILLabel(EOF_WORD, "out", 1us);
+    let leave: &YILInstr = copy YILGoto(EOF_WORD, out);
+    let after: &YILInstr = out;
+
+    let body: [&YILInstr] = copy [copy YILVarDecl(EOF_WORD, "x", YIL_SINT_32, 1us),
+                                  copy YILVarDecl(EOF_WORD, "y", YIL_SINT_32, 2us),
+                                  copy YILTryFinally(EOF_WORD, copy [protectedStore, leave], copy [guard]),
+                                  after];
+
+    let res = optimized(copy [frame("_Y4test3fooFZv", body)]);
+    assert (hasPad(res.body), format("the pad the jump needs was removed :\n%", res));
+}
+
+__test a_call_to_a_frame_of_the_module_that_cannot_throw_loses_the_pad {
+    // the callee is a frame of the module doing nothing that can throw, which
+    // is the only thing that makes a call to it one the region can be trusted
+    // with
+    let (_, guard) = store(2us, 2);
+    let (_, inCallee) = store(3us, 3);
+
+    let call: &YILInstr = copy YILCall(EOF_WORD,
+                                       copy YILNameCallValue(EOF_WORD, YIL_VOID, "_Y4test4sinkFZv", []));
+
+    let body: [&YILInstr] = copy [copy YILVarDecl(EOF_WORD, "y", YIL_SINT_32, 2us),
+                                  copy YILTryFinally(EOF_WORD, copy [call], copy [guard])];
+
+    let refs: [[c8] => Path] = copy ["_Y4test4sinkFZv" => Path("test")];
+    let callee: [&YILInstr] = copy [copy YILVarDecl(EOF_WORD, "z", YIL_SINT_32, 3us), inCallee];
+
+    let res = optimized(copy [frame("_Y4test3fooFZv", body, refs-> refs),
+                              frame("_Y4test4sinkFZv", callee)]);
+
+    assert (!hasPad(res.body), format("the pad the region does not need was kept :\n%", res));
+    assert (holds(res.body, call), format("collapsing the pad lost the call :\n%", res));
+}
+
+__test a_call_reaching_another_module_keeps_the_pad {
+    // `sink` is a frame of the module, but what it calls is not, and a frame
+    // the module does not define is one nothing here can say does not throw --
+    // so the property travels back up the call graph to its caller
+    let (_, guard) = store(2us, 2);
+
+    let call: &YILInstr = copy YILCall(EOF_WORD,
+                                       copy YILNameCallValue(EOF_WORD, YIL_VOID, "_Y4test4sinkFZv", []));
+
+    let body: [&YILInstr] = copy [copy YILVarDecl(EOF_WORD, "y", YIL_SINT_32, 2us),
+                                  copy YILTryFinally(EOF_WORD, copy [call], copy [guard])];
+
+    let outside: &YILInstr = copy YILCall(EOF_WORD,
+                                          copy YILNameCallValue(EOF_WORD, YIL_VOID, "_Y5other4failFZv", []));
+
+    let refs: [[c8] => Path] = copy ["_Y4test4sinkFZv" => Path("test")];
+    let calleeRefs: [[c8] => Path] = copy ["_Y5other4failFZv" => Path("other")];
+
+    let res = optimized(copy [frame("_Y4test3fooFZv", body, refs-> refs),
+                              frame("_Y4test4sinkFZv", copy [outside], refs-> calleeRefs)]);
+
+    assert (hasPad(res.body), format("the pad the call needs was removed :\n%", res));
+}
