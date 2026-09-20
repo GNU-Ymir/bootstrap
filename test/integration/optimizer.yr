@@ -29,6 +29,13 @@ def SWEEP = ["test_resources/control_flow/test11.yr",
              "test_resources/templates/test1.yr"];
 
 /**
+ * The mangled segment naming a destructor: the length prefixed `__dtor` followed
+ * by the marker of the frame kind. `__dtor` alone appears again inside the
+ * mangling of a template argument.
+ * */
+def DTOR_SEGMENT = "6__dtorDT";
+
+/**
  * One case per optimization pass, each a snippet small enough that its optimized
  * form can be read off the source.
  *
@@ -38,7 +45,7 @@ def SWEEP = ["test_resources/control_flow/test11.yr",
  * that pass is written against: landing it shows up as a diff on the case it
  * was written for, and as an unexpected diff anywhere else.
  * */
-@parameters(utils::range (1, 15))
+@parameters(utils::range (1, 18))
 __test one_snippet_per_pass (i: i32) {
     utils::registerCase ("test_resources/optimizer", i);
 }
@@ -128,24 +135,26 @@ fn countInstr(instr: &YILInstr)-> usize {
 }
 
 /**
- * The dead code elimination over the frames a scope guard and a try/catch
- * produce.
+ * What the landing pads of a frame hold is still in the frame after the pipeline.
  *
  * A landing pad is entered by the personality routine and by nothing the frame
  * does, so a pass rooting its reachability at the entry alone sees the handler
  * of every region it believes cannot throw as dead code, and removes what it
- * holds. What is asserted here is the property that catches that, handler by
- * handler: a body that holds a handler before the pipeline holds the same one
- * after, making the same calls.
+ * holds. What is asserted here is the property that catches that: a frame that
+ * made a call before the pipeline makes it after.
  *
- * The calls are what is compared rather than the instructions. A handler is
- * cleaned like anything else -- the `exit` of `test9::foo2` is a store to a
- * variable nothing reads, and leaving it empty is right -- so a count of
- * instructions has a legitimate reason to drop, and asserting on it would state
- * nothing. A call is never a dead store and never a pure value, so the pass has
- * exactly one reason to remove one: believing no path reaches it. That is the
- * mistake this states, and it has to be stated per handler, since a module
- * holds several and one that survives says nothing about the others.
+ * Both sides are counted over the whole frame rather than handler by handler: a
+ * handler is allowed to disappear, the elision pass moving the calls of one into
+ * the region it protected without losing any.
+ *
+ * The frames looked at are the ones whose handlers call something, and the calls
+ * are what is counted rather than the instructions. A handler is cleaned like
+ * anything else -- the `exit` of `test9::foo2` is a store to a variable nothing
+ * reads, and leaving it empty is right -- so a count of instructions has a
+ * legitimate reason to drop, and asserting on it would state
+ * nothing. A call is never a dead store and never a pure value, so a pass has
+ * exactly one reason to remove one on the ground of reachability, and that is
+ * the mistake this states.
  * */
 __test handlers_survive_the_pipeline {
     for package in ["test_resources/scope_guards/test1.yr",
@@ -158,28 +167,149 @@ __test handlers_survive_the_pipeline {
             throw copy AssertError(format("% : -O1 : %", package, err));
         }
 
-        let raw = countHandlers(res.exp), opt = countHandlers(res.opt);
-        assert (raw.len != 0us, format("% : no frame with a handler to check", package));
+        let handlers = countHandlers(res.exp);
+        let raw = countCallsPerFrame(res.exp), opt = countCallsPerFrame(res.opt);
+        assert (handlers.len != 0us, format("% : no frame with a handler to check", package));
 
         let mut checked = 0us;
         for name, before in raw {
-            let mut after: [usize] = [];
+            let mut nb = 0us;
+            if let Ok(hs) = handlers[name] { for h in hs { nb += h; } }
+            if (nb == 0us) continue;
+
+            let mut after = 0us;
             if let Ok(a) = opt[name] { after = a; }
 
-            assert (after.len == before.len,
-                    format("% : -O1 : % : % handlers, down from %", package, name, after.len, before.len));
+            assert (after >= before,
+                    format("% : -O1 : % : % calls, down from the % it made, % of them in a handler",
+                           package, name, after, before, nb));
 
-            for i, nb in before {
-                assert (after[i] == nb,
-                        format("% : -O1 : % : handler #% makes % calls, down from %",
-                               package, name, i, after[i], nb));
-
-                checked += nb;
-            }
+            checked += nb;
         }
 
         assert (checked != 0us, format("% : no handler makes a call, nothing to check", package));
     }
+}
+
+/**
+ * @params:
+ *    - nodes: the nodes of a module
+ * @returns: the number of calls the body of every frame of the module makes
+ * */
+fn countCallsPerFrame(nodes: [&YILNode])-> [[c8] => usize] {
+    let mut res: [[c8] => mut usize] = copy [];
+    for n in nodes {
+        if let f: &YILFrame = n { res[f.name] = countCalls(f.body); }
+    }
+
+    res
+}
+
+/**
+ * The pipeline runs the destructors of a frame as often as the expander
+ * scheduled them.
+ *
+ * Dropping a destructor that was needed is a leak, and a leak is what no golden
+ * file notices: the frames still compile, the verifier still passes, and the
+ * memory is simply never given back. The corpus is the cases whose destructor
+ * does something, and what is asserted, per frame, is the number of destructor
+ * calls -- which the elision pass moves, out of a finally part and into the
+ * region that part protected, and must never lower.
+ *
+ * A case whose destructor is empty is left out on purpose: removing the calls to
+ * it is what the pass is for, and `test_resources/optimizer/test16.yr` is where
+ * that is stated.
+ * */
+__test destructor_calls_survive_the_pipeline {
+    for package in ["test_resources/for_loops/override/test8.yr",
+                    "test_resources/for_loops/override/test11.yr",
+                    "test_resources/for_loops/override/test12.yr",
+                    "test_resources/for_loops/lst_compr_class/test8.yr",
+                    "test_resources/regressions/entity_reassign_rhs_throws/test1.yr",
+                    "test_resources/optimizer/test17.yr",
+                    "test_resources/optimizer/test18.yr"] {
+        let res = utils::compilePackage(package, optLevel-> 1u32);
+        if let Ok(err) = res.err {
+            throw copy AssertError(format("% : -O1 : %", package, err));
+        }
+
+        let raw = countDtorCalls(res.exp), opt = countDtorCalls(res.opt);
+        assert (raw.len != 0us, format("% : no frame runs a destructor", package));
+
+        for name, before in raw {
+            let mut after = 0us;
+            if let Ok(a) = opt[name] { after = a; }
+
+            assert (after == before,
+                    format("% : -O1 : % : % destructor calls, % were scheduled",
+                           package, name, after, before));
+        }
+    }
+}
+
+/**
+ * @params:
+ *    - nodes: the nodes of a module
+ * @returns: for every frame making one, the number of destructor calls it makes
+ * */
+fn countDtorCalls(nodes: [&YILNode])-> [[c8] => usize] {
+    let mut res: [[c8] => mut usize] = copy [];
+    for n in nodes {
+        if let f: &YILFrame = n {
+            let nb = countDtorCall(f.body);
+            if (nb != 0us) { res[f.name] = nb; }
+        }
+    }
+
+    res
+}
+
+/**
+ * @returns: the number of destructor calls an instruction holds
+ * */
+fn countDtorCall(instr: &YILInstr)-> usize {
+    let mut res = 0us;
+    match instr {
+        b: &YILBlock => { for i in b.instrs { res += countDtorCall(i); } }
+        t: &YILTryCatch => {
+            for i in t.tryPart { res += countDtorCall(i); }
+            for i in t.catchPart { res += countDtorCall(i); }
+        }
+        t: &YILTryFinally => {
+            for i in t.tryPart { res += countDtorCall(i); }
+            for i in t.finPart { res += countDtorCall(i); }
+        }
+        c: &YILCall => { return isDtorCall(c.content); }
+        a: &YILAffect => { return isDtorCall(a.right); }
+    }
+
+    res
+}
+
+/**
+ * @returns: 1 iif the value is a call to a destructor, 0 otherwise
+ * */
+fn isDtorCall(value: &YILValue)-> usize {
+    match value {
+        n: &YILNameCallValue => {
+            if (holds(n.funcName, DTOR_SEGMENT)) { return 1us; }
+        }
+    }
+
+    0us
+}
+
+/**
+ * @returns: true iif the name holds the needle
+ * */
+fn holds(name: [c8], needle: [c8])-> bool {
+    if (needle.len > name.len) return false;
+
+    for i in 0us .. ((name.len - needle.len) + 1us) {
+        if (name[i .. i + needle.len] == needle) return true;
+    }
+
+    false
 }
 
 /**
