@@ -384,9 +384,20 @@ pub mod CallExpander {
         context:.registerTouchClass(methProto.closure.type);
 
         let retType = context:.finalizeType(f.type);
-
-        let mut params: [&YILValue] = [];
         let mut inst = ValueExpander::finalize(alias context, methProto.closure, ref list, asLeft-> false);
+
+        // a union hands the member it holds to the method and reads the slot from
+        // its own vtable, so neither the instance nor the callee is the union. The
+        // slot is read after the arguments, as a class dispatch reads it, so that an
+        // argument changing the member held also changes what is dispatched to
+        if let un: &UnionType = methProto.closure.type {
+            let (self_, vtableAddr) = CallExpander::createUnionInstance(alias context, f.loc, un, inst, ref list);
+            let unionParams = CallExpander::finalizeMethodParams(alias context, f, self_, ref list);
+            let unionFptr = CallExpander::createUnionSlot(alias context, f.loc, un, vtableAddr, methProto.vtableIndex, ref list);
+
+            ValueExpander::transferDestroy(unionParams, ref list);
+            return copy YILPtrCallValue(f.loc, retType, unionFptr, unionParams);
+        }
 
         let isDirect = {
             if let c: &ClassPtrType = methProto.closure.type && c.isStruct {
@@ -397,14 +408,7 @@ pub mod CallExpander {
             }
         };
 
-        params ~= [inst];
-        for pi in f.params {
-            params ~= [ValueExpander::finalize(alias context, pi, ref list, asLeft-> false)];
-        }
-
-        for pi in f.addParams {
-            params ~= [ValueExpander::finalize(alias context, pi, ref list, asLeft-> false)];
-        }
+        let params = CallExpander::finalizeMethodParams(alias context, f, inst, ref list);
 
         if (isDirect) {
             let name = Mangler::mangle(methProto.proto);
@@ -420,6 +424,31 @@ pub mod CallExpander {
         // expanded, until then they are still owned by this frame
         ValueExpander::transferDestroy(params, ref list);
         return copy YILPtrCallValue(f.loc, retType, fptr, params);
+    }
+
+    /**
+     * Expand the arguments of a method call, the instance first.
+     *
+     * @params:
+     *   - context: the expansion context
+     *   - f:       the method call value
+     *   - inst:    the instance the method receives
+     *   - list:    the statement list to append instructions to
+     *
+     * @returns:
+     *   - [&YILValue]: the arguments of the call
+     */
+    fn finalizeMethodParams(dmut context: &Expander, f: &MethodCallValue, inst: &YILValue, ref mut list: StmtList)-> [&YILValue] {
+        let mut params: [&YILValue] = copy [inst];
+        for pi in f.params {
+            params ~= [ValueExpander::finalize(alias context, pi, ref list, asLeft-> false)];
+        }
+
+        for pi in f.addParams {
+            params ~= [ValueExpander::finalize(alias context, pi, ref list, asLeft-> false)];
+        }
+
+        params
     }
 
     /**
@@ -444,8 +473,6 @@ pub mod CallExpander {
      *   - &YILValue: the function pointer extracted from the vtable
      */
     pub fn createVtableAccess(dmut context: &Expander, loc: &Word, inst: &YILValue, index: usize, ref mut list: StmtList)-> &YILValue {
-        let ptrSize = global::state::pointerArchSize() / 8us;
-
         let generic = context.typeExpander:.finalizeGenericClassPtr(alias context);
         let castedInst = copy YILCastValue(loc, generic, inst);
 
@@ -459,16 +486,106 @@ pub mod CallExpander {
                                            // and '*(*void) + x' is not the same as '*(void) + x'
                                            copy YILFieldValue(loc, YIL_PTR_2_VOID, derefInst, name-> ClassKeys::VTABLE));
 
+        // the two first slots of a class vtable are the typeinfo and the destructor
+        return CallExpander::createVtableSlotAccess(alias context, loc, vtableAddr, index + 2us, ref list);
+    }
+
+    /**
+     * Create the member a method call on a union hands the callee, and the address
+     * of the vtable the call dispatches through.
+     *
+     * The member held is only known at runtime, so the method receives the member,
+     * never the union itself:
+     *   - a union of records passes the overlay, which is the record,
+     *   - a union of classes passes the pointer the overlay holds.
+     *
+     * @params:
+     *   - context: the expansion context
+     *   - loc:     source location of the call
+     *   - un:      the type of the union instance
+     *   - inst:    the union instance
+     *   - list:    the statement list to append instructions to
+     *
+     * @returns:
+     *   - (&YILValue, &YILValue): (the member the method receives, the address of the vtable)
+     */
+    pub fn createUnionInstance(dmut context: &Expander, loc: &Word, un: &UnionType, inst: &YILValue, ref mut list: StmtList)-> (&YILValue, &YILValue) {
+        let object = if (un.isRecord) { inst } else {
+            match inst.type {
+                p: &YILPointer => { copy YILUnrefValue(loc, p.inner, inst) }
+                _ => { panic; } // a union of classes is a pointer to its object
+            }
+        };
+
+        let valuesType = match object.type {
+            t: &YILTuple => { t.inners[2us] }
+            _ => { panic; } // the union object is a three field aggregate
+        };
+
+        let values = copy YILFieldValue(loc, valuesType, object, name-> UnionKeys::VALUES);
+        let valuesAddr = MemoryExpander::createAddress(alias context, values, context.typeExpander:.finalizePointer(valuesType), ref list);
+
+        let self_ = if (un.isRecord) { valuesAddr } else {
+            copy YILUnrefValue(loc, YIL_PTR_VOID, copy YILCastValue(loc, YIL_PTR_2_VOID, valuesAddr))
+        };
+
+        let vtableAddr = copy YILCastValue(loc, YIL_PTR_VOID,
+                                           copy YILFieldValue(loc, YIL_PTR_2_VOID, object, name-> UnionKeys::VTABLE));
+
+        return (self_, vtableAddr);
+    }
+
+    /**
+     * Read the function pointer a method call on a union dispatches through.
+     *
+     * @params:
+     *   - context:    the expansion context
+     *   - loc:        source location of the call
+     *   - un:         the type of the union instance
+     *   - vtableAddr: the address of the vtable of the union object
+     *   - index:      index of the method in the vtable of the union
+     *   - list:       the statement list to append instructions to
+     *
+     * @returns:
+     *   - &YILValue: the function pointer of the slot
+     */
+    pub fn createUnionSlot(dmut context: &Expander, loc: &Word, un: &UnionType, vtableAddr: &YILValue, index: usize, ref mut list: StmtList)-> &YILValue {
+        let ur = match un.sym.generator {
+            r: &UnionRefType => { r }
+            _ => { panic; } // invalid union
+        };
+
+        // a union declaring a base dispatches through the class vtable of the member,
+        // whose two first slots are the typeinfo and the destructor
+        let slot = if (ur.base.hasValue) { index + 2us } else { index };
+
+        return CallExpander::createVtableSlotAccess(alias context, loc, vtableAddr, slot, ref list);
+    }
+
+    /**
+     * Read the function pointer stored in a slot of a vtable.
+     *
+     * @params:
+     *   - context:    the expansion context
+     *   - loc:        source location of the access
+     *   - vtableAddr: the address of the vtable, as a pointer of void
+     *   - index:      index of the slot in the vtable
+     *   - list:       the statement list to append instructions to
+     *
+     * @returns:
+     *   - &YILValue: the function pointer stored in the slot
+     */
+    fn createVtableSlotAccess(dmut context: &Expander, loc: &Word, vtableAddr: &YILValue, index: usize, ref mut list: StmtList)-> &YILValue {
+        let ptrSize = global::state::pointerArchSize() / 8us;
+
         let (vtableAddrU, _) = ValueExpander::createVarForBlock(alias context, loc, NONE_TYPE, YIL_PTR_VOID, ref list, withValue-> vtableAddr);
 
-        // +1us because 0 is the dtor
         let funcInVtableAddr = copy YILCastValue(loc, YIL_PTR_2_VOID,
                                                  copy YILBinaryValue(loc,
                                                                      YIL_PTR_VOID,
                                                                      BinaryOperators::PLUS,
                                                                      vtableAddrU,
-                                                                     copy YILIntValue(loc, YIL_UINT_MAX, (index + 2us) * cast!{usize} (ptrSize))));
-        // [TYPEINFO, DTOR, funcs*]
+                                                                     copy YILIntValue(loc, YIL_UINT_MAX, index * cast!{usize} (ptrSize))));
 
         let (funcInVtableAddrU, _) = ValueExpander::createVarForBlock(alias context, loc, NONE_TYPE, YIL_PTR_2_VOID, ref list, withValue-> funcInVtableAddr);
         let unref = copy YILUnrefValue(loc, YIL_PTR_2_VOID.inner, funcInVtableAddrU); // recast the vtable to the correct array
