@@ -1,0 +1,411 @@
+/*
+ * Implements semantic validation for method access on a union value.
+ *
+ * Supported forms:
+ *   - unionExpr.method(...)
+ *   - unionExpr:.method(...)
+ *
+ * This module is invoked by FieldValidation when the left operand is a union.
+ *
+ * <hr>
+ *
+ * @Package: ymirc
+ * @Module: ymirc::semantic::validator::value::operator::fields::union_
+ * @File: ymirc/semantic/validator/value/operator/fields/union_.yr
+ * @Author(s):
+ *   - Emile Cadorel <ecadorel@gmail.com>
+ *
+ * @Created(YYYY-MM-DD): 2026-09-21
+ * @Copyright(C) 2021–2026 GNU-Ymir
+ * @License
+ *   ```text
+ *   This file is part of the Ymir language project.
+ *
+ *   Ymir is free software: you can redistribute it and/or modify it
+ *   under the terms of the GNU General Public License as published by
+ *   the Free Software Foundation, either version 3 of the License, or
+ *   (at your option) any later version.
+ *
+ *   Ymir is distributed in the hope that it will be useful,
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *   GNU General Public License for more details.
+ *
+ *   You should have received a copy of the GNU General Public License
+ *   along with Ymir.  If not, see <https://www.gnu.org/licenses/>.
+ *   ```
+ */
+
+in union_;
+
+use ymirc::errors;
+use ymirc::lexing::{keys, word};
+use ymirc::semantic::generator::{type::_, value::_};
+use ymirc::syntax::expression;
+use ymirc::syntax::expression::literal;
+use ymirc::utils::format;
+
+/**
+ * UnionMethodValidation
+ *
+ * Provides semantic validation for method access on a union instance.
+ *
+ * What a union answers to is what it can dispatch whichever member it holds:
+ * the methods its reference collected, or, when it declares a base, the public
+ * methods of that base -- a union is not an instance of its members, so only
+ * their public API is reachable through it.
+ *
+ * The member held is only known at runtime, so the call always goes through a
+ * slot of the union, never straight to an implementation.
+ *
+ * The validator:
+ *   - resolves the method in the slots of the union,
+ *   - enforces the aliasing rules, a mutable method needing ':.',
+ *   - resolves field-methods when the access is not a call,
+ *   - aggregates the candidates into a MultSymValue,
+ *   - names, when nothing matches, what each member declares.
+ */
+pub mod UnionMethodValidation {
+
+    /**
+     * Validate a method access on a union instance.
+     *
+     * @params:
+     *   - context: validation context
+     *   - loc:     operator location
+     *   - object:  validated union instance
+     *   - u:       the type of the union instance
+     *   - method:  method expression(VarExpr)
+     *   - inCall:  whether this access occurs inside a call expression
+     *
+     * @returns:
+     *   A &Value representing the method delegate, or the result of calling a
+     *   field-method.
+     *
+     * @throws:
+     *   ErrorMsg if no method matches, or if the aliasing rules are violated.
+     */
+    pub fn validate(dmut context: &ValidationContext,
+                    loc:          &Word,
+                    object:       &Value,
+                    u:            &UnionType,
+                    method:       &Expression,
+                    inCall:       bool)-> &Value
+        throws ErrorMsg
+    {
+        let uref = UnionMethodValidation::unionRef(u);
+        let mut errors: [&ErrorMsg] = [];
+        let mut values: [&Value] = [];
+
+        UnionMethodValidation::validateMethod(alias context, loc, object, u, uref, method, inCall, ref values, ref errors);
+
+        if (values.len == 0us) {
+            if (errors.len != 0us) throw copy ErrorMsg::list(errors);
+
+            throw UnionMethodValidation::createError(object, uref, method, inCall);
+        }
+
+        if !inCall { // a field-method is called by the access itself
+            let dmut ret = copy MultSymValue(method.loc, values);
+            return CallValidation::validate(alias context, method.loc, ret, []);
+        }
+
+        if (values.len == 1us) return values[0us];
+
+        return copy MultSymValue(method.loc, values, prettyStr-> format("%", method));
+    }
+
+    /**
+     * Collect the slots of the union whose method matches the access.
+     *
+     * A union declaring a base carries the vtable of that base, so the slot is
+     * the index of the method in it. Without a base the slots are the ones its
+     * reference collected, in which every member has an implementation.
+     *
+     * @params:
+     *   - context: validation context
+     *   - loc:     operator location
+     *   - object:  union instance
+     *   - u:       the type of the union instance
+     *   - uref:    the reference of the union
+     *   - method:  method expression
+     *   - inCall:  whether this access occurs inside a call expression
+     *   - values:  output list of valid delegates
+     *   - errors:  output list of errors
+     */
+    fn validateMethod(dmut context:   &ValidationContext,
+                      loc:            &Word,
+                      object:         &Value,
+                      u:              &UnionType,
+                      uref:           &UnionRefType,
+                      method:         &Expression,
+                      inCall:         bool,
+                      ref mut values: [&Value],
+                      ref mut errors: [&ErrorMsg])
+    {
+        if let meth: &VarExpr = method {
+            if let Ok(base) = uref.base {
+                let prots = base.vtableProtections;
+                for i, v in base.vtable {
+                    if (i < prots.len && prots[i] == MethodProtection::PUB) {
+                        UnionMethodValidation::validateCandidate(alias context, loc, object, u, v, i, meth, inCall, ref values, ref errors);
+                    }
+                }
+            } else {
+                for i, v in uref.vtable {
+                    UnionMethodValidation::validateCandidate(alias context, loc, object, u, v, i, meth, inCall, ref values, ref errors);
+                }
+            }
+        }
+    }
+
+    /**
+     * Validate one slot of the union against the access.
+     *
+     * A method is reached by a call, a field-method by the access itself, so a
+     * slot only applies to one of the two forms.
+     *
+     * The member held is only known at runtime, so the dispatch is never
+     * direct, even for a union of records.
+     *
+     * @params:
+     *   - context: validation context
+     *   - loc:     operator location
+     *   - object:  union instance
+     *   - u:       the type of the union instance
+     *   - v:       the method of the slot
+     *   - index:   the index of the slot
+     *   - meth:    method expression
+     *   - inCall:  whether this access occurs inside a call expression
+     *   - values:  output list of valid delegates
+     *   - errors:  output list of errors
+     */
+    fn validateCandidate(dmut context:   &ValidationContext,
+                         loc:            &Word,
+                         object:         &Value,
+                         u:              &UnionType,
+                         v:              &MethodPrototypeValue,
+                         index:          usize,
+                         meth:           &VarExpr,
+                         inCall:         bool,
+                         ref mut values: [&Value],
+                         ref mut errors: [&ErrorMsg])
+    {
+        if (v.sym.path.file != meth.name.str) return;
+
+        let applicable = if inCall { !v.isField && !v.isFieldAssign } else { v.isField };
+        if !applicable return;
+
+        let caller = if inCall {
+            UnionMethodValidation::methodCaller(object, v, ref errors)
+        } else {
+            UnionMethodValidation::fieldMethodCaller(alias context, loc, object, v, ref errors)
+        };
+
+        if let Ok(c: &Value) = caller {
+            values ~= [copy MethodDelegateValue(v.loc, v, closure-> c, direct-> false, vtableIndex-> index, isStruct-> u.isRecord)];
+        }
+    }
+
+    /**
+     * Enforce the aliasing rules of a method call on a union, as they are for
+     * a class: a mutable method requires ClassAliaserValue, an immutable one
+     * forbids it.
+     *
+     * @returns:
+     *   - the value the delegate closes on, or nothing when the rules are
+     *     violated
+     */
+    fn methodCaller(object: &Value, v: &MethodPrototypeValue, ref mut errors: [&ErrorMsg])-> (&Value)? {
+        if (v.isMutable && object !of ClassAliaserValue) {
+            errors ~= [UnionMethodValidation::createMutableError(object, v)];
+            return none;
+        }
+
+        if (!v.isMutable && (object of ClassAliaserValue || object of AliaserValue)) {
+            errors ~= [copy ErrorMsg::fatal(v.loc, format(ValidateErrorMessage::CONST_METHOD, v, tags-> FormatTags(withParams-> true)),
+                                            notes-> copy [copy ErrorMsg::note(object.loc, format(ValidateErrorMessage::UNECESSARY_ALIAS, object.type))])];
+            return none;
+        }
+
+        object?
+    }
+
+    /**
+     * Enforce the aliasing rules of a field-method access on a union: the
+     * access aliases implicitly, so ':.' is forbidden whatever the mutability
+     * of the method.
+     *
+     * @returns:
+     *   - the value the delegate closes on, aliased when the method is
+     *     mutable, or nothing when the rules are violated
+     */
+    fn fieldMethodCaller(dmut context: &ValidationContext,
+                         loc:          &Word,
+                         object:       &Value,
+                         v:            &MethodPrototypeValue,
+                         ref mut errors: [&ErrorMsg])-> (&Value)?
+    {
+        if (object of ClassAliaserValue) {
+            errors ~= [copy ErrorMsg::fatal(v.loc, format(ValidateErrorMessage::FIELD_METHOD_ALIAS, v, tags-> FormatTags(withParams-> true)),
+                                            notes-> copy [copy ErrorMsg::note(object.loc, format(ValidateErrorMessage::UNECESSARY_ALIAS_FIELD_METHOD, object.type))])];
+            return none;
+        }
+
+        if !v.isMutable return object?;
+
+        {
+            let caller = AliasValidation::validate(alias context, loc, object, isClass-> true, isField-> false);
+            return caller?;
+        } catch {
+            err => {
+                errors ~= [copy ErrorMsg::fatal(v.loc, format(ValidateErrorMessage::FIELD_METHOD_MUTABLE_ALIAS, v, tags-> FormatTags(withParams-> true)),
+                                                notes-> copy [err])];
+            }
+        }
+
+        none
+    }
+
+    /**
+     * Create the error of a mutable method reached without ':.'.
+     *
+     * @returns:
+     *   - the error, naming the alias the access is missing and, when the
+     *     access used 'alias', why that is not the one a union needs
+     */
+    fn createMutableError(object: &Value, v: &MethodPrototypeValue)-> &ErrorMsg {
+        let mut notes = copy [copy ErrorMsg::note(object.loc, format(ValidateErrorMessage::IMPLICIT_ALIAS, object.type))];
+        if (object of AliaserValue) {
+            notes = notes ~ copy [copy ErrorMsg::note(object.loc,
+                                                      end-> v.loc,
+                                                      format(ValidateErrorMessage::SIMPLE_ALIAS_NOT_CLASS), oneLine-> true)];
+        }
+
+        copy ErrorMsg::fatal(v.loc, format(ValidateErrorMessage::MUTABLE_METHOD, v, tags-> FormatTags(withParams-> true)),
+                             notes-> notes)
+    }
+
+    /**
+     * Create the error of an access matching no slot of the union.
+     *
+     * @returns:
+     *   - the error, naming what each member declares for that name, or the
+     *     call the access is missing
+     */
+    fn createError(object: &Value, uref: &UnionRefType, method: &Expression, inCall: bool)-> &ErrorMsg {
+        let mut notes: [&ErrorMsg] = [];
+        if let meth: &VarExpr = method {
+            notes = if inCall {
+                UnionMethodValidation::createMemberNotes(uref, meth)
+            } else {
+                UnionMethodValidation::createCallNotes(uref, meth)
+            };
+        }
+
+        if inCall {
+            return copy ErrorMsg::fatal(method.loc, format(ValidateErrorMessage::UNION_NO_METHOD, object.type, method),
+                                        notes-> notes);
+        }
+
+        return copy ErrorMsg::fatal(method.loc, format(ValidateErrorMessage::UNION_NO_FIELD_ACCESS_METHOD, object.type, method),
+                                    notes-> notes);
+    }
+
+    /**
+     * Explain why the members of a union share no slot for a name.
+     *
+     * @returns:
+     *   - a note per member, naming the method it declares for that name or
+     *     saying that it declares none, and nothing when no member declares
+     *     it at all
+     */
+    fn createMemberNotes(uref: &UnionRefType, meth: &VarExpr)-> [&ErrorMsg] {
+        if uref.base.hasValue return []; // the callable methods are the ones of the base, not of the members
+
+        let mut notes: [&ErrorMsg] = [];
+        let mut declared = false;
+
+        for m in uref.members {
+            let name = UnionValidation::declaredType(m);
+            let pubs = UnionMethodValidation::findMethods(m, meth, isPublic-> true);
+            let prvs = UnionMethodValidation::findMethods(m, meth, isPublic-> false);
+
+            if (pubs.len == 0us && prvs.len == 0us) {
+                notes ~= [copy ErrorMsg::note(m.loc, format(ValidateErrorMessage::UNION_METHOD_NOT_IN_MEMBER, name, meth))];
+            }
+
+            for v in pubs {
+                declared = true;
+                notes ~= [copy ErrorMsg::note(v.loc, format(ValidateErrorMessage::UNION_METHOD_IN_MEMBER, name, v,
+                                                            tags-> FormatTags(withParams-> true)))];
+            }
+
+            for v in prvs {
+                declared = true;
+                notes ~= [copy ErrorMsg::note(v.loc, format(ValidateErrorMessage::UNION_METHOD_PRIVATE, name, v,
+                                                            tags-> FormatTags(withParams-> true)))];
+            }
+        }
+
+        if !declared return []; // the name is that of no method at all, there is nothing to explain
+
+        notes
+    }
+
+    /**
+     * Explain an access reading a method of the union without calling it.
+     *
+     * @returns:
+     *   - a note naming the call the access is missing, and nothing when the
+     *     name is that of no method of the union
+     */
+    fn createCallNotes(uref: &UnionRefType, meth: &VarExpr)-> [&ErrorMsg] {
+        for v in uref.vtable {
+            if (v.sym.path.file == meth.name.str && !v.isField && !v.isFieldAssign) {
+                return copy [copy ErrorMsg::note(meth.loc, format(ValidateErrorMessage::FORGET_PAR_PROTO_CALL, MultOperators::CALL), oneLine-> true)];
+            }
+        }
+
+        []
+    }
+
+    /**
+     * @returns the methods a member declares under a name, public or not
+     */
+    fn findMethods(member: &Type, meth: &VarExpr, isPublic: bool)-> [&MethodPrototypeValue] {
+        let mut res: [&MethodPrototypeValue] = [];
+        {
+            if let c: &ClassPtrType = member {
+                let cref = c.inner;
+                let prots = cref.vtableProtections;
+                for i, v in cref.vtable {
+                    if (i < prots.len && (prots[i] == MethodProtection::PUB) == isPublic && v.sym.path.file == meth.name.str) {
+                        res ~= [v];
+                    }
+                }
+            }
+        } catch {
+            _ => {} // an error generator in the member symbol, it is reported elsewhere
+        }
+
+        res
+    }
+
+    /**
+     * @returns the reference of the union, holding what is callable on it
+     *
+     * @throws:
+     *   - ErrorMsg if the union failed to validate
+     */
+    fn unionRef(u: &UnionType)-> &UnionRefType
+        throws ErrorMsg
+    {
+        match u.sym.generator {
+            r: &UnionRefType => { return r; }
+            err: &ErrorGenerator => { throw err.msg; }
+            _ => { panic; }
+        }
+    }
+
+}
