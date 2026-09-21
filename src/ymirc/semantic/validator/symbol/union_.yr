@@ -1,0 +1,365 @@
+/*
+ * Semantic validation of union declarations.
+ *
+ * <hr>
+ *
+ * @Package: ymirc
+ * @Module: ymirc::semantic::validator::symbol::union_
+ * @File: ymirc/semantic/validator/symbol/union_.yr
+ * @Author(s):
+ *   - Emile Cadorel <ecadorel@gmail.com>
+ *
+ * @Created(YYYY-MM-DD): 2026-09-21
+ * @Copyright(C) 2021–2026 GNU-Ymir
+ * @License
+ *   ```text
+ *   This file is part of the Ymir language project.
+ *
+ *   Ymir is free software: you can redistribute it and/or modify it
+ *   under the terms of the GNU General Public License as published by
+ *   the Free Software Foundation, either version 3 of the License, or
+ *   (at your option) any later version.
+ *
+ *   Ymir is distributed in the hope that it will be useful,
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *   GNU General Public License for more details.
+ *
+ *   You should have received a copy of the GNU General Public License
+ *   along with Ymir.  If not, see <https://www.gnu.org/licenses/>.
+ *   ```
+ */
+
+in union_;
+
+use ymirc::errors;
+use ymirc::lexing::word;
+use ymirc::semantic::symbol;
+use ymirc::semantic::generator::{type::_, value};
+use ymirc::syntax::expression::empty;
+use ymirc::utils::{format, log};
+
+/**
+ * UnionValidation module
+ *
+ * Provides semantic validation for union declarations. Responsibilities:
+ *
+ *   - validate the member types,
+ *   - enforce that every member is a record, or that every member is a class,
+ *   - reject the degenerate declarations(no member, duplicated member, union
+ *     member),
+ *   - validate the declared base class and verify that every member descends
+ *     from it,
+ *   - detect forward-reference cycles,
+ *   - construct the UnionType generator.
+ */
+pub mod UnionValidation {
+
+    /**
+     * Validate a union symbol and return its UnionType.
+     *
+     * @params:
+     *   - context: validation context
+     *   - sym:     UnionSymbol to validate
+     *
+     * @returns:
+     *   - the UnionType generated for the union
+     *
+     * @throws:
+     *   - ErrorMsg if validation fails
+     */
+    pub fn validate(dmut context: &ValidationContext, dmut sym: &UnionSymbol)-> &UnionRefType
+        throws ErrorMsg
+    {
+        if (!UnionValidation::checkValidation(context, sym)) {
+            UnionValidation::validateContent(alias context, alias sym);
+        }
+
+        match sym.generator {
+            r: &UnionRefType => {
+                return r;
+            }
+            err: &ErrorGenerator => {
+                throw err.msg;
+            }
+            _ => {
+                panic;
+            }
+        }
+    }
+
+    /**
+     * Validate the full content of a union declaration.
+     *
+     * The generator is set to the UnionType as soon as the members are known,
+     * so that a later failure(the base class) still leaves a type behind for
+     * the diagnostics to name.
+     *
+     * @params:
+     *   - context: validation context
+     *   - sym:     UnionSymbol
+     */
+    fn validateContent(dmut context: &ValidationContext, dmut sym: &UnionSymbol) {
+        logging::info("Validate union %", sym.path);
+
+        sym.generator = copy ErrorGenerator(sym.loc, copy ErrorMsg::fatal(sym.loc, ValidateErrorMessage::FORWARD_REFERENCE_TYPE));
+        context.unionContext:.insert(sym);
+
+        context:.pushReferent(alias sym);
+        context:.enterForeign(isFnBody-> false);
+        {
+            let (members, locs, mut errors) = UnionValidation::validateMembers(alias context, alias sym);
+
+            sym.types = members;
+            sym.generator = copy UnionRefType(sym.loc, sym, members,
+                                              isRecord-> (members.len == 0us || UnionValidation::isRecordMember(members[0])));
+
+            errors ~= UnionValidation::validateBase(alias context, alias sym, members, locs);
+            if (errors.len != 0us) {
+                throw copy ErrorMsg::list(errors);
+            }
+        } catch {
+            err => {
+                sym.generator = copy ErrorGenerator(sym.loc, copy ErrorMsg::fatal(sym.loc, format(ValidateErrorMessage::VALIDATING_SYMBOL, sym.path.toStr()),
+                                                                                  notes-> copy [err]));
+            }
+        } exit {
+            context:.exitForeign();
+            context:.popReferent();
+        }
+
+        context.unionContext:.remove(sym);
+    }
+
+    /**
+     * Validate the member list of a union.
+     *
+     * Every member is validated, so that a declaration with several invalid
+     * members reports them all. A member that fails is simply absent from the
+     * result, the members that follow being validated all the same.
+     *
+     * @params:
+     *   - context: validation context
+     *   - sym:     UnionSymbol
+     *
+     * @returns:
+     *   - the accepted member types, their locations, and the errors raised
+     */
+    fn validateMembers(dmut context: &ValidationContext, dmut sym: &UnionSymbol)-> ([&Type], [&Word], [&ErrorMsg]) {
+        let mut members: [&Type] = [];
+        let mut locs: [&Word] = [];
+        let mut errors: [&ErrorMsg] = [];
+
+        if (sym.decl.types.len == 0us) {
+            errors ~= [copy ErrorMsg::fatal(sym.loc, format(ValidateErrorMessage::UNION_EMPTY, sym.path.toStr()))];
+            return (members, locs, errors);
+        }
+
+        for m in sym.decl.types {
+            {
+                let type = TypeValidation::validate(alias context, m, parentMutable-> false);
+                let member = UnionValidation::validateMemberKind(m.loc, type);
+
+                match UnionValidation::findMember(members, member) {
+                    Ok(i: usize) => {
+                        errors ~= [copy ErrorMsg::fatal(m.loc, format(ValidateErrorMessage::UNION_DUPLICATE_MEMBER, sym.path.toStr(), UnionValidation::declaredType(member)),
+                                                        notes-> copy [copy ErrorMsg::note(locs[i], "")])];
+                    }
+                    _ => {
+                        members ~= [member];
+                        locs ~= [m.loc];
+                    }
+                }
+            } catch {
+                err => {
+                    errors ~= [err];
+                }
+            }
+        }
+
+        errors ~= UnionValidation::verifyMemberKinds(sym, members, locs);
+
+        return (members, locs, errors);
+    }
+
+    /**
+     * Verify that a union member is a record or a class, and normalize it.
+     *
+     * A class member is held as a pointer inside the union, so a class
+     * reference is turned into an instance of it. A member is stored deeply
+     * mutable, the mutability of the union itself gating it as the mutability
+     * of a record gates the type of its fields: the member list carries what a
+     * member can be accessed as, not what it is accessed as here.
+     *
+     * @params:
+     *   - loc:  the location of the member expression
+     *   - type: the validated type of the member
+     *
+     * @returns:
+     *   - the type stored for that member
+     *
+     * @throws:
+     *   - ErrorMsg if the type is neither a record nor a class
+     */
+    fn validateMemberKind(loc: &Word, type: &Type)-> &Type
+        throws ErrorMsg
+    {
+        if let c: &ClassRefType = type && !c.sym.isStruct {
+            return c.createInstance(loc-> loc, isMutable-> true, isInnerMutable-> true);
+        }
+
+        if let c: &ClassPtrType = type && (c.isRecord || !c.isStruct) {
+            return c.toDeeplyMutable();
+        }
+
+        if let u: &UnionRefType = type {
+            throw copy ErrorMsg::fatal(loc, format(ValidateErrorMessage::UNION_MEMBER_IN_UNION),
+                                       notes-> copy [copy ErrorMsg::note(u.sym.loc, "")]);
+        }
+
+        if let u: &UnionType = type {
+            throw copy ErrorMsg::fatal(loc, format(ValidateErrorMessage::UNION_MEMBER_IN_UNION),
+                                       notes-> copy [copy ErrorMsg::note(u.sym.loc, "")]);
+        }
+
+        if let c: &ClassPtrType = type && c.isEntity {
+            throw copy ErrorMsg::fatal(loc, format(ValidateErrorMessage::UNION_MEMBER_NOT_RECORD_NOR_CLASS, type),
+                                       notes-> copy [copy ErrorMsg::note(c.loc, format(ValidateErrorMessage::IS_AN_ENTITY, type), oneLine-> true)]);
+        }
+
+        throw copy ErrorMsg::fatal(loc, format(ValidateErrorMessage::UNION_MEMBER_NOT_RECORD_NOR_CLASS, type));
+    }
+
+    /**
+     * Verify that the members of a union are all records, or all classes.
+     *
+     * @returns:
+     *   - the error raised by the first member whose kind differs from the
+     *     kind of the first member, or nothing
+     */
+    fn verifyMemberKinds(sym: &UnionSymbol, members: [&Type], locs: [&Word])-> [&ErrorMsg] {
+        if (members.len <= 1us) return [];
+
+        let isRecord = UnionValidation::isRecordMember(members[0]);
+        for i in 1us .. members.len {
+            if (UnionValidation::isRecordMember(members[i]) != isRecord) {
+                return copy [copy ErrorMsg::fatal(locs[i], format(ValidateErrorMessage::UNION_MIXED_MEMBERS, sym.path.toStr()),
+                                                  notes-> copy [copy ErrorMsg::note(locs[0], "")])];
+            }
+        }
+
+        []
+    }
+
+    /**
+     * Validate the base class of a union, and verify that every member
+     * descends from it.
+     *
+     * A union of records has no vtable of its own to inherit, so `over` on one
+     * is an error, the note naming the member that makes it a union of
+     * records.
+     *
+     * @params:
+     *   - context: validation context
+     *   - sym:     UnionSymbol
+     *   - members: the accepted member types
+     *   - locs:    the location of each member
+     *
+     * @returns:
+     *   - the errors raised by the base declaration
+     */
+    fn validateBase(dmut context: &ValidationContext, dmut sym: &UnionSymbol, members: [&Type], locs: [&Word])-> [&ErrorMsg] {
+        if sym.decl.ancestor of EmptyExpr return [];
+
+        let mut errors: [&ErrorMsg] = [];
+        {
+            if (members.len != 0us && UnionValidation::isRecordMember(members[0])) {
+                throw copy ErrorMsg::fatal(sym.decl.ancestor.loc, format(ValidateErrorMessage::UNION_BASE_ON_RECORD),
+                                           notes-> copy [copy ErrorMsg::note(locs[0], format(ValidateErrorMessage::IS_A_RECORD, UnionValidation::declaredType(members[0])))]);
+            }
+
+            let base = TypeValidation::validate(alias context, sym.decl.ancestor, parentMutable-> false);
+            UnionValidation::verifyBaseIsClass(sym.decl.ancestor.loc, base);
+
+            for i in 0us .. members.len {
+                if (!TypeVerification::isAncestor(base, members[i])) {
+                    errors ~= [copy ErrorMsg::fatal(locs[i], format(ValidateErrorMessage::NOT_ANCESTOR, base, UnionValidation::declaredType(members[i])))];
+                }
+            }
+        } catch {
+            err => {
+                errors ~= [err];
+            }
+        }
+
+        errors
+    }
+
+    /**
+     * Verify that the base declared by a union is a class type.
+     *
+     * @throws:
+     *   - ErrorMsg if it is anything else
+     */
+    fn verifyBaseIsClass(loc: &Word, base: &Type)
+        throws ErrorMsg
+    {
+        if let c: &ClassRefType = base && !c.sym.isStruct return;
+        if let c: &ClassPtrType = base && !c.isStruct return;
+
+        throw copy ErrorMsg::fatal(loc, format(ValidateErrorMessage::NOT_A_CLASS, base));
+    }
+
+    /**
+     * @returns a member type as its declaration named it, a member being stored
+     * deeply mutable and a class member as the pointer holding it
+     */
+    fn declaredType(member: &Type)-> &Type {
+        if let c: &ClassPtrType = member && !c.isStruct {
+            {
+                return c.inner;
+            } catch {
+                _ => {}
+            }
+        }
+
+        member.clone(0u32)
+    }
+
+    /**
+     * @returns the index of 'member' in 'members', or nothing when absent
+     */
+    fn findMember(members: [&Type], member: &Type)-> (usize)? {
+        for i in 0us .. members.len {
+            if (members[i] == member) return i?;
+        }
+
+        none
+    }
+
+    /**
+     * @returns true iff the member type is a record
+     */
+    fn isRecordMember(member: &Type)-> bool {
+        if let c: &ClassPtrType = member {
+            return c.isRecord;
+        }
+
+        false
+    }
+
+    /**
+     * Determine whether a union is already validated or in validation.
+     *
+     * @returns:
+     *   - true if the union is already validated or in validation,
+     *   - false otherwise
+     */
+    fn checkValidation(context: &ValidationContext, sym: &UnionSymbol)-> bool {
+        if sym.generator of EmptyGenerator {
+            return sym in context.unionContext;
+        }
+
+        return true;
+    }
+}
