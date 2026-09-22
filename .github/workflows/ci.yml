@@ -36,6 +36,10 @@ jobs:
   build:
     name: Build ymirc.test
     runs-on: [self-hosted, linux, x64]
+    # Only for the check run below; every other job of this workflow reads and nothing more.
+    permissions:
+      contents: read
+      checks: write
     steps:
       - uses: actions/checkout@v7
 
@@ -44,6 +48,52 @@ jobs:
         with:
           tag: ${{ env.IMAGE }}
           cache-to: "true"
+
+      # A warning is reported rather than thrown in debug, which is how the image compiles, so
+      # without this the build is green and the warning is only noticed by the next release,
+      # where the same diagnostic is fatal.
+      - name: Annotate the compiler warnings
+        id: warnings
+        run: |
+          set -euo pipefail
+
+          # Read back out of the image rather than off the step above: that layer is cached
+          # across runs and prints nothing at all when it hits, while the log inside it is
+          # whatever the compile that produced the layer wrote.
+          if ! docker run --rm "$IMAGE" cat build.log > build.log; then
+            echo "::notice::this image carries no build log - nothing to report"
+            echo "count=0" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          bash .github/scripts/build-warnings.sh build.log
+
+      # The self-hosted runners have no gh CLI of their own.
+      - uses: ./.github/actions/setup-gh
+        if: steps.warnings.outputs.count != '0'
+
+      # A job's own conclusion is only ever success/failure/cancelled/skipped, so the one status
+      # that says "built, but not cleanly" has to be a check run of its own. A fork's token is
+      # read-only and cannot publish one, hence the guard: the annotations above are what such a
+      # PR gets.
+      - name: Publish the warning check
+        if: steps.warnings.outputs.count != '0' && github.event.pull_request.head.repo.fork != true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          COUNT: ${{ steps.warnings.outputs.count }}
+          # On a pull request github.sha is the merge commit, which is not what the PR lists its
+          # checks against; the head commit is.
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          set -euo pipefail
+          gh api -X POST "repos/${GITHUB_REPOSITORY}/check-runs" \
+              -f name='Compiler warnings' \
+              -f head_sha="$HEAD_SHA" \
+              -f status=completed \
+              -f conclusion=neutral \
+              -f "output[title]=${COUNT} compiler warning(s)" \
+              -F "output[summary]=@build-warnings.md" \
+              --jq .html_url
 
   shard:
     name: ${{ matrix.shard }}
