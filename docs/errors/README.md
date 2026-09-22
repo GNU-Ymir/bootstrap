@@ -26,7 +26,7 @@ check lives:
 | `E1xxx` | lexing | `LexingErrorMessage` -- `src/ymirc/lexing/errors.yr` | 24 |
 | `E2xxx` | parsing | `SyntaxErrorMessage` -- `src/ymirc/syntax/errors.yr` | 11 |
 | `E3xxx` | declaration | `DeclareErrorMessage` -- `src/ymirc/semantic/declarator/errors.yr` | 34 |
-| `E4xxx` | validation | `ValidateErrorMessage` -- `src/ymirc/semantic/validator/errors.yr` | 264 |
+| `E4xxx` | validation | `ValidateErrorMessage` -- `src/ymirc/semantic/validator/errors.yr` | 265 |
 | `E5xxx` | lowering (YIL) | `SerializeYILErrorMessage` -- `src/ymirc/lint/serialize/errors.yr` | 10 |
 
 Each page carries an example wherever a case in the suite raises the code: the
@@ -344,6 +344,7 @@ deliberately carry no code, and have no page here.
 | [E4311](E4311.md) | `UNION_MIXED_MEMBERS` | union <> mixes record and class members |
 | [E4312](E4312.md) | `UNION_NO_METHOD` | union <> has no method named <> |
 | [E4313](E4313.md) | `UNION_NARROWING` | union <> cannot be converted to <> |
+| [E4317](E4317.md) | `UNION_NOT_IMPL` | union <> does not implement trait <> |
 | [E4256](E4256.md) | `UNKNOWN_AT_COMPILE_TIME` | value of type <> is needed but unknown at compilation time |
 | [E4257](E4257.md) | `UNKNOWN_LENGTH_OF_EXPANSION` | unknown length of expansion for type <> |
 | [E4258](E4258.md) | `UNKNOWN_PRAGMA` | unknown __pragma expression <> |
