@@ -26,7 +26,7 @@ check lives:
 | `E1xxx` | lexing | `LexingErrorMessage` -- `src/ymirc/lexing/errors.yr` | 24 |
 | `E2xxx` | parsing | `SyntaxErrorMessage` -- `src/ymirc/syntax/errors.yr` | 11 |
 | `E3xxx` | declaration | `DeclareErrorMessage` -- `src/ymirc/semantic/declarator/errors.yr` | 34 |
-| `E4xxx` | validation | `ValidateErrorMessage` -- `src/ymirc/semantic/validator/errors.yr` | 261 |
+| `E4xxx` | validation | `ValidateErrorMessage` -- `src/ymirc/semantic/validator/errors.yr` | 264 |
 | `E5xxx` | lowering (YIL) | `SerializeYILErrorMessage` -- `src/ymirc/lint/serialize/errors.yr` | 10 |
 
 Each page carries an example wherever a case in the suite raises the code: the
@@ -265,6 +265,7 @@ deliberately carry no code, and have no page here.
 | [E4157](E4157.md) | `NOT_A_LVALUE_TYPE` | value of type <> is not a lvalue |
 | [E4162](E4162.md) | `NOT_A_TRAIT` | <> is not a trait |
 | [E4163](E4163.md) | `NOT_A_TUPLE` | <> is not a tuple type |
+| [E4315](E4315.md) | `NOT_A_UNION` | <> is not a union type |
 | [E4165](E4165.md) | `NOT_MOVABLE` | type <> is not a movable type |
 | [E4166](E4166.md) | `NOT_UNSAFE` | an unsafe context is entered, but no unsafe operations are made |
 | [E4167](E4167.md) | `NO_COPY_EXIST` | no copy exists for type <> |
@@ -339,6 +340,7 @@ deliberately carry no code, and have no page here.
 | [E4308](E4308.md) | `UNION_EMPTY` | union <> declares no member |
 | [E4309](E4309.md) | `UNION_MEMBER_IN_UNION` | a union cannot be a member of another union |
 | [E4310](E4310.md) | `UNION_MEMBER_NOT_RECORD_NOR_CLASS` | the member of a union must be a record or a class type, not <> |
+| [E4314](E4314.md) | `UNION_MEMBER_UNKNOWN` | union <> does not list the member <> |
 | [E4311](E4311.md) | `UNION_MIXED_MEMBERS` | union <> mixes record and class members |
 | [E4312](E4312.md) | `UNION_NO_METHOD` | union <> has no method named <> |
 | [E4313](E4313.md) | `UNION_NARROWING` | union <> cannot be converted to <> |
@@ -449,6 +451,7 @@ ever reused.
 | [E4159](E4159.md) | `NOT_A_RECORD` | <> is not a record type |
 | [E4160](E4160.md) | `NOT_A_SLICE` | <> is not a slice type |
 | [E4161](E4161.md) | `NOT_AN_ENTITY` | <> is not an entity type |
+| [E4316](E4316.md) | `NOT_AN_ENUM` | <> is not an enum type |
 | [E4164](E4164.md) | `NOT_AN_UNION` | <> is not a union type |
 | [E4170](E4170.md) | `NO_DEFAULT_CTOR_MOVE_STRUCT` | type <> is an entity, but has no default ctor self() |
 | [E4174](E4174.md) | `ONE_ITER_LOOP` | do while loop test is always false, the loop is always entered exactly once, so the branching construct is useless |
