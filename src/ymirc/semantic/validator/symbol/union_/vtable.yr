@@ -1,0 +1,183 @@
+/*
+ * Computation of the vtable of a union declaration.
+ *
+ * <hr>
+ *
+ * @Package: ymirc
+ * @Module: ymirc::semantic::validator::symbol::union_::vtable
+ * @File: ymirc/semantic/validator/symbol/union_/vtable.yr
+ * @Author(s):
+ *   - Emile Cadorel <ecadorel@gmail.com>
+ *
+ * @Created(YYYY-MM-DD): 2026-09-21
+ * @Copyright(C) 2021–2026 GNU-Ymir
+ * @License
+ *   ```text
+ *   This file is part of the Ymir language project.
+ *
+ *   Ymir is free software: you can redistribute it and/or modify it
+ *   under the terms of the GNU General Public License as published by
+ *   the Free Software Foundation, either version 3 of the License, or
+ *   (at your option) any later version.
+ *
+ *   Ymir is distributed in the hope that it will be useful,
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *   GNU General Public License for more details.
+ *
+ *   You should have received a copy of the GNU General Public License
+ *   along with Ymir.  If not, see <https://www.gnu.org/licenses/>.
+ *   ```
+ */
+
+in vtable;
+
+use ymirc::semantic::generator::type::_;
+use ymirc::semantic::generator::value::prototype;
+use ymirc::semantic::validator::symbol::class_::method::verif;
+
+/**
+ * UnionVtableValidation module
+ *
+ * Computes what can be called on a union without matching it.
+ *
+ * A union declaring a base needs nothing computed: every member descends from
+ * it, so every method callable on the base is callable on the union, and the
+ * slot holds the member's own class vtable.
+ *
+ * Without a base, the callable API is what the members agree on: a method
+ * every one of them declares publicly under the same name with an identical
+ * signature. The result is one table per member, all of the same length, so
+ * that a call selects a slot and the member held decides the implementation.
+ * That table is not a class vtable and is narrower than one, which is why the
+ * same mechanism serves a union of records -- records have no vtable of their
+ * own, but their methods are collected in the same place.
+ *
+ * A union whose members agree on nothing gets an empty table, which is not an
+ * error: the union is then only usable through a match.
+ */
+pub mod UnionVtableValidation {
+
+    /**
+     * Compute the vtable of a union and install it into its reference.
+     *
+     * @params:
+     *   - uref:    the union reference to fill
+     *   - members: the accepted member types, in declaration order
+     */
+    pub fn validate(dmut uref: &UnionRefType, members: [&Type]) {
+        if uref.base.hasValue return; // the base already provides a vtable for every member
+
+        let mut slots: [&MethodPrototypeValue] = [];
+
+        // one row per retained method, holding the implementation of every member
+        let mut rows: [[&MethodPrototypeValue]] = [];
+
+        if (members.len != 0us) {
+            for cand in UnionVtableValidation::callableMethods(members[0]) {
+                let found = UnionVtableValidation::findInEveryMember(members, cand);
+                if (found.len == members.len) {
+                    slots ~= [UnionVtableValidation::slotOf(uref, cand)];
+                    rows ~= [found];
+                }
+            }
+        }
+
+        // the rows are transposed into one table per member, as the union holds
+        // one member and dispatches through its own table
+        let mut tables: [[&MethodPrototypeValue]] = [];
+        for m in 0us .. members.len {
+            let mut table: [&MethodPrototypeValue] = [];
+            for r in rows {
+                table ~= [r[m]];
+            }
+
+            tables ~= [table];
+        }
+
+        uref:.setVtable(slots, tables);
+    }
+
+    /**
+     * @returns 'cand' named after the union instead of after the member it was
+     * collected from, the implementation reached through the slot being the one
+     * of the member held at runtime
+     */
+    fn slotOf(uref: &UnionRefType, cand: &MethodPrototypeValue)-> &MethodPrototypeValue {
+        copy UnionMethodPrototypeValue(uref.sym.path.push(cand.sym.path.file), cand)
+    }
+
+    /**
+     * @returns the implementation each member provides for 'cand', or nothing
+     * when one of them does not declare it
+     */
+    fn findInEveryMember(members: [&Type], cand: &MethodPrototypeValue)-> [&MethodPrototypeValue] {
+        let mut found: [&MethodPrototypeValue] = [];
+        for m in members {
+            match UnionVtableValidation::findMethod(m, cand) {
+                Ok(meth: &MethodPrototypeValue) => {
+                    found ~= [meth];
+                }
+                _ => {
+                    return [];
+                }
+            }
+        }
+
+        found
+    }
+
+    /**
+     * @returns the method of 'member' matching 'cand' by name and signature,
+     * or nothing
+     */
+    fn findMethod(member: &Type, cand: &MethodPrototypeValue)-> (&MethodPrototypeValue)? {
+        for meth in UnionVtableValidation::callableMethods(member) {
+            if UnionVtableValidation::sameSignature(cand, meth) {
+                return meth?;
+            }
+        }
+
+        none
+    }
+
+    /**
+     * @returns the methods of a member that a union can dispatch to.
+     *
+     * A method has to be public to be callable on the union, and has to have a
+     * body -- an abstract method names no implementation to put in the table.
+     */
+    fn callableMethods(member: &Type)-> [&MethodPrototypeValue] {
+        let mut res: [&MethodPrototypeValue] = [];
+        {
+            if let c: &ClassPtrType = member {
+                let cref = c.inner;
+                let prots = cref.vtableProtections;
+                for i, meth in cref.vtable {
+                    if (i < prots.len && prots[i] == MethodProtection::PUB && !meth.isEmpty) {
+                        res ~= [meth];
+                    }
+                }
+            }
+        } catch {
+            _ => {} // an error generator in the member symbol, it is reported elsewhere
+        }
+
+        res
+    }
+
+    /**
+     * @returns true iff two methods have an identical signature.
+     *
+     * ClassMethodVerification::areSimilar compares the name, the mutability of
+     * 'self' and the parameters. A union dispatches on the slot and hands the
+     * result back with one type, so the return type has to match too.
+     */
+    fn sameSignature(left: &MethodPrototypeValue, right: &MethodPrototypeValue)-> bool {
+        if (!ClassMethodVerification::areSimilar(left, right)) return false;
+
+        if (left.retType != right.retType) return false;
+
+        return left.retType.sameMutability(right.retType);
+    }
+}
