@@ -285,8 +285,10 @@ pub mod TemplateExplicitOfVarSolving {
      * Solve a template parameter of the form:
      *     T impl X
      *
+     * T is bound to a class, or to a union, implementing the trait.
+     *
      * @throws:
-     *   - NOT_A_CLASS if expected type is not a class pointer.
+     *   - NOT_A_CLASS if expected type is neither a class pointer nor a union.
      */
     fn solveImpl(dmut context: &ValidationContext,
                  alls:         [&Expression],
@@ -299,15 +301,21 @@ pub mod TemplateExplicitOfVarSolving {
         }
 
         if let t: &Type = types[0] {
-            if let c: &ClassPtrType = TypeCreation::createEnumUnwrap(t) {
-                let mapper = TemplateExplicitOfVarSolving::solveImplClass(alias context, alls, ofV, c);
+            let unwrapped = TypeCreation::createEnumUnwrap(t);
+            let mapper = match unwrapped {
+                c: &ClassPtrType => { TemplateExplicitOfVarSolving::solveImplClass(alias context, alls, ofV, c) }
+                u: &UnionType    => { TemplateExplicitOfVarSolving::solveImplUnion(alias context, alls, ofV, u) }
+                _                => {
+                    throw copy ErrorMsg::fatal(types[0].loc, format(ValidateErrorMessage::NOT_A_CLASS, types[0]),
+                                               notes-> copy [copy ErrorMsg::note(ofV.loc, "")]);
+                }
+            };
 
-                let dmut retMapper = TemplateMapper(score-> TemplateScore::VAR);
-                retMapper:.merge(mapper);
-                retMapper:.insert(ofV.name.str, TemplateSolvingUtils::createTypeWrapper(ofV.loc, c));
+            let dmut retMapper = TemplateMapper(score-> TemplateScore::VAR);
+            retMapper:.merge(mapper);
+            retMapper:.insert(ofV.name.str, TemplateSolvingUtils::createTypeWrapper(ofV.loc, unwrapped));
 
-                return TemplateSolution(retMapper, 1);
-            }
+            return TemplateSolution(retMapper, 1);
         }
 
         throw copy ErrorMsg::fatal(types[0].loc, format(ValidateErrorMessage::NOT_A_CLASS, types[0]),
@@ -315,7 +323,7 @@ pub mod TemplateExplicitOfVarSolving {
     }
 
     /**
-     * Solve trait implementation constraints for “impl”.
+     * Solve trait implementation constraints for “impl” on a class.
      *
      */
     fn solveImplClass(dmut context: &ValidationContext,
@@ -324,28 +332,102 @@ pub mod TemplateExplicitOfVarSolving {
                       cptr:         &ClassPtrType)-> TemplateMapper
         throws ErrorMsg
     {
-        let inner = cptr.inner;
-        let mut errors: [mut &ErrorMsg] = [];
-        let mut retMapper = TemplateMapper(score-> TemplateScore::TYPE);
-        let trs = inner.allImplementedTraits;
+        let mut errors: [&ErrorMsg] = [];
+        if let Ok(mapper) = TemplateExplicitOfVarSolving::solveImplTraits(alias context, alls, ofV, cptr, cptr.inner.allImplementedTraits, ref errors) {
+            return mapper;
+        }
 
-        for i in 0 .. trs.len {
+        throw copy ErrorMsg::fatal(ofV.loc, format(ValidateErrorMessage::CLASS_NOT_IMPL, cptr, ofV.spec),
+                                   notes-> errors);
+    }
+
+    /**
+     * Solve trait implementation constraints for “impl” on a union, which
+     * implements the traits all its members implement, or those of its base
+     * when it declares one.
+     *
+     * @throws:
+     *   - UNION_NOT_IMPL, noting the base or the members that do not implement
+     *     the trait.
+     */
+    fn solveImplUnion(dmut context: &ValidationContext,
+                      alls:         [&Expression],
+                      ofV:          &TemplateOfVarExpr,
+                      u:            &UnionType)-> TemplateMapper
+        throws ErrorMsg
+    {
+        let uref = UnionValidation::reference(u);
+        let mut errors: [&ErrorMsg] = [];
+        if let Ok(mapper) = TemplateExplicitOfVarSolving::solveImplTraits(alias context, alls, ofV, u, uref.allImplementedTraits, ref errors) {
+            return mapper;
+        }
+
+        throw copy ErrorMsg::fatal(ofV.loc, format(ValidateErrorMessage::UNION_NOT_IMPL, u.sym.path.toStr(), ofV.spec),
+                                   notes-> errors ~ TemplateExplicitOfVarSolving::createUnionImplNotes(alias context, alls, ofV, uref));
+    }
+
+    /**
+     * Solve the trait of an “impl” against the traits a type implements.
+     *
+     * @returns:
+     *   - the mapper of the first trait matching, or nothing, 'errors' then
+     *     holding why each trait failed
+     */
+    fn solveImplTraits(dmut context:   &ValidationContext,
+                       alls:           [&Expression],
+                       ofV:            &TemplateOfVarExpr,
+                       type:           &Type,
+                       trs:            [&TraitRefType],
+                       ref mut errors: [&ErrorMsg])-> (TemplateMapper)?
+    {
+        for i in 0us .. trs.len {
             {
-                let local = TemplateExplicitOfVarSolving::solveOfSpec(alias context, ofV.name, alls, ofV.spec, trs[i .. i + 1]);
+                let local = TemplateExplicitOfVarSolving::solveOfSpec(alias context, ofV.name, alls, ofV.spec, trs[i .. i + 1us]);
                 let finalType = TemplateRewriting::rewrite(local.mapper, ofV.spec);
                 let ofType = TypeValidation::validate(alias context, finalType);
-                TypeVerification::verifyImplement(ofV.loc, cptr, ofType);
+                TypeVerification::verifyImplement(ofV.loc, type, ofType);
 
+                let mut retMapper = TemplateMapper(score-> TemplateScore::TYPE);
                 retMapper:.merge(local.mapper);
-                return retMapper;
+                return retMapper?;
             } catch {
-                err => {
+                err: &ErrorMsg => {
                     errors ~= [err];
                 }
             }
         }
 
-        throw copy ErrorMsg::fatal(ofV.loc, format(ValidateErrorMessage::CLASS_NOT_IMPL, cptr, ofV.spec),
-                                   notes-> errors);
+        none
+    }
+
+    /**
+     * @returns a note on the base of a union when it does not implement the
+     * trait of an “impl”, or else a note on each member that does not
+     */
+    fn createUnionImplNotes(dmut context: &ValidationContext,
+                            alls:         [&Expression],
+                            ofV:          &TemplateOfVarExpr,
+                            uref:         &UnionRefType)-> [&ErrorMsg]
+        throws ErrorMsg
+    {
+        let mut ignored: [&ErrorMsg] = [];
+        if let Ok(b) = uref.base {
+            let bptr = b.createInstance(loc-> b.loc, isMutable-> false, isInnerMutable-> false);
+            if TemplateExplicitOfVarSolving::solveImplTraits(alias context, alls, ofV, bptr, b.allImplementedTraits, ref ignored).hasValue {
+                return [];
+            }
+
+            return copy [copy ErrorMsg::note(uref.sym.decl.ancestor.loc, format(ValidateErrorMessage::UNION_BASE_NOT_IMPL, b, ofV.spec))];
+        }
+
+        let mut notes: [&ErrorMsg] = [];
+        for i, m in uref.members if let c: &ClassPtrType = m {
+            if !TemplateExplicitOfVarSolving::solveImplTraits(alias context, alls, ofV, c, c.inner.allImplementedTraits, ref ignored).hasValue {
+                notes ~= [copy ErrorMsg::note(uref.sym.decl.types[i].loc,
+                                              format(ValidateErrorMessage::UNION_MEMBER_NOT_IMPL, UnionValidation::declaredType(m), ofV.spec))];
+            }
+        }
+
+        notes
     }
 }
