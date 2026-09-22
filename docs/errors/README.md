@@ -26,7 +26,7 @@ check lives:
 | `E1xxx` | lexing | `LexingErrorMessage` -- `src/ymirc/lexing/errors.yr` | 24 |
 | `E2xxx` | parsing | `SyntaxErrorMessage` -- `src/ymirc/syntax/errors.yr` | 11 |
 | `E3xxx` | declaration | `DeclareErrorMessage` -- `src/ymirc/semantic/declarator/errors.yr` | 34 |
-| `E4xxx` | validation | `ValidateErrorMessage` -- `src/ymirc/semantic/validator/errors.yr` | 253 |
+| `E4xxx` | validation | `ValidateErrorMessage` -- `src/ymirc/semantic/validator/errors.yr` | 259 |
 | `E5xxx` | lowering (YIL) | `SerializeYILErrorMessage` -- `src/ymirc/lint/serialize/errors.yr` | 10 |
 
 Each page carries an example wherever a case in the suite raises the code: the
@@ -334,6 +334,12 @@ deliberately carry no code, and have no page here.
 | [E4251](E4251.md) | `UNECESSARY_MOVE` | the move has no effect |
 | [E4252](E4252.md) | `UNECESSARY_REFERENCE` | referencing the value has no effect |
 | [E4253](E4253.md) | `UNINIT_FIELD` | the field <> has no initial value |
+| [E4306](E4306.md) | `UNION_BASE_ON_RECORD` | over is prohibited on a union of records |
+| [E4307](E4307.md) | `UNION_DUPLICATE_MEMBER` | union <> declares the member <> twice |
+| [E4308](E4308.md) | `UNION_EMPTY` | union <> declares no member |
+| [E4309](E4309.md) | `UNION_MEMBER_IN_UNION` | a union cannot be a member of another union |
+| [E4310](E4310.md) | `UNION_MEMBER_NOT_RECORD_NOR_CLASS` | the member of a union must be a record or a class type, not <> |
+| [E4311](E4311.md) | `UNION_MIXED_MEMBERS` | union <> mixes record and class members |
 | [E4256](E4256.md) | `UNKNOWN_AT_COMPILE_TIME` | value of type <> is needed but unknown at compilation time |
 | [E4257](E4257.md) | `UNKNOWN_LENGTH_OF_EXPANSION` | unknown length of expansion for type <> |
 | [E4258](E4258.md) | `UNKNOWN_PRAGMA` | unknown __pragma expression <> |

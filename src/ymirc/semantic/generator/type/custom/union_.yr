@@ -1,0 +1,359 @@
+/*
+ * Declares the UnionType class.
+ *
+ * <hr>
+ *
+ * @Package: ymirc
+ * @Module: ymirc::semantic::generator::type::custom::union_
+ * @File: ymirc/semantic/generator/type/custom/union_.yr
+ * @Author(s):
+ *   - Emile Cadorel <ecadorel@gmail.com>
+ *
+ * @Created(YYYY-MM-DD): 2026-09-21
+ * @Copyright(C) 2021–2026 GNU-Ymir
+ * @License
+ *   ```text
+ *   This file is part of the Ymir language project.
+ *
+ *   Ymir is free software: you can redistribute it and/or modify it
+ *   under the terms of the GNU General Public License as published by
+ *   the Free Software Foundation, either version 3 of the License, or
+ *   (at your option) any later version.
+ *
+ *   Ymir is distributed in the hope that it will be useful,
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *   GNU General Public License for more details.
+ *
+ *   You should have received a copy of the GNU General Public License
+ *   along with Ymir.  If not, see <https://www.gnu.org/licenses/>.
+ *   ```
+ */
+
+
+in union_;
+
+use ymirc::lexing::{keys, tokens, word};
+use ymirc::semantic::symbol;
+use ymirc::utils::{comparison, format};
+
+use std::stream;
+
+
+/**
+ * Native union type.
+ *
+ * UnionType represents a value of a union defined in user code, holding
+ * exactly one of the record types, or one of the class types, listed by its
+ * declaration.
+ *
+ * Whatever the kind of its members, the union object is a three field
+ * aggregate: the index of the member held, the vtable of the methods callable
+ * whichever member is held, and an overlay of the members.
+ *
+ * How that object is reached follows the kind of its members, as it does for a
+ * record and a class:
+ *   - a union of records is the object itself, a value type with one level of
+ *     mutability,
+ *   - a union of classes is a pointer to it, written `&U`, with two levels:
+ *     `mut &(mut U)` is a mutable pointer to a mutable union object.
+ *
+ * UnionType:
+ *   - carries the members in declaration order, the index of a member in that
+ *     list being the discriminant identifying it at runtime,
+ *   - always borrows data when its members are classes, and iff a member does
+ *     when they are records,
+ *   - is equal only to another UnionType referencing the same symbol.
+ */
+@final
+pub class UnionType over CustomType {
+
+    pub {
+        // The symbol defining the union
+        let sym: &UnionSymbol;
+
+        // The types of the members, in declaration order
+        let members: [&Type];
+
+        // True iff the members are records, so that the union is a value type
+        let isRecord: bool;
+    }
+
+    prv {
+        // True iff the union object referenced is also mutable
+        let _isInnerMutable: bool;
+    }
+
+    /**
+     * Construct a union type.
+     *
+     * @params:
+     *   - loc:            source location of the type expression
+     *   - sym:            the union symbol
+     *   - members:        the member types, in declaration order
+     *   - isRecord:       true iff the members are records
+     *   - isMutable:      true iff the value itself is mutable
+     *   - isInnerMutable: true iff the union object referenced is mutable
+     *
+     * Inner mutability is only meaningful for a union of classes. For a union
+     * of records, which is the object itself, it is forced to match the outer
+     * mutability.
+     */
+    pub self (loc: &Word, sym: &UnionSymbol, members: [&Type], isRecord: bool, isMutable: bool, isInnerMutable: bool)
+        with super (loc, isMutable-> isMutable)
+        , sym = sym
+        , members = members
+        , isRecord = isRecord
+        , _isInnerMutable = ((isInnerMutable || isRecord) && isMutable)
+    {}
+
+    /**
+     * A union is deeply mutable iff the value itself and the union object
+     * referenced are both mutable.
+     */
+    @field
+    pub over isDeeplyMutable(self)-> bool {
+        self.isMutable && self._isInnerMutable
+    }
+
+    /**
+     * Determine whether the union requires explicit aliasing.
+     *
+     * A union of classes borrows, so a mutable pointer to a mutable union
+     * object requires aliasing. A union of records requires it only when it is
+     * mutable and one of its members requires it -- the member held is not
+     * known statically, so the strictest one decides.
+     */
+    @field
+    pub over needsExplicitAlias(self)-> bool {
+        if (!self.isRecord) {
+            return self.isMutable && self._isInnerMutable;
+        }
+
+        if (self.isMutable) {
+            for i in self.members {
+                if i.needsExplicitAlias return true;
+            }
+        }
+
+        false
+    }
+
+    /**
+     * A union of classes always borrows. A union of records borrows iff one of
+     * its members does.
+     */
+    @field
+    pub over borrowsData(self)-> bool {
+        if (!self.isRecord) return true;
+
+        for i in self.members {
+            if i.borrowsData return true;
+        }
+
+        false
+    }
+
+    /**
+     * Unions are never movable.
+     *
+     * Only records and classes are accepted as members, and neither is
+     * movable.
+     */
+    @field
+    pub over isMovable(self)-> bool {
+        false
+    }
+
+    /**
+     * Unions are always addressable.
+     */
+    @field
+    pub over isAddressable(self)-> bool {
+        true
+    }
+
+    /**
+     * Unions are compatible only when they are equal.
+     *
+     * Two UnionType instances are compatible iff they reference the same union
+     * symbol.
+     */
+    pub over isCompatible(self, o: &Type)-> bool {
+        self.opEquals(o)
+    }
+
+    /**
+     * Check whether this union can fit into another under mutability rules.
+     *
+     * The member list is fixed by the symbol, so two fitting unions always
+     * have identical members and only mutability is compared:
+     *   - any U-> const U is allowed,
+     *   - borrowed const U-> mut U is forbidden,
+     *   - for a union of classes, mut &(const U)-> mut &(mut U) is forbidden.
+     */
+    pub over mutabilityFit(self, o: &Type, borrowed: bool)-> bool {
+        if (!o.isMutable) return true;
+        if (borrowed && !self.isMutable) return false;
+
+        if let p: &UnionType = o && !self.isRecord {
+            if (!self._isInnerMutable && p._isInnerMutable) return false;
+        }
+
+        true
+    }
+
+    /**
+     * Compute the mutability distance between two unions.
+     *
+     * A union of records costs 1 when losing mutability while borrowed, or
+     * while borrowing data. A union of classes costs 1 for losing the inner
+     * mutability, and 1 more for losing the outer one while borrowed.
+     */
+    pub over mutabilityDistance(self, o: &Type, borrowed: bool)-> u32 {
+        if (!self.isMutable) return 0u32;
+
+        if (self.isRecord) {
+            if (!o.isMutable && (borrowed || self.borrowsData)) return 1u32;
+
+            return 0u32;
+        }
+
+        let mut inner = 0u32;
+        if let p: &UnionType = o {
+            if (self._isInnerMutable && !p._isInnerMutable) { inner = 1u32; }
+        }
+
+        if (borrowed && !o.isMutable) return 1u32 + inner;
+
+        inner
+    }
+
+    /**
+     * Maximum mutability distance for a union:
+     *   - a union of classes, 2 when borrowed(outer and inner), 1 otherwise,
+     *   - a union of records, 1 when borrowed or when it borrows data.
+     */
+    prot over computeMaxMutabilityDistance(self, borrowed: bool)-> u32 {
+        if (borrowed) {
+            if (self.isRecord) return 1u32;
+
+            return 2u32;
+        }
+
+        if (self.isRecord && !self.borrowsData) return 0u32;
+
+        1u32
+    }
+
+    /**
+     * Unions have the same mutability iff their outer mutability matches, and,
+     * for a union of classes, their inner mutability too.
+     */
+    pub over sameMutability(self, o: &Type)-> bool {
+        if let p: &UnionType = o && !self.isRecord {
+            return self.isMutable == p.isMutable && self._isInnerMutable == p._isInnerMutable;
+        }
+
+        return self.isMutable == o.isMutable;
+    }
+
+    /**
+     * Clone the union type with a given mutability level.
+     *
+     * @params:
+     *   - mutLevel: 0 = const, 1 = mut, 2 = deeply mutable
+     */
+    pub over clone(self, mutLevel: u32)-> &Type {
+        let innerMutable = (mutLevel > 1u32);
+        let mutable = (mutLevel != 0u32);
+
+        if (self._isInnerMutable == innerMutable && self.isMutable == mutable) return self;
+
+        copy UnionType(self.loc,
+                       self.sym,
+                       self.members,
+                       isRecord-> self.isRecord,
+                       isMutable-> mutable,
+                       isInnerMutable-> innerMutable)
+    }
+
+    /**
+     * Clone the union type to match the mutability pattern of another type.
+     *
+     * If the pattern is a UnionType, both outer and inner mutability are
+     * copied. Otherwise only the outer one is.
+     */
+    pub over clone(self, pattern: &Type)-> &Type {
+        let innerMutable = if let p: &UnionType = pattern { p._isInnerMutable } else { false };
+
+        copy UnionType(self.loc,
+                       self.sym,
+                       self.members,
+                       isRecord-> self.isRecord,
+                       isMutable-> pattern.isMutable,
+                       isInnerMutable-> innerMutable)
+    }
+
+    /**
+     * Produce a mutable version of the union until a borrow boundary.
+     *
+     * Equivalent to clone(1).
+     */
+    pub over cloneMutableUntilBorrow(self)-> &Type {
+        return self.clone(1);
+    }
+
+    /**
+     * Produce a deeply mutable version of the union.
+     *
+     * Equivalent to clone(2).
+     */
+    pub over toDeeplyMutable(self)-> &Type {
+        return self.clone(2);
+    }
+
+    impl Comparable!{&Generator} {
+
+        /**
+         * Unions are equal when they reference the same union symbol.
+         *
+         * Mutability and member identity do not affect equality.
+         */
+        pub over opEquals(self, o: &Generator)-> bool {
+            if let p: &UnionType = o {
+                return self.sym is p.sym;
+            }
+
+            return false;
+        }
+    }
+
+    impl Streamable;
+    impl Formattable {
+
+        /**
+         * Format the union using the syntax:
+         *   mut U
+         *   U
+         *   mut &(mut U)
+         *   &(U)
+         *
+         * A union of records prints as its symbol name, a union of classes as
+         * &(U) with optional inner mutability.
+         */
+        pub over format(self, dmut stream: &Formatter) {
+            if (self.isMutable) stream:.write(Decorators::MUT, ' ');
+
+            if (self.isRecord) {
+                stream:.write(self.sym.path.toStr());
+            } else {
+                stream:.write(Tokens::AND, '(');
+                if (self._isInnerMutable) stream:.write(Decorators::MUT, ' ');
+                stream:.write(self.sym.path.toStr());
+                stream:.write(')');
+            }
+        }
+    }
+
+}
