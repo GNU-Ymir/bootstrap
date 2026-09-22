@@ -223,7 +223,7 @@ pub mod MatchValidation {
      *        - reject unreachable matchers
      *        - validate the line via validateLine
      *        - accumulate tests, values, types, memInfo
-     *        - update completeness(tautology tracking, union member coverage)
+     *        - update completeness(tautology tracking, sealed member coverage)
      *        - collect errors
      *        - exit block with unused-variable warnings
      *
@@ -270,14 +270,24 @@ pub mod MatchValidation {
                                                                      currentTautCond);
                 }
 
+                // a union names its member by the type of the pattern, which the test of
+                // the arm keeps, where an enum names its field by a name nothing keeps
+                // but the pattern itself
                 if let Ok(index) = MatchValidation::coveredMember(alias context, lineResult.guard.tautology) {
                     result.covered[index] = (); // two arms naming the same member cover one
                 }
 
-                // a union is sealed, so covering its members completes the match as
-                // surely as the tautology chain folding to true, and independently
+                if MatchVerification::isTautology(alias context, lineResult.guard.guard) {
+                    for index in lineResult.covered { // a guard decides the arm too
+                        result.covered[index] = ();
+                    }
+                }
+
+                // a union and an enum are sealed, so covering their members completes
+                // the match as surely as the tautology chain folding to true, and
+                // independently
                 result.isComplete = MatchVerification::isTautology(alias context, currentTautCond)
-                    || MatchVerification::coversUnion(value.type, result.covered);
+                    || MatchVerification::coversSealed(value.type, result.covered);
 
                 result.memInfo = result.memInfo | lineResult.memInfo;
             } catch {
@@ -373,8 +383,10 @@ pub mod MatchValidation {
         throws ErrorMsg
     {
         let mut vars: [&VarDeclValue] = [];
+        let mut covered: [usize] = [];
         // Validate the pattern
-        let (test, retInfo) = MatchValidation::validatePattern(alias context, value, line.filter, memInfo, ref vars);
+        let (test, retInfo) = MatchValidation::validatePattern(alias context, value, line.filter, memInfo, ref vars,
+                                                                ref covered);
         let guard = MatchValidation::validateGuard(alias context, vars, currentCond-> test, guard-> line.guard);
 
         // Validate the value associated with successful pattern match
@@ -388,6 +400,7 @@ pub mod MatchValidation {
         return MatchLineResult(vars-> vars,
                                 test-> guard.test,
                                 memInfo-> retInfo,
+                                covered-> covered,
                                 guard-> guard,
                                 blockValue-> copy BlockValue(line.value.loc, v.type, copy [v]),
                                 blockType-> t);
@@ -595,6 +608,29 @@ pub mod MatchValidation {
                             canBeLazy: bool = false)-> (&Value, MemoryInfo)
         throws ErrorMsg
     {
+        let mut covered: [usize] = []; // a pattern nested in another names no field of the matched enum
+        return MatchValidation::validatePattern(alias context, value, mtch, memInfo, ref vars, ref covered,
+                                                 canBeLazy-> canBeLazy);
+    }
+
+    /**
+     * Validate a pattern, and collect the fields of the matched enum it names.
+     *
+     * Same as the above, for the pattern of an arm, which is the only one that
+     * can name a field of the value the match is over.
+     *
+     * @params:
+     *   - covered: filled with the indices of the fields the pattern names
+     */
+    pub fn validatePattern(dmut context: &ValidationContext,
+                            value: &Value,
+                            mtch: &Expression,
+                            memInfo: MemoryInfo,
+                            ref mut vars: [&VarDeclValue],
+                            ref mut covered: [usize],
+                            canBeLazy: bool = false)-> (&Value, MemoryInfo)
+        throws ErrorMsg
+    {
         match mtch {
             v: &VarDeclExpr => {
                 return MatchVarDeclValidation::validate(alias context, value, v, memInfo, ref vars, canBeLazy-> canBeLazy);
@@ -610,7 +646,7 @@ pub mod MatchValidation {
             }
         }
 
-        let test = MatchValidation::validateEqualPattern(alias context, value, mtch);
+        let test = MatchValidation::validateEqualPattern(alias context, value, mtch, ref covered);
         return (test, MemoryInfo());
     }
 
@@ -639,6 +675,7 @@ pub mod MatchValidation {
      *   - context: validation context
      *   - value:   value being matched
      *   - mtch:    pattern expression
+     *   - covered: filled with the indices of the fields the pattern names
      *
      * @returns:
      *   Boolean test expression.
@@ -648,13 +685,14 @@ pub mod MatchValidation {
      */
     fn validateEqualPattern(dmut context: &ValidationContext,
                              value: &Value,
-                             mtch: &Expression)-> &Value
+                             mtch: &Expression,
+                             ref mut covered: [usize])-> &Value
         throws ErrorMsg
     {
         // e.g. /x | y | 12/, means either x or y or 12
         if let b: &BinaryExpr = mtch && b.op == BinaryOperators::PIPE {
-            let left = MatchValidation::validateEqualPattern(alias context, value, b.left);
-            let right = MatchValidation::validateEqualPattern(alias context, value, b.right);
+            let left = MatchValidation::validateEqualPattern(alias context, value, b.left, ref covered);
+            let right = MatchValidation::validateEqualPattern(alias context, value, b.right, ref covered);
 
             return copy LogicalBoolOperatorValue(mtch.loc, BinaryOperators::DPIPE, left, right);
         }
@@ -673,7 +711,38 @@ pub mod MatchValidation {
         let mut finTest = BinaryComparisonValidation::validate(alias context, mtch.loc, BinaryOperators::DEQUAL, value, eqVal);
         finTest = context.cteInterpret:.reduce(finTest);
 
+        covered ~= MatchValidation::namedField(value, eqVal);
+
         return finTest;
+    }
+
+    /**
+     * Determine the field of the matched enum a pattern names.
+     *
+     * The field is read here and nowhere later: a comparison unwraps both of
+     * its operands to the type the enum proxies, so the test the pattern
+     * becomes holds the value of the field and no longer the field itself.
+     *
+     * @params:
+     *   - value:  value being matched
+     *   - eqVal:  the validated pattern
+     *
+     * @returns:
+     *   The index of the field named, empty when the pattern names none. Two
+     *   fields sharing a value are two fields, each named by its own pattern.
+     */
+    fn namedField(value: &Value, eqVal: &Value)-> [usize] {
+        if let en: &EnumType = value.type {
+            // the enum the field belongs to is the one being matched, and not merely
+            // one whose fields compare against it
+            if let f: &EnumFieldAccessValue = eqVal && f.type == en {
+                for i, d in en.sym.fields if d._0 == f.name {
+                    return copy [i];
+                }
+            }
+        }
+
+        return [];
     }
 
 }
