@@ -1,0 +1,183 @@
+/*
+ * UnionValueExpander — expands the widening of a member into a union object.
+ *
+ * <hr>
+ *
+ * @Package: ymirc
+ * @Module: ymirc::lint::expander::value::union_
+ * @File: ymirc/lint/expander/value/union_.yr
+ * @Author(s):
+ *   - Emile Cadorel <ecadorel@gmail.com>
+ *
+ * @Created(YYYY-MM-DD): 2026-09-22
+ * @Copyright(C) 2021–2026 GNU-Ymir
+ * @License
+ *   ```text
+ *   This file is part of the Ymir language project.
+ *
+ *   Ymir is free software: you can redistribute it and/or modify it
+ *   under the terms of the GNU General Public License as published by
+ *   the Free Software Foundation, either version 3 of the License, or
+ *   (at your option) any later version.
+ *
+ *   Ymir is distributed in the hope that it will be useful,
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *   GNU General Public License for more details.
+ *   ```
+ */
+
+in union_;
+
+use ymirc::global::core_;
+use ymirc::lexing::keys;
+use ymirc::lint::node::_;
+use ymirc::semantic::generator::{mangler, type::_};
+use ymirc::semantic::generator::value::operator;
+
+/**
+ * UnionValueExpander
+ *
+ * Expands the widening of a member value into the union listing it, which is
+ * the only way a union object is ever built.
+ *
+ * The object carries the three fields of a union: the index of the member
+ * held, the vtable the union dispatches through, and the overlay in which the
+ * member is stored. A union of records is that object, a union of classes a
+ * pointer to one, so the widening allocates a block for it.
+ */
+pub mod UnionValueExpander {
+
+    /**
+     * Finalize the widening of a member into a union.
+     *
+     * @params:
+     *   - context: the expansion context
+     *   - w:       the widening value
+     *   - list:    the statement list to append instructions to
+     *
+     * @returns:
+     *   - &YILValue: the union object, or the pointer to it for a union of classes
+     */
+    pub fn finalizeWiden(dmut context: &Expander, w: &UnionWidenValue, ref mut list: StmtList)-> &YILValue {
+        let un = w.unionType;
+        let unType = context:.finalizeType(un);
+        let objType = if (un.isRecord) { unType } else {
+            match unType {
+                p: &YILPointer => { p.inner }
+                _ => { panic; } // a union of classes is a pointer to its object
+            }
+        };
+
+        let member = UnionValueExpander::finalizeMember(alias context, w, ref list);
+
+        // the union of records is the object, the union of classes a block holding it
+        let (object, result) = if (un.isRecord) {
+            let (var, _) = ValueExpander::createVarForBlock(alias context, w.loc, NONE_TYPE, objType, ref list);
+            (var, var)
+        } else {
+            let alloc = copy YILNameCallValue(w.loc, unType, YRuntimeFuncs::ALLOC_BLOCK,
+                                              copy [copy YILIntValue(w.loc, YIL_UINT_MAX, objType.size)]);
+            let (var, _) = ValueExpander::createVarForBlock(alias context, w.loc, NONE_TYPE, unType, ref list,
+                                                            withValue-> alloc);
+            (copy YILUnrefValue(w.loc, objType, var), var)
+        };
+
+        list:.append(copy YILAffect(w.loc,
+                                    copy YILFieldValue(w.loc, YIL_UINT_32, object, name-> UnionKeys::TYPE),
+                                    copy YILIntValue(w.loc, YIL_UINT_32, w.index)));
+
+        list:.append(copy YILAffect(w.loc,
+                                    copy YILFieldValue(w.loc, YIL_PTR_2_VOID, object, name-> UnionKeys::VTABLE),
+                                    UnionValueExpander::finalizeVtable(alias context, w, member)));
+
+        let valuesType = UnionValueExpander::innerType(objType, 2us);
+        let values = copy YILFieldValue(w.loc, valuesType, object, name-> UnionKeys::VALUES);
+        list:.append(copy YILAffect(w.loc,
+                                    copy YILFieldValue(w.loc, UnionValueExpander::innerType(valuesType, w.index), values, w.index),
+                                    member));
+
+        return result;
+    }
+
+    /**
+     * Expand the member the union is made to hold.
+     *
+     * A union declaring a base reads the vtable out of the member as well as
+     * storing it, so the member is bound to a variable rather than evaluated
+     * twice, unless it already is one.
+     *
+     * @params:
+     *   - context: the expansion context
+     *   - w:       the widening value
+     *   - list:    the statement list to append instructions to
+     *
+     * @returns:
+     *   - &YILValue: the member value
+     */
+    fn finalizeMember(dmut context: &Expander, w: &UnionWidenValue, ref mut list: StmtList)-> &YILValue {
+        let member = ValueExpander::finalize(alias context, w.value, ref list, asLeft-> false);
+        if (member of YILVar || !UnionValueExpander::unionRef(w).base.hasValue) return member;
+
+        let (var, _) = ValueExpander::createVarForBlock(alias context, w.loc, NONE_TYPE, member.type, ref list,
+                                                        withValue-> member);
+        var
+    }
+
+    /**
+     * Compute the vtable the union object dispatches through.
+     *
+     * A union declaring a base dispatches through the class vtable the member
+     * carries, which is read out of the member itself so that a member
+     * overriding a method of the base dispatches its own implementation. A
+     * union without a base dispatches through the table synthesized for that
+     * member, and one whose members agree on no method dispatches nothing.
+     *
+     * @params:
+     *   - context: the expansion context
+     *   - w:       the widening value
+     *   - member:  the expanded member value
+     *
+     * @returns:
+     *   - &YILValue: the vtable stored in the union object
+     */
+    fn finalizeVtable(dmut context: &Expander, w: &UnionWidenValue, member: &YILValue)-> &YILValue {
+        let ur = UnionValueExpander::unionRef(w);
+        if ur.base.hasValue {
+            let object = match member.type {
+                p: &YILPointer => { copy YILUnrefValue(w.loc, p.inner, member) }
+                _ => { panic; } // a union declaring a base is a union of classes
+            };
+
+            return copy YILFieldValue(w.loc, YIL_PTR_2_VOID, object, name-> ClassKeys::VTABLE);
+        }
+
+        if (ur.vtable.len == 0us) return YIL_NULL_VALUE;
+
+        // the table is what makes the union reachable, nothing else names it
+        let name = Mangler::mangleUnionVtable(ur, w.index);
+        context:.registerTouchSym(name, ur.loc);
+
+        copy YILAddrValue(w.loc, YIL_PTR_2_VOID, copy YILVar(w.loc, name, YIL_PTR_2_VOID, 0us))
+    }
+
+    /**
+     * @returns the type of the field of a YIL tuple
+     */
+    fn innerType(type: &YILType, index: usize)-> &YILType {
+        match type {
+            t: &YILTuple => { return t.inners[index]; }
+            _ => { panic; } // the union object and its overlay are tuples
+        }
+    }
+
+    /**
+     * @returns the reference of the union the value widens into
+     */
+    fn unionRef(w: &UnionWidenValue)-> &UnionRefType {
+        match w.unionType.sym.generator {
+            r: &UnionRefType => { return r; }
+            _ => { panic; } // invalid union
+        }
+    }
+}
