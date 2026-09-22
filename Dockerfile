@@ -83,7 +83,10 @@ RUN YMIR_STDLIB_VERSION="$(sed -nE 's/^MIDGARD_VERSION=([0-9]+\.[0-9]+).*/\1/p' 
     && mkdir -p /usr/include/ymir \
     && ln -sfn /opt/ymir-stdlib "/usr/include/ymir/${YMIR_STDLIB_VERSION}"
 
-RUN gyllir test --dry -j 12
+# The compiler output is kept in the image rather than only in the build log: a warning is
+# non-fatal in debug, which is how this stage compiles, so CI has to read them back afterwards -
+# and it must still see them when this layer comes from the cache and prints nothing.
+RUN bash -o pipefail -c 'gyllir test --dry -j 12 2>&1 | tee build.log'
 
 FROM build AS test
 RUN ./ymirc.test -sf
