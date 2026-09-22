@@ -26,7 +26,7 @@ check lives:
 | `E1xxx` | lexing | `LexingErrorMessage` -- `src/ymirc/lexing/errors.yr` | 24 |
 | `E2xxx` | parsing | `SyntaxErrorMessage` -- `src/ymirc/syntax/errors.yr` | 11 |
 | `E3xxx` | declaration | `DeclareErrorMessage` -- `src/ymirc/semantic/declarator/errors.yr` | 34 |
-| `E4xxx` | validation | `ValidateErrorMessage` -- `src/ymirc/semantic/validator/errors.yr` | 261 |
+| `E4xxx` | validation | `ValidateErrorMessage` -- `src/ymirc/semantic/validator/errors.yr` | 262 |
 | `E5xxx` | lowering (YIL) | `SerializeYILErrorMessage` -- `src/ymirc/lint/serialize/errors.yr` | 10 |
 
 Each page carries an example wherever a case in the suite raises the code: the
@@ -339,6 +339,7 @@ deliberately carry no code, and have no page here.
 | [E4308](E4308.md) | `UNION_EMPTY` | union <> declares no member |
 | [E4309](E4309.md) | `UNION_MEMBER_IN_UNION` | a union cannot be a member of another union |
 | [E4310](E4310.md) | `UNION_MEMBER_NOT_RECORD_NOR_CLASS` | the member of a union must be a record or a class type, not <> |
+| [E4314](E4314.md) | `UNION_MEMBER_UNKNOWN` | union <> does not list the member <> |
 | [E4311](E4311.md) | `UNION_MIXED_MEMBERS` | union <> mixes record and class members |
 | [E4312](E4312.md) | `UNION_NO_METHOD` | union <> has no method named <> |
 | [E4313](E4313.md) | `UNION_NARROWING` | union <> cannot be converted to <> |
