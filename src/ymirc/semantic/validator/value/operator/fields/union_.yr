@@ -4,6 +4,7 @@
  * Supported forms:
  *   - unionExpr.method(...)
  *   - unionExpr:.method(...)
+ *   - unionExpr.method = value
  *
  * This module is invoked by FieldValidation when the left operand is a union.
  *
@@ -61,7 +62,8 @@ use ymirc::utils::format;
  * The validator:
  *   - resolves the method in the slots of the union,
  *   - enforces the aliasing rules, a mutable method needing ':.',
- *   - resolves field-methods when the access is not a call,
+ *   - resolves field-methods when the access is not a call, and
+ *     field-assign-methods when it is assigned,
  *   - aggregates the candidates into a MultSymValue,
  *   - names, when nothing matches, what each member declares.
  */
@@ -77,6 +79,7 @@ pub mod UnionMethodValidation {
      *   - u:       the type of the union instance
      *   - method:  method expression(VarExpr)
      *   - inCall:  whether this access occurs inside a call expression
+     *   - assign:  whether this access is the target of an assignment
      *
      * @returns:
      *   A &Value representing the method delegate, or the result of calling a
@@ -90,22 +93,23 @@ pub mod UnionMethodValidation {
                     object:       &Value,
                     u:            &UnionType,
                     method:       &Expression,
-                    inCall:       bool)-> &Value
+                    inCall:       bool,
+                    assign:       bool = false)-> &Value
         throws ErrorMsg
     {
         let uref = UnionMethodValidation::unionRef(u);
         let mut errors: [&ErrorMsg] = [];
         let mut values: [&Value] = [];
 
-        UnionMethodValidation::validateMethod(alias context, loc, object, u, uref, method, inCall, ref values, ref errors);
+        UnionMethodValidation::validateMethod(alias context, loc, object, u, uref, method, inCall, assign, ref values, ref errors);
 
         if (values.len == 0us) {
             if (errors.len != 0us) throw copy ErrorMsg::list(errors);
 
-            throw UnionMethodValidation::createError(object, uref, method, inCall);
+            throw UnionMethodValidation::createError(object, uref, method, inCall, assign);
         }
 
-        if !inCall { // a field-method is called by the access itself
+        if (!inCall && !assign) { // a field-method is called by the access itself
             let dmut ret = copy MultSymValue(method.loc, values);
             return CallValidation::validate(alias context, method.loc, ret, []);
         }
@@ -130,6 +134,7 @@ pub mod UnionMethodValidation {
      *   - uref:    the reference of the union
      *   - method:  method expression
      *   - inCall:  whether this access occurs inside a call expression
+     *   - assign:  whether this access is the target of an assignment
      *   - values:  output list of valid delegates
      *   - errors:  output list of errors
      */
@@ -140,6 +145,7 @@ pub mod UnionMethodValidation {
                       uref:           &UnionRefType,
                       method:         &Expression,
                       inCall:         bool,
+                      assign:         bool,
                       ref mut values: [&Value],
                       ref mut errors: [&ErrorMsg])
     {
@@ -148,12 +154,12 @@ pub mod UnionMethodValidation {
                 let prots = base.vtableProtections;
                 for i, v in base.vtable {
                     if (i < prots.len && prots[i] == MethodProtection::PUB) {
-                        UnionMethodValidation::validateCandidate(alias context, loc, object, u, v, i, meth, inCall, ref values, ref errors);
+                        UnionMethodValidation::validateCandidate(alias context, loc, object, u, v, i, meth, inCall, assign, ref values, ref errors);
                     }
                 }
             } else {
                 for i, v in uref.vtable {
-                    UnionMethodValidation::validateCandidate(alias context, loc, object, u, v, i, meth, inCall, ref values, ref errors);
+                    UnionMethodValidation::validateCandidate(alias context, loc, object, u, v, i, meth, inCall, assign, ref values, ref errors);
                 }
             }
         }
@@ -162,8 +168,9 @@ pub mod UnionMethodValidation {
     /**
      * Validate one slot of the union against the access.
      *
-     * A method is reached by a call, a field-method by the access itself, so a
-     * slot only applies to one of the two forms.
+     * A method is reached by a call, a field-method by the access itself and a
+     * field-assign-method by an assignment, so a slot only applies to one of
+     * the three forms.
      *
      * The member held is only known at runtime, so the dispatch is never
      * direct, even for a union of records.
@@ -177,6 +184,7 @@ pub mod UnionMethodValidation {
      *   - index:   the index of the slot
      *   - meth:    method expression
      *   - inCall:  whether this access occurs inside a call expression
+     *   - assign:  whether this access is the target of an assignment
      *   - values:  output list of valid delegates
      *   - errors:  output list of errors
      */
@@ -188,12 +196,19 @@ pub mod UnionMethodValidation {
                          index:          usize,
                          meth:           &VarExpr,
                          inCall:         bool,
+                         assign:         bool,
                          ref mut values: [&Value],
                          ref mut errors: [&ErrorMsg])
     {
         if (v.sym.path.file != meth.name.str) return;
 
-        let applicable = if inCall { !v.isField && !v.isFieldAssign } else { v.isField };
+        let applicable = if inCall {
+            !v.isField && !v.isFieldAssign
+        } else if assign {
+            v.isFieldAssign
+        } else {
+            v.isField
+        };
         if !applicable return;
 
         let caller = if inCall {
@@ -232,9 +247,9 @@ pub mod UnionMethodValidation {
     }
 
     /**
-     * Enforce the aliasing rules of a field-method access on a union: the
-     * access aliases implicitly, so ':.' is forbidden whatever the mutability
-     * of the method.
+     * Enforce the aliasing rules of a field-method or field-assign-method
+     * access on a union: the access aliases implicitly, so ':.' is forbidden
+     * whatever the mutability of the method.
      *
      * @returns:
      *   - the value the delegate closes on, aliased when the method is
@@ -293,7 +308,11 @@ pub mod UnionMethodValidation {
      *   - the error, naming what each member declares for that name, or the
      *     call the access is missing
      */
-    fn createError(object: &Value, uref: &UnionRefType, method: &Expression, inCall: bool)-> &ErrorMsg {
+    fn createError(object: &Value, uref: &UnionRefType, method: &Expression, inCall: bool, assign: bool)-> &ErrorMsg {
+        if assign {
+            return copy ErrorMsg::fatal(method.loc, format(ValidateErrorMessage::UNION_NO_FIELD_ASSIGN_METHOD, object.type, method));
+        }
+
         let mut notes: [&ErrorMsg] = [];
         if let meth: &VarExpr = method {
             notes = if inCall {
