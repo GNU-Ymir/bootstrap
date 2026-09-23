@@ -26,7 +26,7 @@ check lives:
 | `E1xxx` | lexing | `LexingErrorMessage` -- `src/ymirc/lexing/errors.yr` | 24 |
 | `E2xxx` | parsing | `SyntaxErrorMessage` -- `src/ymirc/syntax/errors.yr` | 11 |
 | `E3xxx` | declaration | `DeclareErrorMessage` -- `src/ymirc/semantic/declarator/errors.yr` | 34 |
-| `E4xxx` | validation | `ValidateErrorMessage` -- `src/ymirc/semantic/validator/errors.yr` | 265 |
+| `E4xxx` | validation | `ValidateErrorMessage` -- `src/ymirc/semantic/validator/errors.yr` | 266 |
 | `E5xxx` | lowering (YIL) | `SerializeYILErrorMessage` -- `src/ymirc/lint/serialize/errors.yr` | 10 |
 
 Each page carries an example wherever a case in the suite raises the code: the
@@ -232,6 +232,7 @@ deliberately carry no code, and have no page here.
 | [E4121](E4121.md) | `MAP_KEY_NOT_COMPARABLE` | the type <> cannot be used as a key, it is not comparable |
 | [E4122](E4122.md) | `MAP_KEY_NOT_HASHABLE` | the type <> cannot be used as a key, it is not hashable |
 | [E4123](E4123.md) | `MATCH_NOT_COMPLETE` | the pattern matching has no default case, so each branch must produce a void value not a <> |
+| [E4318](E4318.md) | `MATCH_SEALED_NOT_COMPLETE` | the pattern matching over <> has no default case, so it must cover each of its members |
 | [E4124](E4124.md) | `MAX_LOOP_ITERATIONS` | reached the maximum number of cte iterations <> > <> |
 | [E4125](E4125.md) | `MISMATCH_ALIAS_EXPAND` | cannot alias an expand value, maybe alias and expand keywords are inverted? |
 | [E4126](E4126.md) | `MISMATCH_ALIAS_LAZY` | cannot alias a lazy value, maybe alias and lazy keywords are inverted? |
