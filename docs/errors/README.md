@@ -27,7 +27,7 @@ check lives:
 | `E2xxx` | parsing | `SyntaxErrorMessage` -- `src/ymirc/syntax/errors.yr` | 11 |
 | `E3xxx` | declaration | `DeclareErrorMessage` -- `src/ymirc/semantic/declarator/errors.yr` | 34 |
 | `E4xxx` | validation | `ValidateErrorMessage` -- `src/ymirc/semantic/validator/errors.yr` | 266 |
-| `E5xxx` | lowering (YIL) | `SerializeYILErrorMessage` -- `src/ymirc/lint/serialize/errors.yr` | 10 |
+| `E5xxx` | lowering (YIL) | `SerializeYILErrorMessage` -- `src/ymirc/lint/serialize/errors.yr`, `OptimizerErrorMessage` -- `src/ymirc/lint/optimizer/errors.yr` | 11 |
 
 Each page carries an example wherever a case in the suite raises the code: the
 snippet is quoted from `test_resources/`, so it is one the suite keeps compiling.
@@ -406,6 +406,7 @@ deliberately carry no code, and have no page here.
 | [E5008](E5008.md) | `MALFORMED_BYTECODE_SYMBOL_TABLE` | malformed bytecode, symbol table invalid |
 | [E5009](E5009.md) | `MALFORMED_BYTECODE_LOCATION_TABLE` | malformed bytecode, location table invalid |
 | [E5010](E5010.md) | `MISMATCH_ARCH_POINTER_SIZE` | YIL byte file was created for a <> bits target, mismatch current target arch <> bits |
+| [E5011](E5011.md) | `ALWAYS_OVERFLOW` | slice access always overflows, <> (len) <> <> (index) |
 
 ## Retired
 
