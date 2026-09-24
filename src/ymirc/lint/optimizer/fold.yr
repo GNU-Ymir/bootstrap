@@ -1,0 +1,753 @@
+/*
+ * Declares ConstantFoldingPass, the pass folding the integer arithmetic the
+ * expander leaves in a frame.
+ *
+ * The CTE interpreter folds what the user wrote, before expansion. What the
+ * expander writes afterwards -- the byte offset of an element, the length of a
+ * slice, a cast between two integers -- reaches the backend as it was built:
+ * `YI_5 = 4 * 10; YI_6 = a.ptr + YI_5;`. This pass is the cleanup of that:
+ *
+ *   - constant folding: an operation over integer literals is replaced by its
+ *     result, computed on BigInt and wrapped around the width of its type, the
+ *     way the backend wraps it(`ymir1` sets `-fwrapv`). Folding never raises an
+ *     overflow the program would not raise at runtime, and never folds what
+ *     traps or is undefined at runtime(a division by zero, `MIN / -1`, a shift
+ *     past the width): that is left for the runtime to do,
+ *   - algebraic identities: `x + 0`, `x * 1`, `x * 0`, `x - x`, `- - x`, ...
+ *     A multiplication by a power of two is not turned into a shift: the
+ *     backend does it at every level, and the dump would lose its precedence,
+ *   - cast simplification: a cast to the type the value already has, a chain of
+ *     integer casts that one cast does the same as, and a cast of a literal.
+ *
+ * Only integers are folded. A float literal is a 1024 bits BigFloat that is
+ * never rounded to the precision of its type, so a result computed on it is not
+ * the one the program computes. For the same reason, an operation is folded only
+ * when its operands and its result share the width and the signedness: the
+ * backend converts mismatched operands on its own terms, which is not worth
+ * modelling for the shapes the expander actually emits.
+ *
+ * <hr>
+ *
+ * @Package: ymirc
+ * @Module: ymirc::lint::optimizer::fold
+ * @File: ymirc/lint/optimizer/fold.yr
+ * @Author(s):
+ *   - Emile Cadorel <ecadorel@gmail.com>
+ *
+ * @Created(YYYY-MM-DD): 2026-09-24
+ * @Copyright(C) 2021–2026 GNU-Ymir
+ * @License
+ *   ```text
+ *   This file is part of the Ymir language project.
+ *
+ *   Ymir is free software: you can redistribute it and/or modify it
+ *   under the terms of the GNU General Public License as published by
+ *   the Free Software Foundation, either version 3 of the License, or
+ *   (at your option) any later version.
+ *
+ *   Ymir is distributed in the hope that it will be useful,
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *   GNU General Public License for more details.
+ *
+ *   You should have received a copy of the GNU General Public License
+ *   along with Ymir.  If not, see <https://www.gnu.org/licenses/>.
+ *   ```
+ */
+
+in fold;
+
+use ymirc::lexing::{keys, word};
+use ymirc::lint::node::{_, global::_, instr::_, type::_, value::_};
+use ymirc::lint::optimizer::pass_;
+use ymirc::utils::bigint;
+
+/**
+ * The pass folding the integer arithmetic of a frame, and simplifying the
+ * identities and the casts that are left.
+ * */
+@final
+pub class ConstantFoldingPass over OptimizerPass {
+
+    pub self ()
+        with super ("const-fold", 1u32)
+    {}
+
+    /**
+     * Fold the integer operations of a frame.
+     *
+     * @params:
+     *    - frame: the frame to transform
+     * @returns: the transformed frame, or `frame` itself when nothing moved
+     * */
+    pub over apply(mut self, frame: &YILFrame)-> &YILFrame {
+        let dmut f = copy Folder();
+        let body = f:.foldInstr(frame.body);
+        if (f.getFolded() == 0us && f.getSimplified() == 0us && f.getCasts() == 0us) return frame;
+
+        self:.count("constants folded", nb-> f.getFolded());
+        self:.count("identities simplified", nb-> f.getSimplified());
+        self:.count("casts simplified", nb-> f.getCasts());
+
+        frame.withBody(body)
+    }
+
+}
+
+/**
+ * The folding of a single frame, one bottom up walk of its body.
+ * */
+pub class Folder {
+
+    // The number of operations replaced by their result
+    let mut _folded: usize = 0us;
+
+    // The number of operations replaced by an operand, or by a cheaper operation
+    let mut _simplified: usize = 0us;
+
+    // The number of casts removed or merged into another one
+    let mut _casts: usize = 0us;
+
+    pub self () {}
+
+    /**
+     * @returns: the number of operations replaced by their result
+     * */
+    pub fn getFolded(self)-> usize {
+        self._folded
+    }
+
+    /**
+     * @returns: the number of operations replaced by an operand, or by a cheaper operation
+     * */
+    pub fn getSimplified(self)-> usize {
+        self._simplified
+    }
+
+    /**
+     * @returns: the number of casts removed or merged into another one
+     * */
+    pub fn getCasts(self)-> usize {
+        self._casts
+    }
+
+    /*!
+     * ================================================================================
+     * ================================================================================
+     * =========================          INSTRUCTIONS          =======================
+     * ================================================================================
+     * ================================================================================
+     */
+
+    /**
+     * Fold the values an instruction evaluates, the ones of the instructions it holds included.
+     *
+     * @returns: the folded instruction, or `instr` itself when nothing under it moved
+     * */
+    pub fn foldInstr(mut self, instr: &YILInstr)-> &YILInstr {
+        match instr {
+            b: &YILBlock => {
+                let instrs = self:.foldList(b.instrs);
+                if (sameInstrs(instrs, b.instrs)) return b;
+
+                return copy YILBlock(b.loc, instrs);
+            }
+            t: &YILTryCatch => {
+                let tryPart = self:.foldList(t.tryPart);
+                let catchPart = self:.foldList(t.catchPart);
+                if (sameInstrs(tryPart, t.tryPart) && sameInstrs(catchPart, t.catchPart)) return t;
+
+                return copy YILTryCatch(t.loc, t.catchType, tryPart, catchPart);
+            }
+            t: &YILTryFinally => {
+                let tryPart = self:.foldList(t.tryPart);
+                let finPart = self:.foldList(t.finPart);
+                if (sameInstrs(tryPart, t.tryPart) && sameInstrs(finPart, t.finPart)) return t;
+
+                return copy YILTryFinally(t.loc, tryPart, finPart);
+            }
+            a: &YILAffect => {
+                let left = self:.foldValue(a.left);
+                let right = self:.foldValue(a.right);
+                if (left is a.left && right is a.right) return a;
+
+                return copy YILAffect(a.loc, left, right);
+            }
+            c: &YILCall => {
+                let content = self:.foldValue(c.content);
+                if (content is c.content) return c;
+
+                return copy YILCall(c.loc, content);
+            }
+            r: &YILReturn => {
+                let value = self:.foldValue(r.value);
+                if (value is r.value) return r;
+
+                return copy YILReturn(r.loc, value);
+            }
+            c: &YILCondJmp => {
+                let cond = self:.foldValue(c.cond);
+                if (cond is c.cond) return c;
+
+                return copy YILCondJmp(c.loc, cond, c.then, c.else_);
+            }
+        }
+
+        instr
+    }
+
+    /**
+     * Fold a list of instructions.
+     * */
+    fn foldList(mut self, instrs: [&YILInstr])-> [&YILInstr] {
+        let mut res: [mut &YILInstr] = [];
+        for i in instrs { res ~= [self:.foldInstr(i)]; }
+
+        res
+    }
+
+    /*!
+     * ================================================================================
+     * ================================================================================
+     * ============================          VALUES          ==========================
+     * ================================================================================
+     * ================================================================================
+     */
+
+    /**
+     * Fold a value, its operands first.
+     *
+     * @returns: the folded value, or `value` itself when nothing under it moved
+     * */
+    fn foldValue(mut self, value: &YILValue)-> &YILValue {
+        match value {
+            b: &YILBinaryValue => {
+                let left = self:.foldValue(b.left);
+                return self:.foldBinary(b, left, self:.foldValue(b.right));
+            }
+            u: &YILUnaryValue => { return self:.foldUnary(u, self:.foldValue(u.left)); }
+            c: &YILCastValue => {
+                let inner = self:.foldValue(c.value);
+                if let Ok(res) = self:.simplifyCast(c.loc, c.type, inner) { return res; }
+                if (inner is c.value) return c;
+
+                return copy YILCastValue(c.loc, c.type, inner);
+            }
+            u: &YILUnrefValue => {
+                let inner = self:.foldValue(u.value);
+                if (inner is u.value) return u;
+
+                return copy YILUnrefValue(u.loc, u.type, inner);
+            }
+            a: &YILAddrValue => {
+                let inner = self:.foldValue(a.value);
+                if (inner is a.value) return a;
+
+                return copy YILAddrValue(a.loc, a.type, inner);
+            }
+            f: &YILFieldValue => {
+                let inner = self:.foldValue(f.tuple);
+                if (inner is f.tuple) return f;
+                if (f.name != "") return copy YILFieldValue(f.loc, f.type, inner, f.name);
+
+                return copy YILFieldValue(f.loc, f.type, inner, f.index);
+            }
+            a: &YILArrayAccessValue => {
+                let inner = self:.foldValue(a.value);
+                let index = self:.foldValue(a.index);
+                if (inner is a.value && index is a.index) return a;
+
+                return copy YILArrayAccessValue(a.loc, a.type, inner, index);
+            }
+            t: &YILTupleValue => {
+                let values = self:.foldValues(t.values);
+                if (sameValues(values, t.values)) return t;
+
+                return copy YILTupleValue(t.loc, t.type, values, fieldNames-> t.fieldNames);
+            }
+            a: &YILArrayValue => {
+                let values = self:.foldValues(a.value);
+                if (sameValues(values, a.value)) return a;
+
+                return copy YILArrayValue(a.loc, a.type, values);
+            }
+            n: &YILNameCallValue => {
+                let params = self:.foldValues(n.params);
+                if (sameValues(params, n.params)) return n;
+
+                return copy YILNameCallValue(n.loc, n.type, n.funcName, params);
+            }
+            p: &YILPtrCallValue => {
+                let funcPtr = self:.foldValue(p.funcPtr);
+                let params = self:.foldValues(p.params);
+                if (funcPtr is p.funcPtr && sameValues(params, p.params)) return p;
+
+                return copy YILPtrCallValue(p.loc, p.type, funcPtr, params);
+            }
+        }
+
+        value
+    }
+
+    /**
+     * Fold a list of values.
+     * */
+    fn foldValues(mut self, values: [&YILValue])-> [&YILValue] {
+        let mut res: [mut &YILValue] = [];
+        for v in values { res ~= [self:.foldValue(v)]; }
+
+        res
+    }
+
+    /**
+     * @returns: the binary operation over its folded operands, replaced by its
+     * result or by a simpler equivalent when there is one
+     * */
+    fn foldBinary(mut self, b: &YILBinaryValue, left: &YILValue, right: &YILValue)-> &YILValue {
+        let lc = constOf(left), rc = constOf(right);
+        if let Ok(res) = evalBinary(b, left, right, lc, rc) {
+            self._folded += 1us;
+            return copy YILIntValue(b.loc, b.type, res);
+        }
+
+        if let Ok(res) = simplifyBinary(b, left, right, lc, rc) {
+            self._simplified += 1us;
+            return res;
+        }
+
+        if (left is b.left && right is b.right) return b;
+
+        copy YILBinaryValue(b.loc, b.type, b.op, left, right)
+    }
+
+    /**
+     * @returns: the unary operation over its folded operand, replaced by its
+     * result, or by the operand of an operation it undoes
+     * */
+    fn foldUnary(mut self, u: &YILUnaryValue, operand: &YILValue)-> &YILValue {
+        if let Ok(res) = evalUnary(u, operand) {
+            self._folded += 1us;
+            return copy YILIntValue(u.loc, u.type, res);
+        }
+
+        if let inner: &YILUnaryValue = operand {
+            if (inner.op == u.op && sameInt(inner.type, u.type) && sameInt(inner.left.type, u.type)) {
+                self._simplified += 1us;
+                return inner.left;
+            }
+        }
+
+        if (operand is u.left) return u;
+
+        copy YILUnaryValue(u.loc, u.type, u.op, operand)
+    }
+
+    /**
+     * @returns: the cast of a folded value to `type`, as a literal of the target
+     * type, as the value itself, or merged with the cast it applies to; none when
+     * the cast stays as it is
+     * */
+    fn simplifyCast(mut self, loc: &Word, type: &YILType, value: &YILValue)-> (&YILValue)? {
+        if let t: &YILInt = type {
+            if let Ok(v) = constOf(value) {
+                self._folded += 1us;
+                return (copy YILIntValue(loc, type, wrap(v, t)))?;
+            }
+        }
+
+        if (sameType(value.type, type)) {
+            self._casts += 1us;
+            return value?;
+        }
+
+        if let inner: &YILCastValue = value {
+            if (isMergeable(type, inner.type, inner.value.type)) {
+                self._casts += 1us;
+                if let Ok(res) = self:.simplifyCast(loc, type, inner.value) { return res?; }
+
+                return (copy YILCastValue(loc, type, inner.value))?;
+            }
+        }
+
+        none
+    }
+
+}
+
+/*!
+ * ================================================================================
+ * ================================================================================
+ * ===========================          EVALUATION          =======================
+ * ================================================================================
+ * ================================================================================
+ */
+
+/**
+ * @params:
+ *    - lc, rc: the values of `left` and `right`, when they are integer literals
+ * @returns: the result of a binary operation over two integer literals, none
+ * when it is not one, or when the runtime would trap on it
+ * */
+fn evalBinary(b: &YILBinaryValue, left: &YILValue, right: &YILValue, lc: (&BigInt)?, rc: (&BigInt)?)-> (&BigInt)? {
+    let l = if let Ok(v) = lc { v } else { return none; };
+    let r = if let Ok(v) = rc { v } else { return none; };
+    let t = if let i: &YILInt = b.type { i } else { return none; };
+    if (!sameInt(left.type, right.type)) return none;
+
+    if let Ok(cmp) = compare(b.op, l, r) {
+        return (copy BigInt(if (cmp) { 1u64 } else { 0u64 }))?;
+    }
+
+    if (!sameInt(left.type, t)) return none;
+
+    let bits = t.size * 8u32;
+    match b.op {
+        BinaryOperators::PLUS => { return wrap(l + r, t)?; }
+        BinaryOperators::MINUS => { return wrap(l - r, t)?; }
+        BinaryOperators::STAR => { return wrap(l * r, t)?; }
+        BinaryOperators::DIV => {
+            if (!isDivisible(l, r, t)) return none;
+            return wrap(truncDiv(l, r), t)?;
+        }
+        BinaryOperators::PERCENT => {
+            if (!isDivisible(l, r, t)) return none;
+            return wrap(truncMod(l, r), t)?;
+        }
+        BinaryOperators::LEFTD => {
+            if (r < 0 || r >= bits) return none;
+            return wrap(l * pow2(r.toN!{u32} ()), t)?;
+        }
+        BinaryOperators::RIGHTD => {
+            if (r < 0 || r >= bits) return none;
+            return wrap(floorDiv(l, pow2(r.toN!{u32} ())), t)?;
+        }
+        BinaryOperators::AND => { return wrap(copy BigInt(pattern(l, bits) & pattern(r, bits)), t)?; }
+        BinaryOperators::PIPE => { return wrap(copy BigInt(pattern(l, bits) | pattern(r, bits)), t)?; }
+        BinaryOperators::XOR => { return wrap(copy BigInt(pattern(l, bits) ^ pattern(r, bits)), t)?; }
+    }
+
+    none
+}
+
+/**
+ * @returns: the answer of a comparison of two integers, none when the operator
+ * does not compare
+ * */
+fn compare(op: BinaryOperators, l: &BigInt, r: &BigInt)-> (bool)? {
+    match op {
+        BinaryOperators::INF => { return (l < r)?; }
+        BinaryOperators::SUP => { return (l > r)?; }
+        BinaryOperators::INF_EQUAL => { return (l <= r)?; }
+        BinaryOperators::SUP_EQUAL => { return (l >= r)?; }
+        BinaryOperators::DEQUAL => { return (l == r)?; }
+        BinaryOperators::IS => { return (l == r)?; }
+        BinaryOperators::NOT_EQUAL => { return (l != r)?; }
+        BinaryOperators::NOT_IS => { return (l != r)?; }
+    }
+
+    none
+}
+
+/**
+ * @returns: the result of a unary operation over an integer literal, none when
+ * it is not one
+ * */
+fn evalUnary(u: &YILUnaryValue, operand: &YILValue)-> (&BigInt)? {
+    let v = if let Ok(x) = constOf(operand) { x } else { return none; };
+    let t = if let i: &YILInt = u.type { i } else { return none; };
+    if (!sameInt(operand.type, t)) return none;
+
+    match u.op {
+        UnaryOperators::MINUS => { return wrap(0 - v, t)?; }
+        UnaryOperators::NOT => { return wrap(0 - v - 1, t)?; }
+    }
+
+    none
+}
+
+/*!
+ * ================================================================================
+ * ================================================================================
+ * ===========================          IDENTITIES          =======================
+ * ================================================================================
+ * ================================================================================
+ */
+
+/**
+ * @params:
+ *    - lc, rc: the values of `left` and `right`, when they are integer literals
+ * @returns: a simpler value computing the same thing as the binary operation,
+ * none when there is none
+ *
+ * An operand is kept in place of the operation only when it has the type of the
+ * operation, and an operand is dropped only when evaluating it has no effect.
+ * Apart from integers, only `ptr + 0` is simplified: `-0.0 + 0` is `+0.0`.
+ * */
+fn simplifyBinary(b: &YILBinaryValue, left: &YILValue, right: &YILValue, lc: (&BigInt)?, rc: (&BigInt)?)-> (&YILValue)? {
+    let t = if let i: &YILInt = b.type { i } else {
+        match b.type {
+            _: &YILPointer => {
+                if (b.op == BinaryOperators::PLUS && isLit(rc, 0) && sameType(left.type, b.type)) return left?;
+            }
+        }
+
+        return none;
+    };
+
+    let keepLeft = sameInt(left.type, t);
+    let keepRight = sameInt(right.type, t);
+
+    match b.op {
+        BinaryOperators::PLUS => {
+            if (keepLeft && isLit(rc, 0)) return left?;
+            if (keepRight && isLit(lc, 0)) return right?;
+        }
+        BinaryOperators::MINUS => {
+            if (keepLeft && isLit(rc, 0)) return left?;
+            if (isSame(left, right)) return zero(b)?;
+        }
+        BinaryOperators::STAR => {
+            if (keepLeft && isLit(rc, 1)) return left?;
+            if (keepRight && isLit(lc, 1)) return right?;
+            if (isLit(rc, 0) && dce::isPure(left)) return zero(b)?;
+            if (isLit(lc, 0) && dce::isPure(right)) return zero(b)?;
+        }
+        BinaryOperators::DIV => {
+            if (keepLeft && isLit(rc, 1)) return left?;
+        }
+        BinaryOperators::AND => {
+            if (isLit(rc, 0) && dce::isPure(left)) return zero(b)?;
+            if (isLit(lc, 0) && dce::isPure(right)) return zero(b)?;
+        }
+        BinaryOperators::PIPE => {
+            if (keepLeft && isLit(rc, 0)) return left?;
+            if (keepRight && isLit(lc, 0)) return right?;
+        }
+        BinaryOperators::XOR => {
+            if (keepLeft && isLit(rc, 0)) return left?;
+            if (keepRight && isLit(lc, 0)) return right?;
+            if (isSame(left, right)) return zero(b)?;
+        }
+    }
+
+    none
+}
+
+/**
+ * @returns: true iif the two operands are the same value, which evaluating has
+ * no effect and reads nothing but variables of the frame
+ *
+ * A global is named by the identifier `0` whatever global it is, so two of them
+ * compare equal without being the same.
+ * */
+fn isSame(left: &YILValue, right: &YILValue)-> bool {
+    if (left != right) return false;
+    if (!dce::isPure(left)) return false;
+    for id in copyprop::varsIn(left) {
+        if (id == 0us) return false;
+    }
+
+    true
+}
+
+/**
+ * @returns: `0`, of the type of the operation
+ * */
+fn zero(b: &YILBinaryValue)-> &YILValue {
+    copy YILIntValue(b.loc, b.type, 0us)
+}
+
+/**
+ * @returns: true iif two chained integer casts convert the innermost value the
+ * way a single cast to the outermost type does
+ *
+ * A cast narrowing to at most the width of the middle one keeps the same bits
+ * whatever the middle one did. A chain of widenings does too, as long as the
+ * middle one extends the value the way the innermost type does.
+ * */
+fn isMergeable(outer: &YILType, middle: &YILType, inner: &YILType)-> bool {
+    let t = if let i: &YILInt = outer { i } else { return false; };
+    let m = if let i: &YILInt = middle { i } else { return false; };
+    let x = if let i: &YILInt = inner { i } else { return false; };
+
+    if (t.size <= m.size) return true;
+
+    x.size < m.size && (!x.signed || m.signed)
+}
+
+/*!
+ * ================================================================================
+ * ================================================================================
+ * ============================          HELPERS          =========================
+ * ================================================================================
+ * ================================================================================
+ */
+
+/**
+ * @returns: the value of an integer literal its type can hold
+ *
+ * A literal out of the range of its type is not folded: what the backend makes
+ * of it is not what the literal says.
+ * */
+fn constOf(value: &YILValue)-> (&BigInt)? {
+    if let i: &YILIntValue = value {
+        if let t: &YILInt = i.type {
+            if (fits(i.value, t)) return i.value?;
+        }
+    }
+
+    none
+}
+
+/**
+ * @returns: true iif the value of an operand, as `constOf` gives it, is the literal `n`
+ * */
+fn isLit(c: (&BigInt)?, n: i32)-> bool {
+    if let Ok(v) = c { return v == n; }
+
+    false
+}
+
+/**
+ * @returns: true iif the type holds the value as it is
+ * */
+fn fits(value: &BigInt, type: &YILInt)-> bool {
+    let bits = type.size * 8u32;
+    if (!type.signed) return value >= 0 && value < pow2(bits);
+
+    let half = pow2(bits - 1u32);
+    value >= 0 - half && value < half
+}
+
+/**
+ * @returns: true iif both lists hold the very same instructions
+ * */
+fn sameInstrs(a: [&YILInstr], b: [&YILInstr])-> bool {
+    if (a.len != b.len) return false;
+    for i in 0us .. a.len {
+        if (a[i] !is b[i]) return false;
+    }
+
+    true
+}
+
+/**
+ * @returns: true iif both lists hold the very same values
+ * */
+fn sameValues(a: [&YILValue], b: [&YILValue])-> bool {
+    if (a.len != b.len) return false;
+    for i in 0us .. a.len {
+        if (a[i] !is b[i]) return false;
+    }
+
+    true
+}
+
+/**
+ * @returns: true iif both types are integers of the same width and signedness,
+ * which the backend makes the same type
+ * */
+fn sameInt(a: &YILType, b: &YILType)-> bool {
+    if let x: &YILInt = a {
+        if let y: &YILInt = b {
+            return x.size == y.size && x.signed == y.signed;
+        }
+    }
+
+    false
+}
+
+/**
+ * @returns: true iif a value of the first type needs no conversion to be of the second
+ * */
+fn sameType(a: &YILType, b: &YILType)-> bool {
+    match a {
+        _: &YILInt => { return sameInt(a, b); }
+        _: &YILPointer => { return a == b; }
+        _: &YILFloat => { return a == b; }
+    }
+
+    false
+}
+
+/**
+ * @returns: the integer the type holds for a mathematical value, wrapped around
+ * its width
+ * */
+fn wrap(value: &BigInt, type: &YILInt)-> &BigInt {
+    let bits = type.size * 8u32;
+    let res = modPow2(value, bits);
+    if (type.signed && res >= pow2(bits - 1u32)) return res - pow2(bits);
+
+    res
+}
+
+/**
+ * @returns: the value modulo `2^bits`, in `[0, 2^bits)`
+ * */
+fn modPow2(value: &BigInt, bits: u32)-> &BigInt {
+    let m = pow2(bits);
+    let res = value % m;
+    if (res < 0) return res + m;
+
+    res
+} catch {
+    _ => panic;
+}
+
+/**
+ * @returns: the bits of an integer of `bits` width holding the value
+ * */
+fn pattern(value: &BigInt, bits: u32)-> u64 {
+    modPow2(value, bits).toN!{u64} ()
+}
+
+/**
+ * @returns: `2^bits`
+ * */
+fn pow2(bits: u32)-> &BigInt {
+    if (bits < 64u32) return copy BigInt(1u64 << cast!u64 (bits));
+
+    copy BigInt(1u64 << 63u64) * pow2(bits - 63u32)
+}
+
+/**
+ * @returns: true iif the runtime divides `l` by `r` in the type without trapping
+ * */
+fn isDivisible(l: &BigInt, r: &BigInt, type: &YILInt)-> bool {
+    if (r == 0) return false;
+    if (type.signed && r == -1 && l == 0 - pow2(type.size * 8u32 - 1u32)) return false;
+
+    true
+}
+
+/**
+ * @returns: the quotient of `l` by `r`, rounded towards zero
+ * */
+fn truncDiv(l: &BigInt, r: &BigInt)-> &BigInt {
+    l / r
+} catch {
+    _ => panic;
+}
+
+/**
+ * @returns: the remainder of `l` by `r`, of the sign of `l`
+ * */
+fn truncMod(l: &BigInt, r: &BigInt)-> &BigInt {
+    l % r
+} catch {
+    _ => panic;
+}
+
+/**
+ * @returns: the quotient of `l` by a positive `d`, rounded towards minus infinity,
+ * which is what an arithmetic shift right computes
+ * */
+fn floorDiv(l: &BigInt, d: &BigInt)-> &BigInt {
+    let q = l / d;
+    if (l < 0 && q * d != l) return q - 1;
+
+    q
+} catch {
+    _ => panic;
+}
