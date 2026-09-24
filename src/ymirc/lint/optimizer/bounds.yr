@@ -1,0 +1,1469 @@
+/*
+ * Declares BoundsCheckPass, the pass deciding the bounds checks of a frame the
+ * control flow already answers.
+ *
+ * Every access to a slice the validator could not prove in bounds is guarded by
+ * a comparison of the index with the length, and a branch to a panic. The pass
+ * follows, along every path of the frame, what is known of the lengths and of
+ * the integers the checks compare:
+ *
+ *   - the length a slice was built with, a literal one above all, followed
+ *     through its copies and the runtime calls duplicating or allocating it;
+ *   - the value of an integer assigned a literal, and the bounds a comparison
+ *     taken or not taken puts on it;
+ *   - the orderings a comparison taken or not taken proves, `i < a.len` on
+ *     the path an access to `a[i]` survived, and `#_iter < #_nb_iters` in the
+ *     body of a loop whose bound is the length of the slice it walks.
+ *
+ * A check the facts decide is replaced by its answer, and the dead code
+ * elimination removes the branch it guarded. A check always taken is an access
+ * that panics on every execution reaching it: it is still folded, the panic
+ * staying where it was, and reported as a warning.
+ *
+ * <hr>
+ *
+ * @Package: ymirc
+ * @Module: ymirc::lint::optimizer::bounds
+ * @File: ymirc/lint/optimizer/bounds.yr
+ * @Author(s):
+ *   - Emile Cadorel <ecadorel@gmail.com>
+ *
+ * @Created(YYYY-MM-DD): 2026-09-24
+ * @Copyright(C) 2021–2026 GNU-Ymir
+ * @License
+ *   ```text
+ *   This file is part of the Ymir language project.
+ *
+ *   Ymir is free software: you can redistribute it and/or modify it
+ *   under the terms of the GNU General Public License as published by
+ *   the Free Software Foundation, either version 3 of the License, or
+ *   (at your option) any later version.
+ *
+ *   Ymir is distributed in the hope that it will be useful,
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *   GNU General Public License for more details.
+ *
+ *   You should have received a copy of the GNU General Public License
+ *   along with Ymir.  If not, see <https://www.gnu.org/licenses/>.
+ *   ```
+ */
+
+in bounds;
+
+use ymirc::errors;
+use ymirc::global::core_;
+use ymirc::lexing::{keys, word};
+use ymirc::lint::node::{_, global::_, instr::_, type::_, value::_};
+use ymirc::lint::optimizer::{errors, pass_};
+use ymirc::utils::{bigint, format};
+
+/**
+ * The number of sweeps over the blocks of a frame before the facts are assumed
+ * not to converge, in which case the frame is left as it is.
+ * */
+def MAX_SWEEPS = 16us;
+
+/**
+ * The number of orderings kept per path, the oldest being forgotten first.
+ * */
+def MAX_RELS = 32us;
+
+/**
+ * The pass deciding the bounds checks the control flow already answers.
+ * */
+@final
+pub class BoundsCheckPass over OptimizerPass {
+
+    // The locations already warned about, a check being decided in every round
+    // of the pipeline that still finds it
+    let mut _warned: [[c8] => mut ()] = copy [];
+
+    // The frame the pass last returned, by name: handed back untouched, there is
+    // nothing left in it to decide
+    let mut _done: [[c8] => mut &YILFrame] = copy [];
+
+    pub self ()
+        with super ("bounds-check", 1u32)
+    {}
+
+    /**
+     * Replace the bounds checks of a frame the facts decide by their answer.
+     *
+     * @params:
+     *    - frame: the frame to transform
+     * @returns: the transformed frame, or `frame` itself when nothing moved
+     * */
+    pub over apply(mut self, frame: &YILFrame)-> &YILFrame {
+        if let Ok(done) = self._done[frame.name] {
+            if (done is frame) return frame;
+        }
+
+        let res = self:.check(frame);
+        self._done[frame.name] = res;
+
+        res
+    }
+
+    /**
+     * Decide the bounds checks of a frame, and report the ones always taken.
+     *
+     * @params:
+     *    - frame: the frame to transform
+     * @returns: the transformed frame, or `frame` itself when nothing moved
+     * */
+    fn check(mut self, frame: &YILFrame)-> &YILFrame {
+        if (!hasPanic(frame.body)) return frame;
+
+        let dmut ck = copy Checker(frame);
+        let body = ck:.run();
+
+        for w in ck.getWarnings() {
+            let loc = w.0;
+            let key = format("%:%:%", loc.filename, loc.line, loc.col);
+            if (key in self._warned) continue;
+
+            self._warned[key] = ();
+            self:.report(w.1);
+        }
+
+        if (ck.getRemoved() == 0us && ck.getTaken() == 0us && ck.getFolded() == 0us) return frame;
+
+        self:.count("checks removed", nb-> ck.getRemoved());
+        self:.count("checks always taken", nb-> ck.getTaken());
+        self:.count("comparisons folded", nb-> ck.getFolded());
+
+        frame.withBody(body)
+    }
+
+}
+
+/*!
+ * ================================================================================
+ * ================================================================================
+ * ============================          FACTS          ===========================
+ * ================================================================================
+ * ================================================================================
+ */
+
+/**
+ * The integers a value is known to lie between, both bounds included.
+ * */
+pub class Interval {
+
+    pub {
+        // The smallest value, meaningful iif `hasLo`
+        let lo: &BigInt;
+
+        // The largest value, meaningful iif `hasHi`
+        let hi: &BigInt;
+
+        // False iif the value has no known lower bound
+        let hasLo: bool;
+
+        // False iif the value has no known upper bound
+        let hasHi: bool;
+    }
+
+    pub self (lo: &BigInt, hi: &BigInt, hasLo: bool, hasHi: bool)
+        with lo = lo
+        , hi = hi
+        , hasLo = hasLo
+        , hasHi = hasHi
+    {}
+
+    /**
+     * @returns: the interval holding `v` alone
+     * */
+    pub self exact(v: &BigInt)
+        with lo = v
+        , hi = v
+        , hasLo = true
+        , hasHi = true
+    {}
+
+    /**
+     * @returns: the interval of a length nothing is known of, which is never negative
+     * */
+    pub self length()
+        with lo = copy BigInt(0us)
+        , hi = copy BigInt(0us)
+        , hasLo = true
+        , hasHi = false
+    {}
+
+    /**
+     * @returns: true iif the interval holds a single value
+     * */
+    pub fn isExact(self)-> bool {
+        self.hasLo && self.hasHi && self.lo == self.hi
+    }
+
+    /**
+     * @returns: true iif no value lies in the interval, on a path no execution takes
+     * */
+    pub fn isEmpty(self)-> bool {
+        self.hasLo && self.hasHi && self.lo > self.hi
+    }
+
+    /**
+     * @returns: the smallest interval holding both, what is known on either of two paths
+     * */
+    pub fn hull(self, o: &Interval)-> &Interval {
+        let hasLo = self.hasLo && o.hasLo;
+        let hasHi = self.hasHi && o.hasHi;
+        let lo = if (hasLo && o.lo < self.lo) { o.lo } else { self.lo };
+        let hi = if (hasHi && o.hi > self.hi) { o.hi } else { self.hi };
+
+        copy Interval(lo, hi, hasLo, hasHi)
+    }
+
+    /**
+     * @returns: the interval, its upper bound lowered to `hi` if that is lower
+     * */
+    pub fn capHi(self, hi: &BigInt)-> &Interval {
+        if (self.hasHi && self.hi <= hi) return self;
+
+        copy Interval(self.lo, hi, self.hasLo, true)
+    }
+
+    /**
+     * @returns: the interval, its lower bound raised to `lo` if that is higher
+     * */
+    pub fn capLo(self, lo: &BigInt)-> &Interval {
+        if (self.hasLo && self.lo >= lo) return self;
+
+        copy Interval(lo, self.hi, true, self.hasHi)
+    }
+
+    /**
+     * @returns: true iif both intervals hold the same values
+     * */
+    pub fn sameAs(self, o: &Interval)-> bool {
+        if (self.hasLo != o.hasLo || self.hasHi != o.hasHi) return false;
+        if (self.hasLo && self.lo != o.lo) return false;
+        if (self.hasHi && self.hi != o.hi) return false;
+
+        true
+    }
+
+}
+
+/**
+ * What is known at a point of a frame, true on every path reaching it.
+ *
+ * It is never modified: every update returns a new set of facts, the one it is
+ * built from staying what a block entered or left with.
+ * */
+pub class Facts {
+
+    pub {
+        // The interval of the length of a slice, by variable
+        let lens: [(usize, &Interval)];
+
+        // The interval of an integer, by variable
+        let ints: [(usize, &Interval)];
+
+        // The length of a slice an integer was assigned, `n = a.len`, by variable
+        let lenOf: [(usize, &YILValue)];
+
+        // The comparison a variable was assigned, by variable
+        let conds: [(usize, &YILValue)];
+
+        // The orderings known to hold: `(x, y, true)` is `x < y`, `(x, y, false)` is `x <= y`
+        let rels: [(&YILValue, &YILValue, bool)];
+    }
+
+    pub self (lens: [(usize, &Interval)],
+              ints: [(usize, &Interval)],
+              lenOf: [(usize, &YILValue)],
+              conds: [(usize, &YILValue)],
+              rels: [(&YILValue, &YILValue, bool)])
+        with lens = lens
+        , ints = ints
+        , lenOf = lenOf
+        , conds = conds
+        , rels = rels
+    {}
+
+    /**
+     * @returns: the facts of a point nothing is known of
+     * */
+    pub self empty()
+        with lens = []
+        , ints = []
+        , lenOf = []
+        , conds = []
+        , rels = []
+    {}
+
+    /**
+     * @returns: the interval of the length of the slice held by a variable
+     * */
+    pub fn lenIn(self, id: usize)-> (&Interval)? {
+        for e in self.lens { if (e.0 == id) return e.1?; }
+
+        none
+    }
+
+    /**
+     * @returns: the interval of the integer held by a variable
+     * */
+    pub fn intIn(self, id: usize)-> (&Interval)? {
+        for e in self.ints { if (e.0 == id) return e.1?; }
+
+        none
+    }
+
+    /**
+     * @returns: the length of a slice the variable holds, `a.len` for `n = a.len`
+     * */
+    pub fn lenHeldBy(self, id: usize)-> (&YILValue)? {
+        for e in self.lenOf { if (e.0 == id) return e.1?; }
+
+        none
+    }
+
+    /**
+     * @returns: the comparison the variable holds the result of
+     * */
+    pub fn condIn(self, id: usize)-> (&YILValue)? {
+        for e in self.conds { if (e.0 == id) return e.1?; }
+
+        none
+    }
+
+    /**
+     * @returns: true iif `x < y` is known to hold, or `x <= y` when `strict` is false
+     * */
+    pub fn holds(self, x: &YILValue, y: &YILValue, strict: bool)-> bool {
+        for r in self.rels {
+            if ((r.2 || !strict) && r.0 == x && r.1 == y) return true;
+        }
+
+        false
+    }
+
+    /**
+     * @returns: the facts, the length of the slice held by `id` being `iv`
+     * */
+    pub fn withLen(self, id: usize, iv: &Interval)-> &Facts {
+        let mut res: [(usize, &Interval)] = [];
+        for e in self.lens { if (e.0 != id) res ~= [e]; }
+
+        copy Facts(res ~ [(id, iv)], self.ints, self.lenOf, self.conds, self.rels)
+    }
+
+    /**
+     * @returns: the facts, the integer held by `id` being in `iv`
+     * */
+    pub fn withInt(self, id: usize, iv: &Interval)-> &Facts {
+        let mut res: [(usize, &Interval)] = [];
+        for e in self.ints { if (e.0 != id) res ~= [e]; }
+
+        copy Facts(self.lens, res ~ [(id, iv)], self.lenOf, self.conds, self.rels)
+    }
+
+    /**
+     * @returns: the facts, `id` holding the length `len`
+     * */
+    pub fn withLenOf(self, id: usize, len: &YILValue)-> &Facts {
+        let mut res: [(usize, &YILValue)] = [];
+        for e in self.lenOf { if (e.0 != id) res ~= [e]; }
+
+        copy Facts(self.lens, self.ints, res ~ [(id, len)], self.conds, self.rels)
+    }
+
+    /**
+     * @returns: the facts, `id` holding the result of the comparison `cmp`
+     * */
+    pub fn withCond(self, id: usize, cmp: &YILValue)-> &Facts {
+        let mut res: [(usize, &YILValue)] = [];
+        for e in self.conds { if (e.0 != id) res ~= [e]; }
+
+        copy Facts(self.lens, self.ints, self.lenOf, res ~ [(id, cmp)], self.rels)
+    }
+
+    /**
+     * @returns: the facts, `x < y` holding if `strict`, `x <= y` otherwise
+     * */
+    pub fn withRel(self, x: &YILValue, y: &YILValue, strict: bool)-> &Facts {
+        if (self.holds(x, y, strict)) return self;
+
+        let mut res: [(&YILValue, &YILValue, bool)] = [];
+        let start = if (self.rels.len >= MAX_RELS) { self.rels.len - MAX_RELS + 1us } else { 0us };
+        for i in start .. self.rels.len {
+            let r = self.rels[i];
+            if (r.0 != x || r.1 != y) res ~= [r];
+        }
+
+        copy Facts(self.lens, self.ints, self.lenOf, self.conds, res ~ [(x, y, strict)])
+    }
+
+    /**
+     * @returns: the facts that do not name any of the variables, which a write
+     * to them leaves standing
+     * */
+    pub fn kill(self, ids: [usize])-> &Facts {
+        if (ids.len == 0us || !self.namesAny(ids)) return self;
+
+        let mut lens: [(usize, &Interval)] = [];
+        for e in self.lens { if (!defuse::containsId(ids, e.0)) lens ~= [e]; }
+
+        let mut ints: [(usize, &Interval)] = [];
+        for e in self.ints { if (!defuse::containsId(ids, e.0)) ints ~= [e]; }
+
+        let mut lenOf: [(usize, &YILValue)] = [];
+        for e in self.lenOf {
+            if (!defuse::containsId(ids, e.0) && !names(e.1, ids)) lenOf ~= [e];
+        }
+
+        let mut conds: [(usize, &YILValue)] = [];
+        for e in self.conds {
+            if (!defuse::containsId(ids, e.0) && !names(e.1, ids)) conds ~= [e];
+        }
+
+        let mut rels: [(&YILValue, &YILValue, bool)] = [];
+        for r in self.rels {
+            if (!names(r.0, ids) && !names(r.1, ids)) rels ~= [r];
+        }
+
+        copy Facts(lens, ints, lenOf, conds, rels)
+    }
+
+    /**
+     * @returns: true iif a fact names one of the variables
+     * */
+    pub fn namesAny(self, ids: [usize])-> bool {
+        for e in self.lens { if (defuse::containsId(ids, e.0)) return true; }
+        for e in self.ints { if (defuse::containsId(ids, e.0)) return true; }
+        for e in self.lenOf { if (defuse::containsId(ids, e.0) || names(e.1, ids)) return true; }
+        for e in self.conds { if (defuse::containsId(ids, e.0) || names(e.1, ids)) return true; }
+        for r in self.rels { if (names(r.0, ids) || names(r.1, ids)) return true; }
+
+        false
+    }
+
+    /**
+     * @returns: what is known on both paths, the one `self` describes and `o`
+     * */
+    pub fn meet(self, o: &Facts)-> &Facts {
+        let mut lens: [(usize, &Interval)] = [];
+        for e in self.lens {
+            if let Ok(iv) = o.lenIn(e.0) { lens ~= [(e.0, (e.1).hull(iv))]; }
+        }
+
+        let mut ints: [(usize, &Interval)] = [];
+        for e in self.ints {
+            if let Ok(iv) = o.intIn(e.0) { ints ~= [(e.0, (e.1).hull(iv))]; }
+        }
+
+        let mut lenOf: [(usize, &YILValue)] = [];
+        for e in self.lenOf {
+            if let Ok(v) = o.lenHeldBy(e.0) { if (v == e.1) lenOf ~= [e]; }
+        }
+
+        let mut conds: [(usize, &YILValue)] = [];
+        for e in self.conds {
+            if let Ok(v) = o.condIn(e.0) { if (v == e.1) conds ~= [e]; }
+        }
+
+        let mut rels: [(&YILValue, &YILValue, bool)] = [];
+        for r in self.rels {
+            if (o.holds(r.0, r.1, r.2)) { rels ~= [r]; }
+            else if (r.2 && o.holds(r.0, r.1, false)) { rels ~= [(r.0, r.1, false)]; }
+        }
+
+        copy Facts(lens, ints, lenOf, conds, rels)
+    }
+
+    /**
+     * @returns: true iif both sets hold the same facts
+     * */
+    pub fn sameAs(self, o: &Facts)-> bool {
+        if (self.lens.len != o.lens.len || self.ints.len != o.ints.len) return false;
+        if (self.lenOf.len != o.lenOf.len || self.conds.len != o.conds.len) return false;
+        if (self.rels.len != o.rels.len) return false;
+
+        for e in self.lens {
+            if let Ok(iv) = o.lenIn(e.0) { if (!iv.sameAs(e.1)) return false; }
+            else return false;
+        }
+
+        for e in self.ints {
+            if let Ok(iv) = o.intIn(e.0) { if (!iv.sameAs(e.1)) return false; }
+            else return false;
+        }
+
+        for e in self.lenOf {
+            if let Ok(v) = o.lenHeldBy(e.0) { if (v != e.1) return false; }
+            else return false;
+        }
+
+        for e in self.conds {
+            if let Ok(v) = o.condIn(e.0) { if (v != e.1) return false; }
+            else return false;
+        }
+
+        for r in self.rels {
+            if (!o.holds(r.0, r.1, r.2)) return false;
+            if (!r.2 && o.holds(r.0, r.1, true)) return false;
+        }
+
+        true
+    }
+
+}
+
+/*!
+ * ================================================================================
+ * ================================================================================
+ * ===========================          CHECKER          ==========================
+ * ================================================================================
+ * ================================================================================
+ */
+
+/**
+ * The decision of the bounds checks of a single frame.
+ *
+ * The facts are solved forward over the control flow graph, a comparison taken
+ * or not taken adding what it proves on the edge it leaves by. What is known on
+ * entering a block is what every path into it knows, a landing pad knowing
+ * nothing: it is entered from the middle of a block, and by the personality
+ * routine.
+ * */
+pub class Checker {
+
+    // The frame being rewritten
+    let _frame: &YILFrame;
+
+    // The control flow graph of the frame, the facts are solved over
+    let _graph: &CFG;
+
+    // What every instruction of the frame reads and writes
+    let _du: &DefUse;
+
+    // The variables whose address escaped
+    let mut _escaped: [usize => mut ()] = copy [];
+
+    // The facts entering every block the solver reached, by block
+    let mut _in: [usize => mut &Facts] = copy [];
+
+    // The facts leaving every block the solver reached, by block
+    let mut _out: [usize => mut &Facts] = copy [];
+
+    // The answer of every candidate instruction, per copy of it the graph holds
+    let mut _votes: [usize => mut [(bool)?]] = copy [];
+
+    // The location of the panic the branch taken on a true condition calls, by
+    // rank of the conditional jump
+    let mut _panicGuards: [usize => mut &Word] = copy [];
+
+    // The candidate always taken of a panicking branch, by rank: the comparison
+    // and the facts it was decided on
+    let mut _guards: [usize => mut (&YILValue, &Facts)] = copy [];
+
+    // The answer every candidate is replaced by, by rank
+    let mut _folds: [usize => mut bool] = copy [];
+
+    // The rank of the instruction the rewriting reached
+    let mut _ord: usize = 0us;
+
+    // The number of checks folded to never taken
+    let mut _removed: usize = 0us;
+
+    // The number of checks folded to always taken
+    let mut _taken: usize = 0us;
+
+    // The number of comparisons assigned to a variable replaced by their answer
+    let mut _folded: usize = 0us;
+
+    /**
+     * @params:
+     *    - frame: the frame to rewrite
+     * */
+    pub self (frame: &YILFrame)
+        with _frame = frame
+        , _graph = copy CFG(frame)
+        , _du = copy DefUse(frame)
+    {
+        for id in self._du.getEscaped() { self._escaped[id] = (); }
+    }
+
+    /**
+     * Decide the checks of the frame and rewrite them.
+     *
+     * @returns: the new body
+     * */
+    pub fn run(mut self)-> &YILInstr {
+        self:.findPanicGuards();
+        if (!self:.solve()) return self._frame.body;
+
+        self:.vote();
+        if (self._folds.len == 0us) return self._frame.body;
+
+        self._ord = 0us;
+        self:.rewrite(self._frame.body)
+    }
+
+    /**
+     * @returns: the number of checks folded to never taken
+     * */
+    pub fn getRemoved(self)-> usize {
+        self._removed
+    }
+
+    /**
+     * @returns: the number of checks folded to always taken
+     * */
+    pub fn getTaken(self)-> usize {
+        self._taken
+    }
+
+    /**
+     * @returns: the number of comparisons assigned to a variable replaced by their answer
+     * */
+    pub fn getFolded(self)-> usize {
+        self._folded
+    }
+
+    /**
+     * @returns: the checks always taken that guard a panic, with the location
+     * of each and the warning saying so
+     * */
+    pub fn getWarnings(self)-> [(&Word, &ErrorMsg)] {
+        let mut res: [(&Word, &ErrorMsg)] = [];
+        for ord, g in self._guards {
+            let mut taken = false;
+            if let Ok(f) = self._folds[ord] { taken = f; }
+            if (!taken) continue;
+
+            let cmp = g.0;
+            if let Ok(c) = compareOf(cmp) {
+                let (x, y, strict) = c;
+                let len = describe(g.1, x, upper-> true);
+                let index = describe(g.1, y, upper-> false);
+                let op = if (strict) { BinaryOperators::INF } else { BinaryOperators::INF_EQUAL };
+                let msg = format(OptimizerErrorMessage::ALWAYS_OVERFLOW, len, op, index);
+
+                let end = if (!y.loc.isEof && y.loc.filename == cmp.loc.filename && y.loc.line == cmp.loc.line) { y.loc } else { EOF_WORD };
+                res ~= [(cmp.loc, copy ErrorMsg::warn(cmp.loc, end-> end, msg))];
+            }
+        }
+
+        res
+    }
+
+    /*!
+     * ================================================================================
+     * ================================================================================
+     * ============================          SOLVE          ===========================
+     * ================================================================================
+     * ================================================================================
+     */
+
+    /**
+     * Solve the facts of every block a path reaches, a landing pad being the
+     * start of a path of its own.
+     *
+     * The blocks start from knowing everything, and lose what a path into them
+     * does not know until nothing moves: a fact still standing at the end holds
+     * on every path, loops included.
+     *
+     * @returns: false iif the facts did not converge, nothing being decided then
+     * */
+    fn solve(mut self)-> bool {
+        let graph = self._graph;
+        let mut order = graph.reversePostOrder();
+
+        // a pad the graph believes no path reaches is entered by the personality
+        // routine all the same, and so is everything it falls into
+        let mut skip: [usize => mut ()] = copy [];
+        for b in order { skip[b.getUid()] = (); }
+        for b in graph.deadBlocks() { skip[b.getUid()] = (); }
+        for b in graph.getBlocks() {
+            if (b.getUid() !in skip) order ~= [b];
+        }
+
+        for _ in 0us .. MAX_SWEEPS {
+            let mut changed = false;
+            for b in order {
+                let entering = self.enteringOf(b);
+                let leaving = self:.transferBlock(b, entering, collect-> false);
+
+                if let Ok(old) = self._out[b.getUid()] {
+                    if (!old.sameAs(leaving)) changed = true;
+                } else {
+                    changed = true;
+                }
+
+                self._in[b.getUid()] = entering;
+                self._out[b.getUid()] = leaving;
+            }
+
+            if (!changed) return true;
+        }
+
+        false
+    }
+
+    /**
+     * @returns: the facts true on entering a block, on every path the solver
+     * reached so far
+     * */
+    fn enteringOf(self, bb: &BasicBlock)-> &Facts {
+        let prev = bb.getPrevious();
+        if (prev.len == 0us) return copy Facts::empty();
+
+        let mut res: (&Facts)? = none;
+        for p in prev {
+            if (p.2 != EdgeKind::NORMAL) return copy Facts::empty();
+
+            if let Ok(out) = self._out[(p.0).getUid()] {
+                let through = self.refineEdge(out, p.1);
+                if let Ok(r) = res { res = r.meet(through)?; }
+                else { res = through?; }
+            }
+        }
+
+        if let Ok(r) = res { return r; }
+
+        copy Facts::empty()
+    }
+
+    /**
+     * @params:
+     *    - facts: the facts leaving the block the edge leaves
+     *    - cond:  the value the edge is taken on
+     * @returns: the facts true on the edge, what the condition proves added
+     * */
+    fn refineEdge(self, facts: &Facts, cond: &YILValue)-> &Facts {
+        let mut value = cond;
+        let mut taken = true;
+        if let u: &YILUnaryValue = cond {
+            if (u.op == UnaryOperators::NOT) {
+                value = u.left;
+                taken = false;
+            }
+        }
+
+        let cmp = self.resolveCond(facts, value);
+        if let Ok(c) = compareOf(cmp) {
+            let (x, y, strict) = c;
+            if (taken) return self.refine(facts, x, y, strict);
+
+            return self.refine(facts, y, x, !strict);
+        }
+
+        facts
+    }
+
+    /**
+     * @returns: the comparison a condition is, looking through the variable
+     * holding the result of one
+     * */
+    fn resolveCond(self, facts: &Facts, cond: &YILValue)-> &YILValue {
+        if let v: &YILVar = cond {
+            if let Ok(c) = facts.condIn(v.id) { return c; }
+        }
+
+        cond
+    }
+
+    /**
+     * @returns: the facts, `x < y` holding if `strict`, `x <= y` otherwise
+     * */
+    fn refine(self, facts: &Facts, x: &YILValue, y: &YILValue, strict: bool)-> &Facts {
+        let mut res = facts;
+        if (self.isTrackable(x) && self.isTrackable(y)) {
+            res = res.withRel(x, y, strict);
+            if let v: &YILVar = y {
+                if let Ok(l) = res.lenHeldBy(v.id) { res = res.withRel(x, l, strict); }
+            }
+
+            if let v: &YILVar = x {
+                if let Ok(l) = res.lenHeldBy(v.id) { res = res.withRel(l, y, strict); }
+            }
+        }
+
+        if let Ok(iy) = self.evalInt(res, y) {
+            if (iy.hasHi) {
+                let hi = if (strict) { iy.hi - 1us } else { iy.hi };
+                res = self.bound(res, x, hi, upper-> true);
+            }
+        }
+
+        if let Ok(ix) = self.evalInt(res, x) {
+            if (ix.hasLo) {
+                let lo = if (strict) { ix.lo + 1us } else { ix.lo };
+                res = self.bound(res, y, lo, upper-> false);
+            }
+        }
+
+        res
+    }
+
+    /**
+     * @params:
+     *    - facts: the facts to update
+     *    - value: the value bounded, an integer or the length of a slice
+     *    - b:     the bound
+     *    - upper: true iif the bound is an upper one
+     * @returns: the facts, the value bounded by `b`
+     * */
+    fn bound(self, facts: &Facts, value: &YILValue, b: &BigInt, upper: bool)-> &Facts {
+        if let Ok(id) = self.lenVar(value) {
+            let old = if let Ok(iv) = facts.lenIn(id) { iv } else { copy Interval::length() };
+            return facts.withLen(id, if (upper) { old.capHi(b) } else { old.capLo(b) });
+        }
+
+        if let v: &YILVar = value {
+            if (!self.isOwned(v.id) || !isInt(v.type)) return facts;
+
+            let mut res = facts;
+            if let Ok(l) = facts.lenHeldBy(v.id) { res = self.bound(res, l, b, upper-> upper); }
+
+            let old = if let Ok(iv) = res.intIn(v.id) { iv } else { copy Interval(b, b, false, false) };
+            return res.withInt(v.id, if (upper) { old.capHi(b) } else { old.capLo(b) });
+        }
+
+        facts
+    }
+
+    /**
+     * Walk the instructions of a block, transferring the facts through them.
+     *
+     * @params:
+     *    - bb:       the block to walk
+     *    - entering: the facts true on entering it
+     *    - collect:  true iif the answers of the candidates are collected
+     * @returns: the facts true on leaving it
+     * */
+    fn transferBlock(mut self, bb: &BasicBlock, entering: &Facts, collect: bool)-> &Facts {
+        let instrs = bb.getInstrs();
+        let ords = bb.getOrds();
+
+        let mut facts = entering;
+        for i in 0us .. instrs.len {
+            let cmp = self.candidateOf(facts, instrs[i], ords[i]);
+            let mut answer: (bool)? = none;
+            if let Ok(c) = cmp { answer = self.decide(facts, c); }
+
+            if (collect && ords[i] != bblock::NO_ORD) {
+                self:.collectAnswer(ords[i], answer, cmp, facts);
+            }
+
+            facts = self.transfer(facts, instrs[i], answer, cmp);
+        }
+
+        facts
+    }
+
+    /*!
+     * ================================================================================
+     * ================================================================================
+     * ==========================          TRANSFER          ==========================
+     * ================================================================================
+     * ================================================================================
+     */
+
+    /**
+     * @params:
+     *    - facts:  the facts true before the instruction
+     *    - instr:  the instruction
+     *    - answer: the answer of the check the instruction evaluates, if decided
+     *    - cmp:    the comparison the instruction evaluates, if it is a candidate
+     * @returns: the facts true after it
+     * */
+    fn transfer(self, facts: &Facts, instr: &YILInstr, answer: (bool)?, cmp: (&YILValue)?)-> &Facts {
+        let killed = facts.kill(self._du.ofInstr(instr).getAllDefs());
+
+        match instr {
+            a: &YILAffect => {
+                if let v: &YILVar = a.left {
+                    if (self.isOwned(v.id)) return self.assign(facts, killed, v, a.right, answer, cmp);
+                }
+            }
+            c: &YILCall => {
+                if let n: &YILNameCallValue = c.content {
+                    return self.runtimeCall(facts, killed, n);
+                }
+            }
+        }
+
+        killed
+    }
+
+    /**
+     * @params:
+     *    - pre:    the facts true before the assignment
+     *    - facts:  the same, the ones naming the variable written taken out
+     *    - v:      the variable assigned
+     *    - right:  the value assigned
+     *    - answer: the answer of the comparison assigned, if decided
+     *    - cmp:    the comparison assigned, if it is a candidate
+     * @returns: the facts true after the assignment
+     * */
+    fn assign(self, pre: &Facts, facts: &Facts, v: &YILVar, right: &YILValue, answer: (bool)?, cmp: (&YILValue)?)-> &Facts {
+        let mut res = facts;
+        let reads = copyprop::varsIn(right);
+        let selfRead = defuse::containsId(reads, v.id);
+
+        if let Ok(a) = answer {
+            res = res.withInt(v.id, copy Interval::exact(copy BigInt(if (a) { 1us } else { 0us })));
+        }
+
+        if let Ok(c) = cmp {
+            if (!selfRead && self.isTrackable(c)) res = res.withCond(v.id, c);
+            return res;
+        }
+
+        match right {
+            i: &YILIntValue => { return res.withInt(v.id, copy Interval::exact(i.value)); }
+            w: &YILVar => {
+                if (w.id == v.id || !self.isOwned(w.id)) return res;
+
+                if let Ok(iv) = facts.lenIn(w.id) { res = res.withLen(v.id, iv); }
+                if let Ok(iv) = facts.intIn(w.id) { res = res.withInt(v.id, iv); }
+                if let Ok(l) = facts.lenHeldBy(w.id) { res = res.withLenOf(v.id, l); }
+                if let Ok(c) = facts.condIn(w.id) { res = res.withCond(v.id, c); }
+
+                for r in facts.rels {
+                    if (r.0 == w) res = res.withRel(v, r.1, r.2);
+                    if (r.1 == w) res = res.withRel(r.0, v, r.2);
+                }
+
+                return res;
+            }
+            t: &YILTupleValue => {
+                if let Ok(l) = sliceLenOf(t) {
+                    if let Ok(iv) = self.evalInt(pre, l) { res = res.withLen(v.id, iv); }
+                }
+
+                return res;
+            }
+        }
+
+        if (!selfRead && isLenField(right)) {
+            if let Ok(iv) = self.evalInt(pre, right) { res = res.withInt(v.id, iv); }
+            if (self.isTrackable(right)) res = res.withLenOf(v.id, right);
+        }
+
+        if (!selfRead && isCompare(right) && self.isTrackable(right)) {
+            res = res.withCond(v.id, right);
+        }
+
+        res
+    }
+
+    /**
+     * @params:
+     *    - pre:   the facts true before the call
+     *    - facts: the same, the ones naming a variable the call writes taken out
+     *    - call:  the call
+     * @returns: the facts true after the call, the length of the slice a runtime
+     * function allocating one writes included
+     * */
+    fn runtimeCall(self, pre: &Facts, facts: &Facts, call: &YILNameCallValue)-> &Facts {
+        let params = call.params;
+        let mut lenIdx = 0us, mut fromIdx = 0us;
+        if (call.funcName == YRuntimeFuncs::DUPLICATE_SLICE) { fromIdx = 1us; }
+        else if (call.funcName == YRuntimeFuncs::ALLOC_SET_SLICE) { lenIdx = 2us; }
+        else if (call.funcName == YRuntimeFuncs::ALLOC_NO_SET_SLICE) { lenIdx = 1us; }
+        else return facts;
+
+        if (params.len <= lenIdx || params.len <= fromIdx) return facts;
+
+        if let Ok(out) = defuse::addressedVar(params[0us]) {
+            if (!self.isOwned(out)) return facts;
+
+            if (fromIdx != 0us) {
+                if let Ok(from) = defuse::addressedVar(params[fromIdx]) {
+                    if let Ok(iv) = pre.lenIn(from) { return facts.withLen(out, iv); }
+                }
+
+                return facts;
+            }
+
+            if let Ok(iv) = self.evalInt(pre, params[lenIdx]) { return facts.withLen(out, iv); }
+        }
+
+        facts
+    }
+
+    /*!
+     * ================================================================================
+     * ================================================================================
+     * ===========================          DECIDE          ===========================
+     * ================================================================================
+     * ================================================================================
+     */
+
+    /**
+     * @params:
+     *    - facts: the facts true before the instruction
+     *    - instr: an instruction of the frame
+     *    - ord:   the rank of the instruction
+     * @returns: the comparison the instruction evaluates, iif it is a candidate
+     *
+     * A candidate is a comparison reading the length of a slice, assigned to a
+     * variable or jumped on, or the comparison of a bounds check.
+     * */
+    fn candidateOf(self, facts: &Facts, instr: &YILInstr, ord: usize)-> (&YILValue)? {
+        match instr {
+            a: &YILAffect => {
+                if (isCompare(a.right) && readsLen(a.right)) return a.right?;
+            }
+            c: &YILCondJmp => {
+                let cmp = self.resolveCond(facts, c.cond);
+                if (isCompare(cmp) && (readsLen(cmp) || self.isBoundsCheck(ord, cmp))) return cmp?;
+            }
+        }
+
+        none
+    }
+
+    /**
+     * @returns: true iif the conditional jump of rank `ord` on `cmp` is a bounds
+     * check, whose panic the validator located at the comparison itself
+     * */
+    fn isBoundsCheck(self, ord: usize, cmp: &YILValue)-> bool {
+        if let Ok(loc) = self._panicGuards[ord] { return loc.isSameLoc(cmp.loc); }
+
+        false
+    }
+
+    /**
+     * @returns: the answer of a comparison, when the facts decide it
+     * */
+    fn decide(self, facts: &Facts, cmp: &YILValue)-> (bool)? {
+        if let Ok(c) = compareOf(cmp) {
+            let (x, y, strict) = c;
+            if (facts.holds(x, y, strict)) return true?;
+            if (facts.holds(y, x, !strict)) return false?;
+
+            if let Ok(ix) = self.evalInt(facts, x) {
+                if let Ok(iy) = self.evalInt(facts, y) {
+                    if (ix.isEmpty() || iy.isEmpty()) return none;
+
+                    if (ix.hasHi && iy.hasLo) {
+                        if (strict && ix.hi < iy.lo) return true?;
+                        if (!strict && ix.hi <= iy.lo) return true?;
+                    }
+
+                    if (ix.hasLo && iy.hasHi) {
+                        if (strict && ix.lo >= iy.hi) return false?;
+                        if (!strict && ix.lo > iy.hi) return false?;
+                    }
+                }
+            }
+        }
+
+        none
+    }
+
+    /**
+     * Find the conditional jumps whose branch taken on a true condition panics.
+     * */
+    fn findPanicGuards(mut self) {
+        for b in self._graph.getBlocks() {
+            let ords = b.getOrds();
+            if let Ok(last) = b.getLast() {
+                if let c: &YILCondJmp = last {
+                    if (c.then.id == c.else_.id) continue;
+
+                    for n in b.getNext() {
+                        if (n.2 != EdgeKind::NORMAL || n.1 !is c.cond) continue;
+
+                        for i in (n.0).getInstrs() {
+                            if (isPanic(i)) self._panicGuards[ords[$ - 1us]] = i.loc;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /*!
+     * ================================================================================
+     * ================================================================================
+     * ============================          VOTE          ============================
+     * ================================================================================
+     * ================================================================================
+     */
+
+    /**
+     * Decide the candidates the facts answer on every copy of them.
+     *
+     * The graph builds the finally part of a try/finally twice while the body
+     * holds it once, so an instruction is only rewritten when every block
+     * carrying it gave it the same answer, a block the solver never reached
+     * giving none.
+     * */
+    fn vote(mut self) {
+        let graph = self._graph;
+        for b in graph.getBlocks() {
+            if let Ok(entering) = self._in[b.getUid()] {
+                self:.transferBlock(b, entering, collect-> true);
+            }
+        }
+
+        let mut nbOf: [usize => mut usize] = copy [];
+        for b in graph.getBlocks() {
+            for o in b.getOrds() {
+                if let Ok(n) = nbOf[o] { nbOf[o] = n + 1us; } else { nbOf[o] = 1us; }
+            }
+        }
+
+        for o, answers in self._votes {
+            if let Ok(n) = nbOf[o] { if (answers.len != n) continue; }
+
+            let mut res: (bool)? = none;
+            let mut agree = true;
+            for a in answers {
+                if let Ok(x) = a {
+                    if let Ok(y) = res { if (x != y) agree = false; }
+                    else { res = x?; }
+                } else {
+                    agree = false;
+                }
+            }
+
+            if let Ok(r) = res {
+                if (agree) self._folds[o] = r;
+            }
+        }
+    }
+
+    /**
+     * Record the answer a copy of a candidate got.
+     *
+     * A copy the instruction is not a candidate in gives no answer at all, and
+     * the instruction then has fewer answers than copies.
+     * */
+    fn collectAnswer(mut self, ord: usize, answer: (bool)?, cmp: (&YILValue)?, facts: &Facts) {
+        if let Ok(c) = cmp {
+            self:.addVote(ord, answer);
+
+            if let Ok(a) = answer {
+                if (a && self.isBoundsCheck(ord, c)) self._guards[ord] = (c, facts);
+            }
+        }
+    }
+
+    /**
+     * Add the answer of one copy of a candidate.
+     * */
+    fn addVote(mut self, ord: usize, answer: (bool)?) {
+        if let Ok(old) = self._votes[ord] { self._votes[ord] = old ~ [answer]; }
+        else { self._votes[ord] = copy [answer]; }
+    }
+
+    /*!
+     * ================================================================================
+     * ================================================================================
+     * ===========================          REWRITE          ==========================
+     * ================================================================================
+     * ================================================================================
+     */
+
+    /**
+     * Rewrite an instruction, replacing the candidates decided by their answer.
+     *
+     * The walk counts exactly the way the graph builder counted: every
+     * instruction of the body has a rank, containers included, and the rank is
+     * given before the children are walked.
+     * */
+    fn rewrite(mut self, instr: &YILInstr)-> &YILInstr {
+        let ord = self._ord;
+        self._ord += 1us;
+
+        match instr {
+            b: &YILBlock => { return copy YILBlock(b.loc, self:.rewriteList(b.instrs)); }
+            t: &YILTryCatch => {
+                let tryPart = self:.rewriteList(t.tryPart);
+                return copy YILTryCatch(t.loc, t.catchType, tryPart, self:.rewriteList(t.catchPart));
+            }
+            t: &YILTryFinally => {
+                let tryPart = self:.rewriteList(t.tryPart);
+                return copy YILTryFinally(t.loc, tryPart, self:.rewriteList(t.finPart));
+            }
+        }
+
+        if let Ok(answer) = self._folds[ord] {
+            match instr {
+                a: &YILAffect => {
+                    self._folded += 1us;
+                    return copy YILAffect(a.loc, a.left, literal(a.right, answer));
+                }
+                c: &YILCondJmp => {
+                    if (answer) { self._taken += 1us; } else { self._removed += 1us; }
+                    return copy YILCondJmp(c.loc, literal(c.cond, answer), c.then, c.else_);
+                }
+            }
+        }
+
+        instr
+    }
+
+    /**
+     * Rewrite a list of instructions, replacing the candidates decided by their answer.
+     * */
+    fn rewriteList(mut self, instrs: [&YILInstr])-> [&YILInstr] {
+        let mut res: [mut &YILInstr] = [];
+        for i in instrs { res ~= [self:.rewrite(i)]; }
+
+        res
+    }
+
+    /*!
+     * ================================================================================
+     * ================================================================================
+     * ============================          VALUES          ==========================
+     * ================================================================================
+     * ================================================================================
+     */
+
+    /**
+     * @returns: the interval an integer value is known to lie in
+     * */
+    fn evalInt(self, facts: &Facts, value: &YILValue)-> (&Interval)? {
+        match value {
+            i: &YILIntValue => { return (copy Interval::exact(i.value))?; }
+            v: &YILVar => {
+                if (!self.isOwned(v.id)) return none;
+                return facts.intIn(v.id);
+            }
+            f: &YILFieldValue => {
+                if (f.name != SliceKeys::LEN) return none;
+
+                match f.tuple {
+                    t: &YILTupleValue => {
+                        if let Ok(l) = sliceLenOf(t) { return self.evalInt(facts, l); }
+                    }
+                    v: &YILVar => {
+                        if (!self.isOwned(v.id) || !isSlice(v.type)) return none;
+                        if let Ok(iv) = facts.lenIn(v.id) { return iv?; }
+
+                        return (copy Interval::length())?;
+                    }
+                }
+            }
+        }
+
+        none
+    }
+
+    /**
+     * @returns: the variable a value is the length of, `a` for `a.len`
+     * */
+    fn lenVar(self, value: &YILValue)-> (usize)? {
+        if let f: &YILFieldValue = value {
+            if (f.name != SliceKeys::LEN) return none;
+            if let v: &YILVar = f.tuple {
+                if (self.isOwned(v.id) && isSlice(v.type)) return v.id?;
+            }
+        }
+
+        none
+    }
+
+    /**
+     * @returns: true iif the variable belongs to the frame and nothing writes it
+     * without naming it
+     * */
+    fn isOwned(self, id: usize)-> bool {
+        self._du.isTracked(id) && id !in self._escaped
+    }
+
+    /**
+     * @returns: true iif a fact may name the value: it has no effect, reads no
+     * memory the frame does not own, and only names variables the frame owns
+     * */
+    fn isTrackable(self, value: &YILValue)-> bool {
+        if (!copyprop::isMovable(value) || !dce::isPure(value)) return false;
+
+        for id in copyprop::varsIn(value) {
+            if (!self.isOwned(id)) return false;
+        }
+
+        true
+    }
+
+}
+
+/*!
+ * ================================================================================
+ * ================================================================================
+ * ============================          HELPERS          =========================
+ * ================================================================================
+ * ================================================================================
+ */
+
+/**
+ * @returns: `(x, y, strict)` for a comparison of integers stating `x < y`(strict)
+ * or `x <= y`, the only ones whose negation is the converse ordering
+ * */
+fn compareOf(value: &YILValue)-> ((&YILValue, &YILValue, bool))? {
+    if let b: &YILBinaryValue = value {
+        if (!isInt(b.left.type) || !isInt(b.right.type)) return none;
+
+        if (b.op == BinaryOperators::INF) return (b.left, b.right, true)?;
+        if (b.op == BinaryOperators::INF_EQUAL) return (b.left, b.right, false)?;
+        if (b.op == BinaryOperators::SUP) return (b.right, b.left, true)?;
+        if (b.op == BinaryOperators::SUP_EQUAL) return (b.right, b.left, false)?;
+    }
+
+    none
+}
+
+/**
+ * @returns: true iif the value is an ordering comparison
+ * */
+fn isCompare(value: &YILValue)-> bool {
+    if let Ok(_) = compareOf(value) { return true; }
+
+    false
+}
+
+/**
+ * @returns: true iif one side of the comparison is the length of a slice
+ * */
+fn readsLen(cmp: &YILValue)-> bool {
+    if let Ok(c) = compareOf(cmp) { return isLenField(c.0) || isLenField(c.1); }
+
+    false
+}
+
+/**
+ * @returns: true iif the value reads the length of a slice
+ * */
+fn isLenField(value: &YILValue)-> bool {
+    if let f: &YILFieldValue = value {
+        return f.name == SliceKeys::LEN && isSlice(f.tuple.type);
+    }
+
+    false
+}
+
+/**
+ * @returns: true iif the type is the one of a slice
+ * */
+fn isSlice(type: &YILType)-> bool {
+    if let t: &YILTuple = type {
+        return t.fieldNames.len == 3us
+            && t.fieldNames[0] == SliceKeys::LEN
+            && t.fieldNames[1] == SliceKeys::PTR
+            && t.fieldNames[2] == SliceKeys::BLK_INFO;
+    }
+
+    false
+}
+
+/**
+ * @returns: true iif the type is an integer
+ * */
+fn isInt(type: &YILType)-> bool {
+    if let _: &YILInt = type { return true; }
+
+    false
+}
+
+/**
+ * @returns: the value a slice built field by field is given as its length
+ * */
+fn sliceLenOf(t: &YILTupleValue)-> (&YILValue)? {
+    if (!isSlice(t.type)) return none;
+
+    for i, n in t.fieldNames {
+        if (n == SliceKeys::LEN && i < t.values.len) return t.values[i]?;
+    }
+
+    none
+}
+
+/**
+ * @returns: true iif the value names one of the variables
+ * */
+fn names(value: &YILValue, ids: [usize])-> bool {
+    for i in copyprop::varsIn(value) {
+        if (defuse::containsId(ids, i)) return true;
+    }
+
+    false
+}
+
+/**
+ * @returns: the literal a comparison is replaced by, of the type of the comparison
+ * */
+fn literal(cmp: &YILValue, answer: bool)-> &YILValue {
+    copy YILIntValue(cmp.loc, cmp.type, if (answer) { 1us } else { 0us })
+}
+
+/**
+ * @returns: how a side of a comparison always taken is written in the warning,
+ * the value itself when it is known exactly, its bound otherwise
+ * */
+fn describe(facts: &Facts, value: &YILValue, upper: bool)-> [c8] {
+    let iv = boundOf(facts, value);
+    if let Ok(i) = iv {
+        if (i.isExact()) return format("%", i.lo);
+        if (upper && i.hasHi) return format("at most %", i.hi);
+        if (!upper && i.hasLo) return format("at least %", i.lo);
+    }
+
+    format("%", value)
+}
+
+/**
+ * @returns: the interval of a side of a comparison, read off the facts alone
+ * */
+fn boundOf(facts: &Facts, value: &YILValue)-> (&Interval)? {
+    match value {
+        i: &YILIntValue => { return (copy Interval::exact(i.value))?; }
+        v: &YILVar => { return facts.intIn(v.id); }
+        f: &YILFieldValue => {
+            match f.tuple {
+                v: &YILVar => { return facts.lenIn(v.id); }
+                t: &YILTupleValue => {
+                    if let Ok(l) = sliceLenOf(t) { return boundOf(facts, l); }
+                }
+            }
+        }
+    }
+
+    none
+}
+
+/**
+ * @returns: true iif the instruction is a call to the runtime panic
+ * */
+fn isPanic(instr: &YILInstr)-> bool {
+    if let c: &YILCall = instr {
+        if let n: &YILNameCallValue = c.content {
+            return n.funcName == YRuntimeFuncs::PANIC;
+        }
+    }
+
+    false
+}
+
+/**
+ * @returns: true iif an instruction calls the runtime panic, the ones it holds included
+ * */
+fn hasPanic(instr: &YILInstr)-> bool {
+    match instr {
+        b: &YILBlock => { for i in b.instrs { if (hasPanic(i)) return true; } }
+        t: &YILTryCatch => {
+            for i in t.tryPart { if (hasPanic(i)) return true; }
+            for i in t.catchPart { if (hasPanic(i)) return true; }
+        }
+        t: &YILTryFinally => {
+            for i in t.tryPart { if (hasPanic(i)) return true; }
+            for i in t.finPart { if (hasPanic(i)) return true; }
+        }
+        _ => { return isPanic(instr); }
+    }
+
+    false
+}
