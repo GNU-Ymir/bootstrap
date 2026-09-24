@@ -1,0 +1,525 @@
+/*
+ * Declares ConcatFusionPass, the pass concatenating a chain of slices in one
+ * allocation.
+ *
+ * `a ~ b ~ c` is two concatenations to the expander, the result of the first
+ * being an operand of the second: it is allocated, filled, copied into the
+ * second and dropped. The pass lowers the whole chain to one call to
+ * `_yrt_concat_slices_n`, which allocates the total length once and copies
+ * every operand into it.
+ *
+ * The operands of the chain are then read where its last concatenation was
+ * made rather than where each of them was, and the pass is only allowed to move
+ * them that far because nothing in between can write them: the instructions
+ * between the first concatenation of the chain and its last are required to be
+ * the chain itself and the evaluation of its operands into temporaries nothing
+ * else names.
+ *
+ * <hr>
+ *
+ * @Package: ymirc
+ * @Module: ymirc::lint::optimizer::concat
+ * @File: ymirc/lint/optimizer/concat.yr
+ * @Author(s):
+ *   - Emile Cadorel <ecadorel@gmail.com>
+ *
+ * @Created(YYYY-MM-DD): 2026-09-24
+ * @Copyright(C) 2021–2026 GNU-Ymir
+ * @License
+ *   ```text
+ *   This file is part of the Ymir language project.
+ *
+ *   Ymir is free software: you can redistribute it and/or modify it
+ *   under the terms of the GNU General Public License as published by
+ *   the Free Software Foundation, either version 3 of the License, or
+ *   (at your option) any later version.
+ *
+ *   Ymir is distributed in the hope that it will be useful,
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *   GNU General Public License for more details.
+ *
+ *   You should have received a copy of the GNU General Public License
+ *   along with Ymir.  If not, see <https://www.gnu.org/licenses/>.
+ *   ```
+ */
+
+in concat;
+
+use ymirc::global::core_;
+use ymirc::lint::node::{_, global::_, instr::_, type::_, value::_};
+use ymirc::lint::optimizer::{defuse, pass_};
+use ymirc::utils::format;
+
+/**
+ * The pass fusing the chains of slice concatenations.
+ * */
+@final
+pub class ConcatFusionPass over OptimizerPass {
+
+    pub self ()
+        with super ("concat-fusion", 1u32)
+    {}
+
+    /**
+     * Lower every chain of concatenations of the frame to a single one.
+     *
+     * @params:
+     *    - frame: the frame to transform
+     * @returns: the transformed frame, or `frame` itself when nothing moved
+     * */
+    pub over apply(mut self, frame: &YILFrame)-> &YILFrame {
+        if (nbConcats(frame.body) < 2us) return frame;
+
+        let dmut fu = copy Fuser(frame, alias self:.typeTable());
+        let body = fu:.run();
+        if (fu.getElided() == 0us) return frame;
+
+        self:.count("runtime calls elided", nb-> fu.getElided());
+        frame.withBody(body)
+    }
+
+}
+
+/**
+ * The fusion of the chains of a single frame. A chain is a tree of the
+ * concatenations of a straight line list, each an operand of the next.
+ * */
+pub class Fuser {
+
+    // The frame being rewritten
+    let _frame: &YILFrame;
+
+    // What every instruction of the frame reads and writes
+    let _du: &DefUse;
+
+    // The types of the module, which the arrays of operands are added to
+    let dmut _types: &TypeTable;
+
+    // The number of occurrences of every variable in the body
+    let mut _occs: [usize => mut usize] = copy [];
+
+    // The identifier given to the next variable the fusion creates
+    let mut _nextId: usize = 0us;
+
+    // The number of concatenations removed
+    let mut _elided: usize = 0us;
+
+    /**
+     * @params:
+     *    - frame: the frame to rewrite
+     *    - types: the types of the module
+     * */
+    pub self (frame: &YILFrame, dmut types: &TypeTable)
+        with _frame = frame
+        , _du = copy DefUse(frame)
+        , _types = alias types
+    {
+        for v in self._du.getVars() {
+            if (v.id >= self._nextId) self._nextId = v.id + 1us;
+        }
+
+        countInstr(frame.body, ref self._occs);
+    }
+
+    /**
+     * Rewrite the body of the frame.
+     *
+     * @returns: the new body
+     * */
+    pub fn run(mut self)-> &YILInstr {
+        self:.rewrite(self._frame.body)
+    }
+
+    /**
+     * @returns: the number of concatenations removed
+     * */
+    pub fn getElided(self)-> usize {
+        self._elided
+    }
+
+    /*!
+     * ================================================================================
+     * ================================================================================
+     * ===========================          REWRITE          ==========================
+     * ================================================================================
+     * ================================================================================
+     */
+
+    /**
+     * Rewrite an instruction, fusing the chains of every list it holds.
+     * */
+    fn rewrite(mut self, instr: &YILInstr)-> &YILInstr {
+        match instr {
+            b: &YILBlock => { return copy YILBlock(b.loc, self:.rewriteList(b.instrs)); }
+            t: &YILTryCatch => {
+                let tryPart = self:.rewriteList(t.tryPart);
+                let catchPart = self:.rewriteList(t.catchPart);
+                return copy YILTryCatch(t.loc, t.catchType, tryPart, catchPart);
+            }
+            t: &YILTryFinally => {
+                let tryPart = self:.rewriteList(t.tryPart);
+                let finPart = self:.rewriteList(t.finPart);
+                return copy YILTryFinally(t.loc, tryPart, finPart);
+            }
+        }
+
+        instr
+    }
+
+    /**
+     * Fuse the chains of a list of instructions, keyed by the index of their
+     * concatenations: the one consuming a result, the results it reads by
+     * operand, and the copies carrying a result to its consumer.
+     * */
+    fn rewriteList(mut self, instrs: [&YILInstr])-> [&YILInstr] {
+        let list = copy [self:.rewrite(i) for i in instrs];
+
+        let mut counts: [[usize => usize]] = [];
+        let mut namedAt: [usize => mut [usize]] = copy [];
+        for idx, i in list {
+            let mut c: [usize => mut usize] = copy [];
+            countInstr(i, ref c);
+            counts ~= copy [c];
+
+            for id, _ in c {
+                if let Ok(l) = namedAt[id] { namedAt[id] = l ~ [idx]; }
+                else { namedAt[id] = copy [idx]; }
+            }
+        }
+
+        let mut consumer: [usize => mut usize] = copy [];
+        let mut inputs: [usize => mut [(usize, usize)]] = copy [];
+        let mut carried: [usize => mut [usize]] = copy [];
+
+        for k, i in list {
+            let call = if let Ok(c) = concatOf(i) { c } else { continue; };
+            for side in [1us, 2us] {
+                if let Ok(p) = self.producer(list, namedAt, k, call.params[side]) {
+                    let j = p.0;
+                    if (j in consumer) continue;
+
+                    consumer[j] = k;
+                    if let Ok(l) = inputs[k] { inputs[k] = l ~ [(side, j)]; }
+                    else { inputs[k] = copy [(side, j)]; }
+
+                    carried[j] = p.1;
+                }
+            }
+        }
+
+        let mut replaced: [usize => mut [&YILInstr]] = copy [];
+        let mut removed: [usize => mut ()] = copy [];
+
+        for k, _ in inputs {
+            if (k in consumer) continue;
+
+            let members = membersOf(k, inputs);
+            let first = minOf(members);
+
+            let mut carriers: [usize => mut ()] = copy [];
+            for m in members {
+                if let Ok(cs) = carried[m] { for c in cs { carriers[c] = (); } }
+            }
+
+            if (!self.isMovable(list, counts, first, k, members, carriers)) continue;
+
+            let mut kept: [&YILInstr] = [];
+            for idx in first .. k {
+                removed[idx] = ();
+                if (idx in carriers || defuse::containsId(members, idx)) continue;
+
+                kept ~= copy [list[idx]];
+            }
+
+            replaced[k] = kept ~ self:.fused(list, k, inputs);
+            self._elided += members.len - 1us;
+        }
+
+        let mut res: [&YILInstr] = [];
+        for idx, i in list {
+            if let Ok(r) = replaced[idx] { res ~= r; }
+            else if (!(idx in removed)) { res ~= copy [i]; }
+        }
+
+        res
+    }
+
+    /**
+     * @params:
+     *    - list:    a list of instructions
+     *    - namedAt: the indexes of the instructions naming every variable
+     *    - k:       the index of a concatenation of the list
+     *    - param:   one of its operands
+     * @returns: the index of the concatenation whose result the operand is, and
+     * the indexes of the copies carrying it there, all named by nothing else
+     * */
+    fn producer(self, list: [&YILInstr], namedAt: [usize => [usize]], k: usize, param: &YILValue)-> ((usize, [usize]))? {
+        let mut cur = if let Ok(v) = defuse::addressedVar(param) { v } else { return none; };
+        let mut copies: [usize] = [];
+        let mut idx = k;
+
+        loop {
+            if (!self.isPrivate(cur)) return none;
+            idx = if let Ok(i) = lastBefore(namedAt, cur, idx) { i } else { return none; };
+
+            if let Ok(c) = concatOf(list[idx]) {
+                if let Ok(out) = defuse::addressedVar(c.params[0]) {
+                    if (out == cur) return (idx, copies)?;
+                }
+
+                return none;
+            }
+
+            if let a: &YILAffect = list[idx] {
+                if let l: &YILVar = a.left {
+                    if let r: &YILVar = a.right {
+                        if (l.id == cur) {
+                            copies ~= [idx];
+                            cur = r.id;
+                            continue;
+                        }
+                    }
+                }
+            }
+
+            return none;
+        }
+    }
+
+    /**
+     * @returns: true iif the variable is one of the frame, whose address never
+     * escaped, named by the instruction producing it and by the one reading it
+     * */
+    fn isPrivate(self, id: usize)-> bool {
+        if (!self._du.isTracked(id) || defuse::containsId(self._du.getEscaped(), id)) return false;
+
+        defuse::countOf(self._occs, id) == 2us
+    }
+
+    /**
+     * @params:
+     *    - list:     a list of instructions
+     *    - counts:   the occurrences of the variables every instruction names
+     *    - first:    the index of the first concatenation of a chain
+     *    - k:        the index of its last
+     *    - members:  the indexes of the concatenations of the chain
+     *    - carriers: the indexes of the copies carrying its intermediate results
+     * @returns: true iif everything else between the two evaluates a pure value
+     * into a temporary named nowhere else, before anything reads it
+     * */
+    fn isMovable(self, list: [&YILInstr], counts: [[usize => usize]], first: usize, k: usize, members: [usize], carriers: [usize => ()])-> bool {
+        let mut inSpan: [usize => mut usize] = copy [];
+        for idx in first .. k + 1us {
+            for id, n in counts[idx] { inSpan[id] = defuse::countOf(inSpan, id) + n; }
+        }
+
+        let mut seen: [usize => mut ()] = copy [];
+        for idx in first .. k + 1us {
+            let i = list[idx];
+            if (idx in carriers || defuse::containsId(members, idx)) {
+                for id, _ in counts[idx] { seen[id] = (); }
+                continue;
+            }
+
+            match i {
+                _: &YILVarDecl => { continue; }
+                a: &YILAffect => {
+                    if let v: &YILVar = a.left {
+                        if (!self._du.isTracked(v.id) || v.id in seen) return false;
+                        if (defuse::countOf(inSpan, v.id) != defuse::countOf(self._occs, v.id)) return false;
+                        if (!dce::isPure(a.right) || mentionsValue(a.right, v.id)) return false;
+
+                        for id, _ in counts[idx] { seen[id] = (); }
+                        continue;
+                    }
+                }
+            }
+
+            return false;
+        }
+
+        true
+    }
+
+    /**
+     * @returns: the instructions concatenating the operands of the chain ending
+     * at the concatenation of an index
+     * */
+    fn fused(mut self, list: [&YILInstr], k: usize, inputs: [usize => [(usize, usize)]])-> [&YILInstr] {
+        let call = if let Ok(c) = concatOf(list[k]) { c } else { panic; };
+        let slice = if let a: &YILAddrValue = call.params[0] { a.value.type } else { panic; };
+        let leaves = operandsOf(list, k, inputs);
+
+        let arrType = self._types:.array(slice, leaves.len);
+        let id = self._nextId;
+        self._nextId += 1us;
+
+        let name = format("YI_%", id);
+        let decl: &YILInstr = copy YILVarDecl(call.loc, name, arrType, id, isTemp-> true);
+        let parts = copy YILVar(call.loc, name, arrType, id, isTemp-> true);
+
+        let fill: &YILInstr = copy YILAffect(call.loc, parts, copy YILArrayValue(call.loc, arrType, leaves));
+        let concat: &YILInstr = copy YILCall(call.loc,
+                                             copy YILNameCallValue(call.loc, call.type, YRuntimeFuncs::CONCAT_SLICE_N,
+                                                                   copy [call.params[0],
+                                                                         copy YILAddrValue(call.loc, YIL_PTR_VOID, parts),
+                                                                         copy YILIntValue(call.loc, YIL_UINT_MAX, leaves.len),
+                                                                         call.params[3]]));
+
+        copy [decl, fill, concat]
+    }
+
+}
+
+/*!
+ * ================================================================================
+ * ================================================================================
+ * ============================          CHAIN          ===========================
+ * ================================================================================
+ * ================================================================================
+ */
+
+/**
+ * @returns: the call to `_yrt_concat_slices` the instruction is, if it is one
+ * */
+fn concatOf(instr: &YILInstr)-> (&YILNameCallValue)? {
+    if let c: &YILCall = instr {
+        if let n: &YILNameCallValue = c.content {
+            if (n.funcName == YRuntimeFuncs::CONCAT_SLICE && n.params.len == 4us) {
+                if let Ok(_) = defuse::addressedVar(n.params[0]) { return n?; }
+            }
+        }
+    }
+
+    none
+}
+
+/**
+ * @returns: the indexes of the concatenations of the chain ending at an index
+ * */
+fn membersOf(k: usize, inputs: [usize => [(usize, usize)]])-> [usize] {
+    let mut res: [usize] = copy [k];
+    if let Ok(ins) = inputs[k] {
+        for i in ins { res ~= membersOf(i.1, inputs); }
+    }
+
+    res
+}
+
+/**
+ * @returns: the operands of the chain ending at an index, in the order they are
+ * concatenated
+ * */
+fn operandsOf(list: [&YILInstr], k: usize, inputs: [usize => [(usize, usize)]])-> [&YILValue] {
+    let call = if let Ok(c) = concatOf(list[k]) { c } else { panic; };
+
+    let mut res: [&YILValue] = [];
+    for side in [1us, 2us] {
+        let mut fromChain = false;
+        if let Ok(ins) = inputs[k] {
+            for i in ins {
+                if (i.0 == side) {
+                    res ~= operandsOf(list, i.1, inputs);
+                    fromChain = true;
+                }
+            }
+        }
+
+        if (!fromChain) { res ~= copy [operandValue(call.params[side])]; }
+    }
+
+    res
+}
+
+/**
+ * @returns: the slice an operand passed by address designates
+ * */
+fn operandValue(param: &YILValue)-> &YILValue {
+    if let a: &YILAddrValue = param { return a.value; }
+
+    let inner = if let p: &YILPointer = param.type { p.inner } else { YIL_VOID };
+    copy YILUnrefValue(param.loc, inner, param)
+}
+
+/**
+ * @returns: the smallest of the indexes
+ * */
+fn minOf(idx: [usize])-> usize {
+    let mut res = idx[0];
+    for i in idx { if (i < res) res = i; }
+
+    res
+}
+
+/*!
+ * ================================================================================
+ * ================================================================================
+ * ==========================          OCCURRENCES          =======================
+ * ================================================================================
+ * ================================================================================
+ */
+
+/**
+ * Count the occurrences of every variable an instruction names.
+ * */
+fn countInstr(instr: &YILInstr, ref mut res: [usize => mut usize]) {
+    match instr {
+        b: &YILBlock => { for i in b.instrs { countInstr(i, ref res); } }
+        t: &YILTryCatch => {
+            for i in t.tryPart { countInstr(i, ref res); }
+            for i in t.catchPart { countInstr(i, ref res); }
+        }
+        t: &YILTryFinally => {
+            for i in t.tryPart { countInstr(i, ref res); }
+            for i in t.finPart { countInstr(i, ref res); }
+        }
+        a: &YILAffect => { defuse::countValue(a.left, ref res); defuse::countValue(a.right, ref res); }
+        c: &YILCall => { defuse::countValue(c.content, ref res); }
+        r: &YILReturn => { defuse::countValue(r.value, ref res); }
+        c: &YILCondJmp => { defuse::countValue(c.cond, ref res); }
+    }
+}
+
+/**
+ * @returns: the largest index of an instruction naming the variable below a bound
+ * */
+fn lastBefore(namedAt: [usize => [usize]], id: usize, bound: usize)-> (usize)? {
+    let mut res: (usize)? = none;
+    if let Ok(l) = namedAt[id] {
+        for i in l { if (i < bound) res = i?; }
+    }
+
+    res
+}
+
+/**
+ * @returns: the number of concatenations the instruction holds
+ * */
+fn nbConcats(instr: &YILInstr)-> usize {
+    let mut res = 0us;
+    match instr {
+        b: &YILBlock => { for i in b.instrs { res += nbConcats(i); } }
+        t: &YILTryCatch => {
+            for i in t.tryPart { res += nbConcats(i); }
+            for i in t.catchPart { res += nbConcats(i); }
+        }
+        t: &YILTryFinally => {
+            for i in t.tryPart { res += nbConcats(i); }
+            for i in t.finPart { res += nbConcats(i); }
+        }
+        _ => { if let Ok(_) = concatOf(instr) { res = 1us; } }
+    }
+
+    res
+}
+
+/**
+ * @returns: true iif the value names the variable
+ * */
+fn mentionsValue(value: &YILValue, id: usize)-> bool {
+    let mut counts: [usize => mut usize] = copy [];
+    defuse::countValue(value, ref counts);
+
+    id in counts
+}

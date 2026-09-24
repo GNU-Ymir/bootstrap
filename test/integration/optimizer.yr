@@ -1,9 +1,12 @@
 in optimizer;
 
-use ymirc::lint::node::{_, global::_, instr::_, value::_};
+use ymirc::global::core_;
+use ymirc::lexing::word;
+use ymirc::lint::optimizer;
+use ymirc::lint::node::{_, global::_, instr::_, type::_, value::_};
 use ymirc::utils::format;
 
-use std::io;
+use std::{fs::_, fs::path, io};
 
 /**
  * The packages the pass pipeline is swept over at `-O1`. They are picked for
@@ -45,7 +48,7 @@ def DTOR_SEGMENT = "6__dtorDT";
  * that pass is written against: landing it shows up as a diff on the case it
  * was written for, and as an unexpected diff anywhere else.
  * */
-@parameters(utils::range (1, 18))
+@parameters(utils::range (1, 29))
 __test one_snippet_per_pass (i: i32) {
     utils::registerCase ("test_resources/optimizer", i);
 }
@@ -100,6 +103,114 @@ __test pipeline_over_packages {
     // there would leave it correct and idle
     println("optimizer : -O1 over ", SWEEP.len, " packages : ", padsAfter, " landing pads, down from ", padsBefore);
     assert (padsAfter < padsBefore, format("-O1 : % landing pads, nothing removed of %", padsAfter, padsBefore));
+}
+
+/**
+ * The directories whose cases handle slices, arrays and the values shared with a
+ * future: every one of them that compiles is compiled at `-O1`.
+ * */
+def ALLOC_SWEEP = ["test_resources/lit_slices",
+                   "test_resources/lit_arrays",
+                   "test_resources/references",
+                   "test_resources/concurrency"];
+
+/**
+ * The runtime functions allocating the block of a slice.
+ * */
+def ALLOC_CALLS = ["_yrt_dup_slice", "_yrt_alloc_slice", "_yrt_alloc_slice_no_set",
+                   "_yrt_concat_slices", "_yrt_concat_slices_n"];
+
+/**
+ * The allocations the pipeline removes over the cases handling slices.
+ *
+ * Every case of the corpus is compiled at `-O1`, with the verifier checking every
+ * frame after every pass, and no frame is allowed to allocate more than the
+ * expander made it. A case whose golden is an error is not compiled at all.
+ * */
+__test allocations_over_slices {
+    let mut before = 0us, mut after = 0us;
+
+    for dir in ALLOC_SWEEP {
+        for package in compilingCases(dir) {
+            let res = utils::compilePackage(package, optLevel-> 1u32);
+            if let Ok(err) = res.err {
+                throw copy AssertError(format("% : -O1 : %", package, err));
+            }
+
+            let raw = countAllocs(res.exp), opt = countAllocs(res.opt);
+            assert (opt <= raw, format("% : -O1 : % allocations, up from %", package, opt, raw));
+
+            before += raw;
+            after += opt;
+        }
+    }
+
+    println("optimizer : -O1 over ", ALLOC_SWEEP.len, " directories : ", after, " allocations, down from ", before);
+    assert (after < before, format("-O1 : % allocations, nothing removed of %", after, before));
+}
+
+/**
+ * @params:
+ *    - dir: a directory of cases
+ * @returns: the root file of every case of the directory whose golden is not an error
+ * */
+fn compilingCases(dir: [c8])-> [[c8]]
+    throws AssertError
+{
+    let mut res: [[c8]] = [];
+    for entry in fs::sys::readDir(Path(dir)) {
+        if (entry.path.extension() != "yr") continue;
+        if (fs::sys::isFile(entry.path.stripExtension().addExtension("err"))) continue;
+
+        res ~= [entry.path.toStr()];
+    }
+
+    res
+} catch {
+    f: &FsError => throw copy AssertError(format("% : %", dir, f));
+}
+
+/**
+ * @params:
+ *    - nodes: the nodes of a module
+ * @returns: the number of calls to a runtime function allocating a slice the
+ * frames of the module make
+ * */
+fn countAllocs(nodes: [&YILNode])-> usize {
+    let mut res = 0us;
+    for n in nodes {
+        if let f: &YILFrame = n { res += countAlloc(f.body); }
+    }
+
+    res
+}
+
+/**
+ * @returns: the number of calls to a runtime function allocating a slice an
+ * instruction holds
+ * */
+fn countAlloc(instr: &YILInstr)-> usize {
+    let mut res = 0us;
+    match instr {
+        b: &YILBlock => { for i in b.instrs { res += countAlloc(i); } }
+        t: &YILTryCatch => {
+            for i in t.tryPart { res += countAlloc(i); }
+            for i in t.catchPart { res += countAlloc(i); }
+        }
+        t: &YILTryFinally => {
+            for i in t.tryPart { res += countAlloc(i); }
+            for i in t.finPart { res += countAlloc(i); }
+        }
+        c: &YILCall => {
+            if let n: &YILNameCallValue = c.content {
+                for name in ALLOC_CALLS {
+                    if (n.funcName == name) return 1us;
+                }
+            }
+        }
+    }
+
+    res
 }
 
 /**
@@ -523,4 +634,58 @@ fn collectJumps(instr: &YILInstr, ref mut res: [usize => mut ()]) {
         g: &YILGoto => { res[g.label.id] = (); }
         c: &YILCondJmp => { res[c.then.id] = (); res[c.else_.id] = (); }
     }
+}
+
+/**
+ * A copy carrying the result of a chain the fusion cannot move, made between the
+ * two concatenations of another chain, is not taken for a part of that one.
+ * */
+__test a_carrier_of_another_chain_is_kept {
+    let ptr = copy YILPointer(YIL_SINT_32, uid-> 8us);
+    let slc = copy YILTuple(copy [YIL_UINT_64, ptr, YIL_PTR_VOID], uid-> 9us);
+
+    let mut decls: [&YILInstr] = [];
+    let mut vars: [&YILVar] = [];
+    for i, n in ["a", "b", "c", "d", "e", "f", "tA", "tA2", "tB", "tB2", "r", "y"] {
+        vars ~= copy [copy YILVar(EOF_WORD, n, slc, i + 1us)];
+        decls ~= copy [copy YILVarDecl(EOF_WORD, n, slc, i + 1us)];
+    }
+
+    let (a, b, c, d, e, f) = (vars[0], vars[1], vars[2], vars[3], vars[4], vars[5]);
+    let (tA, tA2, tB, tB2, r, y) = (vars[6], vars[7], vars[8], vars[9], vars[10], vars[11]);
+
+    let carrier: &YILInstr = copy YILAffect(EOF_WORD, tA2, tA);
+    let body = decls ~ copy [concatOf(tA, a, b),
+                             concatOf(tB, c, d),
+                             carrier,
+                             concatOf(tB2, tB, e),
+                             concatOf(r, tA2, f),
+                             copy YILAffect(EOF_WORD, y, copy YILNameCallValue(EOF_WORD, slc, "_Y4test3barFS3i32ZS3i32", copy [tB2])),
+                             copy YILReturn(EOF_WORD, r)];
+
+    let frame = copy YILFrame(EOF_WORD, EOF_WORD, "_Y4test3fooFZS3i32", [], slc,
+                              body-> copy YILBlock(EOF_WORD, body), refs-> copy []);
+
+    let dmut types = copy TypeTable(types-> copy [ptr, slc]);
+    let dmut pass = copy ConcatFusionPass();
+    pass:.useTypes(alias types);
+
+    let res = pass:.apply(frame);
+    let mut kept = false;
+    if let bl: &YILBlock = res.body {
+        for i in bl.instrs { if (i is carrier) kept = true; }
+    }
+
+    assert (kept, format("the copy the unfused chain reads was removed :\n%", res));
+}
+
+/**
+ * @returns: the call concatenating two slices into a third
+ * */
+fn concatOf(out: &YILValue, left: &YILValue, right: &YILValue)-> &YILInstr {
+    copy YILCall(EOF_WORD, copy YILNameCallValue(EOF_WORD, YIL_VOID, YRuntimeFuncs::CONCAT_SLICE,
+                                                 copy [copy YILAddrValue(EOF_WORD, YIL_PTR_VOID, out),
+                                                       copy YILAddrValue(EOF_WORD, YIL_PTR_VOID, left),
+                                                       copy YILAddrValue(EOF_WORD, YIL_PTR_VOID, right),
+                                                       copy YILIntValue(EOF_WORD, YIL_UINT_64, 4us)]))
 }

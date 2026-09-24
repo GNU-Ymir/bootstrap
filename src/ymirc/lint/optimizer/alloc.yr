@@ -1,0 +1,671 @@
+/*
+ * Declares AllocElisionPass, the pass removing the allocations a frame does not
+ * need to make on the heap.
+ *
+ * The pass does two things, both on the ground that the allocation never leaves
+ * the frame:
+ *
+ *   - it removes the duplication of a slice viewing an array of the frame that
+ *     nothing reads after it, `copy [1, 2, 3]` above all: the copy is handed
+ *     the array itself rather than a heap block holding what it holds;
+ *   - it moves to the stack an allocation of a length known at compile time,
+ *     the block becoming an array of the frame.
+ *
+ * To the backend, `_yrt_dup_slice` and `_yrt_alloc_slice` are calls to an
+ * external function that can do anything, so neither is ever removed after
+ * this point.
+ *
+ * <hr>
+ *
+ * @Package: ymirc
+ * @Module: ymirc::lint::optimizer::alloc
+ * @File: ymirc/lint/optimizer/alloc.yr
+ * @Author(s):
+ *   - Emile Cadorel <ecadorel@gmail.com>
+ *
+ * @Created(YYYY-MM-DD): 2026-09-24
+ * @Copyright(C) 2021–2026 GNU-Ymir
+ * @License
+ *   ```text
+ *   This file is part of the Ymir language project.
+ *
+ *   Ymir is free software: you can redistribute it and/or modify it
+ *   under the terms of the GNU General Public License as published by
+ *   the Free Software Foundation, either version 3 of the License, or
+ *   (at your option) any later version.
+ *
+ *   Ymir is distributed in the hope that it will be useful,
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *   GNU General Public License for more details.
+ *
+ *   You should have received a copy of the GNU General Public License
+ *   along with Ymir.  If not, see <https://www.gnu.org/licenses/>.
+ *   ```
+ */
+
+in alloc;
+
+use ymirc::global::core_;
+use ymirc::lexing::keys;
+use ymirc::lint::node::{_, global::_, instr::_, type::_, value::_};
+use ymirc::lint::optimizer::{analysis, escape, pass_};
+use ymirc::utils::format;
+
+/**
+ * The number of times the pass walks a frame before giving up on a fixpoint.
+ * */
+def MAX_ROUNDS = 4us;
+
+/**
+ * The size in bytes of the largest allocation moved to the stack.
+ * */
+def MAX_PROMOTED_SIZE = 1024us;
+
+/**
+ * The number of copies a slice is followed through back to the array it views.
+ * */
+def MAX_CHAIN = 16us;
+
+/**
+ * The pass removing the heap allocations that never leave the frame.
+ * */
+@final
+pub class AllocElisionPass over OptimizerPass {
+
+    pub self ()
+        with super ("alloc-elision", 1u32)
+    {}
+
+    /**
+     * Remove the duplications and the heap allocations the frame does not need.
+     *
+     * @params:
+     *    - frame: the frame to transform
+     * @returns: the transformed frame, or `frame` itself when nothing moved
+     * */
+    pub over apply(mut self, frame: &YILFrame)-> &YILFrame {
+        let mut current = frame;
+        let mut round = 0us;
+
+        while round < MAX_ROUNDS && hasCandidate(current.body) {
+            let dmut el = copy Elider(current, alias self:.typeTable());
+            let body = el:.run();
+            if (el.getElided() == 0us && el.getPromoted() == 0us) break;
+
+            self:.count("runtime calls elided", nb-> el.getElided());
+            self:.count("allocations promoted", nb-> el.getPromoted());
+
+            current = current.withBody(body);
+            round += 1us;
+        }
+
+        current
+    }
+
+}
+
+/**
+ * The elision of the allocations of a single frame, one walk of its body. The
+ * allocations it removes have disjoint holders, the escape analysis of one
+ * reading the others as the heap blocks they were.
+ * */
+pub class Elider {
+
+    // The frame being rewritten
+    let _frame: &YILFrame;
+
+    // The types of the module, which the arrays of the promoted allocations are added to
+    let dmut _types: &TypeTable;
+
+    // The liveness of the frame
+    let _df: &FrameDataflow;
+
+    // The number of occurrences of every variable in the body
+    let mut _occs: [usize => mut usize] = copy [];
+
+    // The number of occurrences of every variable as the operand of `&`
+    let mut _addrs: [usize => mut usize] = copy [];
+
+    // The number of writes to every variable other than an assignment of the whole of it
+    let mut _partial: [usize => mut usize] = copy [];
+
+    // The ranks of the assignments of the whole of every variable
+    let mut _stores: [usize => mut [usize]] = copy [];
+
+    // The value last assigned to the whole of every variable
+    let mut _rhs: [usize => mut &YILValue] = copy [];
+
+    // The calls to the runtime the pass may remove, by rank
+    let mut _calls: [usize => mut &YILNameCallValue] = copy [];
+
+    // The instructions replacing a removed call, by rank
+    let mut _rewrites: [usize => mut [&YILInstr]] = copy [];
+
+    // The declarations to move to the top of the body, by variable
+    let mut _hoisted: [usize => mut ()] = copy [];
+
+    // The declarations moved to the top of the body, and the ones the walk created
+    let mut _top: [&YILInstr] = [];
+
+    // The variables holding one of the allocations removed so far
+    let mut _taken: [usize => mut ()] = copy [];
+
+    // The identifier given to the next variable the walk creates
+    let mut _nextId: usize = 0us;
+
+    // The rank of the instruction the walk reached
+    let mut _ord: usize = 0us;
+
+    // The number of duplications removed
+    let mut _elided: usize = 0us;
+
+    // The number of allocations moved to the stack
+    let mut _promoted: usize = 0us;
+
+    /**
+     * @params:
+     *    - frame: the frame to rewrite
+     *    - types: the types of the module
+     * */
+    pub self (frame: &YILFrame, dmut types: &TypeTable)
+        with _frame = frame
+        , _types = alias types
+        , _df = copy FrameDataflow(frame, withReaching-> false, withAvailable-> false)
+    {
+        for v in self._df.getDefUse().getVars() {
+            if (v.id >= self._nextId) self._nextId = v.id + 1us;
+        }
+
+        self:.collect(frame.body);
+    }
+
+    /**
+     * Rewrite the body of the frame.
+     *
+     * @returns: the new body
+     * */
+    pub fn run(mut self)-> &YILInstr {
+        for ord, call in self._calls {
+            if (call.funcName == YRuntimeFuncs::DUPLICATE_SLICE) {
+                self:.elideDup(ord, call);
+            } else {
+                self:.promote(ord, call);
+            }
+        }
+
+        if (self._rewrites.len == 0us) return self._frame.body;
+
+        self._ord = 0us;
+        let body = self:.rewrite(self._frame.body);
+        let mut instrs: [&YILInstr] = self._top;
+        match body {
+            b: &YILBlock => { instrs ~= b.instrs; }
+            _ => { instrs ~= copy [body]; }
+        }
+
+        copy YILBlock(body.loc, instrs)
+    }
+
+    /**
+     * @returns: the number of duplications removed
+     * */
+    pub fn getElided(self)-> usize {
+        self._elided
+    }
+
+    /**
+     * @returns: the number of allocations moved to the stack
+     * */
+    pub fn getPromoted(self)-> usize {
+        self._promoted
+    }
+
+    /*!
+     * ================================================================================
+     * ================================================================================
+     * ===========================          COLLECT          ==========================
+     * ================================================================================
+     * ================================================================================
+     */
+
+    /**
+     * Collect what the pass needs to know of the body, counting the ranks the
+     * way the graph builder does.
+     * */
+    fn collect(mut self, instr: &YILInstr) {
+        let ord = self._ord;
+        self._ord += 1us;
+
+        match instr {
+            b: &YILBlock => { for i in b.instrs { self:.collect(i); } }
+            t: &YILTryCatch => {
+                for i in t.tryPart { self:.collect(i); }
+                for i in t.catchPart { self:.collect(i); }
+            }
+            t: &YILTryFinally => {
+                for i in t.tryPart { self:.collect(i); }
+                for i in t.finPart { self:.collect(i); }
+            }
+            a: &YILAffect => {
+                match a.left {
+                    v: &YILVar => {
+                        if let Ok(l) = self._stores[v.id] { self._stores[v.id] = l ~ [ord]; }
+                        else { self._stores[v.id] = copy [ord]; }
+
+                        self._rhs[v.id] = a.right;
+                    }
+                    _ => {
+                        if let Ok(id) = self._df.getDefUse().baseVar(a.left) { self._partial[id] = incr(self._partial, id); }
+                    }
+                }
+
+                self:.collectValue(a.left);
+                self:.collectValue(a.right);
+            }
+            c: &YILCall => {
+                if let n: &YILNameCallValue = c.content {
+                    if (isCandidate(n)) { self._calls[ord] = n; }
+                }
+
+                self:.collectValue(c.content);
+            }
+            r: &YILReturn => { self:.collectValue(r.value); }
+            c: &YILCondJmp => { self:.collectValue(c.cond); }
+        }
+    }
+
+    /**
+     * Count the occurrences of the variables a value names.
+     * */
+    fn collectValue(mut self, value: &YILValue) {
+        for sub in defuse::subValues(value) {
+            match sub {
+                v: &YILVar => { self._occs[v.id] = incr(self._occs, v.id); }
+                a: &YILAddrValue => {
+                    if let v: &YILVar = a.value { self._addrs[v.id] = incr(self._addrs, v.id); }
+                }
+                n: &YILNameCallValue => {
+                    let modes = defuse::runtimeParamModes(n.funcName);
+                    for i, p in n.params {
+                        if (i >= modes.len || (modes[i] != ParamMode::OUT && modes[i] != ParamMode::INOUT)) continue;
+                        if let Ok(id) = defuse::addressedVar(p) { self._partial[id] = incr(self._partial, id); }
+                    }
+                }
+            }
+        }
+    }
+
+
+    /*!
+     * ================================================================================
+     * ================================================================================
+     * ============================          DUPS          ============================
+     * ================================================================================
+     * ================================================================================
+     */
+
+    /**
+     * Hand a duplication of a slice viewing an array of the frame the array
+     * itself, when nothing else can see what the copy does to it.
+     *
+     * @params:
+     *    - ord:  the rank of the call
+     *    - call: the call to `_yrt_dup_slice`
+     * */
+    fn elideDup(mut self, ord: usize, call: &YILNameCallValue) {
+        let out = if let Ok(o) = defuse::addressedVar(call.params[0]) { o } else { return; };
+        let src = if let Ok(s) = defuse::addressedVar(call.params[1]) { s } else { return; };
+
+        let (view, array) = if let Ok(x) = self.viewedArray(src) { x } else { return; };
+        if (!self.isNamedByViewOnly(array)) return;
+
+        let du = self._df.getDefUse();
+        let esc = copy EscapeAnalysis(self._frame, du, view, relay-> ord);
+        if (esc.escapes()) return;
+
+        let holders = esc.getHolders();
+        if (!defuse::containsId(holders, out)) return;
+        if (!self.areFree(holders)) return;
+
+        if (!self.noneLiveAfter(ord, holders, except-> out)) return;
+        if (!self.noneSeesAppends(esc, holders)) return;
+
+        let mut stores: [usize] = [];
+        if let Ok(s) = self._stores[array] { stores = s; }
+        if (self._df.runsAgain(ord, stores)) return;
+        for s in stores {
+            if (!self.noneLiveAfter(s, holders)) return;
+        }
+
+        let dst = if let a: &YILAddrValue = call.params[0] { a.value } else { return; };
+        let from = if let a: &YILAddrValue = call.params[1] { a.value } else { return; };
+        let copied: &YILInstr = copy YILAffect(call.loc, dst, from);
+
+        self:.take(holders);
+        self._hoisted[array] = ();
+        self._rewrites[ord] = copy [copied];
+        self._elided += 1us;
+    }
+
+    /**
+     * @params:
+     *    - src: the variable a slice is duplicated from
+     * @returns: the variable holding the view the slice was copied from, and the
+     * array of the frame it views, none iif the slice is not known to be one
+     *
+     * The slice is followed back through the copies the expander chains, each
+     * of which is required to be the only write to its variable: a variable
+     * written twice may hold, when it is duplicated, a slice that is not the view.
+     * */
+    fn viewedArray(self, src: usize)-> ((usize, usize))? {
+        let mut cur = src;
+        for _ in 0us .. MAX_CHAIN {
+            if (!self.isWrittenOnce(cur)) return none;
+
+            let rhs = if let Ok(r) = self._rhs[cur] { r } else { return none; };
+            match rhs {
+                v: &YILVar => { cur = v.id; }
+                t: &YILTupleValue => {
+                    if let Ok(a) = viewOf(t) { return (cur, a)?; }
+                    return none;
+                }
+                _ => { return none; }
+            }
+        }
+
+        none
+    }
+
+    /**
+     * @returns: true iif the variable is assigned once, whole, and written by
+     * nothing else
+     * */
+    fn isWrittenOnce(self, id: usize)-> bool {
+        let du = self._df.getDefUse();
+        if (!du.isTracked(id) || defuse::containsId(du.getEscaped(), id)) return false;
+        if (defuse::countOf(self._partial, id) != 0us) return false;
+
+        if let Ok(s) = self._stores[id] { return s.len == 1us; }
+
+        false
+    }
+
+    /**
+     * @returns: true iif the variable is an array of the frame whose only
+     * occurrences are the assignments filling it and the one view taking its
+     * address
+     * */
+    fn isNamedByViewOnly(self, id: usize)-> bool {
+        let du = self._df.getDefUse();
+        if (!du.isTracked(id)) return false;
+
+        let mut isArray = false;
+        for v in du.getVars() {
+            if (v.id == id) { isArray = v.type of YILArray; }
+        }
+
+        if (!isArray) return false;
+        if (defuse::countOf(self._partial, id) != 0us) return false;
+        if (defuse::countOf(self._addrs, id) != 1us) return false;
+
+        let mut stores = 0us;
+        if let Ok(s) = self._stores[id] { stores = s.len; }
+
+        defuse::countOf(self._occs, id) == stores + 1us
+    }
+
+    /*!
+     * ================================================================================
+     * ================================================================================
+     * ==========================          PROMOTE          ===========================
+     * ================================================================================
+     * ================================================================================
+     */
+
+    /**
+     * Move an allocation of a length known at compile time to an array declared
+     * at the top of the body, filled where the allocation was made: with the
+     * value it repeats, or with the zeroes the collector hands back.
+     *
+     * @params:
+     *    - ord:  the rank of the call
+     *    - call: the call to `_yrt_alloc_slice` or `_yrt_alloc_slice_no_set`
+     * */
+    fn promote(mut self, ord: usize, call: &YILNameCallValue) {
+        let withValue = call.funcName == YRuntimeFuncs::ALLOC_SET_SLICE;
+        let lenParam = if (withValue) { call.params[2] } else { call.params[1] };
+
+        let len = if let i: &YILIntValue = lenParam { i.value.toT!{usize} () } else { return; };
+
+        let dst = if let a: &YILAddrValue = call.params[0] { a.value } else { return; };
+        let res = if let v: &YILVar = dst { v } else { return; };
+        let slc = if let t: &YILTuple = res.type { t } else { return; };
+        if (slc.inners.len != 3us) return;
+
+        let elem = if let p: &YILPointer = slc.inners[1] { p.inner } else { return; };
+        if (len == 0us || elem.size == 0u32 || len > MAX_PROMOTED_SIZE / cast!usize(elem.size)) return;
+
+        let mut fill: &YILValue = YIL_NULL_VALUE;
+        if (withValue) {
+            if let a: &YILAddrValue = call.params[1] { fill = a.value; }
+            else { fill = copy YILUnrefValue(call.loc, elem, call.params[1]); }
+        } else {
+            if (elem !of YILInt) return;
+            fill = copy YILIntValue(call.loc, elem, 0us);
+        }
+
+        let du = self._df.getDefUse();
+        let esc = copy EscapeAnalysis(self._frame, du, res.id);
+        if (esc.escapes()) return;
+
+        let holders = esc.getHolders();
+        if (!self.areFree(holders)) return;
+        if (!self.noneLiveAfter(ord, holders, except-> res.id)) return;
+        if (!self.noneSeesAppends(esc, holders)) return;
+
+        let arrType = self._types:.array(elem, len);
+        let id = self._nextId;
+        self._nextId += 1us;
+
+        let name = format("YI_%", id);
+        let decl: &YILInstr = copy YILVarDecl(call.loc, name, arrType, id, isTemp-> true);
+        let buf = copy YILVar(call.loc, name, arrType, id, isTemp-> true);
+
+        let init = copy YILArrayValue(call.loc, arrType, copy [fill for _ in 0us .. len]);
+        let addr = copy YILAddrValue(call.loc, YIL_PTR_VOID, buf);
+        let view = copy YILTupleValue(call.loc, slc,
+                                      copy [copy YILIntValue(call.loc, slc.inners[0], len),
+                                            copy YILCastValue(call.loc, slc.inners[1], addr),
+                                            YIL_NULL_VALUE],
+                                      fieldNames-> copy [SliceKeys::LEN, SliceKeys::PTR, SliceKeys::BLK_INFO]);
+
+        let filled: &YILInstr = copy YILAffect(call.loc, buf, init);
+        let viewed: &YILInstr = copy YILAffect(call.loc, dst, view);
+
+        self:.take(holders);
+        self._top ~= copy [decl];
+        self._rewrites[ord] = copy [filled, viewed];
+        self._promoted += 1us;
+    }
+
+    /*!
+     * ================================================================================
+     * ================================================================================
+     * ==========================          HOLDERS          ===========================
+     * ================================================================================
+     * ================================================================================
+     */
+
+    /**
+     * @returns: true iif none of the holders holds an allocation removed already
+     * */
+    fn areFree(self, holders: [usize])-> bool {
+        for h in holders {
+            if (h in self._taken) return false;
+        }
+
+        true
+    }
+
+    /**
+     * Register the holders of an allocation that is removed.
+     * */
+    fn take(mut self, holders: [usize]) {
+        for h in holders { self._taken[h] = (); }
+    }
+
+    /**
+     * @params:
+     *    - ord:     the rank of an instruction
+     *    - holders: the holders of an allocation
+     *    - except:  a holder allowed to be read after the instruction
+     * @returns: true iif no other holder is read after the instruction before
+     * being overwritten
+     * */
+    fn noneLiveAfter(self, ord: usize, holders: [usize], except: usize = 0us)-> bool {
+        let live = if let Ok(l) = self._df.liveAfter(ord) { l } else { return false; };
+        for h in holders {
+            if (h != except && defuse::containsId(live, h)) return false;
+        }
+
+        true
+    }
+
+    /**
+     * @returns: true iif no holder but the one grown is read after an append,
+     * the runtime growing its own block in place where the frame's is reallocated
+     * */
+    fn noneSeesAppends(self, esc: &EscapeAnalysis, holders: [usize])-> bool {
+        for ord, h in esc.getAppends() {
+            if (!self.noneLiveAfter(ord, holders, except-> h)) return false;
+        }
+
+        true
+    }
+
+    /*!
+     * ================================================================================
+     * ================================================================================
+     * ===========================          REWRITE          ==========================
+     * ================================================================================
+     * ================================================================================
+     */
+
+    /**
+     * Rewrite an instruction, counting the ranks the way the collection did.
+     * */
+    fn rewrite(mut self, instr: &YILInstr)-> &YILInstr {
+        self._ord += 1us;
+
+        match instr {
+            b: &YILBlock => { return copy YILBlock(b.loc, self:.rewriteList(b.instrs)); }
+            t: &YILTryCatch => {
+                let tryPart = self:.rewriteList(t.tryPart);
+                let catchPart = self:.rewriteList(t.catchPart);
+                return copy YILTryCatch(t.loc, t.catchType, tryPart, catchPart);
+            }
+            t: &YILTryFinally => {
+                let tryPart = self:.rewriteList(t.tryPart);
+                let finPart = self:.rewriteList(t.finPart);
+                return copy YILTryFinally(t.loc, tryPart, finPart);
+            }
+        }
+
+        instr
+    }
+
+    /**
+     * Rewrite a list of instructions, splicing the replacement of a removed call
+     * in its place and moving the declarations of the arrays handed to a copy.
+     * */
+    fn rewriteList(mut self, instrs: [&YILInstr])-> [&YILInstr] {
+        let mut res: [&YILInstr] = [];
+        for i in instrs {
+            let ord = self._ord;
+            match i {
+                v: &YILVarDecl => {
+                    if (v.id in self._hoisted) {
+                        self._ord += 1us;
+                        self._top ~= copy [i];
+                        continue;
+                    }
+                }
+            }
+
+            if let Ok(r) = self._rewrites[ord] {
+                self._ord += 1us;
+                res ~= r;
+                continue;
+            }
+
+            res ~= copy [self:.rewrite(i)];
+        }
+
+        res
+    }
+
+}
+
+/**
+ * @returns: the counter of a variable, incremented
+ * */
+fn incr(counts: [usize => usize], id: usize)-> usize {
+    defuse::countOf(counts, id) + 1us
+}
+
+/**
+ * @returns: true iif the instruction holds a call the pass may remove
+ * */
+fn hasCandidate(instr: &YILInstr)-> bool {
+    match instr {
+        b: &YILBlock => { for i in b.instrs { if (hasCandidate(i)) return true; } }
+        t: &YILTryCatch => {
+            for i in t.tryPart { if (hasCandidate(i)) return true; }
+            for i in t.catchPart { if (hasCandidate(i)) return true; }
+        }
+        t: &YILTryFinally => {
+            for i in t.tryPart { if (hasCandidate(i)) return true; }
+            for i in t.finPart { if (hasCandidate(i)) return true; }
+        }
+        c: &YILCall => {
+            if let n: &YILNameCallValue = c.content { return isCandidate(n); }
+        }
+    }
+
+    false
+}
+
+/**
+ * @returns: true iif the call is one the pass may remove
+ * */
+fn isCandidate(n: &YILNameCallValue)-> bool {
+    if (n.funcName == YRuntimeFuncs::DUPLICATE_SLICE) return n.params.len == 3us;
+    if (n.funcName == YRuntimeFuncs::ALLOC_SET_SLICE) return n.params.len == 4us;
+    if (n.funcName == YRuntimeFuncs::ALLOC_NO_SET_SLICE) return n.params.len == 3us;
+
+    false
+}
+
+/**
+ * @params:
+ *    - t: a tuple value
+ * @returns: the array of the frame the tuple is a view of, if it is a slice
+ * viewing one
+ *
+ * The view the expander builds of an array has no block, the array not being
+ * one the collector allocated.
+ * */
+fn viewOf(t: &YILTupleValue)-> (usize)? {
+    if (t.values.len != 3us) return none;
+
+    match t.values[2] {
+        i: &YILIntValue => { if (i.value != 0) return none; }
+        _ => { return none; }
+    }
+
+    let mut ptr = t.values[1];
+    if let c: &YILCastValue = ptr { ptr = c.value; }
+
+    defuse::addressedVar(ptr)
+}
