@@ -351,7 +351,7 @@ deliberately carry no code, and have no page here.
 | [E4258](E4258.md) | `UNKNOWN_PRAGMA` | unknown __pragma expression <> |
 | [E4259](E4259.md) | `UNREACHABLE_MATCHER` | matcher expression is never evaluated |
 | [E4260](E4260.md) | `UNREACHBLE_STATEMENT` | unreachable statement |
-| [E4261](E4261.md) | `UNRESOLVED_TEMPLATE` | unresolved template |
+| [E4261](E4261.md) | `UNRESOLVED_TEMPLATE` | unresolved template parameter <> |
 | [E4262](E4262.md) | `UNSAFE_CALL` | call of unsafe function outside unsafe context |
 | [E4263](E4263.md) | `UNSAFE_OPERATION` | unsafe operation outside unsafe context |
 | [E4264](E4264.md) | `UNTERMINATED_ESCAPE` | unterminated escape sequence |
