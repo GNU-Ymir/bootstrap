@@ -44,8 +44,7 @@ in implicit;
 use ymirc::errors;
 use ymirc::lexing::word;
 use ymirc::semantic::template_;
-use ymirc::semantic::generator::type;
-use ymirc::semantic::generator::value::template_;
+use ymirc::semantic::generator::{type::_, value::_};
 use ymirc::semantic::validator::template_::solve::{_, implicit::_};
 use ymirc::syntax::{expression, expression::_};
 use ymirc::syntax::declaration::function;
@@ -102,96 +101,7 @@ pub mod TemplateImplicitSolving {
                  forMethod: bool = false)-> TemplateMapper
         throws ErrorMsg
     {
-        let dmut sym = alias context:.getSymbolFromRef(left.sym);
-        context:.pushReferent(alias sym);
-        context:.enterForeign(isFnBody-> false);
-
-        {
-            if let c: &CtorDecl = left.sym.decl.decl {
-                return TemplateImplicitSolving::solve(alias context, loc, left.sym.decl.params, c.proto.params, rights);
-            }
-
-            else if let f: &FunctionDecl = left.sym.decl.decl {
-                let mut params = f.proto.params;
-                if forMethod {
-                    params = params[1 .. $];
-                }
-
-                return TemplateImplicitSolving::solve(alias context, loc, left.sym.decl.params, params, rights);
-            }
-
-            throw copy ErrorMsg::fatal(loc, format(ValidateErrorMessage::TEMPLATE_SPECIALIZATION_FAILS, left, rights));
-        } exit {
-            context:.exitForeign();
-            context:.popReferent();
-        }
-    }
-
-    /**
-     * Solve template parameters against function/constructor parameters.
-     *
-     * Error handling:
-     *   - If solving fails after some bindings were inferred, produce a
-     *     multi-error list with a diagnostic note showing partial bindings.
-     */
-    fn solve(dmut context: &ValidationContext,
-             loc:          &Word,
-             templates:    [&Expression],
-             params:       [&VarDeclExpr],
-             rights:       [&Value])-> TemplateMapper
-        throws ErrorMsg
-    {
-        let types = TemplateSolvingUtils::createTypes(rights);
-        if (params.len > types.len) {
-            throw copy ErrorMsg::fatal(loc, format(ValidateErrorMessage::TEMPLATE_SPECIALIZATION_FAILS, params, types));
-        } // the implicit can be called without enough params
-
-        let mut consumed = 0us;
-        let mut globalMapper = TemplateMapper();
-        let mut syntTemplate = templates;
-
-        for it in 0us .. params.len {
-            // Rewrite the current parameter that will be specialized to remove any template that was already validated
-            let currentParam = TemplateInstructionExprRewriting::rewriteVarDecl(globalMapper, params[it]);
-            let rest = types.len - consumed; // number of types that still can be consumed(Note that there can be more types than params in case of variadics)
-            let syntaxRest = (params.len - it) - 1us; // The number of params that where not validated yet, minus the current one
-            let consomableTypes = types[consumed .. consumed + (rest - syntaxRest)]; // The list of types that can be associated to the current parameter(can be more than 1 in case of variadics)
-
-            {
-                let local = TemplateImplicitSolving::solveParamTemplate(alias context, syntTemplate, currentParam, consomableTypes);
-                globalMapper:.merge(local.mapper);
-                consumed += local.nbConsumed;
-                syntTemplate = TemplateRewriting::rewriteTemplateParams(globalMapper, syntTemplate);
-            } catch {
-                err => {
-                    if (globalMapper.mapping.len != 0) {
-                        let note = copy ErrorMsg::note(loc, format(ValidateErrorMessage::TEMPLATE_SPE, globalMapper));
-                        throw copy ErrorMsg::list(copy [note, err]);
-                    } else throw err;
-                }
-            }
-        }
-
-        return globalMapper;
-    }
-
-    /**
-     * Solve a single template parameter.
-     *
-     * @returns:
-     *   - TemplateSolution(mapper, nbConsumed)
-     */
-    fn solveParamTemplate(dmut context: &ValidationContext,
-                          templates:    [&Expression],
-                          param:        &VarDeclExpr,
-                          types:        [&Type])-> TemplateSolution
-        throws ErrorMsg
-    {
-        if param.type of EmptyExpr {
-            return TemplateSolution(TemplateMapper(), 0);
-        }
-
-        return TemplateImplicitSolving::solveType(alias context, templates, param.type, types);
+        return TemplateImplicitSolving::solveWithTypes(alias context, loc, left, rights, TemplateSolvingUtils::createTypes(rights), forMethod);
     }
 
     /**
@@ -221,5 +131,225 @@ pub mod TemplateImplicitSolving {
         }
 
         return TemplateSolution(TemplateMapper(), 1);
+    }
+
+    /**
+     * Solve the template against the types of the arguments, restarting with the complete type
+     * of each lambda argument whose parameter types got deduced.
+     */
+    fn solveWithTypes(dmut context: &ValidationContext,
+                      loc:          &Word,
+                      left:         &TemplateRefValue,
+                      rights:       [&Value],
+                      types:        [&Type],
+                      forMethod:    bool)-> TemplateMapper
+        throws ErrorMsg
+    {
+        let (mapper, lambdas) = TemplateImplicitSolving::solveInTemplate(alias context, loc, left, rights, types, forMethod);
+        if (lambdas.len == 0us) {
+            return mapper;
+        }
+
+        let refined = TemplateImplicitSolving::inferLambdaTypes(alias context, rights, types, lambdas);
+        return TemplateImplicitSolving::solveWithTypes(alias context, loc, left, rights, refined, forMethod);
+    }
+
+    /**
+     * Solve the parameters of the template within the context of its declaration.
+     *
+     * @returns:
+     *   - the inferred bindings,
+     *   - the lambda arguments whose parameter types are known but whose return type is still
+     *     needed, as (argument index, parameter types).
+     */
+    fn solveInTemplate(dmut context: &ValidationContext,
+                       loc:          &Word,
+                       left:         &TemplateRefValue,
+                       rights:       [&Value],
+                       types:        [&Type],
+                       forMethod:    bool)-> (TemplateMapper, [(usize, [&Type])])
+        throws ErrorMsg
+    {
+        let dmut sym = alias context:.getSymbolFromRef(left.sym);
+        context:.pushReferent(alias sym);
+        context:.enterForeign(isFnBody-> false);
+
+        {
+            if let c: &CtorDecl = left.sym.decl.decl {
+                return TemplateImplicitSolving::solve(alias context, loc, left.sym.decl.params, c.proto.params, rights, types);
+            }
+
+            else if let f: &FunctionDecl = left.sym.decl.decl {
+                let mut params = f.proto.params;
+                if forMethod {
+                    params = params[1 .. $];
+                }
+
+                return TemplateImplicitSolving::solve(alias context, loc, left.sym.decl.params, params, rights, types);
+            }
+
+            throw copy ErrorMsg::fatal(loc, format(ValidateErrorMessage::TEMPLATE_SPECIALIZATION_FAILS, left, rights));
+        } exit {
+            context:.exitForeign();
+            context:.popReferent();
+        }
+    }
+
+    /**
+     * Solve template parameters against function/constructor parameters.
+     *
+     * Error handling:
+     *   - If solving fails after some bindings were inferred, produce a
+     *     multi-error list with a diagnostic note showing partial bindings.
+     */
+    fn solve(dmut context: &ValidationContext,
+             loc:          &Word,
+             templates:    [&Expression],
+             params:       [&VarDeclExpr],
+             rights:       [&Value],
+             types:        [&Type])-> (TemplateMapper, [(usize, [&Type])])
+        throws ErrorMsg
+    {
+        if (params.len > types.len) {
+            throw copy ErrorMsg::fatal(loc, format(ValidateErrorMessage::TEMPLATE_SPECIALIZATION_FAILS, params, types));
+        } // the implicit can be called without enough params
+
+        let mut consumed = 0us;
+        let mut globalMapper = TemplateMapper();
+        let mut syntTemplate = templates;
+        let mut lambdaParams: [(usize, &VarDeclExpr)] = [];
+
+        for it in 0us .. params.len {
+            // Rewrite the current parameter that will be specialized to remove any template that was already validated
+            let currentParam = TemplateInstructionExprRewriting::rewriteVarDecl(globalMapper, params[it]);
+            let rest = types.len - consumed; // number of types that still can be consumed(Note that there can be more types than params in case of variadics)
+            let syntaxRest = (params.len - it) - 1us; // The number of params that where not validated yet, minus the current one
+            let consomableTypes = types[consumed .. consumed + (rest - syntaxRest)]; // The list of types that can be associated to the current parameter(can be more than 1 in case of variadics)
+
+            {
+                let local = TemplateImplicitSolving::solveParamTemplate(alias context, syntTemplate, currentParam, consomableTypes);
+                globalMapper:.merge(local.mapper);
+                syntTemplate = TemplateRewriting::rewriteTemplateParams(globalMapper, syntTemplate);
+
+                if (consumed < rights.len && rights[consumed] of LambdaValue) {
+                    lambdaParams ~= [(consumed, params[it])];
+                }
+
+                consumed += local.nbConsumed;
+            } catch {
+                err => {
+                    if (globalMapper.mapping.len != 0) {
+                        let note = copy ErrorMsg::note(loc, format(ValidateErrorMessage::TEMPLATE_SPE, globalMapper));
+                        throw copy ErrorMsg::list(copy [note, err]);
+                    } else throw err;
+                }
+            }
+        }
+
+        let mut lambdas: [(usize, [&Type])] = [];
+        for lp in lambdaParams {
+            let (index, param) = lp;
+            if let Ok(paramTypes) = TemplateImplicitSolving::lambdaParamTypes(alias context, globalMapper, param, types[index]) {
+                lambdas ~= [(index, paramTypes)];
+            }
+        }
+
+        return (globalMapper, lambdas);
+    }
+
+    /**
+     * The parameter types of an untyped lambda argument given to a function pointer parameter,
+     * when all of them are known from the bindings but its return type is not.
+     */
+    fn lambdaParamTypes(dmut context: &ValidationContext,
+                        mapper:       TemplateMapper,
+                        param:        &VarDeclExpr,
+                        type:         &Type)-> ([&Type])?
+    {
+        let lmbd = match type {
+            l: &LambdaType => { l }
+            _ => { return none; }
+        };
+
+        let fptr = match TemplateRewriting::rewrite(mapper, param.type) {
+            f: &FunctionPtrTypeExpr => { f }
+            _ => { return none; }
+        };
+
+        if (fptr.params.len != lmbd.params.len) return none;
+
+        let mut untyped = false;
+        for t in lmbd.params {
+            if t of NoneType {
+                untyped = true;
+            }
+        }
+
+        if (!untyped) return none;
+
+        let retKnown = {
+            TypeValidation::validate(alias context, fptr.retType);
+            true
+        } catch {
+            _ => { false }
+        };
+
+        if (retKnown) return none;
+
+        {
+            let paramTypes = copy [TypeValidation::validate(alias context, it.type) for it in fptr.params];
+            return (paramTypes)?;
+        } catch {
+            _ => {
+                return none;
+            }
+        }
+    }
+
+    /**
+     * Validate each lambda argument against its deduced parameter types, and replace its type
+     * by the complete prototype it gets.
+     */
+    fn inferLambdaTypes(dmut context: &ValidationContext,
+                        rights:       [&Value],
+                        types:        [&Type],
+                        lambdas:      [(usize, [&Type])])-> [&Type]
+        throws ErrorMsg
+    {
+        let mut result: [mut &Type] = copy types;
+        for pending in lambdas {
+            let (index, paramTypes) = pending;
+            if let lmbd: &LambdaValue = rights[index] {
+                let (proto, _) = LambdaValidation::validate(alias context, lmbd, paramTypes);
+                let retType = match proto.type {
+                    f: &FuncPtrType => { f.retType }
+                    d: &DelegateType => { d.retType }
+                    _ => { NONE_TYPE }
+                };
+
+                result[index] = copy LambdaType(lmbd.loc, paramTypes, retType);
+            }
+        }
+
+        return result;
+    }
+
+    /**
+     * Solve a single template parameter.
+     *
+     * @returns:
+     *   - TemplateSolution(mapper, nbConsumed)
+     */
+    fn solveParamTemplate(dmut context: &ValidationContext,
+                          templates:    [&Expression],
+                          param:        &VarDeclExpr,
+                          types:        [&Type])-> TemplateSolution
+        throws ErrorMsg
+    {
+        if param.type of EmptyExpr {
+            return TemplateSolution(TemplateMapper(), 0);
+        }
+
+        return TemplateImplicitSolving::solveType(alias context, templates, param.type, types);
     }
 }
