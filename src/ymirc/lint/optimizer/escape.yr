@@ -1,0 +1,386 @@
+/*
+ * Declares EscapeAnalysis, the intraprocedural escape analysis of an allocation.
+ *
+ * An allocation escapes a frame when a pointer into it can be read by something
+ * other than the frame: returned, stored anywhere but in a local variable,
+ * passed to a callee, thrown. One that does not escape can live in the frame,
+ * and the analysis is what says it may.
+ *
+ * The analysis follows the pointer rather than the allocation. It starts from
+ * the variable the allocation is stored in, and collects every variable of the
+ * frame that may hold a pointer into it -- a copy of the slice, a pointer to an
+ * element, a slice of a part of it. The allocation escapes as soon as one of
+ * those values goes somewhere that is not a variable of the frame, or a variable
+ * holding it has its own address taken.
+ *
+ * It is flow insensitive: a variable that holds such a pointer at one point of
+ * the frame is taken to hold it everywhere. The only thing a caller can learn
+ * from it is therefore an upper bound on the variables that matter, and the
+ * question of when they are read is the liveness'.
+ *
+ * <hr>
+ *
+ * @Package: ymirc
+ * @Module: ymirc::lint::optimizer::escape
+ * @File: ymirc/lint/optimizer/escape.yr
+ * @Author(s):
+ *   - Emile Cadorel <ecadorel@gmail.com>
+ *
+ * @Created(YYYY-MM-DD): 2026-09-24
+ * @Copyright(C) 2021–2026 GNU-Ymir
+ * @License
+ *   ```text
+ *   This file is part of the Ymir language project.
+ *
+ *   Ymir is free software: you can redistribute it and/or modify it
+ *   under the terms of the GNU General Public License as published by
+ *   the Free Software Foundation, either version 3 of the License, or
+ *   (at your option) any later version.
+ *
+ *   Ymir is distributed in the hope that it will be useful,
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *   GNU General Public License for more details.
+ *
+ *   You should have received a copy of the GNU General Public License
+ *   along with Ymir.  If not, see <https://www.gnu.org/licenses/>.
+ *   ```
+ */
+
+in escape;
+
+use ymirc::global::core_;
+use ymirc::lexing::keys;
+use ymirc::lint::node::{_, global::_, instr::_, type::_, value::_};
+
+/**
+ * The escape analysis of the allocation a variable of a frame holds.
+ * */
+pub class EscapeAnalysis {
+
+    // What every instruction of the frame reads and writes
+    let _du: &DefUse;
+
+    // The rank of the call copying the allocation into its result, whose result
+    // then holds the allocation itself, `bblock::NO_ORD` when there is none
+    let _relay: usize;
+
+    // The variables that may hold a pointer into the allocation
+    let mut _holders: [usize => mut ()] = copy [];
+
+    // The holder every append grows, by rank of the append
+    let mut _appends: [usize => mut usize] = copy [];
+
+    // True iif a pointer into the allocation may be read outside the frame
+    let mut _escapes: bool = false;
+
+    // True iif the last walk of the body found a new holder
+    let mut _grew: bool = false;
+
+    // The rank of the instruction the walk reached
+    let mut _ord: usize = 0us;
+
+    /**
+     * Compute the holders of an allocation.
+     *
+     * @params:
+     *    - frame: the frame holding the allocation
+     *    - du:    what every instruction of the frame reads and writes
+     *    - seed:  the variable the allocation is stored in
+     *    - relay: the rank of a copy of the allocation that is to be read as the
+     *             allocation itself, the result of the call holding it too
+     * */
+    pub self (frame: &YILFrame, du: &DefUse, seed: usize, relay: usize = bblock::NO_ORD)
+        with _du = du
+        , _relay = relay
+    {
+        self:.hold(seed);
+
+        loop {
+            self._grew = false;
+            self._ord = 0us;
+            self:.walk(frame.body);
+
+            if (self._escapes || !self._grew) break;
+        }
+    }
+
+    /**
+     * @returns: true iif a pointer into the allocation may be read outside the frame
+     * */
+    pub fn escapes(self)-> bool {
+        self._escapes
+    }
+
+    /**
+     * @returns: the variables that may hold a pointer into the allocation
+     * */
+    pub fn getHolders(self)-> [usize] {
+        copy [k for k, _ in self._holders]
+    }
+
+    /**
+     * @returns: the holder every append grows, by rank of the append, which the
+     * runtime may grow in place where a block of the frame is reallocated
+     * */
+    pub fn getAppends(self)-> [usize => usize] {
+        self._appends
+    }
+
+    /*!
+     * ================================================================================
+     * ================================================================================
+     * =============================          WALK          ===========================
+     * ================================================================================
+     * ================================================================================
+     */
+
+    /**
+     * Walk an instruction, counting the ranks the way the graph builder does.
+     * */
+    fn walk(mut self, instr: &YILInstr) {
+        let ord = self._ord;
+        self._ord += 1us;
+
+        match instr {
+            b: &YILBlock => { for i in b.instrs { self:.walk(i); } }
+            t: &YILTryCatch => {
+                for i in t.tryPart { self:.walk(i); }
+                for i in t.catchPart { self:.walk(i); }
+            }
+            t: &YILTryFinally => {
+                for i in t.tryPart { self:.walk(i); }
+                for i in t.finPart { self:.walk(i); }
+            }
+            a: &YILAffect => {
+                if (self.carries(a.right)) {
+                    match a.left {
+                        v: &YILVar => { self:.hold(v.id); }
+                        _ => { self._escapes = true; }
+                    }
+                }
+
+                self:.scanDest(a.left);
+                self:.scan(a.right, ord);
+            }
+            c: &YILCall => { self:.scan(c.content, ord); }
+            r: &YILReturn => {
+                if (self.carries(r.value)) { self._escapes = true; }
+                self:.scan(r.value, ord);
+            }
+            c: &YILCondJmp => { self:.scan(c.cond, ord); }
+        }
+    }
+
+    /**
+     * Register a variable as one holding the allocation.
+     *
+     * A variable the frame does not own is read by whatever else can name it,
+     * and a variable whose address escaped is read by whatever received it.
+     * */
+    fn hold(mut self, id: usize) {
+        if (!self._du.isTracked(id) || defuse::containsId(self._du.getEscaped(), id)) {
+            self._escapes = true;
+            return;
+        }
+
+        if (id in self._holders) return;
+
+        self._holders[id] = ();
+        self._grew = true;
+    }
+
+    /*!
+     * ================================================================================
+     * ================================================================================
+     * ============================          VALUES          ==========================
+     * ================================================================================
+     * ================================================================================
+     */
+
+    /**
+     * @params:
+     *    - value: a value of the frame
+     * @returns: true iif evaluating it may produce a pointer into the allocation,
+     * or an aggregate holding one
+     *
+     * The length of a slice and the element a pointer points at are not: the
+     * allocation holds elements, and an element never points back into it.
+     * */
+    fn carries(self, value: &YILValue)-> bool {
+        match value {
+            v: &YILVar => { return v.id in self._holders; }
+            f: &YILFieldValue => {
+                if (f.tuple.type of YILPointer) return false;
+                if (f.name == SliceKeys::LEN) return false;
+
+                return self.carries(f.tuple);
+            }
+            c: &YILCastValue => { return self.carries(c.value); }
+            b: &YILBinaryValue => {
+                if (isComparison(b.op)) return false;
+
+                return self.carries(b.left) || self.carries(b.right);
+            }
+            u: &YILUnaryValue => { return self.carries(u.left); }
+            t: &YILTupleValue => {
+                for v in t.values { if (self.carries(v)) return true; }
+            }
+            a: &YILArrayValue => {
+                for v in a.value { if (self.carries(v)) return true; }
+            }
+            a: &YILArrayAccessValue => {
+                if (a.value.type of YILArray) return self.carries(a.value);
+            }
+            a: &YILAddrValue => { return self.mentions(a.value); }
+        }
+
+        false
+    }
+
+    /**
+     * @returns: true iif a holder of the allocation appears in the value
+     * */
+    fn mentions(self, value: &YILValue)-> bool {
+        match value {
+            v: &YILVar => { return v.id in self._holders; }
+            f: &YILFieldValue => { return self.mentions(f.tuple); }
+            c: &YILCastValue => { return self.mentions(c.value); }
+            b: &YILBinaryValue => { return self.mentions(b.left) || self.mentions(b.right); }
+            u: &YILUnaryValue => { return self.mentions(u.left); }
+            u: &YILUnrefValue => { return self.mentions(u.value); }
+            a: &YILAddrValue => { return self.mentions(a.value); }
+            a: &YILArrayAccessValue => { return self.mentions(a.value) || self.mentions(a.index); }
+            t: &YILTupleValue => {
+                for v in t.values { if (self.mentions(v)) return true; }
+            }
+            a: &YILArrayValue => {
+                for v in a.value { if (self.mentions(v)) return true; }
+            }
+        }
+
+        false
+    }
+
+    /**
+     * Look for the places a value hands the allocation to something else.
+     *
+     * @params:
+     *    - value: a value of the frame
+     *    - ord:   the rank of the instruction holding it
+     * */
+    fn scan(mut self, value: &YILValue, ord: usize) {
+        match value {
+            n: &YILNameCallValue => { self:.scanCall(n, ord); }
+            p: &YILPtrCallValue => {
+                if (self.carries(p.funcPtr)) { self._escapes = true; }
+                for i in p.params {
+                    if (self.carries(i)) { self._escapes = true; }
+                    self:.scan(i, ord);
+                }
+            }
+            a: &YILAddrValue => {
+                if (self.mentions(a.value)) { self._escapes = true; }
+                self:.scan(a.value, ord);
+            }
+            f: &YILFieldValue => { self:.scan(f.tuple, ord); }
+            c: &YILCastValue => { self:.scan(c.value, ord); }
+            b: &YILBinaryValue => { self:.scan(b.left, ord); self:.scan(b.right, ord); }
+            u: &YILUnaryValue => { self:.scan(u.left, ord); }
+            u: &YILUnrefValue => { self:.scan(u.value, ord); }
+            a: &YILArrayAccessValue => { self:.scan(a.value, ord); self:.scan(a.index, ord); }
+            t: &YILTupleValue => { for v in t.values { self:.scan(v, ord); } }
+            a: &YILArrayValue => { for v in a.value { self:.scan(v, ord); } }
+        }
+    }
+
+    /**
+     * Look for the places the destination of an assignment hands the allocation
+     * to something else.
+     *
+     * A store through a pointer into the allocation writes an element of it,
+     * which is what the frame does with it and no escape.
+     * */
+    fn scanDest(mut self, value: &YILValue) {
+        match value {
+            _: &YILVar => {}
+            u: &YILUnrefValue => { self:.scan(u.value, bblock::NO_ORD); }
+            f: &YILFieldValue => { self:.scanDest(f.tuple); }
+            c: &YILCastValue => { self:.scanDest(c.value); }
+            a: &YILArrayAccessValue => {
+                self:.scanDest(a.value);
+                self:.scan(a.index, bblock::NO_ORD);
+            }
+            _ => { self:.scan(value, bblock::NO_ORD); }
+        }
+    }
+
+    /**
+     * Look for the arguments of a call that hand the allocation to the callee,
+     * the only runtime functions known not to keep a slice they are handed the
+     * address of being the ones copying its elements, and the ones writing it.
+     * */
+    fn scanCall(mut self, n: &YILNameCallValue, ord: usize) {
+        let modes = defuse::runtimeParamModes(n.funcName);
+        for i, p in n.params {
+            if (isHeldAddress(p, self._holders)) {
+                if (n.funcName == YRuntimeFuncs::APPEND_SLICE && i == 0us) {
+                    if let Ok(h) = defuse::addressedVar(p) { self._appends[ord] = h; }
+                }
+
+                let mode = if (i < modes.len) { modes[i] } else { ParamMode::VALUE };
+                if (mode != ParamMode::OUT && !copiesElements(n.funcName, i)) {
+                    self._escapes = true;
+                }
+
+                if (ord == self._relay && i == 1us) {
+                    if let Ok(o) = defuse::addressedVar(n.params[0]) { self:.hold(o); }
+                }
+            } else {
+                if (self.carries(p)) { self._escapes = true; }
+                self:.scan(p, ord);
+            }
+        }
+    }
+
+}
+
+/**
+ * @params:
+ *    - name: the name of a runtime function
+ *    - i:    the index of one of its parameters
+ * @returns: true iif the function keeps nothing of the slice the parameter
+ * points at: it copies its elements, or grows it, which `getAppends` reports
+ * */
+fn copiesElements(name: [c8], i: usize)-> bool {
+    if (name == YRuntimeFuncs::DUPLICATE_SLICE) return i == 1us;
+    if (name == YRuntimeFuncs::CONCAT_SLICE) return i == 1us || i == 2us;
+    if (name == YRuntimeFuncs::CONCAT_SLICE_N) return i == 1us;
+    if (name == YRuntimeFuncs::APPEND_SLICE) return i == 0us || i == 1us;
+
+    false
+}
+
+/**
+ * @params:
+ *    - value:   an argument of a call
+ *    - holders: the holders of an allocation
+ * @returns: true iif the argument is the address of one of the holders
+ * */
+fn isHeldAddress(value: &YILValue, holders: [usize => ()])-> bool {
+    if let Ok(id) = defuse::addressedVar(value) {
+        return id in holders;
+    }
+
+    false
+}
+
+/**
+ * @returns: true iif the operator produces a boolean from its operands
+ * */
+fn isComparison(op: BinaryOperators)-> bool {
+    op == BinaryOperators::INF || op == BinaryOperators::SUP ||
+        op == BinaryOperators::INF_EQUAL || op == BinaryOperators::SUP_EQUAL ||
+        op == BinaryOperators::NOT_EQUAL || op == BinaryOperators::DEQUAL ||
+        op == BinaryOperators::DAND || op == BinaryOperators::DPIPE
+}
