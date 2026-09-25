@@ -63,7 +63,8 @@ Build system is `gyllir` (config in `gyllir.toml`, compiler path points at a loc
 - `gyllir build` → `libymirc.a`. **This project is `type = "library"`** (see `gyllir.toml`), so
   it does *not* link a runnable compiler. Any `./ymirc` binary sitting in the repo root is a
   leftover from an older layout and is almost certainly stale — do not use it to check
-  behavior. To run the compiler over a `.yr` snippet, write a test (see below).
+  behavior. To run the compiler over a `.yr` snippet, write a test (see below), or use the
+  ymir-dev preview gyc to also run it (see *Execution tests*).
 - `gyllir test` → builds `./ymirc.test` and runs it. `gyllir test --dry` builds the binary
   without running it, which is what you want before invoking `./ymirc.test` yourself.
   Results are cached in `.ymir_test_success`.
@@ -213,6 +214,30 @@ you which one was selected.
 Afterwards, delete `test_resources/tmpcheck/` and `test/integration/tmpcheck.yr`, revert the
 `mod ::tmpcheck;` line, and re-run `gyllir test --dry` so the built binary no longer references
 the removed module. Verify with `git status` that nothing temporary is left behind.
+
+### Execution tests (ymir-dev)
+
+The golden tests stop at YIL. To check what a program actually *does* once compiled and run, use
+the ymir-dev checkout this repo lives in, `../../` (commands run from there):
+
+```sh
+uv run preview --no-midgard     # rebuild the preview gyc from this checkout, uncommitted changes included
+uv run tests                    # compile and run ../../tests/**/*.yr, in debug (-g) and release (-O2)
+uv run tests generators -m debug
+uv run exec main.yr -o main     # compile an ad-hoc program with the preview gyc
+```
+
+`uv run tests` only sees what the last `preview` built, so rebuild after changing the frontend
+(incremental, but it recompiles the changed frontend modules). A case is
+`tests/<suite>/<name>.yr` with its exact stdout in `<name>.out`, and optionally `.status` (exit
+code or `SIGABRT`), `.stderr` (lines it must contain), `.in` (stdin), `.flags` (extra gyc
+flags). A new case: write the `.yr`, run `uv run tests <name> --update`, then **read the `.out`
+it wrote** — it records what the program did, not what it should do. A failing run leaves its
+outputs in `../../build/tests/`.
+
+Gotchas: gyc prints its diagnostics on stdout; a warning (e.g. an unused `use`) is fatal in
+release but not with `-g`; a panic drops the stdout still buffered, so a panicking case should
+not rely on what it printed before.
 
 ## Architecture: the pipeline
 
