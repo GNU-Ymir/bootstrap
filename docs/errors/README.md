@@ -284,6 +284,7 @@ deliberately carry no code, and have no page here.
 | [E4181](E4181.md) | `OVERRIDE_EMPTY` | method <> must have a body to override <> |
 | [E4182](E4182.md) | `OVERRIDE_FIELD_NO_FIELD` | method <> must be a field method to override <> |
 | [E4183](E4183.md) | `OVERRIDE_FINAL` | cannot override final method <> |
+| [E4319](E4319.md) | `OVERRIDE_GENERATOR_NO_GENERATOR` | method <> must be a generator to override the generator <> |
 | [E4184](E4184.md) | `OVERRIDE_INCOMPATIBLE_RETURN_TYPE` | the return type of the overriding method <> is not compatible with the return type of the ancestor method <> |
 | [E4185](E4185.md) | `OVERRIDE_MISMATCH_PROTECTION` | the protection <> of the overriding method <> does not match the definition in the ancestor class <> |
 | [E4186](E4186.md) | `OVERRIDE_MISMATCH_THROWERS` | the throwers of the overriding method <> are not compatible with the throwers of the ancestor method <> |
@@ -291,6 +292,7 @@ deliberately carry no code, and have no page here.
 | [E4188](E4188.md) | `OVERRIDE_NON_TRAIT_INSIDE` | cannot override a non trait method <> with <> inside impl |
 | [E4189](E4189.md) | `OVERRIDE_NOTHING` | method <> overrides nothing |
 | [E4190](E4190.md) | `OVERRIDE_NO_FIELD_BY_FIELD` | field method <> cannot override the non field method <> |
+| [E4320](E4320.md) | `OVERRIDE_NO_GENERATOR_BY_GENERATOR` | generator <> cannot override the non generator method <> |
 | [E4192](E4192.md) | `OVERRIDE_TRAIT_OUTSIDE` | cannot override trait method <> with <> outside impl |
 | [E4193](E4193.md) | `PATTERN_IS_REFUTABLE` | the pattern <> with value <> is refutable |
 | [E4195](E4195.md) | `RANGE_ON_ARRAY_NO_COPY` | the index operator on <> with a dynamic operand of type <> is allowed only in the context of a copy statement |
