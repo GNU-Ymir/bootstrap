@@ -1,0 +1,689 @@
+/*
+ * Declares DevirtualizationPass, the pass replacing the indirect calls whose
+ * target the frame already determines with direct ones.
+ *
+ * By the time the backend sees a frame, a vtable is an anonymous array of
+ * function pointers and a dispatch is a load through a pointer. The frontend
+ * built that array, and knows what is in every slot of it:
+ *
+ *   - a virtual call on an instance the frame allocated: `_yrt_alloc_class(&VT)`
+ *     names the vtable of the instance, and a slot read out of it is a slot of
+ *     a constant of the module. The read is folded into the address it yields,
+ *     and the call through it becomes a call by name,
+ *   - a delegate call on a delegate the frame built: `(closure-> c, func-> &f)`
+ *     names the function the call reaches, which is called by name with the
+ *     closure as its first argument.
+ *
+ * What is known of a value is followed back through the variables the frame
+ * assigns exactly once, never takes the address of, and never reads before
+ * that assignment on any path, so that a receiver reassigned between its
+ * construction and the call, handed by reference to something that may
+ * reassign it, or read by a loop before it is built, is left dispatched.
+ *
+ * A direct call is not merely a load saved, it is a call the backend can
+ * inline. The callee becomes a dependency of the frame, added to its
+ * references, so that the frame is rebuilt when the callee changes. The call
+ * keeps the arguments of the call through the pointer: the backend declares
+ * the callee after them, as it typed the pointer after them.
+ *
+ * <hr>
+ *
+ * @Package: ymirc
+ * @Module: ymirc::lint::optimizer::devirt
+ * @File: ymirc/lint/optimizer/devirt.yr
+ * @Author(s):
+ *   - Emile Cadorel <ecadorel@gmail.com>
+ *
+ * @Created(YYYY-MM-DD): 2026-09-25
+ * @Copyright(C) 2021–2026 GNU-Ymir
+ * @License
+ *   ```text
+ *   This file is part of the Ymir language project.
+ *
+ *   Ymir is free software: you can redistribute it and/or modify it
+ *   under the terms of the GNU General Public License as published by
+ *   the Free Software Foundation, either version 3 of the License, or
+ *   (at your option) any later version.
+ *
+ *   Ymir is distributed in the hope that it will be useful,
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *   GNU General Public License for more details.
+ *
+ *   You should have received a copy of the GNU General Public License
+ *   along with Ymir.  If not, see <https://www.gnu.org/licenses/>.
+ *   ```
+ */
+
+in devirt;
+
+use ymirc::global::{core_, state};
+use ymirc::lexing::keys;
+use ymirc::lint::node::{_, global::_, instr::_, type::_, value::_};
+use ymirc::lint::optimizer::{cfg, dataflow, defuse, pass_, rewrite};
+use ymirc::utils::format;
+
+use std::fs::path;
+
+/**
+ * The pass replacing the virtual and the delegate calls whose target is known
+ * with calls by name.
+ * */
+@final
+pub class DevirtualizationPass over OptimizerPass {
+
+    // The constants of the module, indexed by name
+    let mut _constants: [[c8] => mut &YILConstant] = copy [];
+
+    // The module a symbol is declared in, for every symbol the module names
+    let mut _paths: [[c8] => mut Path] = copy [];
+
+    pub self ()
+        with super ("devirt", 1u32)
+    {}
+
+    /**
+     * Collect the constants of the module, the vtables among them, and where
+     * every symbol it names is declared.
+     *
+     * @params:
+     *    - nodes: the nodes of the module the pass is about to be applied to
+     * */
+    pub over prepare(mut self, nodes: [&YILSymbol]) {
+        self._constants = copy [];
+        self._paths = copy [];
+        for n in nodes {
+            self._paths[n.name] = n.path;
+            for name, path in n.references {
+                self._paths[name] = path;
+            }
+
+            if let c: &YILConstant = n {
+                self._constants[c.name] = c;
+            }
+        }
+    }
+
+    /**
+     * Replace the indirect calls of a frame whose target is known.
+     *
+     * @params:
+     *    - frame: the frame to transform
+     * @returns: the transformed frame, or `frame` itself when nothing moved
+     * */
+    pub over apply(mut self, frame: &YILFrame)-> &YILFrame {
+        if (!hasCandidate(frame)) return frame;
+
+        let dmut d = copy Devirtualizer(frame, self._constants, self._paths);
+        let body = d:.rewriteInstr(frame.body);
+        if (d.getVirtuals() == 0us && d.getDelegates() == 0us && d.getLoads() == 0us) return frame;
+
+        self:.count("virtual calls devirtualized", nb-> d.getVirtuals());
+        self:.count("delegate calls devirtualized", nb-> d.getDelegates());
+        self:.count("vtable loads folded", nb-> d.getLoads());
+
+        copy YILFrame(frame.loc,
+                      frame.implLoc,
+                      frame.name,
+                      frame.params,
+                      frame.retType,
+                      body-> body,
+                      refs-> d.getRefs(),
+                      isWeak-> frame.isWeak,
+                      isGlobalCtor-> frame.isGlobalCtor)
+    }
+
+}
+
+/**
+ * A pointer statically known to be the address of a global symbol, plus a
+ * byte offset.
+ * */
+@final
+class Address {
+
+    pub {
+        // The name of the symbol
+        let name: [c8];
+
+        // The offset from the symbol, in bytes
+        let offset: usize;
+
+        // True iif the address was read out of a vtable
+        let isSlot: bool;
+    }
+
+    pub self (name: [c8], offset: usize = 0us, isSlot: bool = false)
+        with name = name
+        , offset = offset
+        , isSlot = isSlot
+    {}
+
+}
+
+/**
+ * The devirtualization of a single frame, one walk of its body.
+ * */
+@final
+pub class Devirtualizer over YILRewriter {
+
+    // The constants of the module, indexed by name
+    let _constants: [[c8] => &YILConstant];
+
+    // The module a symbol is declared in, for every symbol the module names
+    let _paths: [[c8] => Path];
+
+    // The value of every variable the frame assigns once, never takes the
+    // address of, and never reads before that assignment
+    let mut _defs: [usize => mut &YILValue] = copy [];
+
+    // The address a variable holds, for the variables it is resolved and known of
+    let mut _addrs: [usize => mut &Address] = copy [];
+
+    // The vtable of the instance a variable points at, for the variables it is resolved and known of
+    let mut _vtables: [usize => mut [c8]] = copy [];
+
+    // The variables whose address, and whose vtable, were already resolved, known or not
+    let mut _addrsDone: [usize => mut ()] = copy [];
+    let mut _vtablesDone: [usize => mut ()] = copy [];
+
+    // The references of the frame, the callees it now calls by name included
+    let mut _refs: [[c8] => mut Path] = copy [];
+
+    // The size of a pointer, in bytes
+    let _ptrSize: usize;
+
+    // The number of virtual calls replaced by a call by name
+    let mut _virtuals: usize = 0us;
+
+    // The number of delegate calls replaced by a call by name
+    let mut _delegates: usize = 0us;
+
+    // The number of reads out of a vtable replaced by the address they yield
+    let mut _loads: usize = 0us;
+
+    /**
+     * @params:
+     *    - frame:     the frame to devirtualize
+     *    - constants: the constants of the module, indexed by name
+     *    - paths:     the module a symbol is declared in, for every symbol the module names
+     * */
+    pub self (frame: &YILFrame, constants: [[c8] => &YILConstant], paths: [[c8] => Path])
+        with super ()
+        , _constants = constants
+        , _paths = paths
+        , _ptrSize = cast!usize (state::pointerArchSize ()) / 8us
+    {
+        for name, path in frame.references {
+            self._refs[name] = path;
+        }
+
+        self:.collectDefs(frame);
+    }
+
+    /**
+     * @returns: the number of virtual calls replaced by a call by name
+     * */
+    pub fn getVirtuals(self)-> usize {
+        self._virtuals
+    }
+
+    /**
+     * @returns: the number of delegate calls replaced by a call by name
+     * */
+    pub fn getDelegates(self)-> usize {
+        self._delegates
+    }
+
+    /**
+     * @returns: the number of reads out of a vtable replaced by the address they yield
+     * */
+    pub fn getLoads(self)-> usize {
+        self._loads
+    }
+
+    /**
+     * @returns: the references of the frame, the callees it now calls by name included
+     * */
+    pub fn getRefs(self)-> [[c8] => Path] {
+        self._refs
+    }
+
+    /*!
+     * ================================================================================
+     * ================================================================================
+     * =========================          DEFINITIONS          ========================
+     * ================================================================================
+     * ================================================================================
+     */
+
+    /**
+     * Collect the value of every variable the frame assigns exactly once, by a
+     * direct assignment, never takes the address of, and never reads before
+     * that assignment.
+     *
+     * A parameter is never one of them: it holds what the caller passed before
+     * any assignment of the frame. A value collected never depends on its own
+     * variable, which would be read before it is assigned: following them
+     * always ends.
+     * */
+    fn collectDefs(mut self, frame: &YILFrame) {
+        let du = copy DefUse(frame);
+        let mut counts: [usize => mut usize] = copy [];
+        let mut values: [usize => mut &YILValue] = copy [];
+
+        self.countDefs(du, frame.body, ref counts, ref values);
+
+        let escaped = du.getEscaped();
+        let mut ids: [usize] = [];
+        for id, _ in values {
+            if (defuse::countOf(counts, id) != 1us) continue;
+            if (defuse::containsId(escaped, id)) continue;
+            if (isParam(frame, id)) continue;
+
+            ids ~= [id];
+        }
+
+        if (ids.len == 0us) return;
+
+        let early = readBeforeAssigned(frame, du, ids);
+        for id in ids {
+            if (defuse::containsId(early, id)) continue;
+            if let Ok(v) = values[id] { self._defs[id] = v; }
+        }
+    }
+
+    /**
+     * Count the writes of every variable in an instruction, and keep the value of
+     * the direct assignments.
+     * */
+    fn countDefs(self, du: &DefUse, instr: &YILInstr, ref mut counts: [usize => mut usize], ref mut values: [usize => mut &YILValue]) {
+        match instr {
+            b: &YILBlock => { for i in b.instrs { self.countDefs(du, i, ref counts, ref values); } }
+            t: &YILTryCatch => {
+                for i in t.tryPart { self.countDefs(du, i, ref counts, ref values); }
+                for i in t.catchPart { self.countDefs(du, i, ref counts, ref values); }
+            }
+            t: &YILTryFinally => {
+                for i in t.tryPart { self.countDefs(du, i, ref counts, ref values); }
+                for i in t.finPart { self.countDefs(du, i, ref counts, ref values); }
+            }
+            _: &YILVarDecl => {}
+            _ => {
+                for id in du.ofInstr(instr).getAllDefs() {
+                    counts[id] = defuse::countOf(counts, id) + 1us;
+                }
+
+                if let a: &YILAffect = instr {
+                    if let v: &YILVar = a.left { values[v.id] = a.right; }
+                }
+            }
+        }
+    }
+
+    /*!
+     * ================================================================================
+     * ================================================================================
+     * ============================          VALUES          ==========================
+     * ================================================================================
+     * ================================================================================
+     */
+
+    /**
+     * @returns: the global symbol a pointer value is the address of, none when it
+     * is not statically known
+     * */
+    fn addressOf(mut self, value: &YILValue)-> (&Address)? {
+        match value {
+            a: &YILAddrValue => {
+                if let v: &YILVar = a.value && v.id == 0us { return (copy Address(v.name))?; }
+            }
+            c: &YILCastValue => {
+                if (c.type of YILPointer) return self:.addressOf(c.value);
+            }
+            v: &YILVar => { return self:.addressOfVar(v); }
+            b: &YILBinaryValue => { return self:.offsetOf(b); }
+            f: &YILFieldValue => {
+                if let Ok(vt) = self:.vtableFieldOf(f) { return (copy Address(vt))?; }
+                if let Ok(inner) = self.fieldOf(f) { return self:.addressOf(inner); }
+            }
+            u: &YILUnrefValue => { return self:.slotOf(u); }
+        }
+
+        none
+    }
+
+    /**
+     * @returns: the global symbol a variable holds the address of, resolved once
+     * per variable
+     * */
+    fn addressOfVar(mut self, v: &YILVar)-> (&Address)? {
+        if (v.id in self._addrsDone) {
+            if let Ok(a) = self._addrs[v.id] { return a?; }
+            return none;
+        }
+
+        self._addrsDone[v.id] = ();
+        let d = if let Ok(x) = self._defs[v.id] { x } else { return none; };
+        let res = self:.addressOf(d);
+        if let Ok(a) = res { self._addrs[v.id] = a; }
+
+        res
+    }
+
+    /**
+     * @returns: the address a byte offset added to a known address is
+     *
+     * Only an arithmetic on a pointer of void counts bytes: it is the one the
+     * expander uses to walk a vtable.
+     * */
+    fn offsetOf(mut self, b: &YILBinaryValue)-> (&Address)? {
+        if (b.op != BinaryOperators::PLUS) return none;
+        let p = if let x: &YILPointer = b.left.type { x } else { return none; };
+        if (p.inner !of YILVoid) return none;
+
+        let k = if let i: &YILIntValue = b.right && i.value >= 0 { cast!usize (i.value.toN!{u64} ()) } else { return none; };
+        if let Ok(a) = self:.addressOf(b.left) {
+            return (copy Address(a.name, offset-> a.offset + k, isSlot-> a.isSlot))?;
+        }
+
+        none
+    }
+
+    /**
+     * @returns: the function stored in the slot of a vtable a read is made on,
+     * none when the read is not one
+     * */
+    fn slotOf(mut self, u: &YILUnrefValue)-> (&Address)? {
+        if (u.type !of YILPointer) return none;
+
+        let a = if let Ok(x) = self:.addressOf(u.value) { x } else { return none; };
+        if (a.offset % self._ptrSize != 0us) return none;
+
+        let cst = if let Ok(c) = self._constants[a.name] { c } else { return none; };
+        let arr = if let x: &YILArrayValue = cst.value { x } else { return none; };
+
+        let i = a.offset / self._ptrSize;
+        if (i >= arr.value.len) return none;
+
+        if let e: &YILAddrValue = arr.value[i] {
+            if let v: &YILVar = e.value && v.id == 0us { return (copy Address(v.name, isSlot-> true))?; }
+        }
+
+        none
+    }
+
+    /**
+     * @returns: the vtable a read of the vtable field of an instance yields, none
+     * when the instance is not one the frame allocated
+     * */
+    fn vtableFieldOf(mut self, f: &YILFieldValue)-> ([c8])? {
+        if (f.name != ClassKeys::VTABLE) return none;
+        if let u: &YILUnrefValue = f.tuple {
+            return self:.vtableOf(u.value);
+        }
+
+        none
+    }
+
+    /**
+     * @returns: the vtable of the class instance a pointer value points at, none
+     * when it is not statically known
+     *
+     * The vtable of an instance is the one it was allocated with, and nothing
+     * writes it afterwards.
+     * */
+    fn vtableOf(mut self, value: &YILValue)-> ([c8])? {
+        match value {
+            c: &YILCastValue => { return self:.vtableOf(c.value); }
+            v: &YILVar => { return self:.vtableOfVar(v); }
+            n: &YILNameCallValue => {
+                if (n.funcName != YRuntimeFuncs::ALLOC_CLASS || n.params.len != 1us) return none;
+                if let Ok(a) = self:.addressOf(n.params[0us]) && (a.offset == 0us && a.name in self._constants) {
+                    return a.name?;
+                }
+            }
+        }
+
+        none
+    }
+
+    /**
+     * @returns: the vtable of the class instance a variable points at, resolved
+     * once per variable
+     * */
+    fn vtableOfVar(mut self, v: &YILVar)-> ([c8])? {
+        if (v.id in self._vtablesDone) {
+            if let Ok(vt) = self._vtables[v.id] { return vt?; }
+            return none;
+        }
+
+        self._vtablesDone[v.id] = ();
+        let d = if let Ok(x) = self._defs[v.id] { x } else { return none; };
+        let res = self:.vtableOf(d);
+        if let Ok(vt) = res { self._vtables[v.id] = vt; }
+
+        res
+    }
+
+    /**
+     * @returns: the value a field of a tuple the frame built holds, none when the
+     * tuple is not one
+     * */
+    fn fieldOf(self, f: &YILFieldValue)-> (&YILValue)? {
+        let t = if let Ok(x) = self.tupleOf(f.tuple) { x } else { return none; };
+        if (f.name == "") {
+            if (f.index < t.values.len) return t.values[f.index]?;
+            return none;
+        }
+
+        for i, n in t.fieldNames {
+            if (n == f.name && i < t.values.len) return t.values[i]?;
+        }
+
+        none
+    }
+
+    /**
+     * @returns: the tuple literal a value is, none when it is not statically one
+     * */
+    fn tupleOf(self, value: &YILValue)-> (&YILTupleValue)? {
+        match value {
+            t: &YILTupleValue => { return t?; }
+            v: &YILVar => {
+                if let Ok(d) = self._defs[v.id] { return self.tupleOf(d); }
+            }
+        }
+
+        none
+    }
+
+    /*!
+     * ================================================================================
+     * ================================================================================
+     * ==========================          REWRITING          =========================
+     * ================================================================================
+     * ================================================================================
+     */
+
+    /**
+     * Rewrite a value, its operands first.
+     *
+     * A read of the vtable of a known instance, or of a slot of a known vtable, is
+     * replaced by the address it yields: that is a constant, which dead code
+     * elimination removes once the call it fed is direct.
+     *
+     * @returns: the rewritten value, or `value` itself when nothing under it moved
+     * */
+    pub over rewriteValue(mut self, value: &YILValue)-> &YILValue {
+        match value {
+            p: &YILPtrCallValue => { return self:.rewritePtrCall(p); }
+            f: &YILFieldValue => {
+                if let Ok(vt) = self:.vtableFieldOf(f) && self:.reference(vt) {
+                    self._loads += 1us;
+                    return copy YILAddrValue(f.loc, f.type, copy YILVar(f.loc, vt, f.type, 0us));
+                }
+            }
+            u: &YILUnrefValue => {
+                if let Ok(a) = self:.slotOf(u) && self:.reference(a.name) {
+                    self._loads += 1us;
+                    return copy YILAddrValue(u.loc, u.type, copy YILVar(u.loc, a.name, YIL_VOID, 0us));
+                }
+            }
+        }
+
+        self:.rewriteOperands(value)
+    }
+
+    /**
+     * @returns: the call by name of the function a call by pointer reaches, when
+     * it is known, the call by pointer over its rewritten operands otherwise
+     *
+     * The target is resolved on the call as the frame wrote it, the reads it goes
+     * through being folded independently.
+     * */
+    fn rewritePtrCall(mut self, p: &YILPtrCallValue)-> &YILValue {
+        if let Ok(a) = self:.addressOf(p.funcPtr) && self:.isCallable(a) {
+            if (a.isSlot) { self._virtuals += 1us; }
+            else { self._delegates += 1us; }
+
+            return copy YILNameCallValue(p.loc, p.type, a.name, self:.rewriteValues(p.params));
+        }
+
+        self:.rewriteOperands(p)
+    }
+
+    /**
+     * @returns: true iif a known address is a function the frame can call by name,
+     * which it then references
+     *
+     * A runtime helper is never called by name through the address a frame holds:
+     * the helper stored in a delegate is one only the runtime has the signature of.
+     * */
+    fn isCallable(mut self, a: &Address)-> bool {
+        if (a.offset != 0us) return false;
+        if (a.name in self._constants) return false;
+        if (core_::isRuntimeFunc(a.name)) return false;
+
+        self:.reference(a.name)
+    }
+
+    /**
+     * Make a symbol a reference of the frame.
+     *
+     * @returns: true iif the module a symbol is declared in is known, so that it
+     * is one the frame may refer to
+     * */
+    fn reference(mut self, name: [c8])-> bool {
+        if (name in self._refs) return true;
+        if let Ok(p) = self._paths[name] {
+            self._refs[name] = p;
+            return true;
+        }
+
+        false
+    }
+
+}
+
+/*!
+ * ================================================================================
+ * ================================================================================
+ * ============================          HELPERS          =========================
+ * ================================================================================
+ * ================================================================================
+ */
+
+/**
+ * @returns: true iif a frame makes a call through a pointer or reads the vtable
+ * of an instance, the only things the pass rewrites
+ * */
+fn hasCandidate(frame: &YILFrame)-> bool {
+    for v in defuse::allValues(frame.body) {
+        match v {
+            _: &YILPtrCallValue => { return true; }
+            f: &YILFieldValue => { if (f.name == ClassKeys::VTABLE) return true; }
+        }
+    }
+
+    false
+}
+
+/**
+ * @returns: true iif the variable is a parameter of the frame
+ * */
+fn isParam(frame: &YILFrame, id: usize)-> bool {
+    for p in frame.params {
+        if (p.id == id) return true;
+    }
+
+    false
+}
+
+/**
+ * The variables among `ids`, each written by a single instruction, that some
+ * path of the frame reads before that instruction ran.
+ *
+ * A forward analysis over the graph of the frame, a fact per variable: the
+ * variable may be unassigned. Every fact holds at the entry, and the block
+ * holding the write kills it; an exception edge leaves before the closing
+ * instruction of a block, so a write it closes on does not kill it there.
+ * */
+fn readBeforeAssigned(frame: &YILFrame, du: &DefUse, ids: [usize])-> [usize] {
+    let graph = copy CFG(frame);
+    let nb = ids.len;
+
+    let mut names: [[c8]] = [];
+    for id in ids { names ~= [format("%", id)]; }
+
+    let dmut analysis = copy Analysis("unassigned variables", Direction::FORWARD, MeetKind::UNION, names);
+    for b in graph.getBlocks() {
+        let mut gen = dataflow::setEmpty(nb);
+        let mut kill = dataflow::setEmpty(nb);
+        let mut preKill = dataflow::setEmpty(nb);
+        if (b is graph.getEntry()) { gen = dataflow::setFull(nb); }
+
+        let instrs = b.getInstrs();
+        for z, instr in instrs {
+            let defs = assignedBy(du, instr);
+            for i, id in ids {
+                if (!defuse::containsId(defs, id)) continue;
+                kill = dataflow::setWith(kill, i);
+                if (z + 1us < instrs.len) { preKill = dataflow::setWith(preKill, i); }
+            }
+        }
+
+        analysis:.setBlock(b.getUid(), gen, kill);
+        analysis:.setBlockPre(b.getUid(), gen, preKill);
+    }
+
+    let sol = dataflow::solve(graph, analysis);
+    let mut early: [usize] = [];
+    for b in graph.getBlocks() {
+        if (!sol.covers(b)) continue;
+
+        let mut unassigned = sol.inOf(b);
+        for instr in b.getInstrs() {
+            let uses = du.ofInstr(instr).getUses();
+            let defs = assignedBy(du, instr);
+            for i, id in ids {
+                if (dataflow::setHas(unassigned, i) && defuse::containsId(uses, id) && !defuse::containsId(early, id)) {
+                    early ~= [id];
+                }
+
+                if (defuse::containsId(defs, id)) { unassigned = dataflow::setWithout(unassigned, i); }
+            }
+        }
+    }
+
+    early
+}
+
+/**
+ * @returns: the variables an instruction assigns, which a declaration does not
+ * */
+fn assignedBy(du: &DefUse, instr: &YILInstr)-> [usize] {
+    if (instr of YILVarDecl) return [];
+
+    du.ofInstr(instr).getAllDefs()
+}
