@@ -1,0 +1,276 @@
+/*
+ * Declares YILRewriter, the rebuild of the instructions and the values of a
+ * frame shared by the passes transforming values in place.
+ *
+ * A pass rewriting values overrides `rewriteValue` for the nodes it transforms,
+ * and hands every other one to `rewriteOperands`, which rebuilds it from its
+ * rewritten operands. A node none of whose operands moved is returned as it is,
+ * so that a pass tells it changed nothing by the identity of what it returns.
+ *
+ * A place -- the destination of an assignment, the operand of `&` -- is not a
+ * value: it names a storage, not what it holds. It goes through `rewriteDest`,
+ * which never hands the place itself to `rewriteValue`, only the values it is
+ * computed from (the pointer it dereferences, the index it accesses).
+ *
+ * <hr>
+ *
+ * @Package: ymirc
+ * @Module: ymirc::lint::optimizer::rewrite
+ * @File: ymirc/lint/optimizer/rewrite.yr
+ * @Author(s):
+ *   - Emile Cadorel <ecadorel@gmail.com>
+ *
+ * @Created(YYYY-MM-DD): 2026-09-26
+ * @Copyright(C) 2021–2026 GNU-Ymir
+ * @License
+ *   ```text
+ *   This file is part of the Ymir language project.
+ *
+ *   Ymir is free software: you can redistribute it and/or modify it
+ *   under the terms of the GNU General Public License as published by
+ *   the Free Software Foundation, either version 3 of the License, or
+ *   (at your option) any later version.
+ *
+ *   Ymir is distributed in the hope that it will be useful,
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *   GNU General Public License for more details.
+ *
+ *   You should have received a copy of the GNU General Public License
+ *   along with Ymir.  If not, see <https://www.gnu.org/licenses/>.
+ *   ```
+ */
+
+in rewrite;
+
+use ymirc::lint::node::{_, instr::_, value::_};
+
+/**
+ * The identity preserving rebuild of the instructions and the values of a frame.
+ * */
+pub class YILRewriter {
+
+    pub self () {}
+
+    /**
+     * Rewrite the values an instruction evaluates, the ones of the instructions
+     * it holds included.
+     *
+     * @returns: the rewritten instruction, or `instr` itself when nothing under it moved
+     * */
+    pub fn rewriteInstr(mut self, instr: &YILInstr)-> &YILInstr {
+        match instr {
+            b: &YILBlock => {
+                let instrs = self:.rewriteList(b.instrs);
+                if (sameInstrs(instrs, b.instrs)) return b;
+
+                return copy YILBlock(b.loc, instrs);
+            }
+            t: &YILTryCatch => {
+                let tryPart = self:.rewriteList(t.tryPart);
+                let catchPart = self:.rewriteList(t.catchPart);
+                if (sameInstrs(tryPart, t.tryPart) && sameInstrs(catchPart, t.catchPart)) return t;
+
+                return copy YILTryCatch(t.loc, t.catchType, tryPart, catchPart);
+            }
+            t: &YILTryFinally => {
+                let tryPart = self:.rewriteList(t.tryPart);
+                let finPart = self:.rewriteList(t.finPart);
+                if (sameInstrs(tryPart, t.tryPart) && sameInstrs(finPart, t.finPart)) return t;
+
+                return copy YILTryFinally(t.loc, tryPart, finPart);
+            }
+            a: &YILAffect => {
+                let left = self:.rewriteDest(a.left);
+                let right = self:.rewriteValue(a.right);
+                if (left is a.left && right is a.right) return a;
+
+                return copy YILAffect(a.loc, left, right);
+            }
+            c: &YILCall => {
+                let content = self:.rewriteValue(c.content);
+                if (content is c.content) return c;
+
+                return copy YILCall(c.loc, content);
+            }
+            r: &YILReturn => {
+                let value = self:.rewriteValue(r.value);
+                if (value is r.value) return r;
+
+                return copy YILReturn(r.loc, value);
+            }
+            c: &YILCondJmp => {
+                let cond = self:.rewriteValue(c.cond);
+                if (cond is c.cond) return c;
+
+                return copy YILCondJmp(c.loc, cond, c.then, c.else_);
+            }
+        }
+
+        instr
+    }
+
+    /**
+     * Rewrite a value.
+     *
+     * @returns: the rewritten value, or `value` itself when nothing under it moved
+     * */
+    pub fn rewriteValue(mut self, value: &YILValue)-> &YILValue {
+        self:.rewriteOperands(value)
+    }
+
+    /**
+     * Rewrite a list of instructions.
+     * */
+    prot fn rewriteList(mut self, instrs: [&YILInstr])-> [&YILInstr] {
+        let mut res: [mut &YILInstr] = [];
+        for i in instrs { res ~= [self:.rewriteInstr(i)]; }
+
+        res
+    }
+
+    /**
+     * Rewrite a list of values.
+     * */
+    prot fn rewriteValues(mut self, values: [&YILValue])-> [&YILValue] {
+        let mut res: [mut &YILValue] = [];
+        for v in values { res ~= [self:.rewriteValue(v)]; }
+
+        res
+    }
+
+    /**
+     * Rebuild a value from its rewritten operands.
+     *
+     * @returns: the rebuilt value, or `value` itself when none of its operands moved
+     * */
+    prot fn rewriteOperands(mut self, value: &YILValue)-> &YILValue {
+        match value {
+            b: &YILBinaryValue => {
+                let left = self:.rewriteValue(b.left);
+                let right = self:.rewriteValue(b.right);
+                if (left is b.left && right is b.right) return b;
+
+                return copy YILBinaryValue(b.loc, b.type, b.op, left, right);
+            }
+            u: &YILUnaryValue => {
+                let inner = self:.rewriteValue(u.left);
+                if (inner is u.left) return u;
+
+                return copy YILUnaryValue(u.loc, u.type, u.op, inner);
+            }
+            c: &YILCastValue => {
+                let inner = self:.rewriteValue(c.value);
+                if (inner is c.value) return c;
+
+                return copy YILCastValue(c.loc, c.type, inner);
+            }
+            u: &YILUnrefValue => {
+                let inner = self:.rewriteValue(u.value);
+                if (inner is u.value) return u;
+
+                return copy YILUnrefValue(u.loc, u.type, inner);
+            }
+            a: &YILAddrValue => {
+                let inner = self:.rewriteDest(a.value);
+                if (inner is a.value) return a;
+
+                return copy YILAddrValue(a.loc, a.type, inner);
+            }
+            f: &YILFieldValue => { return withTuple(f, self:.rewriteValue(f.tuple)); }
+            a: &YILArrayAccessValue => { return withArray(a, self:.rewriteValue(a.value), self:.rewriteValue(a.index)); }
+            t: &YILTupleValue => {
+                let values = self:.rewriteValues(t.values);
+                if (sameValues(values, t.values)) return t;
+
+                return copy YILTupleValue(t.loc, t.type, values, fieldNames-> t.fieldNames);
+            }
+            a: &YILArrayValue => {
+                let values = self:.rewriteValues(a.value);
+                if (sameValues(values, a.value)) return a;
+
+                return copy YILArrayValue(a.loc, a.type, values);
+            }
+            n: &YILNameCallValue => {
+                let params = self:.rewriteValues(n.params);
+                if (sameValues(params, n.params)) return n;
+
+                return copy YILNameCallValue(n.loc, n.type, n.funcName, params);
+            }
+            p: &YILPtrCallValue => {
+                let funcPtr = self:.rewriteValue(p.funcPtr);
+                let params = self:.rewriteValues(p.params);
+                if (funcPtr is p.funcPtr && sameValues(params, p.params)) return p;
+
+                return copy YILPtrCallValue(p.loc, p.type, funcPtr, params);
+            }
+        }
+
+        value
+    }
+
+    /**
+     * Rewrite the values a place is computed from, leaving the place itself.
+     *
+     * @returns: the rebuilt place, or `value` itself when nothing under it moved
+     * */
+    prot fn rewriteDest(mut self, value: &YILValue)-> &YILValue {
+        match value {
+            _: &YILVar => { return value; }
+            f: &YILFieldValue => { return withTuple(f, self:.rewriteDest(f.tuple)); }
+            a: &YILArrayAccessValue => { return withArray(a, self:.rewriteDest(a.value), self:.rewriteValue(a.index)); }
+            u: &YILUnrefValue => {
+                let inner = self:.rewriteValue(u.value);
+                if (inner is u.value) return u;
+
+                return copy YILUnrefValue(u.loc, u.type, inner);
+            }
+        }
+
+        self:.rewriteValue(value)
+    }
+
+}
+
+/**
+ * @returns: true iif both lists hold the very same instructions
+ * */
+pub fn sameInstrs(a: [&YILInstr], b: [&YILInstr])-> bool {
+    if (a.len != b.len) return false;
+    for i in 0us .. a.len {
+        if (a[i] !is b[i]) return false;
+    }
+
+    true
+}
+
+/**
+ * @returns: true iif both lists hold the very same values
+ * */
+pub fn sameValues(a: [&YILValue], b: [&YILValue])-> bool {
+    if (a.len != b.len) return false;
+    for i in 0us .. a.len {
+        if (a[i] !is b[i]) return false;
+    }
+
+    true
+}
+
+/**
+ * @returns: the field read over another tuple, or `f` itself when it is the same one
+ * */
+fn withTuple(f: &YILFieldValue, tuple: &YILValue)-> &YILValue {
+    if (tuple is f.tuple) return f;
+    if (f.name != "") return copy YILFieldValue(f.loc, f.type, tuple, f.name);
+
+    copy YILFieldValue(f.loc, f.type, tuple, f.index)
+}
+
+/**
+ * @returns: the array access over another array or index, or `a` itself when both are the same
+ * */
+fn withArray(a: &YILArrayAccessValue, array: &YILValue, index: &YILValue)-> &YILValue {
+    if (array is a.value && index is a.index) return a;
+
+    copy YILArrayAccessValue(a.loc, a.type, array, index)
+}
