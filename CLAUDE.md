@@ -142,6 +142,10 @@ Either way, each case:
      which a warning is reported instead of thrown; absent, a warning is fatal as any other
      error. Compared whether or not the case compiles, so a case can carry both a `.warn`
      and an `.err`. `test_resources/warnings/` is the directory dedicated to it.
+   - `testN.lsp` — expected JSON dump of the reported warnings and the thrown error as LSP
+     `Diagnostic` objects (`errors::lsp`), the current directory written `$ROOT` in the URIs.
+     Compared whether or not the case compiles, and a case carrying it needs no `.err` to
+     fail. `test_resources/lsp/` is the directory dedicated to it.
 
 If a case has *no* golden file at all, the only assertion is "compilation raised no error" —
 and when it does raise one, the full formatted error is printed to stderr. That makes a

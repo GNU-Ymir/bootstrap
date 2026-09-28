@@ -1,0 +1,216 @@
+/*
+ * lsp::flattening — an ErrorMsg tree flattened into LSP diagnostics.
+ *
+ * <hr>
+ *
+ * @Package: ymirc
+ * @Module: ymirc::errors::lsp::flattening
+ * @File: ymirc/errors/lsp/flattening.yr
+ * @Author(s):
+ *   - Emile Cadorel <ecadorel@gmail.com>
+ *
+ * @Created(YYYY-MM-DD): 2026-09-28
+ * @Copyright(C) 2021–2026 GNU-Ymir
+ * @License
+ *   ```text
+ *   This file is part of the Ymir language project.
+ *
+ *   Ymir is free software: you can redistribute it and/or modify it
+ *   under the terms of the GNU General Public License as published by
+ *   the Free Software Foundation, either version 3 of the License, or
+ *   (at your option) any later version.
+ *
+ *   Ymir is distributed in the hope that it will be useful,
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *   GNU General Public License for more details.
+ *
+ *   You should have received a copy of the GNU General Public License
+ *   along with Ymir.  If not, see <https://www.gnu.org/licenses/>.
+ *   ```
+ */
+
+in flattening;
+
+use ymirc::errors::lsp::place;
+use ymirc::errors::snippet::suggestion;
+use ymirc::lexing::word;
+use ymirc::utils::colors;
+
+/**
+ * Flattens diagnostic trees into the failures they hold, as LSP diagnostics.
+ */
+pub mod Flattening {
+
+    /**
+     * Flatten diagnostic trees into the failures they hold, a failure reached
+     * twice being kept once.
+     *
+     * @params:
+     *   - errs: the trees, e.g. the reported warnings and the thrown error,
+     *   - encoding: the unit of the character offsets.
+     */
+    pub fn diagnosticsOf(errs: [&message::ErrorMsg], encoding: PositionEncoding = PositionEncoding::UTF16)-> [LspDiagnostic] {
+        let dmut seen: [usize => ()] = copy [];
+        let mut res: [LspDiagnostic] = [];
+        for e in errs {
+            res ~= Flattening::collect(e, [], encoding, alias seen);
+        }
+
+        res
+    }
+
+    /**
+     * @params:
+     *   - trace: the context frames `err` was reached through, innermost first.
+     * @returns: the failures of `err` not in `seen`, which they are added to.
+     */
+    fn collect(err: &message::ErrorMsg, trace: [RelatedInfo], encoding: PositionEncoding, dmut seen: [usize => ()])-> [LspDiagnostic] {
+        if (err.isList) {
+            let mut res: [LspDiagnostic] = [];
+            for n in err.notes {
+                res ~= Flattening::collect(n, trace, encoding, alias seen);
+            }
+
+            return res;
+        }
+
+        if (err.isContext && err.notes.len != 0us) {
+            let inner = Flattening::frameOf(err, encoding) ~ trace;
+            let mut res: [LspDiagnostic] = [];
+            for n in err.notes {
+                res ~= Flattening::collect(n, inner, encoding, alias seen);
+            }
+
+            return res;
+        }
+
+        if (err.id in seen) return [];
+        seen[err.id] = ();
+
+        let mut msg = colors::stripColors(err.msg);
+        let mut related: [RelatedInfo] = [];
+        let mut frames: [RelatedInfo] = [];
+        for n in err.notes {
+            let (r, f, lost) = Flattening::gather(n, encoding);
+            related ~= r;
+            frames ~= f;
+            for l in lost {
+                msg = if (msg == "") { l } else { msg ~ "\n" ~ l };
+            }
+        }
+
+        copy [LspDiagnostic(Location(err.loc, err.endLoc, encoding),
+                            Flattening::severityOf(err),
+                            if (err.isNote) { code::NO_CODE } else { err.code },
+                            msg,
+                            related ~ frames ~ trace,
+                            Flattening::fixesOf(err, encoding))]
+    }
+
+    /**
+     * Collect a note of a failure, and its own subtree.
+     *
+     * @returns:
+     *   - .0: the places it and its subtree name, in tree order,
+     *   - .1: the context frames it and its subtree were reached through,
+     *   - .2: what it and its subtree say without naming a place, appended to the
+     *         message of the failure.
+     */
+    fn gather(err: &message::ErrorMsg, encoding: PositionEncoding)-> ([RelatedInfo], [RelatedInfo], [[c8]]) {
+        let mut related: [RelatedInfo] = [];
+        let mut frames: [RelatedInfo] = [];
+        let mut lost: [[c8]] = [];
+
+        // a place is named even with nothing said there, as the excerpt labels it
+        let msg = colors::stripColors(err.msg);
+        if (!err.isContext) {
+            if (!err.isOneLine && isPlaced(err.loc)) {
+                related ~= [RelatedInfo(Location(err.loc, err.endLoc, encoding), msg)];
+            } else if (msg != "") {
+                lost ~= [msg];
+            }
+        }
+
+        for n in err.notes {
+            let (r, f, l) = Flattening::gather(n, encoding);
+            related ~= r;
+            frames ~= f;
+            lost ~= l;
+        }
+
+        // a frame found under a failure is deeper than the one enclosing it
+        if (err.isContext) {
+            frames ~= Flattening::frameOf(err, encoding);
+        }
+
+        (related, frames, lost)
+    }
+
+    /**
+     * @returns: the related information a context frame is, none when it names no
+     *           place.
+     */
+    fn frameOf(err: &message::ErrorMsg, encoding: PositionEncoding)-> [RelatedInfo] {
+        if (!isPlaced(err.loc)) return [];
+
+        copy [RelatedInfo(Location(err.loc, EOF_WORD, encoding), colors::stripColors(err.msg))]
+    }
+
+    /**
+     * @returns: the severity of a failure, a note standing alone being an
+     *           information.
+     */
+    fn severityOf(err: &message::ErrorMsg)-> DiagnosticSeverity {
+        if (err.isNote) return DiagnosticSeverity::INFORMATION;
+        if (err.isWarning) return DiagnosticSeverity::WARNING;
+
+        DiagnosticSeverity::ERROR
+    }
+
+    /**
+     * @returns: the edits `err` and its subtree propose that apply to the source,
+     *           cf. `ErrorMsg::gatherFixes`.
+     */
+    fn fixesOf(err: &message::ErrorMsg, encoding: PositionEncoding)-> [QuickFix] {
+        let mut res: [QuickFix] = [];
+        match err.fix {
+            Ok(e: Edit) => {
+                if let Ok(q) = Flattening::quickFixOf(e, encoding) {
+                    res ~= [q];
+                }
+            }
+        }
+
+        for n in err.notes {
+            res ~= Flattening::fixesOf(n, encoding);
+        }
+
+        res
+    }
+
+    /**
+     * @returns: the text edits of `e`, none when one of its splices is not a place
+     *           of the source, cf. `suggestion::applyEdit`.
+     */
+    fn quickFixOf(e: Edit, encoding: PositionEncoding)-> (QuickFix)? {
+        if (e.splices.len == 0us) return none;
+
+        let mut edits: [TextEdit] = [];
+        for s in e.splices {
+            if (!isPlaced(s.loc)) return none;
+
+            let begin = s.loc.lineSeek + cast!usize(s.loc.col) - 1us;
+            if (begin + s.len > s.loc.fileContent.len) return none;
+            if (s.len != 0us && (s.len != s.loc.len || s.loc.fileContent[begin .. begin + s.len] != s.loc.str)) {
+                return none;
+            }
+
+            let start = Position(s.loc, 0us, encoding);
+            let end = Position(s.loc, s.len, encoding);
+            edits ~= [TextEdit(Location(s.loc.filename, start, end), s.replacement)];
+        }
+
+        (QuickFix(colors::stripColors(e.msg), edits))?
+    }
+}
