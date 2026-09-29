@@ -2045,37 +2045,15 @@ pub mod ExpressionVisitor {
      * @grammar
      * ```
      * MatchExpr:=
-     *    'match' ExpressionSimple(0) '{' MatchExpr(MatchExpr)* '}'
-     *
-     *
-     * MatchExpr:=
-     *   PatternExpr Guard? ' => ' BlockOrSingleExpr
+     *    'match' ExpressionSimple(0) '{' MatchLine+ '}'
      * ```
      * */
     fn readMatch(dmut context: &SyntaxVisitor, loc: &Word)-> &Expression
         throws ErrorMsg
     {
         let value = ExpressionVisitor::readExpressionSimple(alias context, BinaryOperatorsLevelNames::BOOL_LOGIC);
-        let mut matchers: [MatchLine] = [];
         context:.readTokens(Tokens::LACC);
-        loop {
-            let pattern = ExpressionVisitor::readPatternExpr(alias context);
-
-            let mut guard: &Expression = EMPTY_EXPR;
-            let (hasTest, _) = context:.readIf(Keys::IF);
-            if !hasTest.isEof {
-                guard = ExpressionVisitor::readExpressionSimple(alias context, BinaryOperatorsLevelNames::BOOL_LOGIC);
-            }
-
-            context:.readTokens(Tokens::DARROW);
-            let blk = ExpressionVisitor::readBlockOrSingleExpr(alias context);
-
-            matchers ~= [MatchLine(pattern, guard, blk)];
-
-            let (end, _) = context:.readIf(Tokens::RACC);
-            if !end.isEof
-                break;
-        }
+        let matchers = ExpressionVisitor::readMatchLines(alias context);
 
         return copy MatcherExpr(loc, value, matchers, isCatcher-> false);
     }
@@ -2091,16 +2069,37 @@ pub mod ExpressionVisitor {
      * @grammar
      * ```
      * CatchExpr:=
-     *    'catch' '{' MatchExpr(MatchExpr)* '}'
+     *    'catch' '{' MatchLine+ '}'
      * ```
      * */
     fn readCatch(dmut context: &SyntaxVisitor, loc: &Word)-> &Expression
         throws ErrorMsg
     {
-        let mut matchers: [MatchLine] = [];
         context:.readTokens(Tokens::LACC);
+        let matchers = ExpressionVisitor::readMatchLines(alias context);
+
+        return copy MatcherExpr(loc, EMPTY_EXPR, matchers, isCatcher-> true);
+    }
+
+    /**
+     * Read the arms of a match or a catch expression, up to the closing '}'
+     *
+     * @params:
+     *    - context: the context of the reading
+     *
+     * @grammar
+     * ```
+     * MatchLine:=
+     *   ArmPattern ('if' ExpressionSimple(BOOL_LOGIC))? '=>' ArmValue
+     * ```
+     * */
+    fn readMatchLines(dmut context: &SyntaxVisitor)-> [MatchLine]
+        throws ErrorMsg
+    {
+        let mut matchers: [MatchLine] = [];
+        let mut prev: &Expression = EMPTY_EXPR;
         loop {
-            let pattern = ExpressionVisitor::readPatternExpr(alias context);
+            let pattern = ExpressionVisitor::readArmPattern(alias context, prev);
 
             let mut guard: &Expression = EMPTY_EXPR;
             let (hasTest, _) = context:.readIf(Keys::IF);
@@ -2109,16 +2108,123 @@ pub mod ExpressionVisitor {
             }
 
             context:.readTokens(Tokens::DARROW);
-            let blk = ExpressionVisitor::readBlockOrSingleExpr(alias context);
+            let (blk, isOpen) = ExpressionVisitor::readArmValue(alias context);
 
             matchers ~= [MatchLine(pattern, guard, blk)];
+            prev = if isOpen { blk } else { EMPTY_EXPR };
 
             let (end, _) = context:.readIf(Tokens::RACC);
             if !end.isEof
                 break;
         }
 
-        return copy MatcherExpr(loc, EMPTY_EXPR, matchers, isCatcher-> true);
+        return matchers;
+    }
+
+    /**
+     * Read the pattern of an arm
+     *
+     * @params:
+     *    - context: the context of the reading
+     *    - prev:    the value of the previous arm, if nothing ended it
+     *
+     * @throws:
+     *    - ARM_READ_AS_OPERAND: the pattern was read as the arguments of a call or an index ending `prev`
+     *
+     * @grammar
+     * ```
+     * ArmPattern:= PatternExpr
+     * ```
+     * */
+    fn readArmPattern(dmut context: &SyntaxVisitor, prev: &Expression)-> &Expression
+        throws ErrorMsg
+    {
+        let start = context.getSeek();
+        {
+            return ExpressionVisitor::readPatternExpr(alias context);
+        } catch {
+            err => {
+                context:.rewindToSeek(start);
+                let (follow, _) = context:.readIf(Tokens::DARROW, Keys::IF);
+                if let Ok(call) = ExpressionVisitor::trailingMultOperator(prev) {
+                    if !follow.isEof {
+                        throw copy ErrorMsg::fatal(follow, format(SyntaxErrorMessage::ARM_READ_AS_OPERAND, call.op),
+                                                   notes-> copy [copy ErrorMsg::note(call.loc, end-> call.end,
+                                                                                     format(SyntaxErrorMessage::ARM_READ_AS_OPERAND_NOTE))]);
+                    }
+                }
+
+                throw err;
+            }
+        }
+    }
+
+    /**
+     * @returns: the call or index operator an expression ends with, if any
+     * */
+    fn trailingMultOperator(expr: &Expression)-> (&MultOperatorExpr)? {
+        match expr {
+            m: &MultOperatorExpr => { (m)? }
+            b: &BinaryExpr       => { ExpressionVisitor::trailingMultOperator(b.right) }
+            _                    => { none }
+        }
+    }
+
+    /**
+     * Read the value of an arm: a block, or an expression that a ';' makes a statement and a ',' ends
+     *
+     * @params:
+     *    - context: the context of the reading
+     *
+     * @returns:
+     *    - the value of the arm
+     *    - true if nothing ended the value, so that it could have swallowed the pattern of the next arm
+     *
+     * @throws:
+     *    - ARM_COMMA: a ',' follows a block, or a statement
+     *
+     * @grammar
+     * ```
+     * ArmValue:=
+     *    Block(false)
+     *  | InstrOrExpr (';' | ',')?
+     * ```
+     * */
+    fn readArmValue(dmut context: &SyntaxVisitor)-> (&Expression, bool)
+        throws ErrorMsg
+    {
+        let (open, _) = context:.readIf(Tokens::LACC);
+        if open == Tokens::LACC {
+            let blk = ExpressionVisitor::readBlock(alias context, open, withGuards-> false);
+            ExpressionVisitor::refuseArmComma(alias context);
+            return (blk, false);
+        }
+
+        let expr = ExpressionVisitor::readInstrOrExpr(alias context);
+        if !context.needClosingExpr(expr) {
+            ExpressionVisitor::refuseArmComma(alias context);
+            return (expr, false);
+        }
+
+        let (cl, _) = context:.readIf(Tokens::SEMI_COLON, Tokens::COMA);
+        if cl == Tokens::SEMI_COLON {
+            ExpressionVisitor::refuseArmComma(alias context);
+            return (copy BlockExpr(expr.loc, cl, content-> copy [expr, EMPTY_EXPR]), false);
+        }
+
+        return (expr, cl.isEof);
+    }
+
+    /**
+     * Throw ARM_COMMA if a ',' follows an arm whose value is not a simple expression
+     * */
+    fn refuseArmComma(dmut context: &SyntaxVisitor)
+        throws ErrorMsg
+    {
+        let (coma, _) = context:.readIf(Tokens::COMA);
+        if !coma.isEof {
+            throw copy ErrorMsg::fatal(coma, format(SyntaxErrorMessage::ARM_COMMA));
+        }
     }
 
     /**
