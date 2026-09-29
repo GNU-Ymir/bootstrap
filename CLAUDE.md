@@ -70,6 +70,17 @@ Build system is `gyllir` (config in `gyllir.toml`, compiler path points at a loc
   Results are cached in `.ymir_test_success`.
 - `gyllir build --release` / `gyllir test --release` for release-mode builds.
 
+### Measuring allocation
+
+`perf` is unusable here (`perf_event_paranoid = 4`), so perf work is measured with the Boehm GC's
+own counters: `tools/gc-stats.sh [--release] [-j N] [--gyc COMPILER] [-C DIR] [-t TARGET] [REV]`
+makes a full build of a gyllir project (this one by default, `-C ../midgard -t gymidgard_release`
+for another) at a revision (the working tree by default) in a scratch directory, leaving
+`.target/` alone, and prints the collections, bytes allocated, GC time against user CPU, and peak
+heap. What it measures is the frontend of the compiler, not the one of the tree: a frontend change
+is measured by rebuilding the ymir-dev preview (`uv run preview --no-midgard`) on each side of it
+and passing `--gyc ymirc`, with the same project, REV and `-j` both times.
+
 ### Running tests
 
 ```
