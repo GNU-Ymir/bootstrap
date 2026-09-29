@@ -24,7 +24,7 @@ check lives:
 | Range | Stage | Catalogue | Live codes |
 |---|---|---|---|
 | `E1xxx` | lexing | `LexingErrorMessage` -- `src/ymirc/lexing/errors.yr` | 24 |
-| `E2xxx` | parsing | `SyntaxErrorMessage` -- `src/ymirc/syntax/errors.yr` | 11 |
+| `E2xxx` | parsing | `SyntaxErrorMessage` -- `src/ymirc/syntax/errors.yr` | 13 |
 | `E3xxx` | declaration | `DeclareErrorMessage` -- `src/ymirc/semantic/declarator/errors.yr` | 34 |
 | `E4xxx` | validation | `ValidateErrorMessage` -- `src/ymirc/semantic/validator/errors.yr` | 266 |
 | `E5xxx` | lowering (YIL) | `SerializeYILErrorMessage` -- `src/ymirc/lint/serialize/errors.yr`, `OptimizerErrorMessage` -- `src/ymirc/lint/optimizer/errors.yr` | 11 |
@@ -82,6 +82,8 @@ deliberately carry no code, and have no page here.
 | [E2013](E2013.md) | `MOVE_MISSING_OPERAND` | missing the value moved by the operator |
 | [E2014](E2014.md) | `ATTRIBUTE_WITHOUT_ARGS` | attribute <> takes no argument |
 | [E2015](E2015.md) | `ATTRIBUTE_ARITY` | attribute <> takes <> argument(s), but <> were given |
+| [E2016](E2016.md) | `ARM_READ_AS_OPERAND` | the value of the previous arm was read as the operand of the operator <> |
+| [E2017](E2017.md) | `ARM_COMMA` | a comma only ends an arm whose value is a simple expression, neither a block nor a statement |
 
 ## E3xxx -- declaration
 
