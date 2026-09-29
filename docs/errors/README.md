@@ -84,6 +84,7 @@ deliberately carry no code, and have no page here.
 | [E2015](E2015.md) | `ATTRIBUTE_ARITY` | attribute <> takes <> argument(s), but <> were given |
 | [E2016](E2016.md) | `ARM_READ_AS_OPERAND` | the value of the previous arm was read as the operand of the operator <> |
 | [E2017](E2017.md) | `ARM_COMMA` | a comma only ends an arm whose value is a simple expression, neither a block nor a statement |
+| [E2018](E2018.md) | `FOR_FILTER_ELSE` | the filter of a for loop cannot have an else branch |
 
 ## E3xxx -- declaration
 
