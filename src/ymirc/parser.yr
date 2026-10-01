@@ -63,12 +63,12 @@
 
 in parser;
 
-use ymirc::{errors, utils::_};
+use ymirc::{errors, session, utils::_};
 use ymirc::doc::visitor;
 use ymirc::lexing::word;
 use ymirc::lint::{expander, node::_, optimizer, serialize};
 use ymirc::semantic::{declarator, generator, index, symbol, validator};
-use ymirc::syntax::{_, declaration::_};
+use ymirc::syntax::{declaration::_, visitor};
 
 use std::{env, fs::_, io};
 
@@ -130,6 +130,18 @@ pub class Parser {
     // The occurrences of the entities of the package, filled during validationStep()
     let dmut _index: &SemanticIndex = copy SemanticIndex();
 
+    // The session the package is compiled in, cf. inSession
+    let dmut _session: (&Session)?;
+
+    // The token the compilation in the session is cancelled through
+    let _token: (&global::state::CancellationToken)?;
+
+    // The syntax trees the modules are read from
+    let dmut _syntaxCache: &SyntaxCache;
+
+    // The diagnostics reported without aborting the compilation
+    let mut _warnings: [&ErrorMsg] = [];
+
     /**
      * @params:
      *    - file: the path root file of the package to compile
@@ -141,6 +153,28 @@ pub class Parser {
         with _file = file
         , _overlay = overlay
         , _indexing = index
+        , _session = none
+        , _token = none
+        , _syntaxCache = copy SyntaxCache()
+    {}
+
+    /**
+     * A parser compiling in `session`: the configuration of the session is
+     * the one of the compilation, and the files it already read are not read
+     * again while they do not change. The compilation is the one `cancel` of
+     * the session stops from now on. Its results (the thrown error, the
+     * warnings) are rendered with the paths of the session only while it is
+     * entered, cf. `Session::enter`.
+     *
+     * @params: cf. the default constructor
+     */
+    pub self inSession(dmut session: &Session, file: [c8], overlay: [Path => [c8]] = copy [], index: bool = false)
+        with _file = file
+        , _overlay = overlay
+        , _indexing = index
+        , _session = (alias session)?
+        , _token = (session:.compilation())?
+        , _syntaxCache = alias session:.syntaxCache()
     {}
 
     /*!
@@ -234,7 +268,7 @@ pub class Parser {
      *     order they were raised. They were already printed when raised.
      */
     pub fn getWarnings(self)-> [&ErrorMsg] {
-        errors::diagnostic::reported()
+        self._warnings
     }
 
     /*!
@@ -254,24 +288,48 @@ pub class Parser {
      *   - calls parsePackage().
      *
      * Throws:
-     *   - ErrorMsg on syntax or validation errors.
+     *   - ErrorMsg on syntax or validation errors, or if the compilation was cancelled.
      */
     pub fn parseAll(mut self)
         throws ErrorMsg
     {
-        errors::diagnostic::resetToDefault();
-
-        let mut path = Path(self._file);
-        let mut package = path.parent();
-        if (!path.isAbsolute()) {
-            path = env::currentDir().push(path);
-            package = path.parent();
+        if let Ok(dmut session) = alias self._session {
+            session:.enter();
         }
 
-        global::state::setPackage(package);
-        global::state::setRootModule(path);
-        global::state::setSourceOverlay(self._overlay);
-        self:.parsePackage(path);
+        {
+            errors::diagnostic::resetToDefault();
+
+            let mut path = Path(self._file);
+            let mut package = path.parent();
+            if (!path.isAbsolute()) {
+                path = env::currentDir().push(path);
+                package = path.parent();
+            }
+
+            global::state::setPackage(package);
+            global::state::setRootModule(path);
+            global::state::setSourceOverlay(self._overlay);
+            if let Ok(token) = self._token {
+                global::state::setCancellationToken(token);
+            }
+
+            self:.parsePackage(path);
+            errors::diagnostic::checkCancelled();
+        } catch {
+            err: &ErrorMsg => {
+                if let Ok(cancelled) = errors::diagnostic::cancellation() {
+                    throw cancelled;
+                }
+
+                throw err;
+            }
+        } exit {
+            self._warnings = errors::diagnostic::reported();
+            if let Ok(dmut session) = alias self._session {
+                session:.exit();
+            }
+        }
     }
 
     /**
@@ -300,10 +358,12 @@ pub class Parser {
         self._semGenerators = s2;
         self._modSym = modSym;
 
+        errors::diagnostic::checkCancelled();
         let (s3, s4) = self:.expansionStep(file, s2);
         self._expNodes = s3;
         self._expTypes = s4;
 
+        errors::diagnostic::checkCancelled();
         let s5 = self:.optimizationStep(file, modules, s3, s4);
         self._optNodes = s5;
     }
@@ -329,9 +389,8 @@ pub class Parser {
     fn syntaxStep(mut self, file: Path)-> &ModuleDecl
         throws ErrorMsg
     {
-        let dmut visitor = copy SyntaxVisitor(file);
-        let module = visitor:.read();
-        if let Ok(err) = visitor.recoveredError() {
+        let (module, recovered) = self._syntaxCache:.read(file);
+        if let Ok(err) = recovered {
             errors::diagnostic::defer(err);
         }
 
@@ -375,7 +434,7 @@ pub class Parser {
     {
         if (global::state::noSem()) return ([], [], symbol::EMPTY_SYMBOL);
 
-        let dmut declarator = copy Declarator(packageDir-> file.parent());
+        let dmut declarator = copy Declarator(packageDir-> file.parent(), syntaxCache-> alias self._syntaxCache);
         self:.importExternPackages(alias declarator);
 
         let dmut modSym = declarator:.declareGlobal(modSynt, global::state::package());
@@ -534,9 +593,8 @@ pub class Parser {
 
         logging::info("Loading external package %", file.toStr());
         {
-            let dmut visitor = copy SyntaxVisitor(file);
-            let modSynt = visitor:.read();
-            if let Ok(err) = visitor.recoveredError() {
+            let (modSynt, recovered) = self._syntaxCache:.read(file);
+            if let Ok(err) = recovered {
                 errors::diagnostic::defer(copy ErrorMsg::fatal(EOF_WORD, format(DeclareErrorMessage::IMPORT_EXTERN_PACKAGE, path.toStr()), oneLine-> true, notes-> copy [err]));
             }
 
