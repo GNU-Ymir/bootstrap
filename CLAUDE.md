@@ -164,6 +164,11 @@ Either way, each case:
      which a warning is reported instead of thrown; absent, a warning is fatal as any other
      error. Compared whether or not the case compiles, so a case can carry both a `.warn`
      and an `.err`. `test_resources/warnings/` is the directory dedicated to it.
+   - `testN.idx` — expected dump of the semantic index (`semantic::index`), one line per
+     token of the package declaring or referring to an entity, and per entity it names. A case carrying this file is
+     compiled with `Parser(..., index-> true)`; compared whether or not the case compiles, the
+     occurrences met before an error being recorded. `test_resources/index/` is the directory
+     dedicated to it.
    - `testN.lsp` — expected JSON dump of the reported warnings and the thrown error as LSP
      `Diagnostic` objects (`errors::lsp`), the current directory written `$ROOT` in the URIs.
      Compared whether or not the case compiles, and a case carrying it needs no `.err` to
