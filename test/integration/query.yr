@@ -1,0 +1,183 @@
+in query;
+
+use ymirc::{parser, query};
+use ymirc::errors;
+use ymirc::errors::lsp;
+use ymirc::semantic::index;
+use ymirc::utils::format;
+
+use std::{config::_, config::json, env, fs::_, io};
+
+/**
+ * @returns: the parser of the package `file` compiled with an index, the absolute
+ * path its tokens name the file by, and the content of the file
+ * */
+fn compile (file: [c8], withRecovery: bool = false)-> (&Parser, [c8], [c8]) {
+    ymirc::global::state::resetToDefault();
+    if withRecovery {
+        ymirc::global::state::activateErrorRecovery();
+    }
+
+    let dmut p = copy Parser(file-> file, index-> true);
+    {
+        p:.parseAll();
+    } catch {
+        _: &ErrorMsg => {}
+    }
+
+    let content = {
+        let dmut f = File::open(Path(file));
+        f:.readAll()
+    } catch {
+        _ => ""
+    };
+
+    (p, env::currentDir().push(file).toStr(), content)
+}
+
+/**
+ * @returns: the labels of `items`, sorted
+ * */
+fn labels (items: [CompletionItem])-> [[c8]] {
+    use std::algorithm::sorting;
+    sort(copy [i.label for i in items], |a, b| => { a < b })
+}
+
+__test hover_describes_a_local_and_a_symbol {
+    let (p, file, _) = compile("test_resources/query/test1.yr");
+    let index = p.getIndex();
+
+    if let Ok(h) = HoverQuery::at(index, file, 8u64, 5u64) {
+        assert(h.text == "sum: i32");
+    } else { assert(false, "no hover on sum"); }
+
+    // the signature, then the documentation of the function
+    if let Ok(h) = HoverQuery::at(index, file, 24u64, 18u64) {
+        assert(h.text == "test1::add (a: i32, b: i32)-> i32\n\nAdds two numbers");
+        assert(h.loc.line == 24u64 && h.loc.col == 17u64);
+    } else { assert(false, "no hover on add"); }
+
+    if let Ok(h) = HoverQuery::at(index, file, 24u64, 29u64) {
+        assert(h.text == "test1::Point::norm ()-> i32");
+    } else { assert(false, "no hover on norm"); }
+
+    if let Ok(_) = HoverQuery::at(index, file, 24u64, 16u64) { assert(false, "a hover on a blank"); }
+}
+
+__test definition_and_references_of_an_entity {
+    let (p, file, _) = compile("test_resources/query/test1.yr");
+    let index = p.getIndex();
+
+    if let Ok(d) = NavigationQuery::definition(index, file, 24u64, 17u64) {
+        assert(d.line == 6u64 && d.col == 4u64);
+    } else { assert(false, "no definition of add"); }
+
+    // the field `x` of `p.x`
+    if let Ok(d) = NavigationQuery::definition(index, file, 24u64, 24u64) {
+        assert(d.line == 12u64 && d.col == 13u64);
+    } else { assert(false, "no definition of x"); }
+
+    assert(NavigationQuery::references(index, file, 24u64, 17u64).len == 2us);
+    assert(NavigationQuery::references(index, file, 24u64, 17u64, withDeclaration-> false).len == 1us);
+    assert(NavigationQuery::references(index, file, 23u64, 9u64).len == 3us);
+}
+
+__test outline_lists_the_declarations_of_a_file {
+    let (p, file, _) = compile("test_resources/query/test1.yr");
+    let syms = OutlineQuery::symbols(p.getModuleSymbol(), file);
+
+    assert(syms.len == 3us);
+    assert(syms[0].name == "add" && syms[0].kind == SymbolKind::FUNCTION);
+    assert(syms[1].name == "Point" && syms[1].kind == SymbolKind::CLASS);
+    assert(syms[2].name == "main" && syms[2].kind == SymbolKind::FUNCTION);
+
+    let members = copy [c.name for c in syms[1].children];
+    assert(members == ["x", "y", "self", "norm"]);
+    assert(syms[1].children[0].kind == SymbolKind::FIELD);
+    assert(syms[1].children[2].kind == SymbolKind::CONSTRUCTOR);
+    assert(syms[1].children[3].kind == SymbolKind::METHOD);
+}
+
+__test completion_of_members_and_of_the_scope {
+    let (p, file, content) = compile("test_resources/query/test1.yr");
+    let index = p.getIndex();
+    let root = p.getModuleSymbol();
+
+    // after `p.`, and after `p.x`
+    assert(labels(CompletionQuery::at(index, root, file, content, 24u64, 24u64)) == ["norm", "x", "y"]);
+    assert(labels(CompletionQuery::at(index, root, file, content, 24u64, 25u64)) == ["x"]);
+
+    // on the blank line ending `main`: its locals but the one of the closed block, and the symbols
+    assert(labels(CompletionQuery::at(index, root, file, content, 28u64, 5u64)) == ["Point", "add", "main", "p", "test1", "total"]);
+}
+
+__test completion_on_a_line_being_written {
+    // `p.` does not parse, the type of `p` is found from its declaration
+    let (p, file, content) = compile("test_resources/query/test2.yr", withRecovery-> true);
+    assert(labels(CompletionQuery::at(p.getIndex(), p.getModuleSymbol(), file, content, 15u64, 7u64)) == ["twice", "x"]);
+}
+
+__test completion_by_visibility {
+    let (p, file, content) = compile("test_resources/query/test3.yr");
+    let index = p.getIndex();
+    let root = p.getModuleSymbol();
+
+    // after `c:.`, outside of the class: neither its private field nor its private method
+    assert(labels(CompletionQuery::at(index, root, file, content, 40u64, 8u64)) == ["get", "inc", "show"]);
+
+    // after `self.`, in a method of the class
+    assert(labels(CompletionQuery::at(index, root, file, content, 18u64, 14u64)) == ["_n", "get", "hidden", "inc", "show"]);
+
+    // after a loop, without its variable, and with the symbols of a used module but not the ones of a module named by its path
+    assert(labels(CompletionQuery::at(index, root, file, content, 44u64, 5u64)) == ["Box", "Counter", "Show", "aux", "c", "id", "lib", "main", "test3", "value"]);
+}
+
+__test outline_of_impls_and_templates {
+    let (p, file, _) = compile("test_resources/query/test3.yr");
+    let syms = OutlineQuery::symbols(p.getModuleSymbol(), file);
+
+    assert(copy [s.name for s in syms] == ["Show", "Counter", "Box", "id", "main"]);
+    assert(syms[2].kind == SymbolKind::CLASS);
+    assert(copy [c.name for c in syms[1].children] == ["_n", "self", "inc", "hidden", "get", "show"]);
+}
+
+__test protocol_positions {
+    let content = "let x = 1;\nlet é = 2;\n";
+
+    // the line and the character from 0, `é` being one UTF-16 unit for two bytes
+    assert(QueryExporting::fromPosition(content, 1u64, 4u64, PositionEncoding::UTF16) == (2u64, 5u64));
+    assert(QueryExporting::fromPosition(content, 1u64, 6u64, PositionEncoding::UTF16) == (2u64, 8u64));
+    assert(QueryExporting::fromPosition(content, 1u64, 6u64, PositionEncoding::UTF8) == (2u64, 7u64));
+}
+
+__test protocol_objects {
+    let (p, file, content) = compile("test_resources/query/test1.yr");
+    let index = p.getIndex();
+    let enc = PositionEncoding::UTF16;
+
+    let dmut res = copy Dict();
+    if let Ok(h) = HoverQuery::at(index, file, 24u64, 17u64) {
+        res["hover"] = QueryExporting::dump(h, enc);
+    }
+
+    if let Ok(d) = NavigationQuery::definition(index, file, 24u64, 17u64) {
+        res["definition"] = QueryExporting::dump(copy [d], enc);
+    }
+
+    res["references"] = QueryExporting::dump(NavigationQuery::references(index, file, 23u64, 9u64), enc);
+    res["outline"] = QueryExporting::dump(OutlineQuery::symbols(p.getModuleSymbol(), file), enc);
+    res["completion"] = QueryExporting::dump(CompletionQuery::at(index, p.getModuleSymbol(), file, content, 24u64, 24u64));
+
+    let golden = "test_resources/query/test1.json";
+    let expected = {
+        let dmut f = File::open(Path(golden));
+        f:.readAll()
+    } catch {
+        _ => ""
+    };
+
+    let root = errors::lsp::JsonExporting::uri(env::currentDir().toStr() ~ "/");
+    let dmut stream = copy Formatter();
+    stream:.write(json::dump(utils::replaceAll(res, root, "file://$ROOT/"))):.write("\n");
+    utils::compareResultWithString(stream, expected, origin-> golden);
+}

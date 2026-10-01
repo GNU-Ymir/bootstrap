@@ -307,7 +307,9 @@ Cross-cutting: `src/ymirc/errors` (the `ErrorMsg` type and its pretty-printing/f
 this is what both compiler diagnostics and `.err` golden files render through),
 `src/ymirc/global` (process-wide compiler state, versions, include dirs, debug/dump flags —
 `global::state::resetToDefault()` is called between test compiles to reset this),
-`src/ymirc/utils` (bigint/bigfloat, string/formatting helpers, logging).
+`src/ymirc/utils` (bigint/bigfloat, string/formatting helpers, logging), `src/ymirc/query` (the
+queries of a language server — hover, definition, references, outline, completion — answered from
+the semantic index `semantic::index` a `Parser(..., index-> true)` records during validation).
 
 ### Key control-flow/validation invariant worth knowing
 

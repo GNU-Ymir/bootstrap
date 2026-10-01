@@ -1,0 +1,415 @@
+/*
+ * query::completion — the names that can be written at a position.
+ *
+ * The line being written does not always parse, so what precedes a `.` or a
+ * `::` is found in the text, and resolved by the token at its position if it
+ * was indexed, by its name among the entities visible there otherwise.
+ *
+ * <hr>
+ *
+ * @Package: ymirc
+ * @Module: ymirc::query::completion
+ * @File: ymirc/query/completion.yr
+ * @Author(s):
+ *   - Emile Cadorel <ecadorel@gmail.com>
+ *
+ * @Created(YYYY-MM-DD): 2026-10-01
+ * @Copyright(C) 2021–2026 GNU-Ymir
+ * @License
+ *   ```text
+ *   This file is part of the Ymir language project.
+ *
+ *   Ymir is free software: you can redistribute it and/or modify it
+ *   under the terms of the GNU General Public License as published by
+ *   the Free Software Foundation, either version 3 of the License, or
+ *   (at your option) any later version.
+ *
+ *   Ymir is distributed in the hope that it will be useful,
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *   GNU General Public License for more details.
+ *
+ *   You should have received a copy of the GNU General Public License
+ *   along with Ymir.  If not, see <https://www.gnu.org/licenses/>.
+ *   ```
+ */
+
+in completion;
+
+use ymirc::lexing::{keys, word};
+use ymirc::semantic::{index, symbol};
+use ymirc::semantic::generator::{type::_, value};
+use ymirc::syntax::declaration::{block, custom, function};
+use ymirc::utils::format;
+
+/**
+ * The kind of a completion, valued as the protocol's `CompletionItemKind`
+ */
+pub enum CompletionKind : i32
+| METHOD      = 2
+| FUNCTION    = 3
+| CONSTRUCTOR = 4
+| FIELD       = 5
+| VARIABLE    = 6
+| CLASS       = 7
+| INTERFACE   = 8
+| MODULE      = 9
+| ENUM        = 13
+| CONSTANT    = 21
+| STRUCT      = 22
+;
+
+/**
+ * A name that can be written at a position
+ */
+@data
+pub record CompletionItem {
+    // The name
+    let label: [c8];
+
+    // The kind of the entity it names
+    let kind: CompletionKind;
+
+    // The type or the signature of the entity
+    let detail: [c8];
+}
+
+pub mod CompletionQuery {
+
+    /**
+     * @returns: the names that can be written at the column `col` of the line
+     * `line` of `file`, whose content is `content`, starting with the identifier
+     * the position ends: the members of the value before a `.`, the symbols of
+     * the module before a `::`, and the locals in scope and the visible symbols
+     * otherwise
+     */
+    pub fn at(index: &SemanticIndex, root: &Symbol, file: [c8], content: [c8], line: u64, col: u64)-> [CompletionItem] {
+        let offset = offsetOf(content, line, col);
+        let mut start = offset;
+        while (start > 0us && isIdentChar(content[start - 1us])) { start -= 1us; }
+        let prefix = content[start .. offset];
+
+        let mut before = start;
+        while (before > 0us && isBlank(content[before - 1us])) { before -= 1us; }
+
+        let locals = visibleLocals(index, file, line, col);
+        let items = if (before >= 2us && content[before - 2us .. before] == "::") {
+            if let Ok(base) = resolveBase(index, root, file, content, locals, before - 2us) {
+                symbolMembers(base.symbol)
+            } else { [] }
+        } else if (before >= 1us && content[before - 1us] == '.' && !(before >= 2us && content[before - 2us] == '.')) {
+            let dot = if (before >= 2us && content[before - 2us] == ':') { before - 2us } else { before - 1us };
+            if let Ok(base) = resolveBase(index, root, file, content, locals, dot) {
+                if let Ok(t) = typeOf(base) { typeMembers(t, enclosingClass(locals)) } else { [] }
+            } else { [] }
+        } else {
+            inScope(root, file, locals)
+        };
+
+        let dmut seen: [[c8] => ()] = copy [];
+        let mut res: [CompletionItem] = [];
+        for i in items if i.label.len >= prefix.len && i.label[0us .. prefix.len] == prefix && i.label !in seen {
+            seen[i.label] = ();
+            res ~= [i];
+        }
+
+        res
+    }
+
+    /**
+     * @returns: the locals in scope `locals`, then the module of `file` and the
+     * modules it uses, with the symbols they declare
+     */
+    fn inScope(root: &Symbol, file: [c8], locals: [Occurrence])-> [CompletionItem] {
+        let mut res: [CompletionItem] = [];
+        for o in locals {
+            res ~= [CompletionItem(o.decl.loc.str, CompletionKind::VARIABLE, detailOf(o))];
+        }
+
+        if let Ok(m) = moduleOf(root, file) {
+            for s in [m] ~ m.used {
+                if let Ok(k) = kindOf(s) {
+                    res ~= [CompletionItem(s.loc.str, k, format("%", s.path))];
+                }
+
+                res ~= symbolMembers(s, protection-> if (s is m) { Protection::PRIVATE } else { Protection::PUBLIC });
+            }
+        }
+
+        res
+    }
+
+    /**
+     * @returns: the declarations of the locals of `file` before the position
+     * and in scope there, the closest one first; a local whose block is not
+     * known is in scope until a symbol is declared between it and the position
+     */
+    fn visibleLocals(index: &SemanticIndex, file: [c8], line: u64, col: u64)-> [Occurrence] {
+        let mut res: [Occurrence] = [];
+        for o in index.occurrences() {
+            if (o.kind != OccurrenceKind::DECLARATION || o.symbol !of EmptySymbol || o.loc.filename != file) continue;
+            if (!isBefore(o.loc.line, o.loc.col, line, col)) continue;
+            if (!o.scopeEnd.isEof) {
+                if (!isBefore(line, col, o.scopeEnd.line, o.scopeEnd.col + 1u64)) continue;
+            } else if (symbolDeclaredBetween(index, file, o.loc, line, col)) continue;
+
+            res = [o] ~ res;
+        }
+
+        res
+    }
+
+    /**
+     * @returns: true iif a symbol of `file` is declared after `loc` and before the position
+     */
+    fn symbolDeclaredBetween(index: &SemanticIndex, file: [c8], loc: &Word, line: u64, col: u64)-> bool {
+        for o in index.occurrences() {
+            if (o.kind == OccurrenceKind::DECLARATION && o.symbol !of EmptySymbol && o.loc.filename == file
+                && isBefore(loc.line, loc.col, o.loc.line, o.loc.col) && isBefore(o.loc.line, o.loc.col, line, col)) {
+                return true;
+            }
+        }
+
+        false
+    }
+
+    /**
+     * @returns: the occurrence of the name ending before `end` (blanks
+     * skipped), the token at its position if it was indexed, the local of
+     * `locals` or the symbol of the file of that name otherwise
+     */
+    fn resolveBase(index: &SemanticIndex, root: &Symbol, file: [c8], content: [c8], locals: [Occurrence], end: usize)-> Occurrence? {
+        let mut stop = end;
+        while (stop > 0us && isBlank(content[stop - 1us])) { stop -= 1us; }
+        let mut begin = stop;
+        while (begin > 0us && isIdentChar(content[begin - 1us])) { begin -= 1us; }
+        if (begin == stop) return none;
+
+        let name = content[begin .. stop];
+        let (line, col) = positionOf(content, begin);
+        if let Ok(o) = index.at(file, line, col) {
+            return o?;
+        }
+
+        for o in locals if o.decl.loc.str == name {
+            return o?;
+        }
+
+        for o in index.occurrences() if o.loc.filename == file && o.symbol !of EmptySymbol && o.loc.str == name {
+            return o?;
+        }
+
+        if let Ok(m) = moduleOf(root, file) {
+            for s in m.allLocalSymbols(protection-> Protection::PRIVATE) if s.loc.str == name {
+                return (Occurrence(s.loc, OccurrenceKind::DECLARATION, symbol-> s))?;
+            }
+        }
+
+        none
+    }
+
+    /**
+     * @returns: the type of the entity `occ` names, none if it has none
+     */
+    fn typeOf(occ: Occurrence)-> (&Type)? {
+        if let Ok(t) = occ.localType() return t?;
+        match occ.resolved {
+            v: &Value => return v.type?;
+            t: &Type  => return t?;
+        }
+
+        none
+    }
+
+    /**
+     * @returns: the fields and methods of the class `type` is an instance of,
+     * the inherited ones included, those visible from the class `current`
+     */
+    fn typeMembers(type: &Type, current: (&ClassRefType)?)-> [CompletionItem] {
+        let mut cref = classOf(type);
+        let mut res: [CompletionItem] = [];
+        if let Ok(c) = cref {
+            for m in c.vtable {
+                let (inPrv, inProt) = protections(current, m.classRef);
+                if (!isHidden(m.sym.protection == Protection::PRIVATE, m.sym.protection == Protection::PROTECTED, inPrv, inProt)) {
+                    res ~= [CompletionItem(m.sym.path.file, CompletionKind::METHOD, format("%", m, tags-> FormatTags(withParams-> true)))];
+                }
+            }
+
+            let prots = c.templateMethodProtections;
+            for i, m in c.templateMethods {
+                let (inPrv, inProt) = if let Ok(owner) = m.classSym.classRef { protections(current, owner) } else { (false, false) };
+                if (!isHidden(prots[i] <= MethodProtection::PRV, prots[i] == MethodProtection::PROT, inPrv, inProt)) {
+                    res ~= [CompletionItem(m.name, CompletionKind::METHOD, format("%", m, tags-> FormatTags(withParams-> true)))];
+                }
+            }
+        }
+
+        while let Ok(c) = cref {
+            let (inPrv, inProt) = protections(current, c);
+            for f in c.localFields if !isHidden(c.sym.isFieldPrivate(f.name), c.sym.isFieldProtected(f.name), inPrv, inProt) {
+                res ~= [CompletionItem(f.name, CompletionKind::FIELD, format("%", f.varType))];
+            }
+
+            cref = c.ancestor;
+        }
+
+        res
+    }
+
+    /**
+     * @returns: the class `type` is an instance of, none if it is not one
+     */
+    fn classOf(type: &Type)-> (&ClassRefType)? {
+        match type {
+            p: &ClassPtrType => return p.sym.classRef;
+            r: &ClassRefType => return r?;
+        }
+
+        none
+    }
+
+    /**
+     * @returns: the class whose method or constructor declares the `self` of `locals`, none if none does
+     */
+    fn enclosingClass(locals: [Occurrence])-> (&ClassRefType)? {
+        for o in locals if o.decl.loc.str == Keys::SELF {
+            if let Ok(t) = o.localType() return classOf(t);
+        }
+
+        none
+    }
+
+    /**
+     * @returns: whether the private and the protected members of `owner` are
+     * visible from the class `current`, as its own or as the ones of an ancestor
+     */
+    fn protections(current: (&ClassRefType)?, owner: &ClassRefType)-> (bool, bool) {
+        if let Ok(cl) = current {
+            if (cl == owner) return (true, true);
+
+            let mut anc = cl.ancestor;
+            while let Ok(a) = anc {
+                if (a == owner) return (false, true);
+                anc = a.ancestor;
+            }
+        }
+
+        (false, false)
+    }
+
+    /**
+     * @returns: true iif a member private (`prv`) or protected (`prot`) is not visible
+     */
+    fn isHidden(prv: bool, prot: bool, inPrv: bool, inProt: bool)-> bool {
+        (prv && !inPrv) || (prot && !inPrv && !inProt)
+    }
+
+    /**
+     * @returns: the symbols declared in `sym`, those of `protection` and above
+     */
+    fn symbolMembers(sym: &Symbol, protection: Protection = Protection::PUBLIC)-> [CompletionItem] {
+        let mut res: [CompletionItem] = [];
+        let base = if let l: &LazyModuleSymbol = sym { l.finalized } else { sym };
+        for s in base.allLocalSymbols(protection-> protection) {
+            if let Ok(k) = kindOf(s) {
+                res ~= [CompletionItem(s.loc.str, k, format("%", s.path))];
+            }
+        }
+
+        res
+    }
+
+    /**
+     * @returns: the module `file` declares, found in the symbol tree of `root`
+     */
+    fn moduleOf(root: &Symbol, file: [c8])-> (&Symbol)? {
+        if let m: &ModuleSymbol = root && (m.isGlobal && m.loc.filename == file) {
+            return root?;
+        }
+
+        for s in root.allLocalSymbols(protection-> Protection::PRIVATE) if s of ModuleSymbol {
+            if let Ok(m) = moduleOf(s, file) return m?;
+        }
+
+        none
+    }
+
+    /**
+     * @returns: the completion kind of the entity `sym` declares, none if it is not one
+     */
+    fn kindOf(sym: &Symbol)-> (CompletionKind)? {
+        match sym {
+            ModuleSymbol()     => return CompletionKind::MODULE?;
+            LazyModuleSymbol() => return CompletionKind::MODULE?;
+            c: &ClassSymbol    => return (if (c.isStruct) { CompletionKind::STRUCT } else { CompletionKind::CLASS })?;
+            f: &FunctionSymbol => return (if (f.isMethod) { CompletionKind::METHOD } else { CompletionKind::FUNCTION })?;
+            EnumSymbol()       => return CompletionKind::ENUM?;
+            TraitSymbol()      => return CompletionKind::INTERFACE?;
+            UnionSymbol()      => return CompletionKind::STRUCT?;
+            GlobalVarSymbol()  => return CompletionKind::VARIABLE?;
+            DefSymbol()        => return CompletionKind::CONSTANT?;
+            MacroSymbol()      => return CompletionKind::FUNCTION?;
+            t: &TemplateSymbol => match t.decl.decl {
+                CtorDecl()     => return CompletionKind::CONSTRUCTOR?;
+                FunctionDecl() => return (if (t.isMethod) { CompletionKind::METHOD } else { CompletionKind::FUNCTION })?;
+                c: &TypeDecl   => return (if (c.isRecord || c.isEntity) { CompletionKind::STRUCT } else { CompletionKind::CLASS })?;
+                TraitDecl()    => return CompletionKind::INTERFACE?;
+                EnumDecl()     => return CompletionKind::ENUM?;
+                UnionDecl()    => return CompletionKind::STRUCT?;
+                _              => return CompletionKind::FUNCTION?;
+            }
+        }
+
+        none
+    }
+
+    /**
+     * @returns: the type of the local `occ` declares, as text
+     */
+    fn detailOf(occ: Occurrence)-> [c8] {
+        if let Ok(t) = occ.localType() return format("%", t);
+        ""
+    }
+
+    /**
+     * @returns: the offset in `content` of the column `col` of the line `line`
+     */
+    fn offsetOf(content: [c8], line: u64, col: u64)-> usize {
+        let mut l = 1u64;
+        let mut i = 0us;
+        while (l < line && i < content.len) {
+            if (content[i] == '\n') l += 1u64;
+            i += 1us;
+        }
+
+        let res = i + cast!usize(col) - 1us;
+        if (res > content.len) { content.len } else { res }
+    }
+
+    /**
+     * @returns: the line and column of the offset `offset` of `content`
+     */
+    fn positionOf(content: [c8], offset: usize)-> (u64, u64) {
+        let mut line = 1u64;
+        let mut lineStart = 0us;
+        for i in 0us .. offset if content[i] == '\n' {
+            line += 1u64;
+            lineStart = i + 1us;
+        }
+
+        (line, cast!u64(offset - lineStart) + 1u64)
+    }
+
+    fn isBefore(l1: u64, c1: u64, l2: u64, c2: u64)-> bool {
+        l1 < l2 || (l1 == l2 && c1 < c2)
+    }
+
+    fn isIdentChar(c: c8)-> bool {
+        (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_'
+    }
+
+    fn isBlank(c: c8)-> bool {
+        c == ' ' || c == '\t' || c == '\n' || c == '\r'
+    }
+}
