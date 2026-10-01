@@ -94,6 +94,15 @@ pub class SyntaxVisitor {
 
         // The location of the extern block being read
         let mut _inExternBlock: (&Word, &Word) = (EOF_WORD, EOF_WORD);
+
+        // Whether a syntax error is recovered from at a declaration or instruction boundary, cf. `read`
+        let mut _recovering: bool = false;
+
+        // The errors recovered from, with the seek of the declaration or instruction they discarded
+        let mut _errors: [(usize, &ErrorMsg)] = [];
+
+        // The error of the reading, kept instead of thrown when error recovery is active, cf. `read`
+        let mut _recovered: (&ErrorMsg)? = none;
     }
 
     /*!
@@ -168,6 +177,11 @@ pub class SyntaxVisitor {
      * Once the visitor is initialized, (with open for instance) the content can
      * be read an transformed into a syntax tree
      *
+     * A syntax error is recovered from at the next declaration or instruction,
+     * so every error of the file is thrown at once. When error recovery is
+     * active, they are kept instead, cf. `recoveredError`, and the tree read
+     * around them is returned.
+     *
      * @example:
      * ```
      * let dmut visitor = copy Visitor::open(Path("foo.yr"));
@@ -186,6 +200,7 @@ pub class SyntaxVisitor {
     pub fn read(mut self)-> &ModuleDecl
         throws ErrorMsg
     {
+        self._recovering = true;
         let (loc, path, comm) = self:.readGlobalModuleName();
         let block = GlobalVisitor::readBlock(alias self, loc, comm);
         let ret = copy ModuleDecl(loc-> loc,
@@ -193,6 +208,17 @@ pub class SyntaxVisitor {
                                    comm-> comm,
                                    block-> block,
                                    isGlobal-> true);
+
+        if (self._errors.len != 0us) {
+            let err = if (self._errors.len == 1us) {
+                self._errors[0us]._1
+            } else {
+                copy ErrorMsg::list(copy [e._1 for e in self._errors])
+            };
+
+            if (!state::isErrorRecoveryActive()) throw err;
+            self._recovered = (err)?;
+        }
 
         ret
     }
@@ -1207,7 +1233,143 @@ pub class SyntaxVisitor {
      * ```
      * */
     pub fn rewindToSeek(mut self, seek: usize) {
-        self._lex:.rewindToSeek(seek)
+        self._lex:.rewindToSeek(seek);
+        if (self._errors.len != 0us && self._errors[$ - 1us]._0 >= seek) {
+            self._errors = copy [e for e in self._errors if e._0 < seek];
+        }
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          RECOVERY          ====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * @returns: the syntax errors `read` returned a tree in spite of, when error recovery is active
+     * */
+    pub fn recoveredError(self)-> (&ErrorMsg)? {
+        self._recovered
+    }
+
+    /**
+     * @returns: the number of errors recovered from so far
+     * */
+    pub fn nbErrors(self)-> usize {
+        self._errors.len
+    }
+
+    /**
+     * Note the errors recovered from since there were `since` of them as raised
+     * inside the declaration block opened at `loc`, as a thrown one would be
+     * */
+    pub fn noteErrorsInBlock(mut self, since: usize, loc: &Word) {
+        if (self._errors.len <= since) return;
+        let mut errors: [(usize, &ErrorMsg)] = self._errors[0us .. since];
+        for e in self._errors[since .. $] {
+            errors ~= [(e._0, copy ErrorMsg::note(loc, SyntaxErrorMessage::IN_DECL_BLOCK, notes-> copy [e._1]))];
+        }
+
+        self._errors = errors;
+    }
+
+    /**
+     * Recover from an error that does not prevent reading on from the cursor:
+     * record it as raised before the cursor, so recovering from what follows keeps it
+     *
+     * @throws: `err`, if the visitor is not recovering
+     * */
+    pub fn recordError(mut self, err: &ErrorMsg)
+        throws ErrorMsg
+    {
+        if (!self._recovering) throw err;
+        self._errors ~= [(self.getSeek() - 1us, err)];
+    }
+
+    /**
+     * Recover from an error raised by the declaration or instruction starting
+     * at `start`: record it, and skip that declaration or instruction
+     *
+     * @params:
+     *    - start:  the seek of the declaration or instruction
+     *    - err:    the error it raised
+     *    - atDecl: true if it is a declaration, false if it is an instruction
+     *
+     * @throws: `err`, if the visitor is not recovering, or if nothing can be
+     * skipped to carry on reading
+     * */
+    pub fn recover(mut self, start: usize, err: &ErrorMsg, atDecl: bool)
+        throws ErrorMsg
+    {
+        if (!self._recovering) throw err;
+
+        self:.rewindToSeek(start);
+        let col = self.peekToken().col;
+        self:.skipTo(col, atDecl-> atDecl);
+        if (self.getSeek() == start) throw err;
+
+        self._errors ~= [(start, err)];
+    }
+
+    /**
+     * Skip the tokens, brackets balanced, up to a ';' ending them (included), or
+     * a resync point (excluded), cf. `isResyncPoint`, the declaration attributes
+     * apply to being skipped with them.
+     * */
+    fn skipTo(mut self, col: u64, atDecl: bool) {
+        let mut depth = 0us;
+        let mut line = self.peekToken().line;
+        let mut first = true;
+        let mut inAttrs = atDecl && self.peekToken() == Tokens::AT;
+        loop {
+            let tok = self.peekToken();
+            if (tok.isEof) break;
+            if (!first) {
+                if (inAttrs && depth == 0us && tok != Tokens::RACC && tok.line > line && tok.col <= col) {
+                    inAttrs = (tok == Tokens::AT);
+                } else if (self.isResyncPoint(tok, line, col, depth, atDecl)) break;
+            }
+
+            self:.readToken();
+            first = false;
+            line = tok.line;
+            match tok.str {
+                Tokens::LPAR | Tokens::LCRO | Tokens::LACC => { depth += 1us; }
+                Tokens::RPAR | Tokens::RCRO | Tokens::RACC => { if (depth != 0us) depth -= 1us; }
+                Tokens::SEMI_COLON => { if (depth == 0us) break; }
+            }
+        }
+    }
+
+    /**
+     * @returns: true if `skipTo` must stop before `tok`: a '}' closing the enclosing
+     * block, or a line starting at a column no further than `col`, a declaration
+     * one when skipping a declaration
+     * */
+    fn isResyncPoint(self, tok: &Word, line: u64, col: u64, depth: usize, atDecl: bool)-> bool {
+        if (depth == 0us && tok == Tokens::RACC) return true;
+        if (tok.line <= line || tok.col > col) return false;
+
+        // a bracket left open by what is skipped, the line closing the enclosing block
+        if (tok == Tokens::RACC && tok.col < col) return true;
+
+        if (atDecl) {
+            if (tok == Tokens::AT || tok == Keys::YIELD) return true;
+            for k in __SPECIAL_GLOBAL__.listKeysExternPubPrvUse if tok == k {
+                return true;
+            }
+
+            return false;
+        }
+
+        for k in [Tokens::RPAR, Tokens::RCRO, Tokens::RACC, Tokens::DOT, Tokens::DOT_AND,
+                  Keys::ELSE, Keys::CATCH, Keys::EXIT, Keys::SUCCESS, Keys::FAILURE] if tok == k {
+            return false;
+        }
+
+        true
     }
 
     /*!
