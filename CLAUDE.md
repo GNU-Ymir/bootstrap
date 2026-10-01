@@ -306,7 +306,9 @@ The whole frontend is orchestrated by `Parser` (`src/ymirc/parser.yr`), in three
 Cross-cutting: `src/ymirc/errors` (the `ErrorMsg` type and its pretty-printing/formatting —
 this is what both compiler diagnostics and `.err` golden files render through),
 `src/ymirc/global` (process-wide compiler state, versions, include dirs, debug/dump flags —
-`global::state::resetToDefault()` is called between test compiles to reset this),
+`global::state::resetToDefault()` is called between test compiles to reset this; a
+`ymirc::session::Session` keeps the state of a workspace instead, installed for the length of a
+`Parser::inSession` compile, with the syntax trees it already read and the token cancelling it),
 `src/ymirc/utils` (bigint/bigfloat, string/formatting helpers, logging), `src/ymirc/query` (the
 queries of a language server — hover, definition, references, outline, completion — answered from
 the semantic index `semantic::index` a `Parser(..., index-> true)` records during validation).
