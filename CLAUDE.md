@@ -129,6 +129,10 @@ Those blocks call, from `test/integration/utils.yr`, either:
   A slice there — `copy [i for i in 1 ... 24]` — is rejected with `E4288 the parameters of a
   unit test are produced as mut [mut i32], but a generator was expected`.
 
+`registerTest(..., withOverlay-> dir)` compiles the case with the files of `dir` as unsaved
+buffers (`Parser(file, overlay)`), each replacing the source file at the same path relative to
+the directory of the root file, existing on the disk or not — see `test_resources/overlay/`.
+
 Either way, each case:
 
 1. Compiles the given `.yr` file through the real `Parser` pipeline.
