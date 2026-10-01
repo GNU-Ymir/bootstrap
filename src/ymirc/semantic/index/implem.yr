@@ -1,0 +1,198 @@
+/*
+ * Declares the SemanticIndex, which answers what entity a position of the
+ * source names.
+ *
+ * While validation runs, every token declaring an entity or referring to one
+ * is recorded as an Occurrence, so a position is resolved by the occurrence
+ * whose token covers it, and the declaration and the references of an entity
+ * are the occurrences naming it.
+ *
+ * <hr>
+ *
+ * @Package: ymirc
+ * @Module: ymirc::semantic::index::implem
+ * @File: ymirc/semantic/index/implem.yr
+ * @Author(s):
+ *   - Emile Cadorel <ecadorel@gmail.com>
+ *
+ * @Created(YYYY-MM-DD): 2026-10-01
+ * @Copyright(C) 2021–2026 GNU-Ymir
+ * @License
+ *   ```text
+ *   This file is part of the Ymir language project.
+ *
+ *   Ymir is free software: you can redistribute it and/or modify it
+ *   under the terms of the GNU General Public License as published by
+ *   the Free Software Foundation, either version 3 of the License, or
+ *   (at your option) any later version.
+ *
+ *   Ymir is distributed in the hope that it will be useful,
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *   GNU General Public License for more details.
+ *
+ *   You should have received a copy of the GNU General Public License
+ *   along with Ymir.  If not, see <https://www.gnu.org/licenses/>.
+ *   ```
+ */
+
+in implem;
+
+use ymirc::semantic::symbol;
+use ymirc::semantic::index::occurrence;
+use ymirc::syntax::declaration::block;
+use ymirc::utils::format;
+
+use std::stream;
+
+/**
+ * The occurrences of the entities of a compilation, cf. the module header
+ */
+@final
+pub class SemanticIndex {
+
+    // The directory the indexed files are in
+    let _root: [c8];
+
+    let mut _occurrences: [mut Occurrence] = [];
+
+    // The position in _occurrences of the occurrences recorded, by their token
+    let dmut _byToken: [[c8] => [usize]] = copy [];
+
+    /**
+     * @params:
+     *    - root: the directory the indexed files are in, the occurrences in the
+     *      other ones (those of the libraries) not being recorded
+     */
+    pub self (root: [c8] = "")
+        with _root = root
+    {}
+
+    /**
+     * Record an occurrence, if its token is in a file of the root directory, and
+     * written in that file rather than made up by the validation; it replaces the
+     * one recorded before at the same token naming the same entity the same way,
+     * what a validation made again supersedes what it made first
+     */
+    pub fn insert(mut self, occ: Occurrence) {
+        let loc = occ.loc;
+        if (loc.isEof) return;
+        if (loc.filename.len <= self._root.len || loc.filename[0us .. self._root.len] != self._root) return;
+        if (loc.seek + loc.str.len > loc.fileContent.len) return;
+        if (loc.fileContent[loc.seek .. loc.seek + loc.str.len] != loc.str) return;
+
+        let key = format("%:%", loc.filename, loc.seek);
+        let mut same: [usize] = [];
+        if let Ok(lst) = self._byToken[key] {
+            for i in lst {
+                let o = self._occurrences[i];
+                if (o.kind == occ.kind && o.isSameEntity(occ)) {
+                    self._occurrences[i] = occ;
+                    return;
+                }
+            }
+
+            same = lst;
+        }
+
+        self._byToken[key] = same ~ [self._occurrences.len];
+        self._occurrences ~= [occ];
+    }
+
+    /**
+     * Record the declaration of `sym` and of every symbol declared inside it,
+     * its unittests and its destructor included, the ones without a location
+     * in a file excepted
+     */
+    pub fn declareSymbols(mut self, sym: &Symbol) {
+        if (sym of LazyModuleSymbol) return;
+        if (!sym.loc.isEof && sym.loc.filename != "") {
+            self:.insert(Occurrence(sym.loc, OccurrenceKind::DECLARATION, symbol-> sym));
+        }
+
+        for s in sym.allLocalSymbols(protection-> Protection::PRIVATE) {
+            self:.declareSymbols(s);
+        }
+
+        for u in sym.unitTests {
+            self:.declareSymbols(u);
+        }
+
+        if let c: &ClassSymbol = sym {
+            self:.declareSymbols(c.dtor);
+        }
+    }
+
+    /**
+     * @returns: the occurrences recorded, in the order they were
+     */
+    pub fn occurrences(self)-> [Occurrence] {
+        self._occurrences
+    }
+
+    /**
+     * @returns: the occurrence whose token covers the column `col` of the line
+     * `line` of the file `file`, none if no token naming an entity does
+     */
+    pub fn at(self, file: [c8], line: u64, col: u64)-> Occurrence? {
+        for o in self._occurrences if o.covers(file, line, col) {
+            return o?;
+        }
+
+        none
+    }
+
+    /**
+     * @returns: the declaration of the entity `occ` names, none if it was not
+     * recorded
+     */
+    pub fn declarationOf(self, occ: Occurrence)-> Occurrence? {
+        for o in self._occurrences if o.kind == OccurrenceKind::DECLARATION && o.isSameEntity(occ) {
+            return o?;
+        }
+
+        none
+    }
+
+    /**
+     * @returns: the occurrences naming the entity `occ` names, its declaration
+     * included, a token once whatever the number of times it was recorded
+     */
+    pub fn referencesOf(self, occ: Occurrence)-> [Occurrence] {
+        let dmut seen: [[c8] => ()] = copy [];
+        let mut res: [Occurrence] = [];
+        for o in self._occurrences if o.isSameEntity(occ) {
+            let key = format("%:%:%", o.loc.filename, o.loc.line, o.loc.col);
+            if (key !in seen) {
+                seen[key] = ();
+                res ~= [o];
+            }
+        }
+
+        res
+    }
+
+    impl Streamable;
+    impl Formattable {
+
+        /**
+         * Format the occurrences one per line, sorted by position.
+         */
+        pub over format(self, dmut stream: &Formatter) {
+            use std::algorithm::sorting;
+
+            let sorted = sort(copy [(o.loc, format("%", o)) for o in self._occurrences], |a, b| => {
+                let wa = a._0;
+                let wb = b._0;
+                if (wa.filename != wb.filename) return wa.filename < wb.filename;
+                if (wa.line != wb.line) return wa.line < wb.line;
+                if (wa.col != wb.col) return wa.col < wb.col;
+                a._1 < b._1
+            });
+
+            for l in sorted {
+                stream:.write(l._1, "\n");
+            }
+        }
+    }
+}
