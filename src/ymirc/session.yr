@@ -1,0 +1,158 @@
+/*
+ * session — the state of the compilations of a workspace.
+ *
+ * The configuration of a compilation (`global::state`) and its diagnostics
+ * (`errors::diagnostic`) are per thread, and reset between two compilations.
+ * A language server compiles several workspaces from the same threads, each
+ * with its own configuration: a Session keeps the one of a workspace, and
+ * installs it for the length of a compilation (cf. `Parser::inSession`),
+ * restoring the one of the thread afterwards. Its compilations run one at a
+ * time, whatever the thread. It also keeps the syntax trees of the files it
+ * read, reused while they do not change, and the token its latest compilation
+ * can be cancelled through.
+ *
+ * <hr>
+ *
+ * @Package: ymirc
+ * @Module: ymirc::session
+ * @File: ymirc/session.yr
+ * @Author(s):
+ *   - Emile Cadorel <ecadorel@gmail.com>
+ *
+ * @Created(YYYY-MM-DD): 2026-10-01
+ * @Copyright(C) 2021–2026 GNU-Ymir
+ * @License
+ *   ```text
+ *   This file is part of the Ymir language project.
+ *
+ *   Ymir is free software: you can redistribute it and/or modify it
+ *   under the terms of the GNU General Public License as published by
+ *   the Free Software Foundation, either version 3 of the License, or
+ *   (at your option) any later version.
+ *
+ *   Ymir is distributed in the hope that it will be useful,
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *   GNU General Public License for more details.
+ *
+ *   You should have received a copy of the GNU General Public License
+ *   along with Ymir.  If not, see <https://www.gnu.org/licenses/>.
+ *   ```
+ */
+
+in session;
+
+use core::concurrency::sync::mutex;
+
+use ymirc::errors;
+use ymirc::errors::diagnostic;
+use ymirc::global::state;
+use ymirc::syntax::visitor;
+
+/**
+ * The sessions entered in the thread, the innermost last.
+ *
+ * @info: thread local, cf. `Session::enter`.
+ */
+@thread
+lazy mut __ENTERED__: [mut [&Session]] = copy [copy []];
+
+@final
+pub class Session {
+
+    // The configuration of the compilations of the session
+    let dmut _state: State = State();
+
+    // The syntax trees of the files the session read
+    let dmut _cache: &SyntaxCache;
+
+    // The token the latest compilation can be asked to stop through
+    let dmut _token: &CancellationToken = copy CancellationToken();
+
+    // Held by the thread the session is entered in, from `enter` to `exit`
+    let dmut _lock: &Mutex = copy Mutex();
+
+    // The number of times the session was entered in the thread holding it
+    let mut _depth: usize = 0us;
+
+    // The configuration and the diagnostics of the thread, while the session is entered
+    let dmut _saved: State = State();
+    let mut _savedDiagnostics: ([&ErrorMsg], [&ErrorMsg]) = ([], []);
+
+    /**
+     * @params:
+     *    - withCache: whether the syntax trees of the files read are kept
+     */
+    pub self (withCache: bool = true)
+        with _cache = copy SyntaxCache(enabled-> withCache)
+    {}
+
+    /**
+     * Install the configuration of the session in the thread, so that it is
+     * the one of the compilations that follow, and the one the setters of
+     * `state` modify, until `exit`. Waits for the thread the session is
+     * entered in, if any other, to exit it; entering it again in the thread
+     * it is the innermost of only counts, to be matched by as many `exit`
+     */
+    pub fn enter(mut self) {
+        let entered = __ENTERED__[0];
+        if (entered.len != 0us && entered[entered.len - 1us] is self) {
+            self._depth += 1us;
+            return;
+        }
+
+        self._lock:.lock();
+        __ENTERED__[0] = entered ~ [self];
+        self._depth = 1us;
+        self._saved = alias state::current();
+        self._savedDiagnostics = diagnostic::save();
+
+        state::install(alias self._state);
+    }
+
+    /**
+     * Keep the configuration of the thread as the one of the session, and
+     * restore the configuration and the diagnostics the thread had before
+     * the matching `enter`
+     */
+    pub fn exit(mut self) {
+        self._depth -= 1us;
+        if (self._depth != 0us) return;
+
+        self._state = alias state::current();
+        state::install(alias self._saved);
+        diagnostic::restore(self._savedDiagnostics);
+
+        let entered = __ENTERED__[0];
+        __ENTERED__[0] = entered[0us .. entered.len - 1us];
+        self._lock:.unlock();
+    }
+
+    /**
+     * Start a compilation in the session, the one `cancel` stops from then on
+     *
+     * @returns: the token the compilation is cancelled through
+     */
+    pub fn compilation(mut self)-> &CancellationToken {
+        atomic self {
+            self._token = copy CancellationToken();
+            return self._token;
+        }
+    }
+
+    /**
+     * Ask the latest compilation started in the session to stop, from any thread
+     */
+    pub fn cancel(mut self) {
+        atomic self {
+            self._token:.cancel();
+        }
+    }
+
+    /**
+     * @returns: the syntax trees of the files the session read
+     */
+    pub fn syntaxCache(mut self)-> dmut &SyntaxCache {
+        alias self._cache
+    }
+}
