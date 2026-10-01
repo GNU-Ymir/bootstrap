@@ -133,6 +133,13 @@ Those blocks call, from `test/integration/utils.yr`, either:
 buffers (`Parser(file, overlay)`), each replacing the source file at the same path relative to
 the directory of the root file, existing on the disk or not — see `test_resources/overlay/`.
 
+`withRecovery-> true` compiles the case with error recovery (`state::activateErrorRecovery()`):
+the syntax errors are deferred (`errors::diagnostic::defer`) instead of thrown, the partial tree is
+validated, and they fail the compilation along with the validation error once it is over — see
+`test_resources/error_recovery/`. Without it, the syntax step still recovers at the next
+declaration or instruction (`SyntaxVisitor.recover`), so every syntax error of a file is thrown
+at once (`test_resources/syntax_recovery/`).
+
 Either way, each case:
 
 1. Compiles the given `.yr` file through the real `Parser` pipeline.
