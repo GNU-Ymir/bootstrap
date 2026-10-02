@@ -26,7 +26,7 @@ check lives:
 | `E1xxx` | lexing | `LexingErrorMessage` -- `src/ymirc/lexing/errors.yr` | 24 |
 | `E2xxx` | parsing | `SyntaxErrorMessage` -- `src/ymirc/syntax/errors.yr` | 13 |
 | `E3xxx` | declaration | `DeclareErrorMessage` -- `src/ymirc/semantic/declarator/errors.yr` | 34 |
-| `E4xxx` | validation | `ValidateErrorMessage` -- `src/ymirc/semantic/validator/errors.yr` | 266 |
+| `E4xxx` | validation | `ValidateErrorMessage` -- `src/ymirc/semantic/validator/errors.yr` | 267 |
 | `E5xxx` | lowering (YIL) | `SerializeYILErrorMessage` -- `src/ymirc/lint/serialize/errors.yr`, `OptimizerErrorMessage` -- `src/ymirc/lint/optimizer/errors.yr` | 11 |
 
 Each page carries an example wherever a case in the suite raises the code: the
@@ -145,6 +145,7 @@ deliberately carry no code, and have no page here.
 | [E4015](E4015.md) | `CLASS_ALIAS_FIELD_NO_CLASS` | alias operator :. is only usable on class, record, entity, map or generator types, not <> |
 | [E4016](E4016.md) | `CLASS_ALIAS_INDEX_NO_CLASS` | class alias operator :[ is only usable on class, record or entity types, not <> |
 | [E4017](E4017.md) | `CLASS_FIELD_NOT_VALIDATED_YET` | field <> has not yet been validated |
+| [E4321](E4321.md) | `CLASS_METHOD_NOT_VALIDATED_YET` | method <> cannot be used while the methods of <> are being validated |
 | [E4018](E4018.md) | `CLASS_NOT_IMPL` | class type <> does not implement trait <> |
 | [E4019](E4019.md) | `CLASS_NO_FIELD` | class <> has no field named <> |
 | [E4020](E4020.md) | `CLASS_NO_METHOD` | class <> has no method named <> |
