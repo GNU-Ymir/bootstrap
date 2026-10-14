@@ -25,7 +25,7 @@ check lives:
 |---|---|---|---|
 | `E1xxx` | lexing | `LexingErrorMessage` -- `src/ymirc/lexing/errors.yr` | 24 |
 | `E2xxx` | parsing | `SyntaxErrorMessage` -- `src/ymirc/syntax/errors.yr` | 13 |
-| `E3xxx` | declaration | `DeclareErrorMessage` -- `src/ymirc/semantic/declarator/errors.yr` | 34 |
+| `E3xxx` | declaration | `DeclareErrorMessage` -- `src/ymirc/semantic/declarator/errors.yr` | 37 |
 | `E4xxx` | validation | `ValidateErrorMessage` -- `src/ymirc/semantic/validator/errors.yr` | 270 |
 | `E5xxx` | lowering (YIL) | `SerializeYILErrorMessage` -- `src/ymirc/lint/serialize/errors.yr`, `OptimizerErrorMessage` -- `src/ymirc/lint/optimizer/errors.yr` | 11 |
 
@@ -124,6 +124,9 @@ deliberately carry no code, and have no page here.
 | [E3038](E3038.md) | `UNUSED_USE` | no symbol is resolved through the use of <> |
 | [E3039](E3039.md) | `SINGLE_WILDCARD_USE` | only <> is resolved through the use of <> |
 | [E3040](E3040.md) | `MACRO_NOT_RESTRICTABLE` | macro rule <> cannot be restricted to a list of values, only a built-in rule can be |
+| [E3041](E3041.md) | `UNDEFINED_ATTRIBUTE_FOR_MODULE` | custom attribute <> is not valid on modules |
+| [E3042](E3042.md) | `UNDEFINED_ATTRIBUTE_FOR_ENTITY` | custom attribute <> is not valid on entities |
+| [E3043](E3043.md) | `COMPANION_WITHOUT_TYPE` | the companion module <> is not named after a class, a record or an entity of module <> |
 
 ## E4xxx -- validation
 
