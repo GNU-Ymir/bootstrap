@@ -1,0 +1,430 @@
+/*
+ * Implements semantic validation for the affectation of a part of an array or a slice in Ymir.
+ *
+ * Responsibilities:
+ *   - Validate the affectation of several elements, `a [i, j, k] = v`.
+ *   - Validate the affectation of a range of elements, `a [x .. y] = v`.
+ *   - Check the length of the affected value, at compile time when possible, at run-time
+ *     otherwise.
+ *   - Read the whole affected value before writing any element, so that a part can be
+ *     affected from an overlapping one.
+ *
+ * <hr>
+ *
+ * @Package: ymirc
+ * @Module: ymirc::semantic::validator::value::operator::index::part
+ * @File: ymirc/semantic/validator/value/operator/index/part.yr
+ * @Author(s):
+ *   - Emile Cadorel <ecadorel@gmail.com>
+ *
+ * @Created(YYYY-MM-DD): 2026-10-14
+ * @Copyright(C) 2021–2026 GNU-Ymir
+ * @License
+ *   ```text
+ *   This file is part of the Ymir language project.
+ *
+ *   Ymir is free software: you can redistribute it and/or modify it
+ *   under the terms of the GNU General Public License as published by
+ *   the Free Software Foundation, either version 3 of the License, or
+ *   (at your option) any later version.
+ *
+ *   Ymir is distributed in the hope that it will be useful,
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *   GNU General Public License for more details.
+ *
+ *   You should have received a copy of the GNU General Public License
+ *   along with Ymir.  If not, see <https://www.gnu.org/licenses/>.
+ *   ```
+ */
+
+in part;
+
+use ymirc::errors;
+use ymirc::lexing::{keys, tokens, word};
+use ymirc::semantic::generator::{type::_, value::_};
+use ymirc::semantic::validator::value::operator::index::slice;
+use ymirc::utils::format;
+
+/**
+ * PartAffectValidation
+ *
+ * Provides semantic validation for the affectation of a part of an array or a slice:
+ *
+ *      a [i, j, k] = v
+ *      a [x .. y] = v
+ *
+ * The affected value is an array or a slice of as many elements as the part.
+ */
+pub mod PartAffectValidation {
+
+    /**
+     * Tell whether an index operation designates a part of an array or a slice.
+     *
+     * @params:
+     *   - objectType:   the type of the indexed object
+     *   - indicesTypes: list of index types
+     *
+     * @returns:
+     *   true iff the object is an array or a slice indexed by a range or by several integers.
+     */
+    pub fn isPart(objectType: &Type, indicesTypes: [&Type])-> bool {
+        if (objectType !of ArrayType && objectType !of SliceType) return false;
+        if (indicesTypes.len == 1us && indicesTypes[0] of RangeType) return true;
+
+        SliceIndexValidation::isIntList(indicesTypes)
+    }
+
+    /**
+     * Validate the affectation of a part of an array or a slice.
+     *
+     * @params:
+     *   - context:      validation context
+     *   - loc:          location of the index operator
+     *   - op:           assignment operator, only `=` is defined
+     *   - object:       the array or slice value being indexed
+     *   - indices:      validated index values, a range or several integers
+     *   - indicesTypes: their types
+     *   - right:        the affected value
+     *
+     * @returns:
+     *   A &Value performing the element wise affectations.
+     *
+     * @throws:
+     *   ErrorMsg if the operator is not `=`, if the affected value is not an array or a slice,
+     *   if the lengths differ at compile time, or if an element affectation fails.
+     */
+    pub fn validate(dmut context: &ValidationContext,
+                    loc:          &Word,
+                    op:           BinaryOperators,
+                    object:       &Value,
+                    indices:      [&Value],
+                    indicesTypes: [&Type],
+                    right:        &Value)-> &Value
+        throws ErrorMsg
+    {
+        if (op != BinaryOperators::EQUAL) {
+            throw copy ErrorMsg::fatal(loc, end-> right.loc,
+                                       format(ValidateErrorMessage::PART_AFFECT_OPERATOR, object.type, Tokens::EQUAL));
+        }
+
+        let (src, byAlias) = if let a: &AliaserValue = right {
+            (a.value, true)
+        } else {
+            (right, false)
+        };
+
+        if (src.type !of ArrayType && src.type !of SliceType) {
+            throw copy ErrorMsg::fatal(loc, end-> right.loc,
+                                       format(ValidateErrorMessage::PART_AFFECT_TYPE, object.type, src.type));
+        }
+
+        if (indicesTypes[0] of RangeType) {
+            return PartAffectValidation::validateRange(alias context, loc, object, indices, indicesTypes, src, byAlias);
+        }
+
+        return PartAffectValidation::validateScatter(alias context, loc, object, indices, src, byAlias);
+    }
+
+    /**
+     * Validate the affectation of several elements, `a [i, j, k] = v`.
+     *
+     * The affected value is first copied into a static array, so that every element is read
+     * before the first one is written, then each element is affected as `a [i] = v [0]` is.
+     *
+     * @params:
+     *   - context: validation context
+     *   - loc:     location of the index operator
+     *   - object:  the array or slice value being indexed
+     *   - indices: validated integer index values
+     *   - src:     the affected array or slice, unwrapped from its alias
+     *   - byAlias: true iff the affected value is explicitly aliased
+     *
+     * @returns:
+     *   A &Value performing the element wise affectations.
+     *
+     * @throws:
+     *   ErrorMsg if the length of `src` is known and is not the number of indices, or if an
+     *   element affectation fails.
+     */
+    fn validateScatter(dmut context: &ValidationContext,
+                       loc:          &Word,
+                       object:       &Value,
+                       indices:      [&Value],
+                       src:          &Value,
+                       byAlias:      bool)-> &Value
+        throws ErrorMsg
+    {
+        let mut values: [&Value] = [];
+        let (inner, elems) = match src.type {
+            a: &ArrayType => {
+                if (a.len != indices.len) {
+                    throw copy ErrorMsg::fatal(loc, end-> src.loc,
+                                               format(ValidateErrorMessage::PART_AFFECT_LENGTH, indices.len, a.len));
+                }
+                (a.value, src)
+            }
+            s: &SliceType => {
+                let n = copy IntValue(loc, USIZE_TYPE, indices.len);
+                values ~= PartAffectValidation::verifyLength(alias context, loc, n, src);
+
+                let mut accesses: [&Value] = [];
+                for k in 0us .. indices.len {
+                    accesses ~= [copy SliceAccessValue(loc, s.value, src, copy IntValue(loc, USIZE_TYPE, k))];
+                }
+
+                (s.value, copy ArrayValue(loc, copy ArrayType(loc, s.value, indices.len, isMutable-> false), accesses))
+            }
+            _ => panic;
+        };
+
+        let srcDecl = copy VarDeclValue(loc.locate(PartAffectKeys::SRC), elems.type, elems, isMutable-> false);
+        let srcRef = VariableCreation::createVarFromDecl(srcDecl, canCte-> false);
+        values ~= [srcDecl];
+
+        for k, index in indices {
+            let elem = IndexValidation::validate(alias context, loc, object, index);
+            let acc = PartAffectValidation::createSourceAccess(loc, inner,
+                                                               copy ArrayAccessValue(loc, inner, srcRef, copy IntValue(loc, USIZE_TYPE, k)),
+                                                               byAlias-> byAlias);
+
+            values ~= [BinaryAffectValidation::validate(alias context, loc, BinaryOperators::EQUAL, elem, copy ValueWrapperExpr(acc.loc, acc))];
+        }
+
+        return copy BlockValue(loc, VOID_TYPE, values ~ [UNIT_VALUE], isSet-> true);
+    }
+
+    /**
+     * Validate the affectation of a range of elements, `a [x .. y] = v`.
+     *
+     * The part and the affected value are both seen as slices, copied element by element in a
+     * loop that runs backward when the part starts after the source, so that overlapping parts
+     * are copied as memmove does.
+     *
+     * @params:
+     *   - context:      validation context
+     *   - loc:          location of the index operator
+     *   - object:       the array or slice value being indexed
+     *   - indices:      the validated range value, alone
+     *   - indicesTypes: its range type, alone
+     *   - src:          the affected array or slice, unwrapped from its alias
+     *   - byAlias:      true iff the affected value is explicitly aliased
+     *
+     * @returns:
+     *   A &Value performing the element wise affectations.
+     *
+     * @throws:
+     *   ErrorMsg if the part is not writable, if the lengths are known and differ, or if the
+     *   element affectation fails.
+     */
+    fn validateRange(dmut context: &ValidationContext,
+                     loc:          &Word,
+                     object:       &Value,
+                     indices:      [&Value],
+                     indicesTypes: [&Type],
+                     src:          &Value,
+                     byAlias:      bool)-> &Value
+        throws ErrorMsg
+    {
+        PartAffectValidation::verifyWritable(loc, object);
+
+        let dst = IndexValidation::validate(alias context, loc, object, indices, indicesTypes,
+                                            byAlias-> false,
+                                            inCopy-> true);
+
+        let srcSlice = if let a: &ArrayType = src.type {
+            ValueCreation::createSliceAliasFromArray(src.loc, a, src, mutable-> false)
+        } else {
+            src
+        };
+
+        let mut values: [&Value] = [];
+        let dstDecl = copy VarDeclValue(loc.locate(PartAffectKeys::DST), dst.type, dst, isMutable-> false);
+        let dstRef = VariableCreation::createVarFromDecl(dstDecl, canCte-> false);
+        let srcDecl = copy VarDeclValue(loc.locate(PartAffectKeys::SRC), srcSlice.type, srcSlice, isMutable-> false);
+        let srcRef = VariableCreation::createVarFromDecl(srcDecl, canCte-> false);
+        values ~= [dstDecl, srcDecl];
+
+        let len = copy StructFieldAccessValue(loc, USIZE_TYPE, dstRef, SliceKeys::LEN);
+        values ~= PartAffectValidation::verifyLength(alias context, loc, context.cteInterpret:.reduceSliceLen(dst), srcSlice,
+                                                     dynLen-> len,
+                                                     dynSrc-> srcRef);
+
+        let (dstInner, srcInner) = match (dst.type, srcSlice.type) {
+            (d: &SliceType, s: &SliceType) => { (d.value, s.value) }
+            _ => panic;
+        };
+
+        let dstPtr = copy StructFieldAccessValue(loc, copy PointerType(loc, dstInner, isMutable-> dstInner.isMutable), dstRef, SliceKeys::PTR);
+        let srcPtr = copy StructFieldAccessValue(loc, copy PointerType(loc, srcInner, isMutable-> false), srcRef, SliceKeys::PTR);
+
+        let forward = PartAffectValidation::createCopyLoop(alias context, loc, dstRef, srcRef, len, byAlias-> byAlias, backward-> false);
+        let backward = PartAffectValidation::createCopyLoop(alias context, loc, dstRef, srcRef, len, byAlias-> byAlias, backward-> true);
+        values ~= [copy ConditionalValue(loc, VOID_TYPE,
+                                         copy CmpPointerOperatorValue(loc, BinaryOperators::SUP, dstPtr, srcPtr),
+                                         thenv-> backward,
+                                         elsev-> forward,
+                                         isComplete-> true)];
+
+        return copy BlockValue(loc, VOID_TYPE, values ~ [UNIT_VALUE], isSet-> true);
+    }
+
+    /**
+     * Create the loop copying the elements of `src` into `dst`, both slices of `len` elements.
+     *
+     * @params:
+     *   - context:  validation context
+     *   - loc:      location of the index operator
+     *   - dst:      the variable holding the affected part
+     *   - src:      the variable holding the affected value
+     *   - len:      the number of elements to copy
+     *   - byAlias:  true iff the affected value is explicitly aliased
+     *   - backward: true to copy from the last element to the first one
+     *
+     * @returns:
+     *   The block declaring the loop index and running the loop.
+     *
+     * @throws:
+     *   ErrorMsg if the element affectation fails.
+     */
+    fn createCopyLoop(dmut context: &ValidationContext,
+                      loc:          &Word,
+                      dst:          &VarRefValue,
+                      src:          &VarRefValue,
+                      len:          &Value,
+                      byAlias:      bool,
+                      backward:     bool)-> &Value
+        throws ErrorMsg
+    {
+        let (dstInner, srcInner) = match (dst.type, src.type) {
+            (d: &SliceType, s: &SliceType) => { (d.value, s.value) }
+            _ => panic;
+        };
+
+        let zero = copy IntValue(loc, USIZE_TYPE, 0us);
+        let one = copy IntValue(loc, USIZE_TYPE, 1us);
+        let start: &Value = if backward { len } else { zero };
+        let indexDecl = copy VarDeclValue(loc.locate(PartAffectKeys::INDEX), USIZE_TYPE, start, isMutable-> true);
+        let index = VariableCreation::createVarFromDecl(indexDecl, canCte-> false);
+
+        let acc = PartAffectValidation::createSourceAccess(loc, srcInner, copy SliceAccessValue(loc, srcInner, src, index),
+                                                           byAlias-> byAlias);
+
+        let affect = BinaryAffectValidation::validate(alias context, loc, BinaryOperators::EQUAL,
+                                                      copy SliceAccessValue(loc, dstInner, dst, index),
+                                                      copy ValueWrapperExpr(acc.loc, acc));
+
+        let copyLoop = if backward {
+            let decrement = copy AffectValue(loc, USIZE_TYPE, index, copy MathIntOperatorValue(loc, USIZE_TYPE, BinaryOperators::MINUS, index, one));
+            copy LoopValue(loc, VOID_TYPE,
+                           copy CmpIntOperatorValue(loc, BinaryOperators::INF, zero, index),
+                           copy BlockValue(loc, VOID_TYPE, copy [decrement, affect]))
+        } else {
+            let increment = copy AffectValue(loc, USIZE_TYPE, index, copy MathIntOperatorValue(loc, USIZE_TYPE, BinaryOperators::PLUS, index, one));
+            copy LoopValue(loc, VOID_TYPE,
+                           copy CmpIntOperatorValue(loc, BinaryOperators::INF, index, len),
+                           copy BlockValue(loc, VOID_TYPE, copy [affect]),
+                           step-> increment)
+        };
+
+        return copy BlockValue(loc, VOID_TYPE, copy [indexDecl, copyLoop]);
+    }
+
+    /**
+     * Wrap the access to an element of the affected value in an alias when the affected value is
+     * explicitly aliased and the element needs it, as the tuple left affectation does.
+     *
+     * @params:
+     *   - loc:     location of the index operator
+     *   - inner:   the type of the element
+     *   - access:  the access to the element
+     *   - byAlias: true iff the affected value is explicitly aliased
+     *
+     * @returns:
+     *   The access, aliased if needed.
+     */
+    fn createSourceAccess(loc: &Word, inner: &Type, access: &Value, byAlias: bool)-> &Value {
+        if (byAlias && inner.isMutable && inner.needsExplicitAlias) {
+            return copy AliaserValue(loc, inner, access);
+        }
+
+        access
+    }
+
+    /**
+     * Verify that the length of `src` is `len`, at compile time when both are known, and with a
+     * run-time check otherwise(unless in an unsafe context).
+     *
+     * @params:
+     *   - context: validation context
+     *   - loc:     location of the index operator
+     *   - len:     the number of elements of the part
+     *   - src:     the affected slice
+     *   - dynLen:  the value of `len` read by the run-time check, `len` itself by default
+     *   - dynSrc:  the value of `src` read by the run-time check, `src` itself by default
+     *
+     * @returns:
+     *   The run-time check, if one is needed.
+     *
+     * @throws:
+     *   ErrorMsg if both lengths are known and differ.
+     */
+    fn verifyLength(dmut context: &ValidationContext,
+                    loc:          &Word,
+                    len:          &Value,
+                    src:          &Value,
+                    dynLen:       &Value = UNIT_VALUE,
+                    dynSrc:       &Value = UNIT_VALUE)-> [&Value]
+        throws ErrorMsg
+    {
+        let mut checks: [&Value] = [];
+        let srcLen = context.cteInterpret:.reduceSliceLen(src);
+        let (cteLen, cteSrcLen) = {
+            (context.cteInterpret:.computeInt(len), context.cteInterpret:.computeInt(srcLen))
+        } catch {
+            _ => {
+                if (!context.getUnsafeContextLoc().isEof) {
+                    ValueVerification::verifyUnsafeContext(alias context, loc);
+                    return checks;
+                }
+
+                let rtLen = if (dynLen of UnitValue) { len } else { dynLen };
+                let rtSrc = if (dynSrc of UnitValue) { src } else { dynSrc };
+                let cmp = copy CmpIntOperatorValue(loc, BinaryOperators::NOT_EQUAL, rtLen,
+                                                   copy StructFieldAccessValue(loc, USIZE_TYPE, rtSrc, SliceKeys::LEN));
+
+                checks ~= [ValueCreation::createOutOfArrayTest(loc, cmp)];
+                return checks;
+            }
+        };
+
+        if (cteLen != cteSrcLen) {
+            throw copy ErrorMsg::fatal(loc, end-> src.loc, format(ValidateErrorMessage::PART_AFFECT_LENGTH, cteLen, cteSrcLen));
+        }
+
+        return checks;
+    }
+
+    /**
+     * Verify that the elements of `object` can be affected, as `object [0] = v` requires.
+     *
+     * @params:
+     *   - loc:    location of the index operator
+     *   - object: the array or slice value being indexed
+     *
+     * @throws:
+     *   ErrorMsg if the elements cannot be affected.
+     */
+    fn verifyWritable(loc: &Word, object: &Value)
+        throws ErrorMsg
+    {
+        let zero = copy IntValue(loc, USIZE_TYPE, 0us);
+        let elem: &Value = match object.type {
+            a: &ArrayType => { copy ArrayAccessValue(loc, a.value, object, zero) }
+            s: &SliceType => { copy SliceAccessValue(loc, s.value, object, zero) }
+            _ => panic;
+        };
+
+        MemoryVerification::verifyLeftOperandMove(loc, elem);
+    }
+}

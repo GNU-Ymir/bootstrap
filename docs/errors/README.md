@@ -26,7 +26,7 @@ check lives:
 | `E1xxx` | lexing | `LexingErrorMessage` -- `src/ymirc/lexing/errors.yr` | 24 |
 | `E2xxx` | parsing | `SyntaxErrorMessage` -- `src/ymirc/syntax/errors.yr` | 13 |
 | `E3xxx` | declaration | `DeclareErrorMessage` -- `src/ymirc/semantic/declarator/errors.yr` | 34 |
-| `E4xxx` | validation | `ValidateErrorMessage` -- `src/ymirc/semantic/validator/errors.yr` | 267 |
+| `E4xxx` | validation | `ValidateErrorMessage` -- `src/ymirc/semantic/validator/errors.yr` | 270 |
 | `E5xxx` | lowering (YIL) | `SerializeYILErrorMessage` -- `src/ymirc/lint/serialize/errors.yr`, `OptimizerErrorMessage` -- `src/ymirc/lint/optimizer/errors.yr` | 11 |
 
 Each page carries an example wherever a case in the suite raises the code: the
@@ -298,6 +298,9 @@ deliberately carry no code, and have no page here.
 | [E4190](E4190.md) | `OVERRIDE_NO_FIELD_BY_FIELD` | field method <> cannot override the non field method <> |
 | [E4320](E4320.md) | `OVERRIDE_NO_GENERATOR_BY_GENERATOR` | generator <> cannot override the non generator method <> |
 | [E4192](E4192.md) | `OVERRIDE_TRAIT_OUTSIDE` | cannot override trait method <> with <> outside impl |
+| [E4324](E4324.md) | `PART_AFFECT_LENGTH` | a part of <> elements cannot be affected from <> elements |
+| [E4322](E4322.md) | `PART_AFFECT_OPERATOR` | the affectation of a part of <> is only defined for the operator <> |
+| [E4323](E4323.md) | `PART_AFFECT_TYPE` | a part of <> cannot be affected from a value of type <>, an array or a slice was expected |
 | [E4193](E4193.md) | `PATTERN_IS_REFUTABLE` | the pattern <> with value <> is refutable |
 | [E4195](E4195.md) | `RANGE_ON_ARRAY_NO_COPY` | the index operator on <> with a dynamic operand of type <> is allowed only in the context of a copy statement |
 | [E4196](E4196.md) | `RECURSIVE_ANCESTOR` | ancestor cycle found when validating <> |
