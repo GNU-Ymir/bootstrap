@@ -309,6 +309,9 @@ pub class ValidationContext {
     /// Stack of closure types representing captured variables.
     let dmut _closureType               : &ClosureList = copy ClosureList();
 
+    /// The index of the frame enclosed by each closure of `_closureType`.
+    let dmut _closureIndexes            : &List!{usize} = copy List!{usize} ();
+
     /*!
      * ====================================================================================================
      * ====================================================================================================
@@ -391,17 +394,20 @@ pub class ValidationContext {
 
     /**
      * Record that the token `loc` refers to the local variable or parameter `name`,
-     * declared in the current frame, or in the one the current closure encloses
+     * declared in the current frame, or in one of the frames the current closures enclose
      */
     pub fn indexVarRef(mut self, loc: &Word, name: [c8]) {
         if let Ok(_) = self._index {
             if let Ok(decl) = self.getLocalNoUse(name) {
                 self:.indexLocalRef(loc, decl);
-            } else if (self._closureType.len != 0us) {
-                let vars = self._closureType.back.vars;
+                return;
+            }
+
+            for level in 0us .. self._closureType.len {
+                let vars = self._closureType[self._closureType.len - 1us - level].vars;
                 for i in 0us .. vars.len if let Ok(decl) = vars[i].content[name] {
                     self:.indexLocalRef(loc, decl);
-                    break;
+                    return;
                 }
             }
         }
@@ -1030,6 +1036,7 @@ pub class ValidationContext {
         self._usedSyms.back.front.content["#{CLOSURE-VARREF}"] = EOF_WORD;
 
         self._closureType:.push(alias clType);
+        self._closureIndexes:.push(closureIndex);
     }
 
     /**
@@ -1039,6 +1046,7 @@ pub class ValidationContext {
     pub fn exitClosure(mut self)-> &ClosureType {
         let type = self._closureType.back;
         self._closureType:.pop();
+        self._closureIndexes:.pop();
 
         type
     }
@@ -1732,18 +1740,38 @@ pub class ValidationContext {
         // We are not inside a closure
         if (self._closureType.len == 0) return none;
 
-        // Retreive current closure information
-        let dmut closureType = alias self._closureType.back;
+        return self:.getInClosure(loc, name, self._closureType.len - 1us, self._symbols.len - 1us);
+    }
+
+    /**
+     * Search a variable in the closure at `level` of the closure stack, enclosing it when it is
+     * a local of the frame the closure encloses, or a variable that frame gets from its own closure
+     * @params:
+     *   - name: the name of the variable
+     *   - level: the index of the closure in the closure stack
+     *   - frame: the index of the frame validating the body of that closure
+     * @returns: the access to the field of the closure holding the variable, none if it cannot be enclosed
+     * @throws: if the variable is found but cannot be enclosed
+     */
+    fn getInClosure(mut self, loc: &Word, name: [c8], level: usize, frame: usize)-> ((&Value)?)
+        throws ErrorMsg
+    {
+        let dmut closureType = alias self._closureType:[level];
 
         // The closure ref is inserted in the frame of the closure by 'enterClosure'.
-        // Its absence means the current frame is a foreign entered inside the body of
+        // Its absence means the frame is a foreign entered inside the body of
         // the closure(e.g. the instantiation of a template called by the closure), that
         // frame encloses nothing, so 'name' is simply not a local of it
-        let oldRef = if let Ok(v: &VarRefValue) = self:.getLocal(EOF_WORD, "#{CLOSURE-VARREF}", canBeInClosure-> false) {
+        let scopes = self._symbols[frame];
+        if (scopes.len == 0us) return none;
+
+        let oldRef = if let Ok(v: &VarRefValue) = scopes.front.content["#{CLOSURE-VARREF}"] {
             v
         } else {
             return none;
         };
+
+        if (oldRef.refId != closureType.refId) return none;
 
         // 1. Reuse
         if let Ok((field, byRef, index)) = closureType.find(name) {
@@ -1758,41 +1786,63 @@ pub class ValidationContext {
         // 2. can insert?
         if closureType.isFinalized { return none; } // cannot insert new enclosings
 
-        // 3. insert
+        // 3. insert a local of the enclosed frame
         let syms = closureType.vars;
-        for i in 0us .. syms.len { // Find the enclosable variable
-            if let Ok(g) = syms[i].content[name] { // enclose a new sym
+        for i in 0us .. syms.len {
+            if let Ok(g) = syms[i].content[name] {
                 let value = self.enclose(loc, g);
-                let type = value.type;
-
                 closureType.used:[i].content[name] = EOF_WORD; // set as used in the upper frame
-                closureType:.insert(name, type, value, false);
 
-                // index in the tuple list, to find it even if we add other enclosed elements
-                let fndIndex = closureType.values.len - 1us;
-
-                // Change the type of the closure var reference(first hidden parameter of the delegate)
-                let closureRef = copy VarRefValue(oldRef.loc,
-                                                  EOF_WORD,
-                                                  closureType,
-                                                  oldRef.refId,
-                                                  isSelf-> oldRef.isSelf,
-                                                  isReference-> false);
-
-                self._symbols.back.front.content["#{CLOSURE-VARREF}"] = closureRef;
-
-                // Return an access to the field of the var
-                return (copy ClosureFieldAccessValue(loc.locate(name),
-                                                     type,
-                                                     closureRef,
-                                                     fndIndex,
-                                                     name-> name,
-                                                     isByRef-> false))?;
+                return self:.insertInClosure(loc, name, value, oldRef, level, frame)?;
             }
         }
 
-        // 4. Not found in parent function
+        // 4. insert a variable the enclosed frame encloses from the closure around it
+        if (level != 0us) {
+            if let Ok(g) = self:.getInClosure(loc, name, level - 1us, self._closureIndexes[level]) {
+                return self:.insertInClosure(loc, name, self.enclose(loc, g), oldRef, level, frame)?;
+            }
+        }
+
+        // 5. Not found in parent function
         return none;
+    }
+
+    /**
+     * Enclose a value in the closure at `level` of the closure stack
+     * @params:
+     *   - name: the name of the enclosed variable
+     *   - value: the value enclosed, evaluated in the frame the closure encloses
+     *   - oldRef: the current reference to the closure, in the frame validating its body
+     *   - level: the index of the closure in the closure stack
+     *   - frame: the index of the frame validating the body of that closure
+     * @returns: the access to the field of the closure holding the value
+     */
+    fn insertInClosure(mut self, loc: &Word, name: [c8], value: &Value, oldRef: &VarRefValue, level: usize, frame: usize)-> &Value {
+        let dmut closureType = alias self._closureType:[level];
+        let type = value.type;
+
+        closureType:.insert(name, type, value, false);
+
+        // index in the tuple list, to find it even if we add other enclosed elements
+        let fndIndex = closureType.values.len - 1us;
+
+        // Change the type of the closure var reference(first hidden parameter of the delegate)
+        let closureRef = copy VarRefValue(oldRef.loc,
+                                          EOF_WORD,
+                                          closureType,
+                                          oldRef.refId,
+                                          isSelf-> oldRef.isSelf,
+                                          isReference-> false);
+
+        self._symbols:[frame].front.content["#{CLOSURE-VARREF}"] = closureRef;
+
+        copy ClosureFieldAccessValue(loc.locate(name),
+                                     type,
+                                     closureRef,
+                                     fndIndex,
+                                     name-> name,
+                                     isByRef-> false)
     }
 
     /**
