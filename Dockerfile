@@ -86,7 +86,7 @@ RUN YMIR_STDLIB_VERSION="$(sed -nE 's/^MIDGARD_VERSION=([0-9]+\.[0-9]+).*/\1/p' 
 # The compiler output is kept in the image rather than only in the build log: a warning is
 # non-fatal in debug, which is how this stage compiles, so CI has to read them back afterwards -
 # and it must still see them when this layer comes from the cache and prints nothing.
-RUN bash -o pipefail -c 'gyllir test --dry -j 12 2>&1 | tee build.log'
+RUN bash -o pipefail -c 'gyllir test --dry --build-jobs 12 2>&1 | tee build.log'
 
 FROM build AS test
 RUN ./ymirc.test -sf
@@ -99,6 +99,6 @@ RUN ./ymirc.test -sf
 # zip. These are build output (the expanded-YIL dumps for every module of the compiler itself),
 # and let downstream consumers build ymirc without needing the Ymir source.
 FROM test AS package
-RUN gyllir build --release -j 12 \
+RUN gyllir build --release --j 12 \
     && cp libymirc.a /libymirc_release.a \
     && find .target/ymirc/release/yils -name '*.yil' -print | zip -q -j /ymirc_yil.zip -@
