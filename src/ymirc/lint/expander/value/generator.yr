@@ -36,8 +36,11 @@ use ymirc::global::core_;
 use ymirc::lexing::{keys, word};
 use ymirc::lint::node::_;
 use ymirc::lint::expander::value::_;
+use ymirc::lint::optimizer;
+use ymirc::lint::optimizer::defuse;
 use ymirc::semantic::generator::{_, value::_};
 use ymirc::semantic::generator::type::native;
+use ymirc::utils::format;
 
 /**
  * The states of a generator frame, a state above DONE resumes the body after a yield.
@@ -55,9 +58,9 @@ enum GeneratorStates
  *     initializes it,
  *   - the function resuming the body up to its next yield: `resume (frame, out)-> bool`.
  *
- * Every variable of the resume function is a field of the frame, the resume
- * function thus has no local, and suspending the body is only a return, whose
- * resumption is a jump dispatched on the state of the frame.
+ * A variable of the resume function whose value crosses a suspension is a field of the
+ * frame, any other is a local of the resume function. Suspending the body is thus only
+ * a return, whose resumption is a jump dispatched on the state of the frame.
  *
  * A generator consumed where it is created (YieldInitValue) is initialized in a frame
  * reserved by the consumer, a local or a field of the frame of the consuming generator,
@@ -269,14 +272,19 @@ pub mod GeneratorExpander {
         body:.append(copy YILReturn(frame.loc, copy YILIntValue(frame.loc, YIL_UINT_8, 0us)));
 
         let gen = context:.exitGenerator();
-        GeneratorExpander::layoutFrame(alias tuple, gen);
-        context.typeExpander:.registerTuple(tuple);
-
         let mut list = StmtList();
         GeneratorExpander::finalizeDispatch(alias context, frame.loc, state, gen, ref list);
         list:.append(body);
 
-        let mut instr: &YILInstr = copy YILBlock(frame.loc, list[]);
+        let resume = copy YILFrame(frame.loc, frame.implLoc, name, params, YIL_UINT_8,
+                                   body-> copy YILBlock(frame.loc, list[]),
+                                   refs-> copy []);
+        let (inner, locals) = GeneratorExpander::promoteLocals(resume, gen);
+
+        GeneratorExpander::layoutFrame(alias tuple, copy [(t, gen.names[i]) for i, t in gen.types] ~ locals);
+        context.typeExpander:.registerTuple(tuple);
+
+        let mut instr = inner;
         if enterCoverage {
             instr = FrameExpander::finalizeCoverage(alias context, frame, instr, frameAddr, frameCoverAddr);
         }
@@ -302,25 +310,62 @@ pub mod GeneratorExpander {
     }
 
     /**
+     * Make a field of the frame of every local of the resume function whose value crosses a
+     * suspension: it is live at a resume label, or its address is taken and a pointer to it
+     * may be read after the suspension.
+     *
+     * @params:
+     *   - resume: the resume function, whose locals are not fields yet
+     *   - gen:    the generator frame, whose resume labels are all known
+     *
+     * @returns: (the body of the resume function, those locals read from their fields, the fields)
+     */
+    fn promoteLocals(resume: &YILFrame, gen: &GeneratorFrame)-> (&YILInstr, [(&YILType, [c8])]) {
+        let flow = copy FrameDataflow(resume, withReaching-> false, withAvailable-> false);
+        let vars = flow.getDefUse().getVars();
+        let escaped = flow.getDefUse().getEscaped();
+
+        let mut fields: [usize => mut &YILValue] = copy [];
+        let mut locals: [(&YILType, [c8])] = [];
+        for v in vars[resume.params.len .. $] {
+            let mut crosses = defuse::containsId(escaped, v.id);
+            for r in gen.resumes {
+                if let Ok(bb) = flow.getCfg().getLabel(r.id) {
+                    crosses = crosses || (flow.hasFacts(bb) && flow.isLiveIn(bb, v.id));
+                }
+            }
+
+            if crosses {
+                let name = if v.isTemp { "#" ~ v.name } else { format("%#%", v.name, v.id) };
+                fields[v.id] = copy YILFieldValue(v.loc, v.type, gen.frame, name);
+                locals ~= [(v.type, name)];
+            }
+        }
+
+        let dmut rewriter = copy FieldRewriter(fields);
+        (rewriter:.rewriteInstr(resume.body), locals)
+    }
+
+    /**
      * Complete the fields of the frame, ordered by decreasing alignment then size, so that
      * none of them is padded, those of the same layout staying in declaration order.
      * Accessed by name only, the fields of a frame can be laid out freely.
      *
      * @params:
-     *   - tuple: the frame, whose fields are set
-     *   - gen:   the generator frame, whose fields are all declared
+     *   - tuple:  the frame, whose fields are set
+     *   - fields: the type and name of every field, in declaration order
      */
-    fn layoutFrame(dmut tuple: &YILTuple, gen: &GeneratorFrame) {
+    fn layoutFrame(dmut tuple: &YILTuple, fields: [(&YILType, [c8])]) {
         use std::algorithm::sorting;
 
-        let fields = sort(copy [(t.align, t.size, i, t, gen.names[i]) for i, t in gen.types], |a, b| => {
+        let sorted = sort(copy [((f._0).align, (f._0).size, i, f._0, f._1) for i, f in fields], |a, b| => {
             if (a._0 != b._0) return a._0 > b._0;
             if (a._1 != b._1) return a._1 > b._1;
             a._2 < b._2
         });
 
-        tuple.inners = copy [f._3 for f in fields];
-        tuple.fieldNames = copy [f._4 for f in fields];
+        tuple.inners = copy [f._3 for f in sorted];
+        tuple.fieldNames = copy [f._4 for f in sorted];
     }
 
     /**
@@ -478,5 +523,50 @@ pub mod GeneratorExpander {
         } else {
             context:.insertSymbol(name, final);
         }
+    }
+}
+
+/**
+ * Rewrites the locals of a resume function that are fields of the frame of its generator
+ * into accesses to those fields, their declarations removed.
+ */
+class FieldRewriter over YILRewriter {
+
+    // the access to the field of each promoted local, by variable id
+    let _fields: [usize => &YILValue];
+
+    pub self (fields: [usize => &YILValue])
+        with super ()
+        , _fields = fields
+    {}
+
+    pub over rewriteValue(mut self, value: &YILValue)-> &YILValue {
+        if let v: &YILVar = value {
+            if let Ok(f) = self._fields[v.id] { return f; }
+            return v;
+        }
+
+        self:.rewriteOperands(value)
+    }
+
+    prot over rewriteDest(mut self, value: &YILValue)-> &YILValue {
+        if let v: &YILVar = value {
+            return self:.rewriteValue(v);
+        }
+
+        self.super:.rewriteDest(value)
+    }
+
+    prot over rewriteList(mut self, instrs: [&YILInstr])-> [&YILInstr] {
+        let mut res: [mut &YILInstr] = [];
+        for i in instrs {
+            if let v: &YILVarDecl = i {
+                if v.id in self._fields { continue; }
+            }
+
+            res ~= [self:.rewriteInstr(i)];
+        }
+
+        res
     }
 }
