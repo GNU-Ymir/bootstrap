@@ -47,32 +47,93 @@ enum GeneratorStates
 | DONE  = 1us;
 
 /**
- * Expands a generator into two frames:
+ * Expands a generator into three frames:
  *
- *   - the function called by the user, that allocates the frame of the
- *     generator, stores its parameters and returns the handle `{frame, &resume}`,
+ *   - the function initializing the generator in a frame reserved by its caller: it
+ *     stores the parameters and returns the handle `{frame, &resume}`, `init (frame, params...)`,
+ *   - the function called by the user, that allocates the frame of the generator and
+ *     initializes it,
  *   - the function resuming the body up to its next yield: `resume (frame, out)-> bool`.
  *
  * Every variable of the resume function is a field of the frame, the resume
  * function thus has no local, and suspending the body is only a return, whose
  * resumption is a jump dispatched on the state of the frame.
+ *
+ * A generator consumed where it is created (YieldInitValue) is initialized in a frame
+ * reserved by the consumer, a local or a field of the frame of the consuming generator,
+ * when its frame is known: the generator is lowered by this expansion, and its frame
+ * does not embed the one of the consumer.
  */
 pub mod GeneratorExpander {
 
     /**
-     * Finalize the frame of a generator into its create and resume frames.
+     * Finalize the frame of a generator into its init, create and resume frames, unless
+     * a consumer already did.
      *
      * @params:
      *   - context: the expansion context
      *   - frame:   the frame generator node, a generator
      */
     pub fn finalizeGenerator(dmut context: &Expander, frame: &FrameGenerator) {
+        let name = Mangler::mangle(frame);
+        if !context:.startGenerator(name) {
+            return;
+        }
+
         let yieldType = if let y: &YieldType = frame.retType { y } else { panic; };
         let dmut tuple = context.typeExpander:.createEmptyTuple();
         let framePtr = context.typeExpander:.finalizePointer(tuple);
 
         GeneratorExpander::finalizeResumeFrame(alias context, frame, yieldType, alias tuple, framePtr);
+        context:.endGenerator(name, tuple);
+
+        GeneratorExpander::finalizeInitFrame(alias context, frame, framePtr);
         GeneratorExpander::finalizeCreateFrame(alias context, frame, tuple, framePtr);
+    }
+
+    /**
+     * Finalize the creation of a generator consumed in place: its frame is reserved in the
+     * current frame and initialized by `init (&frame, params...)`, or allocated by the
+     * generator when its frame is not known.
+     *
+     * @returns:
+     *   - &YILValue: the call, returning the handle of the generator
+     */
+    pub fn finalizeInit(dmut context: &Expander, i: &YieldInitValue, ref mut list: StmtList)-> &YILValue {
+        let frame = match context.getGeneratorDecl(Mangler::mangle(i.call.proto)) {
+            Ok(f) => { f }
+            _ => { return CallExpander::finalizeSimpleCall(alias context, i.call, ref list); }
+        };
+
+        let tuple = match GeneratorExpander::getFrame(alias context, frame) {
+            Ok(t) => { t }
+            _ => { return CallExpander::finalizeSimpleCall(alias context, i.call, ref list); }
+        };
+
+        let (_, frameAddr) = ValueExpander::createVarForBlock(alias context, i.loc, NONE_TYPE, tuple, ref list,
+                                                              getAddr-> true);
+        let params = CallExpander::finalizeArgs(alias context, i.call, ref list);
+
+        let name = Mangler::mangleInitFrame(frame);
+        context:.registerTouchSym(name, frame.implLoc);
+
+        return copy YILNameCallValue(i.loc, context:.finalizeType(i.type), name, copy [frameAddr] ~ params);
+    }
+
+    /**
+     * Get the frame of a generator, lowering it first if it was not.
+     *
+     * @returns: the frame, none while the generator is being lowered, its frame being incomplete
+     */
+    fn getFrame(dmut context: &Expander, frame: &FrameGenerator)-> (&YILTuple)? {
+        let name = Mangler::mangle(frame);
+        if !context.isGeneratorStarted(name) {
+            let scopes = context:.suspendScopes();
+            GeneratorExpander::finalizeGenerator(alias context, frame);
+            context:.resumeScopes(scopes);
+        }
+
+        context.getGeneratorTuple(name)
     }
 
     /**
@@ -262,15 +323,15 @@ pub mod GeneratorExpander {
     }
 
     /**
-     * Finalize the function creating a generator: it allocates the frame, stores the
-     * parameters in it, and returns the handle pairing the frame and the resume function.
+     * Finalize the function initializing a generator in a frame it does not own: it stores
+     * the parameters in it, and returns the handle pairing the frame and the resume function.
      * A parameter passed by reference (the `self` of a record) is copied into the frame.
      *
      * @params:
-     *   - tuple: the complete type of the frame
+     *   - framePtr: the type of the pointer to the frame
      */
-    fn finalizeCreateFrame(dmut context: &Expander, frame: &FrameGenerator, tuple: &YILTuple, framePtr: &YILPointer) {
-        let name = Mangler::mangle(frame);
+    fn finalizeInitFrame(dmut context: &Expander, frame: &FrameGenerator, framePtr: &YILPointer) {
+        let name = Mangler::mangleInitFrame(frame);
         let resumeName = Mangler::mangleResumeFrame(frame);
         let loc = frame.loc;
         let mut list = StmtList();
@@ -279,31 +340,18 @@ pub mod GeneratorExpander {
         context:.enterFrame(frame.name.toStr());
         context:.enterBlock();
 
-        let mut params: [&YILVarDecl] = [];
-        let mut args: [&YILValue] = [];
-        for p in frame.params {
-            let varId = context:.generateVarId();
-            let type = context:.finalizeType(p.type);
-            if p.isReference {
-                let ptrType = context.typeExpander:.finalizePointer(type);
-                params ~= [copy YILVarDecl(p.loc, p.loc.str, ptrType, varId)];
-                args ~= [copy YILUnrefValue(p.loc, type, copy YILVar(p.loc, p.loc.str, ptrType, varId))];
-            } else {
-                params ~= [copy YILVarDecl(p.loc, p.loc.str, type, varId)];
-                args ~= [copy YILVar(p.loc, p.loc.str, type, varId)];
-            }
-        }
-
-        let alloc = copy YILNameCallValue(loc, framePtr, YRuntimeFuncs::ALLOC_BLOCK,
-                                          copy [copy YILIntValue(loc, YIL_UINT_MAX, tuple.size)]);
-        let (framePtrVar, _) = ValueExpander::createVarForBlock(alias context, loc, NONE_TYPE, framePtr, ref list,
-                                                                withValue-> alloc);
-        let frameRef = copy YILUnrefValue(loc, tuple, framePtrVar);
+        let frameId = context:.generateVarId();
+        let framePtrVar = copy YILVar(loc, GeneratorKeys::FRAME, framePtr, frameId);
+        let (params, vars) = GeneratorExpander::finalizeParams(alias context, frame);
+        let frameRef = copy YILUnrefValue(loc, framePtr.inner, framePtrVar);
 
         list:.append(copy YILAffect(loc, copy YILFieldValue(loc, YIL_UINT_32, frameRef, GeneratorKeys::STATE),
                                     copy YILIntValue(loc, YIL_UINT_32, cast!usize (GeneratorStates::START))));
         for i, p in frame.params {
-            list:.append(copy YILAffect(p.loc, copy YILFieldValue(p.loc, args[i].type, frameRef, p.loc.str), args[i]));
+            let type = context:.finalizeType(p.type);
+            let arg = if p.isReference { copy YILUnrefValue(p.loc, type, vars[i]) } else { vars[i] };
+
+            list:.append(copy YILAffect(p.loc, copy YILFieldValue(p.loc, type, frameRef, p.loc.str), arg));
         }
 
         context:.registerTouchSym(resumeName, frame.implLoc);
@@ -321,12 +369,89 @@ pub mod GeneratorExpander {
         let final = copy YILFrame(loc,
                                   frame.implLoc,
                                   name,
-                                  params,
+                                  copy [copy YILVarDecl(loc, GeneratorKeys::FRAME, framePtr, frameId)] ~ params,
                                   context:.finalizeType(frame.retType),
                                   body-> copy YILBlock(loc, list[]),
                                   isWeak-> frame.isWeak,
                                   refs-> touching);
 
+        GeneratorExpander::insertFrame(alias context, frame, name, final);
+    }
+
+    /**
+     * Finalize the function creating a generator: it allocates the frame, and initializes it.
+     *
+     * @params:
+     *   - tuple: the complete type of the frame
+     */
+    fn finalizeCreateFrame(dmut context: &Expander, frame: &FrameGenerator, tuple: &YILTuple, framePtr: &YILPointer) {
+        let name = Mangler::mangle(frame);
+        let initName = Mangler::mangleInitFrame(frame);
+        let loc = frame.loc;
+        let retType = context:.finalizeType(frame.retType);
+        let mut list = StmtList();
+
+        context:.enterSymbol();
+        context:.enterFrame(frame.name.toStr());
+        context:.enterBlock();
+
+        let (params, args) = GeneratorExpander::finalizeParams(alias context, frame);
+
+        let alloc = copy YILNameCallValue(loc, framePtr, YRuntimeFuncs::ALLOC_BLOCK,
+                                          copy [copy YILIntValue(loc, YIL_UINT_MAX, tuple.size)]);
+        let (framePtrVar, _) = ValueExpander::createVarForBlock(alias context, loc, NONE_TYPE, framePtr, ref list,
+                                                                withValue-> alloc);
+
+        context:.registerTouchSym(initName, frame.implLoc);
+        let init = copy YILNameCallValue(loc, retType, initName, copy [framePtrVar] ~ args);
+        let (handle, _) = ValueExpander::createVarForBlock(alias context, loc, NONE_TYPE, retType, ref list,
+                                                           withValue-> init);
+
+        list:.append(copy YILReturn(loc, handle));
+
+        context:.exitBlock();
+        context:.exitFrame();
+        let touching = context:.exitSymbol();
+
+        let final = copy YILFrame(loc,
+                                  frame.implLoc,
+                                  name,
+                                  params,
+                                  retType,
+                                  body-> copy YILBlock(loc, list[]),
+                                  isWeak-> frame.isWeak,
+                                  refs-> touching);
+
+        GeneratorExpander::insertFrame(alias context, frame, name, final);
+    }
+
+    /**
+     * Declare the parameters of the generator in the current frame, those passed by reference
+     * being pointers.
+     *
+     * @returns: (the declarations of the parameters, the variables reading them)
+     */
+    fn finalizeParams(dmut context: &Expander, frame: &FrameGenerator)-> ([&YILVarDecl], [&YILValue]) {
+        let mut params: [&YILVarDecl] = [];
+        let mut vars: [&YILValue] = [];
+        for p in frame.params {
+            let varId = context:.generateVarId();
+            let mut type = context:.finalizeType(p.type);
+            if p.isReference {
+                type = context.typeExpander:.finalizePointer(type);
+            }
+
+            params ~= [copy YILVarDecl(p.loc, p.loc.str, type, varId)];
+            vars ~= [copy YILVar(p.loc, p.loc.str, type, varId)];
+        }
+
+        (params, vars)
+    }
+
+    /**
+     * Insert a frame of the generator `frame`, weak if the generator is.
+     */
+    fn insertFrame(dmut context: &Expander, frame: &FrameGenerator, name: [c8], final: &YILFrame) {
         if (frame.isWeak) {
             context:.insertWeak(name, final);
         } else {
