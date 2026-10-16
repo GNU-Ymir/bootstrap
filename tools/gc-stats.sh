@@ -59,6 +59,12 @@ else
     git ls-files -z -co --exclude-standard | tar --null -T - --ignore-failed-read -c 2>/dev/null | tar -x -C "$WORK"
 fi
 
+# a [compiler] table pins a release of gyc that gyllir installs in its cache, a top-level
+# compiler key names the binary otherwise
+PINNED=$(sed -nE '/^\[compiler\]/,/^\[/ s/^version *= *"(.*)"/\1/p' gyllir.toml)
+if [ -z "$GYC" ] && [ -n "$PINNED" ]; then
+    GYC="${GYLLIR_CACHE_DIR:-$HOME/.local/gyllir}/compiler/$PINNED/usr/bin/gyc"
+fi
 GYC=$(command -v "${GYC:-$(sed -nE '/^\[/q; s/^compiler = "(.*)"/\1/p' gyllir.toml)}") || {
     echo "gc-stats: no compiler to build with" >&2
     exit 1
@@ -70,7 +76,12 @@ cat > "$WORK/.gc/compiler" <<EOF
 GC_PRINT_STATS=1 GC_LOG_FILE="$WORK/.gc/\$\$.log" exec "$GYC" "\$@"
 EOF
 chmod +x "$WORK/.gc/compiler"
-sed -i -E "s|^compiler = \".*\"|compiler = \"$WORK/.gc/compiler\"|" "$WORK/gyllir.toml"
+awk -v gyc="$WORK/.gc/compiler" '
+    BEGIN { print "compiler = \"" gyc "\"" }
+    /^\[/ { table = $0 }
+    /^\[compiler\]/ || table == "[compiler]" || (table == "" && /^compiler *=/) { next }
+    { print }' "$WORK/gyllir.toml" > "$WORK/.gc/gyllir.toml"
+mv "$WORK/.gc/gyllir.toml" "$WORK/gyllir.toml"
 
 cd "$WORK"
 if ! /usr/bin/time -f "%U" -o "$WORK/.gc/cpu" gyllir build $TARGET $MODE --j "$JOBS" > "$WORK/.gc/build.txt" 2>&1; then
