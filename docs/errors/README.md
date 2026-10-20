@@ -26,7 +26,7 @@ check lives:
 | `E1xxx` | lexing | `LexingErrorMessage` -- `src/ymirc/lexing/errors.yr` | 24 |
 | `E2xxx` | parsing | `SyntaxErrorMessage` -- `src/ymirc/syntax/errors.yr` | 13 |
 | `E3xxx` | declaration | `DeclareErrorMessage` -- `src/ymirc/semantic/declarator/errors.yr` | 37 |
-| `E4xxx` | validation | `ValidateErrorMessage` -- `src/ymirc/semantic/validator/errors.yr` | 270 |
+| `E4xxx` | validation | `ValidateErrorMessage` -- `src/ymirc/semantic/validator/errors.yr` | 272 |
 | `E5xxx` | lowering (YIL) | `SerializeYILErrorMessage` -- `src/ymirc/lint/serialize/errors.yr`, `OptimizerErrorMessage` -- `src/ymirc/lint/optimizer/errors.yr` | 11 |
 
 Each page carries an example wherever a case in the suite raises the code: the
@@ -164,6 +164,8 @@ deliberately carry no code, and have no page here.
 | [E4035](E4035.md) | `CTOR_INFINITE_REDIRECTION` | infinite constructor redirection calls when calling <> |
 | [E4036](E4036.md) | `CTOR_MAP_DCOPY` | using a deep copy instead of a one level copy is prohibited when constructing a map <> |
 | [E4037](E4037.md) | `CTOR_MAP_STACK` | creating an instance of map <> on the stack is prohibited |
+| [E4330](E4330.md) | `DECLARED_DMUT_NOT_MUTATED` | the variable <> is only rebound, its type <> can be <> |
+| [E4329](E4329.md) | `DECLARED_MUT_NOT_MUTATED` | the variable <> is declared mutable but never mutated |
 | [E4038](E4038.md) | `DECLARED_NOT_USED` | the symbol <> was declared but never used |
 | [E4039](E4039.md) | `DECLARE_VOID_VAR` | cannot declare a variable of type <> |
 | [E4040](E4040.md) | `DECREASING_RANGE_ACCESS` | range index cannot be decreasing for type <>, but goes from <> to <> |
