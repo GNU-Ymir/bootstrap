@@ -1,0 +1,211 @@
+/*
+ * Implements semantic validation for method calls on deferred constructions in Ymir.
+ *
+ * Responsibilities:
+ *   - Infer the template parameters left unresolved by the construction of a
+ *     template class from the arguments of the first method called on it.
+ *   - Validate the construction on the inferred specialization.
+ *   - Declare again the variable the construction initializes, now that its
+ *     type is known, in place of the deferred one.
+ *   - Validate the method call on the constructed value.
+ *
+ * <hr>
+ *
+ * @Package: ymirc
+ * @Module: ymirc::semantic::validator::value::operator::call::deferred
+ * @File: ymirc/semantic/validator/value/operator/call/deferred.yr
+ * @Author(s):
+ *   - Emile Cadorel <ecadorel@gmail.com>
+ *
+ * @Created(YYYY-MM-DD): 2026-10-20
+ * @Copyright(C) 2021–2026 GNU-Ymir
+ * @License
+ *   ```text
+ *   This file is part of the Ymir language project.
+ *
+ *   Ymir is free software: you can redistribute it and/or modify it
+ *   under the terms of the GNU General Public License as published by
+ *   the Free Software Foundation, either version 3 of the License, or
+ *   (at your option) any later version.
+ *
+ *   Ymir is distributed in the hope that it will be useful,
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *   GNU General Public License for more details.
+ *
+ *   You should have received a copy of the GNU General Public License
+ *   along with Ymir.  If not, see <https://www.gnu.org/licenses/>.
+ *   ```
+ */
+
+in deferred;
+
+use ymirc::errors;
+use ymirc::lexing::word;
+use ymirc::semantic::generator::value::_;
+use ymirc::semantic::generator::type::temporary;
+use ymirc::semantic::validator::value::operator::call::template_;
+use ymirc::syntax::expression::_;
+use ymirc::utils::format;
+
+/**
+ * DeferredCallValidation module
+ *
+ * Validates the call of a method on a value whose type is a DeferredClassType,
+ * i.e. the construction of a template class whose template parameters are not
+ * all inferred, or a variable initialized by it.
+ */
+pub mod DeferredCallValidation {
+
+    /**
+     * Validate the call of a method on a deferred construction.
+     *
+     * The template parameters the construction leaves unresolved are inferred
+     * from the arguments of the call, and the construction is validated on the
+     * specialization so inferred. When it initializes a variable, the variable
+     * is declared again with the type of the construction, replacing the
+     * deferred one in its scope and its block.
+     *
+     * @params:
+     *   - context: validation context
+     *   - loc:     location of the call operator
+     *   - left:    the method accessed on the deferred construction
+     *   - rights:  the arguments of the call, the named ones first
+     *   - nbNamed: number of named arguments in `rights`
+     *   - inCopy:  whether the call occurs inside a copy expression
+     *
+     * @returns:
+     *   - the method call on the constructed value
+     *
+     * @throws:
+     *   - NO_METHOD_INFERS if no method of the class infers the template parameters left
+     *   - ErrorMsg if the construction or the method call fails to validate
+     */
+    pub fn validate(dmut context: &ValidationContext,
+                    loc:          &Word,
+                    left:         &DeferredMethodValue,
+                    rights:       [&Value],
+                    nbNamed:      usize,
+                    inCopy:       bool = false)-> &Value
+        throws ErrorMsg
+    {
+        let object = DeferredCallValidation::resolveObject(alias context, left, rights, nbNamed-> nbNamed);
+        let method = FieldValidation::validate(alias context, left.loc, left.op, object, left.field, inCall-> true);
+
+        return CallValidation::validate(alias context, loc, method, rights,
+                                         nbNamed-> nbNamed,
+                                         inCopy-> inCopy);
+    }
+
+    /**
+     * Resolve the object of a method accessed on a deferred construction.
+     *
+     * @returns:
+     *   - the construction on the inferred specialization, or a reference to the
+     *     variable it initializes, declared again with its type
+     *
+     * @throws:
+     *   - ErrorMsg if the construction cannot be resolved
+     */
+    fn resolveObject(dmut context: &ValidationContext,
+                     left:         &DeferredMethodValue,
+                     rights:       [&Value],
+                     nbNamed:      usize)-> &Value
+        throws ErrorMsg
+    {
+        match left.object {
+            r: &VarRefValue => {
+                // the variable was resolved by a call validated meanwhile, e.g. in the arguments
+                if let Ok(decl: &VarDeclValue) = context.getResolvedLocal(r.refId) {
+                    return DeferredCallValidation::createVarRef(r.loc, decl);
+                }
+
+                if let ctor: &DeferredCtorValue = r.value {
+                    let value = DeferredCallValidation::resolveCtor(alias context, ctor, left.field, rights, nbNamed-> nbNamed);
+                    return DeferredCallValidation::resolveVar(alias context, r, value);
+                }
+            }
+            c: &DeferredCtorValue => {
+                return DeferredCallValidation::resolveCtor(alias context, c, left.field, rights, nbNamed-> nbNamed);
+            }
+        }
+
+        throw DeferredCallValidation::createUninferredError(left.loc, left.object);
+    }
+
+    /**
+     * Validate a deferred construction on the specialization inferred by the method `field`
+     * called with `rights`.
+     *
+     * @throws:
+     *   - UNINFERRED_CLASS_TEMPLATE if the method is not named by an identifier
+     *   - NO_COPY_EXIST if the construction is copied, but the specialization is not a class
+     *   - ErrorMsg if the template parameters cannot be inferred, or the construction fails
+     */
+    fn resolveCtor(dmut context: &ValidationContext,
+                   ctor:         &DeferredCtorValue,
+                   field:        &Expression,
+                   rights:       [&Value],
+                   nbNamed:      usize)-> &Value
+        throws ErrorMsg
+    {
+        if let v: &VarExpr = field {
+            let value = TemplatePrototypeCallValidation::validateDeferred(alias context, v.loc, ctor, v.name, rights,
+                                                                           nbNamed-> nbNamed);
+            if (ctor.inCopy && !CopyValidation::isAllocated(value)) {
+                throw copy ErrorMsg::fatal(ctor.loc, format(ValidateErrorMessage::NO_COPY_EXIST, value.type));
+            }
+
+            return value;
+        }
+
+        throw DeferredCallValidation::createUninferredError(field.loc, ctor);
+    }
+
+    /**
+     * Declare again the variable `r` refers to, initialized by `value` the construction it was
+     * deferred to, and replace the deferred variable by it.
+     *
+     * @returns:
+     *   - a reference to the variable declared again
+     */
+    fn resolveVar(dmut context: &ValidationContext, r: &VarRefValue, value: &Value)-> &Value
+        throws ErrorMsg
+    {
+        if let Ok(vdecl) = context.getDeferredLocal(r.refId) {
+            let decl = MatchValidation::resolveDeferredVar(alias context, value, vdecl);
+            context:.resolveDeferredLocal(r.refId, decl);
+
+            return DeferredCallValidation::createVarRef(r.loc, decl);
+        }
+
+        throw DeferredCallValidation::createUninferredError(r.loc, r);
+    }
+
+    /**
+     * @returns: a reference at `loc` to the variable `decl`
+     */
+    fn createVarRef(loc: &Word, decl: &VarDeclValue)-> &Value {
+        copy VarRefValue(loc,
+                         decl.loc,
+                         decl.varType,
+                         decl.uniqId,
+                         canCte-> decl.isCte,
+                         isReference-> decl.isReference,
+                         isLazy-> decl.isLazy,
+                         value-> if (decl.isMutable) { UNIT_VALUE } else { decl.value })
+    }
+
+    /**
+     * @returns: the error of a value whose type is deferred, used where it cannot be inferred
+     */
+    fn createUninferredError(loc: &Word, value: &Value)-> &ErrorMsg {
+        let mut notes: [&ErrorMsg] = [];
+        if let d: &DeferredClassType = value.type {
+            notes = copy [copy ErrorMsg::note(i.loc, format(ValidateErrorMessage::UNRESOLVED_TEMPLATE, i)) for i in d.unresolved];
+        }
+
+        copy ErrorMsg::fatal(loc, format(ValidateErrorMessage::UNINFERRED_CLASS_TEMPLATE, value.type), notes-> notes)
+    }
+
+}

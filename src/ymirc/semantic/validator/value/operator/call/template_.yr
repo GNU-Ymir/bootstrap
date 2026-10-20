@@ -9,7 +9,8 @@
  *   - sorts and matches call arguments against prototype parameters,
  *   - performs implicit template solving for call-site arguments,
  *   - finalizes function, method, and constructor prototypes,
- *   - infers the template arguments of a class from its constructors,
+ *   - infers the template arguments of a class from its constructors, or defers them
+ *     to the first method called on the constructed value,
  *   - computes call scores for overload resolution,
  *   - constructs call values(PrototypeCallValue, MethodCallValue, CtorCallValue),
  *   - handles candidate-mode error reporting for overload resolution.
@@ -47,7 +48,7 @@
 in template_;
 
 use ymirc::errors;
-use ymirc::lexing::word;
+use ymirc::lexing::{keys, word};
 use ymirc::semantic::{symbol, template_};
 use ymirc::semantic::generator::{type::_, value::_};
 use ymirc::semantic::validator::value::operator::call::multsym;
@@ -350,6 +351,10 @@ pub mod TemplatePrototypeCallValidation {
      * The construction is then validated on every specialization so inferred, and the one
      * accepting the arguments with the best score is kept.
      *
+     * When the constructors accepting the arguments leave some template parameters of the
+     * class unresolved, the construction is deferred, cf. DeferredCtorValue: the parameters
+     * left are inferred by the first method called on the constructed value.
+     *
      * @params:
      *   - context:   validation context used for inference and call validation
      *   - loc:       source location of the call
@@ -362,12 +367,12 @@ pub mod TemplatePrototypeCallValidation {
      *
      * @returns:
      *   - (&Value, TemplateMapper, u32):
-     *        * call value (CtorCallValue) on the inferred specialization,
+     *        * call value (CtorCallValue) on the inferred specialization, or DeferredCtorValue,
      *        * mapper of the specialization,
      *        * call score for overload resolution
      *
      * @throws:
-     *   - NO_CTOR_FOUND if no unnamed constructor infers every template parameter
+     *   - NO_CTOR_FOUND if no unnamed constructor accepts the arguments
      *   - WORKS_WITH_BOTH if several specializations accept the arguments with the same score
      *   - candidate-mode diagnostics if candidate = true
      */
@@ -382,58 +387,15 @@ pub mod TemplatePrototypeCallValidation {
         throws ErrorMsg
     {
         {
-            let mappers = TemplatePrototypeCallValidation::inferClassMappers(alias context, loc, left, cl, rights,
-                                                                             nbNamed-> nbNamed);
-
-            let mut results: [(&Value, TemplateMapper, u32)] = [];
-            let mut errors: [&ErrorMsg] = [];
-            let mut highestScore = 0u32;
-            for mapper in mappers {
-                {
-                    let (call, score) = TemplatePrototypeCallValidation::validateSpecializedCtor(alias context, loc, left, mapper, rights,
-                                                                                                 nbNamed-> nbNamed,
-                                                                                                 inCopy-> inCopy);
-
-                    let finalScore = score + mapper.score;
-                    if (finalScore > highestScore) {
-                        highestScore = finalScore;
-                        results = copy [(call, mapper, finalScore)];
-                    } else if (finalScore == highestScore) {
-                        results ~= [(call, mapper, finalScore)];
-                    }
-                } catch {
-                    err: &ErrorMsg => {
-                        errors ~= [err.withNote(copy [copy ErrorMsg::note(loc, format(ValidateErrorMessage::TEMPLATE_SPE, mapper),
-                                                                          oneLine-> true)])];
-                    }
-                }
+            let (mappers, partials, unresolved) = TemplatePrototypeCallValidation::inferClassMappers(alias context, loc, left, cl, rights,
+                                                                                                     nbNamed-> nbNamed);
+            if (mappers.len == 0us) {
+                return (copy DeferredCtorValue(loc, left, rights, nbNamed, inCopy, partials, unresolved), TemplateMapper(), 0u32);
             }
 
-            if (results.len == 0us) {
-                if (errors.len == 1us) throw errors[0];
-                throw copy ErrorMsg::list(errors);
-            }
-
-            if (results.len != 1us) {
-                let mut notes: [&ErrorMsg] = [];
-                for r in results {
-                    let ctor: &Value = match r._0 {
-                        c: &CtorCallValue => { c.delegate.proto }
-                        _ => { left }
-                    };
-
-                    notes ~= [copy ErrorMsg::note(ctor.loc, format(ValidateErrorMessage::CANDIDATE_ARE, CallParamListCreation::formatPrettyName(ctor)),
-                                                  oneLine-> true,
-                                                  withLoc-> true,
-                                                  notes-> copy [copy ErrorMsg::note(ctor.loc, format(ValidateErrorMessage::TEMPLATE_SPE, r._1),
-                                                                                    oneLine-> true)])];
-                }
-
-                throw copy ErrorMsg::fatal(loc, format(ValidateErrorMessage::WORKS_WITH_BOTH, CallParamListCreation::formatPrettyName(left), rights),
-                                           notes-> notes);
-            }
-
-            return results[0];
+            return TemplatePrototypeCallValidation::validateSpecializations(alias context, loc, left, mappers, rights,
+                                                                            nbNamed-> nbNamed,
+                                                                            inCopy-> inCopy);
         } catch {
             err: &ErrorMsg => {
                 if (!candidate) throw err;
@@ -443,6 +405,86 @@ pub mod TemplatePrototypeCallValidation {
                                           withLoc-> true);
             }
         }
+    }
+
+    /**
+     * Validate the construction of a class template on each of the given specializations, and
+     * keep the one accepting the arguments with the best score.
+     *
+     * @params:
+     *   - context: validation context used for declaration and call validation
+     *   - loc:     source location of the call
+     *   - left:    TemplateRefValue representing the class template reference
+     *   - mappers: the template arguments of each specialization
+     *   - rights:  list of argument values
+     *   - nbNamed: number of named arguments in the call
+     *   - inCopy:  whether the call occurs inside a copy expression
+     *
+     * @returns:
+     *   - (&Value, TemplateMapper, u32): the construction, the mapper of its specialization and its score
+     *
+     * @throws:
+     *   - the errors of every specialization if none accepts the arguments
+     *   - WORKS_WITH_BOTH if several specializations accept the arguments with the same score
+     */
+    pub fn validateSpecializations(dmut context: &ValidationContext,
+                                   loc:          &Word,
+                                   left:         &TemplateRefValue,
+                                   mappers:      [TemplateMapper],
+                                   rights:       [&Value],
+                                   nbNamed:      usize,
+                                   inCopy:       bool)-> (&Value, TemplateMapper, u32)
+        throws ErrorMsg
+    {
+        let mut results: [(&Value, TemplateMapper, u32)] = [];
+        let mut errors: [&ErrorMsg] = [];
+        let mut highestScore = 0u32;
+        for mapper in mappers {
+            {
+                let (call, score) = TemplatePrototypeCallValidation::validateSpecializedCtor(alias context, loc, left, mapper, rights,
+                                                                                             nbNamed-> nbNamed,
+                                                                                             inCopy-> inCopy);
+
+                let finalScore = score + mapper.score;
+                if (finalScore > highestScore) {
+                    highestScore = finalScore;
+                    results = copy [(call, mapper, finalScore)];
+                } else if (finalScore == highestScore) {
+                    results ~= [(call, mapper, finalScore)];
+                }
+            } catch {
+                err: &ErrorMsg => {
+                    errors ~= [err.withNote(copy [copy ErrorMsg::note(loc, format(ValidateErrorMessage::TEMPLATE_SPE, mapper),
+                                                                      oneLine-> true)])];
+                }
+            }
+        }
+
+        if (results.len == 0us) {
+            if (errors.len == 1us) throw errors[0];
+            throw copy ErrorMsg::list(errors);
+        }
+
+        if (results.len != 1us) {
+            let mut notes: [&ErrorMsg] = [];
+            for r in results {
+                let ctor: &Value = match r._0 {
+                    c: &CtorCallValue => { c.delegate.proto }
+                    _ => { left }
+                };
+
+                notes ~= [copy ErrorMsg::note(ctor.loc, format(ValidateErrorMessage::CANDIDATE_ARE, CallParamListCreation::formatPrettyName(ctor)),
+                                              oneLine-> true,
+                                              withLoc-> true,
+                                              notes-> copy [copy ErrorMsg::note(ctor.loc, format(ValidateErrorMessage::TEMPLATE_SPE, r._1),
+                                                                                oneLine-> true)])];
+            }
+
+            throw copy ErrorMsg::fatal(loc, format(ValidateErrorMessage::WORKS_WITH_BOTH, CallParamListCreation::formatPrettyName(left), rights),
+                                       notes-> notes);
+        }
+
+        return results[0];
     }
 
     /**
@@ -459,20 +501,25 @@ pub mod TemplatePrototypeCallValidation {
      *   - nbNamed: number of named arguments in the call
      *
      * @returns:
-     *   - [TemplateMapper]: the distinct mappers binding every template parameter of the class
+     *   - ([TemplateMapper], [TemplateMapper], [&Expression]):
+     *        * the distinct mappers binding every template parameter of the class,
+     *        * the distinct mappers of the constructors leaving some of them unresolved,
+     *        * the parameters left unresolved by the first of those
      *
      * @throws:
-     *   - NO_CTOR_FOUND if no constructor infers them, with a note per constructor
+     *   - NO_CTOR_FOUND if no constructor accepts the arguments, with a note per constructor
      */
     fn inferClassMappers(dmut context: &ValidationContext,
                          loc:          &Word,
                          left:         &TemplateRefValue,
                          cl:           &TypeDecl,
                          rights:       [&Value],
-                         nbNamed:      usize)-> [TemplateMapper]
+                         nbNamed:      usize)-> ([TemplateMapper], [TemplateMapper], [&Expression])
         throws ErrorMsg
     {
         let mut mappers: [TemplateMapper] = [];
+        let mut partials: [TemplateMapper] = [];
+        let mut unresolved: [&Expression] = [];
         let mut errors: [&ErrorMsg] = [];
         for ctor in TemplatePrototypeCallValidation::unnamedCtors(cl.decls) {
             let (templates, decl) = ctor;
@@ -491,18 +538,13 @@ pub mod TemplatePrototypeCallValidation {
                     mapper:.remove(name);
                 }
 
-                let unresolved = TemplateRewriting::rewriteTemplateParams(mapper, left.sym.decl.params);
-                if (unresolved.len != 0us) {
-                    throw copy ErrorMsg::list(copy [copy ErrorMsg::fatal(i.loc, format(ValidateErrorMessage::UNRESOLVED_TEMPLATE, i))
-                                                    for i in unresolved]);
+                let missing = TemplateRewriting::rewriteTemplateParams(mapper, left.sym.decl.params);
+                if (missing.len != 0us) {
+                    if (partials.len == 0us) unresolved = missing;
+                    TemplatePrototypeCallValidation::insertDistinct(ref partials, mapper);
+                } else {
+                    TemplatePrototypeCallValidation::insertDistinct(ref mappers, mapper);
                 }
-
-                let mut known = false;
-                for m in mappers if (m == mapper) {
-                    known = true;
-                }
-
-                if (!known) mappers ~= [mapper];
             } catch {
                 err: &ErrorMsg => {
                     errors ~= [copy ErrorMsg::note(decl.loc, format(ValidateErrorMessage::CANDIDATE_ARE, format("%::self %", left, decl.proto)),
@@ -513,11 +555,172 @@ pub mod TemplatePrototypeCallValidation {
             }
         }
 
-        if (mappers.len == 0us) {
+        if (mappers.len == 0us && partials.len == 0us) {
             throw copy ErrorMsg::fatal(loc, format(ValidateErrorMessage::NO_CTOR_FOUND, left), notes-> errors);
         }
 
-        return mappers;
+        return (mappers, partials, unresolved);
+    }
+
+    /**
+     * Validate a deferred construction, cf. DeferredCtorValue, the template parameters it leaves
+     * unresolved being inferred from the arguments as each of the methods `name` of the class
+     * would receive them, along with those inferred by its constructors.
+     *
+     * @params:
+     *   - context: validation context used for inference and call validation
+     *   - loc:     source location of the method call
+     *   - ctor:    the deferred construction
+     *   - name:    the name of the method called on the constructed value
+     *   - rights:  the arguments of the method call
+     *   - nbNamed: number of named arguments in the method call
+     *
+     * @returns:
+     *   - the construction (CtorCallValue) on the inferred specialization
+     *
+     * @throws:
+     *   - METHOD_LEAVES_TEMPLATE if the methods accepting the arguments leave some template parameters
+     *     unresolved, the construction being deferred only once
+     *   - NO_METHOD_INFERS if no method accepts the arguments, with a note per method
+     *   - the errors of the construction on the inferred specializations
+     */
+    pub fn validateDeferred(dmut context: &ValidationContext,
+                            loc:          &Word,
+                            ctor:         &DeferredCtorValue,
+                            name:         &Word,
+                            rights:       [&Value],
+                            nbNamed:      usize)-> &Value
+        throws ErrorMsg
+    {
+        let left = ctor.left;
+        let mut mappers: [TemplateMapper] = [];
+        let mut partials: [&ErrorMsg] = [];
+        let mut errors: [&ErrorMsg] = [];
+        if let cl: &TypeDecl = left.sym.decl.decl {
+            for method in TemplatePrototypeCallValidation::methodsNamed(cl.decls, name.str) {
+                let (templates, decl) = method;
+                {
+                    let allTemplates = left.sym.decl.params ~ templates;
+                    let argList = TemplatePrototypeCallValidation::validateParamDecls(alias context, left, decl.proto.params[1us .. $]);
+                    let (params, rest) = CallParamListCreation::validateParamListSort(loc, argList, rights,
+                                                                                      nbNamed-> nbNamed,
+                                                                                      isVariadic-> TemplatePrototypeCallValidation::hasVariadic(allTemplates));
+
+                    let solved = TemplateSolving::solveImplicitMethod(alias context, loc, left, allTemplates, decl,
+                                                                      rights-> (params ~ rest));
+                    let mut methodMapper = TemplateMapper();
+                    methodMapper:.merge(solved);
+                    for n in declaredTemplateNames(templates) {
+                        methodMapper:.remove(n);
+                    }
+
+                    let mut missing: [&Expression] = [];
+                    let mut solves = false;
+                    for partial in ctor.mappers {
+                        let mut mapper = TemplateMapper();
+                        mapper:.merge(partial);
+                        mapper:.merge(methodMapper);
+
+                        let unsolved = TemplateRewriting::rewriteTemplateParams(mapper, left.sym.decl.params);
+                        if (unsolved.len == 0us) {
+                            solves = true;
+                            TemplatePrototypeCallValidation::insertDistinct(ref mappers, mapper);
+                        } else if (missing.len == 0us) {
+                            missing = unsolved;
+                        }
+                    }
+
+                    if (!solves) {
+                        partials ~= [TemplatePrototypeCallValidation::createMethodNote(left, decl,
+                                                                                       copy [copy ErrorMsg::note(i.loc, format(ValidateErrorMessage::UNRESOLVED_TEMPLATE, i))
+                                                                                             for i in missing])];
+                    }
+                } catch {
+                    err: &ErrorMsg => {
+                        errors ~= [TemplatePrototypeCallValidation::createMethodNote(left, decl, copy [err])];
+                    }
+                }
+            }
+        }
+
+        if (mappers.len == 0us && partials.len != 0us) {
+            throw copy ErrorMsg::fatal(name, format(ValidateErrorMessage::METHOD_LEAVES_TEMPLATE, name.str, left),
+                                       notes-> partials ~ [copy ErrorMsg::note(ctor.loc, ValidateErrorMessage::DEFERRED_CTOR)]);
+        }
+
+        if (mappers.len == 0us) {
+            throw copy ErrorMsg::fatal(name, format(ValidateErrorMessage::NO_METHOD_INFERS, name.str, left,
+                                                    CallParamListCreation::formatParamsWithTypes(rights)),
+                                       notes-> errors);
+        }
+
+        let (call, _, _) = TemplatePrototypeCallValidation::validateSpecializations(alias context, ctor.loc, left, mappers, ctor.rights,
+                                                                                    nbNamed-> ctor.nbNamed,
+                                                                                    inCopy-> ctor.inCopy);
+        return call;
+    }
+
+    /**
+     * @returns: the note presenting the method `decl` of the class template `left` as a candidate, explained by `notes`
+     */
+    fn createMethodNote(left: &TemplateRefValue, decl: &FunctionDecl, notes: [&ErrorMsg])-> &ErrorMsg {
+        copy ErrorMsg::note(decl.loc, format(ValidateErrorMessage::CANDIDATE_ARE, format("%::% %", left, decl.name.str, decl.proto)),
+                            notes-> notes,
+                            oneLine-> true,
+                            withLoc-> true)
+    }
+
+    /**
+     * @returns: the methods named `name` among the declarations of a class, each with the
+     *           template parameters it declares of its own
+     */
+    fn methodsNamed(decls: [&Declaration], name: [c8])-> [([&Expression], &FunctionDecl)] {
+        let mut result: [([&Expression], &FunctionDecl)] = [];
+        for d in decls match d {
+            b: &BlockDecl => {
+                result ~= TemplatePrototypeCallValidation::methodsNamed(b.decls, name);
+            }
+            c: &CondBlockDecl => {
+                result ~= TemplatePrototypeCallValidation::methodsNamed(c.decls, name);
+                result ~= TemplatePrototypeCallValidation::methodsNamed(copy [c.else_], name);
+            }
+            i: &ImplDecl => {
+                result ~= TemplatePrototypeCallValidation::methodsNamed(i.decls, name);
+            }
+            CtorDecl() => {}
+            DtorDecl() => {}
+            f: &FunctionDecl => {
+                if (TemplatePrototypeCallValidation::isMethodNamed(f, name)) {
+                    let noTemplates: [&Expression] = [];
+                    result ~= [(noTemplates, f)];
+                }
+            }
+            t: &TemplateDecl => {
+                if let f: &FunctionDecl = t.decl && TemplatePrototypeCallValidation::isMethodNamed(f, name) {
+                    result ~= [(t.params, f)];
+                }
+            }
+        }
+
+        return result;
+    }
+
+    /**
+     * @returns: true iif the function is named `name` and takes a `self` parameter
+     */
+    fn isMethodNamed(f: &FunctionDecl, name: [c8])-> bool {
+        f.name.str == name && f.proto.params.len != 0us && f.proto.params[0us].name.str == Keys::SELF
+    }
+
+    /**
+     * Append `mapper` to `mappers` unless an equal one is already there
+     */
+    pub fn insertDistinct(ref mut mappers: [TemplateMapper], mapper: TemplateMapper) {
+        for m in mappers if (m == mapper) {
+            return;
+        }
+
+        mappers ~= [mapper];
     }
 
     /**
