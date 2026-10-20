@@ -9,6 +9,7 @@
  *   - sorts and matches call arguments against prototype parameters,
  *   - performs implicit template solving for call-site arguments,
  *   - finalizes function, method, and constructor prototypes,
+ *   - infers the template arguments of a class from its constructors,
  *   - computes call scores for overload resolution,
  *   - constructs call values(PrototypeCallValue, MethodCallValue, CtorCallValue),
  *   - handles candidate-mode error reporting for overload resolution.
@@ -47,10 +48,10 @@ in template_;
 
 use ymirc::errors;
 use ymirc::lexing::word;
-use ymirc::semantic::template_;
+use ymirc::semantic::{symbol, template_};
 use ymirc::semantic::generator::{type::_, value::_};
-use ymirc::syntax::expression::_;
-use ymirc::syntax::declaration::function;
+use ymirc::semantic::validator::value::operator::call::multsym;
+use ymirc::syntax::{declaration, declaration::_, expression::_};
 use ymirc::utils::format;
 
 
@@ -341,6 +342,266 @@ pub mod TemplatePrototypeCallValidation {
                                           withLoc-> true);
             }
         }
+    }
+
+    /**
+     * Validate the construction of a template class whose template arguments are not given,
+     * inferring them from the arguments as each of its unnamed constructors would receive them.
+     * The construction is then validated on every specialization so inferred, and the one
+     * accepting the arguments with the best score is kept.
+     *
+     * @params:
+     *   - context:   validation context used for inference and call validation
+     *   - loc:       source location of the call
+     *   - left:      TemplateRefValue representing the class template reference
+     *   - cl:        the type declaration of the class template
+     *   - rights:    list of argument values
+     *   - nbNamed:   number of named arguments in the call
+     *   - candidate: whether the call is being validated as an overload candidate
+     *   - inCopy:    whether the call occurs inside a copy expression
+     *
+     * @returns:
+     *   - (&Value, TemplateMapper, u32):
+     *        * call value (CtorCallValue) on the inferred specialization,
+     *        * mapper of the specialization,
+     *        * call score for overload resolution
+     *
+     * @throws:
+     *   - NO_CTOR_FOUND if no unnamed constructor infers every template parameter
+     *   - WORKS_WITH_BOTH if several specializations accept the arguments with the same score
+     *   - candidate-mode diagnostics if candidate = true
+     */
+    pub fn validateClass(dmut context: &ValidationContext,
+                         loc:          &Word,
+                         left:         &TemplateRefValue,
+                         cl:           &TypeDecl,
+                         rights:       [&Value],
+                         nbNamed:      usize,
+                         candidate:    bool = false,
+                         inCopy:       bool = false)-> (&Value, TemplateMapper, u32)
+        throws ErrorMsg
+    {
+        {
+            let mappers = TemplatePrototypeCallValidation::inferClassMappers(alias context, loc, left, cl, rights,
+                                                                             nbNamed-> nbNamed);
+
+            let mut results: [(&Value, TemplateMapper, u32)] = [];
+            let mut errors: [&ErrorMsg] = [];
+            let mut highestScore = 0u32;
+            for mapper in mappers {
+                {
+                    let (call, score) = TemplatePrototypeCallValidation::validateSpecializedCtor(alias context, loc, left, mapper, rights,
+                                                                                                 nbNamed-> nbNamed,
+                                                                                                 inCopy-> inCopy);
+
+                    let finalScore = score + mapper.score;
+                    if (finalScore > highestScore) {
+                        highestScore = finalScore;
+                        results = copy [(call, mapper, finalScore)];
+                    } else if (finalScore == highestScore) {
+                        results ~= [(call, mapper, finalScore)];
+                    }
+                } catch {
+                    err: &ErrorMsg => {
+                        errors ~= [err.withNote(copy [copy ErrorMsg::note(loc, format(ValidateErrorMessage::TEMPLATE_SPE, mapper),
+                                                                          oneLine-> true)])];
+                    }
+                }
+            }
+
+            if (results.len == 0us) {
+                if (errors.len == 1us) throw errors[0];
+                throw copy ErrorMsg::list(errors);
+            }
+
+            if (results.len != 1us) {
+                let mut notes: [&ErrorMsg] = [];
+                for r in results {
+                    let ctor: &Value = match r._0 {
+                        c: &CtorCallValue => { c.delegate.proto }
+                        _ => { left }
+                    };
+
+                    notes ~= [copy ErrorMsg::note(ctor.loc, format(ValidateErrorMessage::CANDIDATE_ARE, CallParamListCreation::formatPrettyName(ctor)),
+                                                  oneLine-> true,
+                                                  withLoc-> true,
+                                                  notes-> copy [copy ErrorMsg::note(ctor.loc, format(ValidateErrorMessage::TEMPLATE_SPE, r._1),
+                                                                                    oneLine-> true)])];
+                }
+
+                throw copy ErrorMsg::fatal(loc, format(ValidateErrorMessage::WORKS_WITH_BOTH, CallParamListCreation::formatPrettyName(left), rights),
+                                           notes-> notes);
+            }
+
+            return results[0];
+        } catch {
+            err: &ErrorMsg => {
+                if (!candidate) throw err;
+                throw copy ErrorMsg::note(left.loc, format(ValidateErrorMessage::CANDIDATE_ARE, CallParamListCreation::formatPrettyName(left)),
+                                          notes-> copy [err],
+                                          oneLine-> true,
+                                          withLoc-> true);
+            }
+        }
+    }
+
+    /**
+     * Infer the template arguments of a class from the arguments given to each of its unnamed
+     * constructors, as if the constructor was a template declaring the parameters of the
+     * class before its own.
+     *
+     * @params:
+     *   - context: validation context used for template solving
+     *   - loc:     source location of the call
+     *   - left:    TemplateRefValue representing the class template reference
+     *   - cl:      the type declaration of the class template
+     *   - rights:  list of argument values
+     *   - nbNamed: number of named arguments in the call
+     *
+     * @returns:
+     *   - [TemplateMapper]: the distinct mappers binding every template parameter of the class
+     *
+     * @throws:
+     *   - NO_CTOR_FOUND if no constructor infers them, with a note per constructor
+     */
+    fn inferClassMappers(dmut context: &ValidationContext,
+                         loc:          &Word,
+                         left:         &TemplateRefValue,
+                         cl:           &TypeDecl,
+                         rights:       [&Value],
+                         nbNamed:      usize)-> [TemplateMapper]
+        throws ErrorMsg
+    {
+        let mut mappers: [TemplateMapper] = [];
+        let mut errors: [&ErrorMsg] = [];
+        for ctor in TemplatePrototypeCallValidation::unnamedCtors(cl.decls) {
+            let (templates, decl) = ctor;
+            {
+                let allTemplates = left.sym.decl.params ~ templates;
+                let argList = TemplatePrototypeCallValidation::validateParamDecls(alias context, left, decl.proto.params);
+                let (params, rest) = CallParamListCreation::validateParamListSort(loc, argList, rights,
+                                                                                  nbNamed-> nbNamed,
+                                                                                  isVariadic-> TemplatePrototypeCallValidation::hasVariadic(allTemplates));
+
+                let solved = TemplateSolving::solveImplicitCtor(alias context, loc, left, allTemplates, decl,
+                                                                rights-> (params ~ rest));
+                let mut mapper = TemplateMapper();
+                mapper:.merge(solved);
+                for name in declaredTemplateNames(templates) {
+                    mapper:.remove(name);
+                }
+
+                let unresolved = TemplateRewriting::rewriteTemplateParams(mapper, left.sym.decl.params);
+                if (unresolved.len != 0us) {
+                    throw copy ErrorMsg::list(copy [copy ErrorMsg::fatal(i.loc, format(ValidateErrorMessage::UNRESOLVED_TEMPLATE, i))
+                                                    for i in unresolved]);
+                }
+
+                let mut known = false;
+                for m in mappers if (m == mapper) {
+                    known = true;
+                }
+
+                if (!known) mappers ~= [mapper];
+            } catch {
+                err: &ErrorMsg => {
+                    errors ~= [copy ErrorMsg::note(decl.loc, format(ValidateErrorMessage::CANDIDATE_ARE, format("%::self %", left, decl.proto)),
+                                                   notes-> copy [err],
+                                                   oneLine-> true,
+                                                   withLoc-> true)];
+                }
+            }
+        }
+
+        if (mappers.len == 0us) {
+            throw copy ErrorMsg::fatal(loc, format(ValidateErrorMessage::NO_CTOR_FOUND, left), notes-> errors);
+        }
+
+        return mappers;
+    }
+
+    /**
+     * Validate a construction on the specialization of a class template.
+     *
+     * @params:
+     *   - context: validation context used for declaration and call validation
+     *   - loc:     source location of the call
+     *   - left:    TemplateRefValue representing the class template reference
+     *   - mapper:  the template arguments of the specialization
+     *   - rights:  list of argument values
+     *   - nbNamed: number of named arguments in the call
+     *   - inCopy:  whether the call occurs inside a copy expression
+     *
+     * @returns:
+     *   - (&Value, u32): the construction and its score
+     *
+     * @throws:
+     *   - TEMPLATE_SPECIALIZATION_FAILS if the specialization cannot be declared
+     *   - UNDEFINED_CALL_OP if none of its constructors accepts the arguments
+     */
+    fn validateSpecializedCtor(dmut context: &ValidationContext,
+                               loc:          &Word,
+                               left:         &TemplateRefValue,
+                               mapper:       TemplateMapper,
+                               rights:       [&Value],
+                               nbNamed:      usize,
+                               inCopy:       bool)-> (&Value, u32)
+        throws ErrorMsg
+    {
+        let mut syms: [dmut &Symbol] = [];
+        syms ~= [alias TemplateDeclaration::declare(alias context, loc, mapper, left)];
+
+        let ctors = VariableValidation::validateMultSymbols(alias context, loc, alias syms);
+        let value: &MultSymValue = match ctors {
+            m: &MultSymValue => { m }
+            c: _ => { copy MultSymValue(c.loc, copy [c], prettyStr-> format("%", c)) }
+        };
+
+        return MultSymCallValidation::validate(alias context, loc, value, rights,
+                                               nbNamed-> nbNamed,
+                                               inCopy-> inCopy);
+    }
+
+    /**
+     * @returns: true iif one of the template parameters is variadic, the only kind that can
+     *           receive more arguments than a prototype declares parameters
+     */
+    fn hasVariadic(templates: [&Expression])-> bool {
+        for t in templates if (t of TemplateVariadicVarExpr) {
+            return true;
+        }
+
+        return false;
+    }
+
+    /**
+     * @returns: the unnamed constructors among the declarations of a class, each with the
+     *           template parameters it declares of its own
+     */
+    fn unnamedCtors(decls: [&Declaration])-> [([&Expression], &CtorDecl)] {
+        let mut result: [([&Expression], &CtorDecl)] = [];
+        for d in decls match d {
+            b: &BlockDecl => {
+                result ~= TemplatePrototypeCallValidation::unnamedCtors(b.decls);
+            }
+            c: &CondBlockDecl => {
+                result ~= TemplatePrototypeCallValidation::unnamedCtors(c.decls);
+                result ~= TemplatePrototypeCallValidation::unnamedCtors(copy [c.else_]);
+            }
+            c: &CtorDecl => {
+                if (c.name.isEof) {
+                    let noTemplates: [&Expression] = [];
+                    result ~= [(noTemplates, c)];
+                }
+            }
+            t: &TemplateDecl => {
+                if let c: &CtorDecl = t.decl && c.name.isEof {
+                    result ~= [(t.params, c)];
+                }
+            }
+        }
+
+        return result;
     }
 
     /**
