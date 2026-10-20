@@ -48,6 +48,7 @@ in context;
 
 use ymirc::errors;
 use ymirc::errors::diagnostic;
+use ymirc::errors::snippet::suggestion;
 use ymirc::lexing::{keys, word};
 use ymirc::semantic::{declarator, index, interpret, symbol};
 use ymirc::semantic::generator;
@@ -931,7 +932,7 @@ pub class ValidationContext {
      *    - .1: true if the current context allows to access the protected elements of clRef type
      */
     pub fn getCurrentClassReferentProtections(self, clRef: &ClassRefType)-> (bool, bool) {
-        let mut current = self.getCurrentClassReferent();
+        let current = self.getCurrentClassReferent();
         match current {
             cl: &ClassRefType => {
                 if (cl == clRef) return (true, true); // We are in the class definition(a method, a ctor, etc.)
@@ -1417,7 +1418,8 @@ pub class ValidationContext {
      * to the end of that statement, cf. exitUnusedCollect, so they do not discard the
      * value the scope produced
      * @throws:
-     *   - &ErrorMsg: if a symbol was declared but unused and warnUnused
+     *   - &ErrorMsg: if a symbol was declared but unused, or more mutable than its
+     *     mutations need, and warnUnused
      */
     pub fn quitBlock(mut self, warnUnused: bool = true)
         throws ErrorMsg
@@ -1429,6 +1431,8 @@ pub class ValidationContext {
 
         let mut errors: [&ErrorMsg] = [];
 
+        // the mutations of a variable a macro declares depend on the expansion
+        let inMacro = self._macroReferent.back !of EmptySymbol;
         let used = self._usedSyms.back.back;
         for name, g in self._symbols.back.back.content {
             if let v: &VarDeclValue = g && v.varType of DeferredClassType {
@@ -1446,6 +1450,10 @@ pub class ValidationContext {
                 if error {
                     errors ~= [copy ErrorMsg::warn(g.loc, format(ValidateErrorMessage::DECLARED_NOT_USED, name))];
                 }
+            } else if let v: &VarDeclValue = g && (!v.mutLoc.isEof && !inMacro) {
+                if let Ok(warn) = self.createUnmutatedWarning(name, v, used) {
+                    errors ~= [warn];
+                }
             }
         }
 
@@ -1462,6 +1470,80 @@ pub class ValidationContext {
             }
 
             throw copy ErrorMsg::list(fatals);
+        }
+    }
+
+    /**
+     * @params:
+     *   - name: the name of the variable
+     *   - decl: its declaration
+     *   - used: the uses of the scope declaring it
+     * @returns: the warning of a variable declaring more mutability than its mutations
+     *           consume, none if they consume all of it
+     */
+    fn createUnmutatedWarning(self, name: [c8], decl: &VarDeclValue, used: &UsedVars)-> (&ErrorMsg)? {
+        let enough = decl.varType.clone(1u32);
+        let declared = if (!decl.varType.isMutable) {
+            MutabilityLevel::NONE
+        } else if (!decl.varType.sameMutability(enough)) {
+            MutabilityLevel::DEEP
+        } else {
+            MutabilityLevel::OUTER
+        };
+
+        let mut consumed = if let Ok(l) = used.mutated[name] { l } else { MutabilityLevel::NONE };
+        if (consumed >= declared) return none;
+
+        let required = self.requiredMutability(decl);
+        if (required > consumed) consumed = required;
+        if (consumed >= declared) return none;
+
+        if (consumed == MutabilityLevel::NONE) {
+            // `mut` keeps a variable initialized by a literal from being folded at compile time
+            if (decl.value.isFullLiteral) return none;
+
+            return (copy ErrorMsg::warn(decl.mutLoc, format(ValidateErrorMessage::DECLARED_MUT_NOT_MUTATED, name)))?;
+        }
+
+        // a reference keeps the mutability of what it refers to
+        if (decl.isReference) return none;
+
+        let warn = copy ErrorMsg::warn(decl.mutLoc, format(ValidateErrorMessage::DECLARED_DMUT_NOT_MUTATED, name, decl.varType, enough));
+        if (decl.mutLoc == Keys::DMUTABLE) {
+            return warn.withFix(Edit(decl.mutLoc, replacement-> Keys::MUTABLE, len-> decl.mutLoc.len,
+                                     msg-> format(ValidateErrorMessage::DECLARED_DMUT_NOT_MUTATED_NOTE)))?;
+        }
+
+        warn?
+    }
+
+    /**
+     * @params:
+     *   - decl: the declaration of a variable
+     * @returns: the mutability the initial value of `decl` requires, e.g. an alias is
+     *           stored as mutable as the data it borrows
+     */
+    fn requiredMutability(self, decl: &VarDeclValue)-> MutabilityLevel {
+        if (self.fitsMutability(decl, 0u32)) return MutabilityLevel::NONE;
+        if (self.fitsMutability(decl, 1u32)) return MutabilityLevel::OUTER;
+        MutabilityLevel::DEEP
+    }
+
+    /**
+     * @params:
+     *   - decl:  the declaration of a variable
+     *   - level: the mutability level the type of the variable is restricted to
+     * @returns: true iff the initial value of `decl` can be stored in that restricted type
+     */
+    fn fitsMutability(self, decl: &VarDeclValue, level: u32)-> bool {
+        {
+            MemoryVerification::verifyMemoryOwner(decl.loc, decl.varType.clone(level), decl.value,
+                                                  construct-> true,
+                                                  byReference-> decl.isReference,
+                                                  byLazy-> decl.isLazy);
+            true
+        } catch {
+            _ => { false }
         }
     }
 
@@ -1787,6 +1869,51 @@ pub class ValidationContext {
     }
 
     /**
+     * Record the mutation of `value`, raising the mutability consumed by the local
+     * variable of the current frame it is a part of
+     * @params:
+     *   - value: the mutated value
+     *   - whole: true iff the value is handed out(alias, ref, address, move), which
+     *            consumes all the mutability its variable declares
+     */
+    pub fn consumeMutability(mut self, value: &Value, whole: bool = false) {
+        match value {
+            t: &TupleValue => { for v in t.values { self:.consumeMutability(v, whole-> whole); } return; }
+            a: &ArrayValue => { for v in a.values { self:.consumeMutability(v, whole-> whole); } return; }
+        }
+
+        let (root, inner) = VariableVerification::rootVariable(value);
+        let var = if let Ok(r) = root { r } else { return; };
+        if (self._symbols.len == 0us) return;
+
+        let level = if (whole || inner) { MutabilityLevel::DEEP } else { MutabilityLevel::OUTER };
+        let name = var.declLoc.str;
+        for i in 0 .. self._symbols.back.len {
+            if let Ok(g) = self._symbols.back[i].content[name] {
+                if (g.uniqId != var.refId) return;
+                if let Ok(old) = self._usedSyms.back[i].mutated[name] && old >= level { return; }
+
+                self._usedSyms.back:[i].mutated[name] = level;
+                return;
+            }
+        }
+    }
+
+    /**
+     * Record that a part of the current frame is left unvalidated, e.g. the branch a
+     * cte conditional does not take: the mutations it may hold consume all the
+     * mutability of the variables it sees
+     */
+    pub fn consumeAllMutability(mut self) {
+        if (self._symbols.len == 0us) return;
+        for i in 0 .. self._symbols.back.len {
+            for name, _ in self._symbols.back[i].content {
+                self._usedSyms.back:[i].mutated[name] = MutabilityLevel::DEEP;
+            }
+        }
+    }
+
+    /**
      * Force the variable declared locally to be put inside the closure
      * @params:
      *   - name: the name of the variable to put in the closure
@@ -1867,6 +1994,7 @@ pub class ValidationContext {
             if let Ok(g) = syms[i].content[name] {
                 let value = self.enclose(loc, g);
                 closureType.used:[i].content[name] = EOF_WORD; // set as used in the upper frame
+                closureType.used:[i].mutated[name] = MutabilityLevel::DEEP;
 
                 return self:.insertInClosure(loc, name, value, oldRef, level, frame)?;
             }
@@ -1954,6 +2082,7 @@ pub class ValidationContext {
         closureType:.insert(name, type, UNIT_VALUE, byReference);
         for i in 0 .. syms.len if let Ok(_) = syms[i].content[name] { // Mark the var as used
             closureType.used:[i].content[name] = EOF_WORD;
+            closureType.used:[i].mutated[name] = MutabilityLevel::DEEP;
             break;
         }
 
@@ -2151,7 +2280,7 @@ pub class ValidationContext {
         else {
             let dmut lst = self._referent.back.getCloseSymbols(name, distance);
             if self._macroReferent.back !of EmptySymbol {
-                let dmut lst2 = self._macroReferent.back.getCloseSymbols(name, distance);
+                let lst2 = self._macroReferent.back.getCloseSymbols(name, distance);
                 for z in lst2[] {
                     lst:.insert(z);
                 }
