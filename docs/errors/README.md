@@ -24,8 +24,8 @@ check lives:
 | Range | Stage | Catalogue | Live codes |
 |---|---|---|---|
 | `E1xxx` | lexing | `LexingErrorMessage` -- `src/ymirc/lexing/errors.yr` | 24 |
-| `E2xxx` | parsing | `SyntaxErrorMessage` -- `src/ymirc/syntax/errors.yr` | 15 |
-| `E3xxx` | declaration | `DeclareErrorMessage` -- `src/ymirc/semantic/declarator/errors.yr` | 35 |
+| `E2xxx` | parsing | `SyntaxErrorMessage` -- `src/ymirc/syntax/errors.yr` | 17 |
+| `E3xxx` | declaration | `DeclareErrorMessage` -- `src/ymirc/semantic/declarator/errors.yr` | 36 |
 | `E4xxx` | validation | `ValidateErrorMessage` -- `src/ymirc/semantic/validator/errors.yr` | 272 |
 | `E5xxx` | lowering (YIL) | `SerializeYILErrorMessage` -- `src/ymirc/lint/serialize/errors.yr`, `OptimizerErrorMessage` -- `src/ymirc/lint/optimizer/errors.yr` | 11 |
 
@@ -86,6 +86,8 @@ deliberately carry no code, and have no page here.
 | [E2017](E2017.md) | `ARM_COMMA` | a comma only ends an arm whose value is a simple expression, neither a block nor a statement |
 | [E2018](E2018.md) | `FOR_FILTER_ELSE` | the filter of a for loop cannot have an else branch |
 | [E2019](E2019.md) | `MOD_WITHOUT_ROOT` | module <> is declared neither a child nor a sibling |
+| [E2020](E2020.md) | `EMPTY_TAG_LIST` | a tag list names at least one tag |
+| [E2021](E2021.md) | `UNEXPECTED_TAGS` | unexpected tag list <> |
 
 ## E3xxx -- declaration
 
@@ -126,6 +128,7 @@ deliberately carry no code, and have no page here.
 | [E3041](E3041.md) | `UNDEFINED_ATTRIBUTE_FOR_MODULE` | custom attribute <> is not valid on modules |
 | [E3042](E3042.md) | `UNDEFINED_ATTRIBUTE_FOR_ENTITY` | custom attribute <> is not valid on entities |
 | [E3043](E3043.md) | `COMPANION_WITHOUT_TYPE` | the companion module <> is not named after a class, a record or an entity of module <> |
+| [E3044](E3044.md) | `NOT_SUPPORTED_IN` | not supported in version ymir <> |
 
 ## E4xxx -- validation
 
