@@ -1,0 +1,253 @@
+/*
+ * Syntax visitor of tag declarations.
+ *
+ * <hr>
+ *
+ * @Package: ymirc
+ * @Module: ymirc::syntax::visitor::tag
+ * @File: ymirc/syntax/visitor/tag.yr
+ * @Author(s):
+ *   - Emile Cadorel <ecadorel@gmail.com>
+ *
+ * @Created(YYYY-MM-DD): 2026-10-21
+ * @Copyright(C) 2021–2026 GNU-Ymir
+ * @License
+ *   ```text
+ *   This file is part of the Ymir language project.
+ *
+ *   Ymir is free software: you can redistribute it and/or modify it
+ *   under the terms of the GNU General Public License as published by
+ *   the Free Software Foundation, either version 3 of the License, or
+ *   (at your option) any later version.
+ *
+ *   Ymir is distributed in the hope that it will be useful,
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *   GNU General Public License for more details.
+ *
+ *   You should have received a copy of the GNU General Public License
+ *   along with Ymir.  If not, see <https://www.gnu.org/licenses/>.
+ *   ```
+ */
+
+in tag;
+
+use ymirc::errors;
+use ymirc::lexing::{keys, tokens, word};
+use ymirc::syntax::{_, declaration::_, visitor::_, visitor::special};
+use ymirc::syntax::expression::empty;
+use ymirc::utils::format;
+
+pub mod TagVisitor {
+
+    /**
+     * Read a tag declaration, introduced by the keyword `tag`
+     *
+     * @params:
+     *    - context: the context of the reading
+     *    - loc:     the location of the `tag` keyword
+     *    - comm:    the comment above the tag
+     *
+     * @grammar
+     * ```
+     * TagDecl:=
+     *    'tag' Identifier TagParams? '{' TagDeclTop* '}'
+     *
+     * TagParams:=
+     *    '(' ParamList? ')'
+     *
+     * TagDeclTop:=
+     *      Attributes? ProtectionKw '{' (Attributes? TagDeclaration)* '}'
+     *    | Attributes? ProtectionKw TagDeclaration
+     *    | Attributes? TagDeclaration
+     *
+     * TagDeclaration:=
+     *      TagCtor
+     *    | GlobalVarDecl
+     *    | FunctionDecl
+     *    | TypeDecl
+     *    | EnumDecl
+     *    | UnionDecl
+     *
+     * TagCtor:=
+     *    'self' (TemplateTest? TemplateParams)? '(' ParamList? ')' Throwers? Block(withGuards = true)
+     * ```
+     * */
+    pub fn read(dmut context: &SyntaxVisitor, loc: &Word, comm: [c8])-> &Declaration
+        throws ErrorMsg
+    {
+        let (name, _) = context:.readIdentifier();
+        let proto = if (context.peekToken() == Tokens::LPAR) {
+            TypeVisitor::readCtorPrototype(alias context)
+        } else {
+            FunctionPrototype([], EMPTY_EXPR, false)
+        };
+
+        let (open, _) = context:.readTokens(Tokens::LACC);
+        let decls = TagVisitor::readBlock(alias context, open, protected-> false);
+
+        copy TagDecl(loc-> loc, comm-> comm, name-> name, proto-> proto, decls-> decls)
+    }
+
+    /**
+     * Read the declarations of a tag up to the '}' closing them
+     *
+     * @params:
+     *    - context:   the context of the reading
+     *    - loc:       the location of the '{' opening the block
+     *    - protected: true iif the block is opened by a protection, and cannot hold another one
+     *
+     * @grammar: cf. `TagVisitor::read`
+     * */
+    fn readBlock(dmut context: &SyntaxVisitor, loc: &Word, protected: bool)-> [&Declaration]
+        throws ErrorMsg
+    {
+        let mut decls: [&Declaration] = [];
+        {
+            loop {
+                let (attrLoc, attrs, attrComm) = context:.readAttributes();
+                let (tok, tokComm) = context:.readToken();
+                match tok {
+                    Keys::PRIVATE | Keys::PUBLIC if !protected => {
+                        decls ~= [TagVisitor::readProtectionBlock(alias context, tok, attrComm ~ tokComm, attrs-> (attrLoc, attrs))];
+                    }
+                    Tokens::RACC => {
+                        context.checkNoAttributes(tok, attrLoc, attrs);
+                        break;
+                    }
+                    _ => {
+                        if tok.isEof {
+                            throw copy ErrorMsg::fatal(loc.spanTo(tok), SyntaxErrorMessage::BLOCK_NEVER_CLOSED);
+                        }
+
+                        decls ~= [TagVisitor::readDeclaration(alias context, tok, attrComm ~ tokComm, attrs-> (attrLoc, attrs), protected-> protected)];
+                    }
+                }
+            }
+        } catch {
+            err => {
+                throw copy ErrorMsg::note(loc, SyntaxErrorMessage::IN_DECL_BLOCK, notes-> copy [err]);
+            }
+        }
+
+        decls
+    }
+
+    /**
+     * Read the declarations of a tag a protection keyword applies to
+     *
+     * @params:
+     *    - context: the context of the reading
+     *    - loc:     the location of the `pub` or `prv` keyword
+     *    - comm:    the comments above the protection
+     *    - attrs:   the attributes above the protection
+     *
+     * @grammar: cf. `TagVisitor::read`
+     * */
+    fn readProtectionBlock(dmut context: &SyntaxVisitor, loc: &Word, comm: [c8], attrs: (&Word, [AttributeWord]))-> &BlockDecl
+        throws ErrorMsg
+    {
+        let protection = block::toProtection(loc.str);
+        let (tok, tokComm) = context:.readToken();
+        if (tok == Tokens::LACC) {
+            context.checkNoAttributes(tok, attrs._0, attrs._1);
+            return copy BlockDecl(loc-> loc,
+                                  comm-> comm,
+                                  decls-> TagVisitor::readBlock(alias context, tok, protected-> true),
+                                  protection-> protection,
+                                  isSet-> false);
+        }
+
+        copy BlockDecl(loc-> loc,
+                       comm-> "",
+                       decls-> copy [TagVisitor::readDeclaration(alias context, tok, comm ~ tokComm, attrs-> attrs, protected-> true)],
+                       protection-> protection,
+                       isSet-> false)
+    }
+
+    /**
+     * Read a declaration of a tag
+     *
+     * @params:
+     *    - context:   the context of the reading
+     *    - tok:       the token introducing the declaration
+     *    - comm:      the comments above the declaration
+     *    - attrs:     the attributes above the declaration
+     *    - protected: true iif a protection keyword was read before the declaration
+     *
+     * @grammar: cf. `TagVisitor::read`
+     * */
+    fn readDeclaration(dmut context: &SyntaxVisitor, tok: &Word, comm: [c8], attrs: (&Word, [AttributeWord]), protected: bool)-> &Declaration
+        throws ErrorMsg
+    {
+        let expected = if (protected) { __SPECIAL_TAG__.tagDeclProtected } else { __SPECIAL_TAG__.tagDeclTop };
+        if (tok == Keys::SELF) {
+            return TagVisitor::readCtor(alias context, tok, comm, attrs-> attrs._1);
+        }
+
+        for k in expected if tok == k {
+            return GlobalVisitor::readDeclaration(alias context, tok, comm, tags-> (EOF_WORD, []), attrs-> attrs, expected-> expected);
+        }
+
+        context.checkNotTagList(tok, placement-> false);
+        throw copy ErrorMsg::fatal(tok, format(SyntaxErrorMessage::UNEXPECTED_BUT_LST, tok.name, expected));
+    }
+
+    /**
+     * Read a tag ctor, the code run once per tag site at program start
+     *
+     * @params:
+     *    - context: the context of the reading
+     *    - loc:     the location of the `self` keyword
+     *    - comm:    the comments above the ctor
+     *    - attrs:   the attributes above the ctor
+     *
+     * @grammar: cf. `TagVisitor::read`
+     * */
+    fn readCtor(dmut context: &SyntaxVisitor, loc: &Word, comm: [c8], attrs: [AttributeWord])-> &Declaration
+        throws ErrorMsg
+    {
+        if (context.peekToken() == Tokens::LPAR) {
+            return TagVisitor::readCtorContent(alias context, loc, comm, attrs);
+        }
+
+        let (ifLoc, test) = context:.readTemplateTest();
+        let templates = context:.readTemplateParameters(ifLoc-> ifLoc);
+        let ctor = TagVisitor::readCtorContent(alias context, loc, comm, attrs);
+
+        copy TemplateDecl(loc, comm, guard-> test, params-> templates, decl-> ctor)
+    }
+
+    /**
+     * Read the parameters, throwers and body of a tag ctor
+     *
+     * @params:
+     *    - context: the context of the reading
+     *    - loc:     the location of the `self` keyword
+     *    - comm:    the comments above the ctor
+     *    - attrs:   the attributes above the ctor
+     *
+     * @grammar: cf. `TagVisitor::read`
+     * */
+    fn readCtorContent(dmut context: &SyntaxVisitor, loc: &Word, comm: [c8], attrs: [AttributeWord])-> &CtorDecl
+        throws ErrorMsg
+    {
+        let proto = TypeVisitor::readCtorPrototype(alias context);
+        let (throwLoc, throwers) = TypeVisitor::readCtorThrowers(alias context);
+
+        let (open, _) = context:.readTokens(Tokens::LACC);
+        let body = ExpressionVisitor::readBlock(alias context, open, withGuards-> true);
+
+        copy CtorDecl(loc-> loc,
+                      comm-> comm,
+                      rename-> EOF_WORD,
+                      proto-> proto,
+                      body-> body,
+                      redirect-> none,
+                      fields-> [],
+                      throwerLoc-> throwLoc,
+                      throwers-> throwers,
+                      attrs-> attrs)
+    }
+
+}

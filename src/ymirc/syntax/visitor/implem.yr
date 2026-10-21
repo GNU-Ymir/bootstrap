@@ -75,6 +75,26 @@ pub fn readSource(path: Path)-> [c8]
 }
 
 /**
+ * @returns: true iif `tok` is a list of tags, `#[...]`, `#(...)` or `#{...}` read as one word by the lexer
+ * */
+pub fn isTagList(tok: &Word)-> bool {
+    if let str: &StringWord = tok match str.open {
+        Tokens::MACRO_ACC | Tokens::MACRO_PAR | Tokens::MACRO_CRO => { return true; }
+    }
+
+    false
+}
+
+/**
+ * @returns: the word locating where `tok` starts, the opening bracket of a list
+ * of tags, whose word is placed at its content
+ * */
+pub fn wordStart(tok: &Word)-> &Word {
+    if let str: &StringWord = tok && isTagList(str) return str.open;
+    tok
+}
+
+/**
  * The syntax visitor class is the class used to transform a text content into an analyzable syntax tree
  * The syntax visitor will validated the content of the source code, but only at a syntaxic level
  */
@@ -425,6 +445,168 @@ pub class SyntaxVisitor {
         }
 
         args
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ======================================          TAGS          ======================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Throw a syntax error if there are tags in a wrong position(i.e. !tagLoc.isEof)
+     *
+     * @params:
+     *    - loc:    the location of the declaration that cannot have tags
+     *    - tagLoc: the location of the tags(or EOF if not read)
+     *    - tags:   the list of read tags
+     * */
+    pub fn checkNoTags(self, loc: &Word, tagLoc: &Word, tags: [&Expression])
+        throws ErrorMsg
+    {
+        if (tagLoc.isEof) return;
+
+        let mut notes: [&ErrorMsg] = [];
+        if !loc.isEof {
+            notes = copy [copy ErrorMsg::note(loc, "")];
+        }
+
+        throw copy ErrorMsg::fatal(tagLoc, format(SyntaxErrorMessage::UNEXPECTED_TAGS, tags), notes-> notes);
+    }
+
+    /**
+     * Throw a syntax error if `tok`, read where a declaration was expected, is a list of tags
+     *
+     * @params:
+     *    - tok:       the token read instead of a declaration
+     *    - placement: true iif the declaration could have taken tags, written before what was read already
+     * */
+    pub fn checkNotTagList(self, tok: &Word, placement: bool)
+        throws ErrorMsg
+    {
+        if let str: &StringWord = tok && isTagList(str) {
+            let notes = if (placement) {
+                copy [copy ErrorMsg::note(EOF_WORD, format(SyntaxErrorMessage::TAGS_PLACEMENT), oneLine-> true)]
+            } else { [] };
+
+            throw copy ErrorMsg::fatal(str.open, format(SyntaxErrorMessage::UNEXPECTED_TAGS, copy [str.str]), notes-> notes);
+        }
+    }
+
+    /**
+     * Read the lists of tags written before a declaration, `#[a] #[b]` being
+     * read as `#[a, b]`. If no list is read, an empty list is returned
+     *
+     * A malformed list is recovered from, the declaration it is written before
+     * being read as if it were not there.
+     *
+     * @grammar
+     * ```
+     * TagLists:=
+     *    TagList*
+     *
+     * TagList:=
+     *    ('#[' | '#(' | '#{') Tag(',' Tag)* (']' | ')' | '}')
+     *
+     * Tag:=
+     *    Identifier('::' Identifier)* ArgumentList(withNamed = true)?
+     * ```
+     *
+     * @returns:
+     *   - .0: the location of the first tag list(or EOF if nothing read)
+     *   - .1: the tags read
+     *   - .2: the comments on top of the tag lists
+     * */
+    pub fn readTags(mut self)-> (&Word, [&Expression], [c8])
+        throws ErrorMsg
+    {
+        let mut loc = EOF_WORD;
+        let mut tags: [&Expression] = [];
+        let mut comm = "";
+        while let str: &StringWord = self.peekToken() && isTagList(str) {
+            let (_, listComm) = self:.readToken();
+            if (loc.isEof) loc = str.open;
+            comm ~= listComm;
+
+            {
+                tags ~= self.readTagList(str);
+            } catch {
+                err => { self:.recordError(err); }
+            }
+        }
+
+        (loc, tags, comm)
+    }
+
+    /**
+     * Read the tags of a tag list, from the file it is written in so their
+     * locations are the ones of the file. The closing bracket is read along
+     * with them, so a list ending too early is located at it
+     *
+     * @params:
+     *    - list: the word of the tag list, as read by the lexer
+     *
+     * @returns: the tags of the list
+     * */
+    fn readTagList(self, list: &StringWord)-> [&Expression]
+        throws ErrorMsg
+    {
+        let open = list.open;
+        let close = list.close.str;
+        let start = open.seek + open.str.len;
+        let end = list.close.seek; // the closing word is placed past the bracket
+
+        let dmut visitor = if (start + close.len <= end && end <= open.fileContent.len) {
+            copy SyntaxVisitor::fromStr(open.filename, open.fileContent[0us .. end],
+                                        fileContent-> open.fileContent,
+                                        line-> open.line, col-> open.col + cast!u64(open.str.len),
+                                        seek-> start, lineSeek-> open.lineSeek)
+        } else { // not read from a file, the content is all there is to parse
+            copy SyntaxVisitor::fromStr(open.filename, list.str ~ close)
+        };
+
+        if (visitor.peekToken() == close) {
+            throw copy ErrorMsg::fatal(open, SyntaxErrorMessage::EMPTY_TAG_LIST);
+        }
+
+        let mut tags: [&Expression] = [];
+        loop {
+            tags ~= [visitor:.readTag()];
+            let (next, _) = visitor:.readTokens(Tokens::COMA, close);
+            if (next == close) break;
+        }
+
+        tags
+    }
+
+    /**
+     * Read a tag of a tag list, its path and the arguments constructing it
+     *
+     * @grammar: cf. `self.readTags`
+     *
+     * @returns: the path of the tag, or the call of that path
+     * */
+    fn readTag(mut self)-> &Expression
+        throws ErrorMsg
+    {
+        let (fst, _) = self:.readIdentifier();
+        let mut path: &Expression = copy VarExpr(fst, isQuoted-> fst.isString);
+        while let (colon, _) = self:.readIf(Tokens::DCOLON) && !colon.isEof {
+            let (ident, _) = self:.readIdentifier();
+            path = copy BinaryExpr(colon, path, copy VarExpr(ident, isQuoted-> ident.isString));
+        }
+
+        let (open, _) = self:.readIf(Tokens::LPAR);
+        if (open.isEof) return path;
+
+        let (args, close) = ExpressionVisitor::readArgumentList(alias self, open, withNamed-> true);
+        copy MultOperatorExpr(start-> open,
+                              end-> close,
+                              op-> MultOperators::CALL,
+                              left-> path,
+                              rights-> args)
     }
 
     /*!
@@ -1351,7 +1533,7 @@ pub class SyntaxVisitor {
         if (!self.isRecovering()) throw err;
 
         self:.rewindToSeek(start);
-        let col = self.peekToken().col;
+        let col = wordStart(self.peekToken()).col;
         self:.skipTo(col, atDecl-> atDecl);
         if (self.getSeek() == start) throw err;
 
@@ -1361,25 +1543,26 @@ pub class SyntaxVisitor {
     /**
      * Skip the tokens, brackets balanced, up to a ';' ending them (included), or
      * a resync point (excluded), cf. `isResyncPoint`, the declaration attributes
-     * apply to being skipped with them.
+     * and tags apply to being skipped with them.
      * */
     fn skipTo(mut self, col: u64, atDecl: bool) {
         let mut depth = 0us;
-        let mut line = self.peekToken().line;
+        let mut line = wordStart(self.peekToken()).line;
         let mut first = true;
-        let mut inAttrs = atDecl && self.peekToken() == Tokens::AT;
+        let mut inAttrs = atDecl && (self.peekToken() == Tokens::AT || isTagList(self.peekToken()));
         loop {
             let tok = self.peekToken();
+            let at = wordStart(tok);
             if (tok.isEof) break;
             if (!first) {
-                if (inAttrs && depth == 0us && tok != Tokens::RACC && tok.line > line && tok.col <= col) {
-                    inAttrs = (tok == Tokens::AT);
+                if (inAttrs && depth == 0us && tok != Tokens::RACC && at.line > line && at.col <= col) {
+                    inAttrs = (tok == Tokens::AT || isTagList(tok));
                 } else if (self.isResyncPoint(tok, line, col, depth, atDecl)) break;
             }
 
             self:.readToken();
             first = false;
-            line = tok.line;
+            line = at.line;
             match tok.str {
                 Tokens::LPAR | Tokens::LCRO | Tokens::LACC => { depth += 1us; }
                 Tokens::RPAR | Tokens::RCRO | Tokens::RACC => { if (depth != 0us) depth -= 1us; }
@@ -1395,13 +1578,14 @@ pub class SyntaxVisitor {
      * */
     fn isResyncPoint(self, tok: &Word, line: u64, col: u64, depth: usize, atDecl: bool)-> bool {
         if (depth == 0us && tok == Tokens::RACC) return true;
-        if (tok.line <= line || tok.col > col) return false;
+        let at = wordStart(tok);
+        if (at.line <= line || at.col > col) return false;
 
         // a bracket left open by what is skipped, the line closing the enclosing block
         if (tok == Tokens::RACC && tok.col < col) return true;
 
         if (atDecl) {
-            if (tok == Tokens::AT || tok == Keys::YIELD) return true;
+            if (tok == Tokens::AT || tok == Keys::YIELD || isTagList(tok)) return true;
             for k in __SPECIAL_GLOBAL__.listKeysExternPubPrvUse if tok == k {
                 return true;
             }
