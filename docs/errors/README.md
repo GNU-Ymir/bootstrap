@@ -24,8 +24,8 @@ check lives:
 | Range | Stage | Catalogue | Live codes |
 |---|---|---|---|
 | `E1xxx` | lexing | `LexingErrorMessage` -- `src/ymirc/lexing/errors.yr` | 24 |
-| `E2xxx` | parsing | `SyntaxErrorMessage` -- `src/ymirc/syntax/errors.yr` | 13 |
-| `E3xxx` | declaration | `DeclareErrorMessage` -- `src/ymirc/semantic/declarator/errors.yr` | 37 |
+| `E2xxx` | parsing | `SyntaxErrorMessage` -- `src/ymirc/syntax/errors.yr` | 15 |
+| `E3xxx` | declaration | `DeclareErrorMessage` -- `src/ymirc/semantic/declarator/errors.yr` | 35 |
 | `E4xxx` | validation | `ValidateErrorMessage` -- `src/ymirc/semantic/validator/errors.yr` | 272 |
 | `E5xxx` | lowering (YIL) | `SerializeYILErrorMessage` -- `src/ymirc/lint/serialize/errors.yr`, `OptimizerErrorMessage` -- `src/ymirc/lint/optimizer/errors.yr` | 11 |
 
@@ -85,13 +85,13 @@ deliberately carry no code, and have no page here.
 | [E2016](E2016.md) | `ARM_READ_AS_OPERAND` | the value of the previous arm was read as the operand of the operator <> |
 | [E2017](E2017.md) | `ARM_COMMA` | a comma only ends an arm whose value is a simple expression, neither a block nor a statement |
 | [E2018](E2018.md) | `FOR_FILTER_ELSE` | the filter of a for loop cannot have an else branch |
+| [E2019](E2019.md) | `MOD_WITHOUT_ROOT` | module <> is declared neither a child nor a sibling |
 
 ## E3xxx -- declaration
 
 | Code | Name | Message |
 |---|---|---|
 | [E3001](E3001.md) | `ABSTRACT_AND_FINAL` | a class cannot be both abstract and final |
-| [E3002](E3002.md) | `CONFLICT_MODULES` | module is ambiguously defined in both <> and <> |
 | [E3003](E3003.md) | `DECL_GLOB_STATIC_NON_EXTERN` | only external global variables may be declared static |
 | [E3004](E3004.md) | `DECL_GLOB_THREAD_EXTERN` | only local global variables may be declared thread-local |
 | [E3006](E3006.md) | `DEFAULT_CTOR_ALREADY_DECLARED` | the ctor built from the fields is already declared |
@@ -99,7 +99,6 @@ deliberately carry no code, and have no page here.
 | [E3009](E3009.md) | `MALFORMED_CORE` | core module is malformed |
 | [E3010](E3010.md) | `MULTIPLE_DESTRUCTOR` | a class may only define one destructor |
 | [E3012](E3012.md) | `NO_MODULE_NAMED` | no module named <> found inside module <> |
-| [E3013](E3013.md) | `NO_SUCH_FILE` | module should be located in <> or <>, but no such file exists or access is denied |
 | [E3014](E3014.md) | `NO_SUCH_FILE_ONE` | module should be located in <>, but no such file exists or access is denied |
 | [E3015](E3015.md) | `OVERLAID_AND_PACKED` | a record cannot be both overlaid and packed |
 | [E3016](E3016.md) | `PRIVATE_IN_THIS_CONTEXT` | <> is private in this context |
@@ -437,9 +436,11 @@ ever reused.
 | [E2005](E2005.md) | `UNDEFINED_ATTRIBUTE` | undefined attribute <> |
 | [E2010](E2010.md) | `UNTERMINATED_BLOCK` | unterminated block |
 | [E2011](E2011.md) | `USED_AS_IDENTIFIER` | <> cannot be used as an identifier |
+| [E3002](E3002.md) | `CONFLICT_MODULES` | module is ambiguously defined in both <> and <> |
 | [E3005](E3005.md) | `DECL_VARIADIC_FUNC` | only external C functions may be variadic |
 | [E3008](E3008.md) | `DTOR_IN_RECORD` | record types cannot define destructors |
 | [E3011](E3011.md) | `NOT_OVERRIDE` | method <> is marked override but does not override any base method |
+| [E3013](E3013.md) | `NO_SUCH_FILE` | module should be located in <> or <>, but no such file exists or access is denied |
 | [E3028](E3028.md) | `UNEXPECTED_IN_CLASS` | unexpected declaration inside a class |
 | [E3031](E3031.md) | `UNEXPECTED_IN_MACRO` | unexpected declaration inside a macro |
 | [E3032](E3032.md) | `UNEXPECTED_IN_MODULE` | unexpected declaration |
