@@ -25,8 +25,8 @@ check lives:
 |---|---|---|---|
 | `E1xxx` | lexing | `LexingErrorMessage` -- `src/ymirc/lexing/errors.yr` | 24 |
 | `E2xxx` | parsing | `SyntaxErrorMessage` -- `src/ymirc/syntax/errors.yr` | 17 |
-| `E3xxx` | declaration | `DeclareErrorMessage` -- `src/ymirc/semantic/declarator/errors.yr` | 36 |
-| `E4xxx` | validation | `ValidateErrorMessage` -- `src/ymirc/semantic/validator/errors.yr` | 272 |
+| `E3xxx` | declaration | `DeclareErrorMessage` -- `src/ymirc/semantic/declarator/errors.yr` | 37 |
+| `E4xxx` | validation | `ValidateErrorMessage` -- `src/ymirc/semantic/validator/errors.yr` | 273 |
 | `E5xxx` | lowering (YIL) | `SerializeYILErrorMessage` -- `src/ymirc/lint/serialize/errors.yr`, `OptimizerErrorMessage` -- `src/ymirc/lint/optimizer/errors.yr` | 11 |
 
 Each page carries an example wherever a case in the suite raises the code: the
@@ -128,7 +128,8 @@ deliberately carry no code, and have no page here.
 | [E3041](E3041.md) | `UNDEFINED_ATTRIBUTE_FOR_MODULE` | custom attribute <> is not valid on modules |
 | [E3042](E3042.md) | `UNDEFINED_ATTRIBUTE_FOR_ENTITY` | custom attribute <> is not valid on entities |
 | [E3043](E3043.md) | `COMPANION_WITHOUT_TYPE` | the companion module <> is not named after a class, a record or an entity of module <> |
-| [E3044](E3044.md) | `NOT_SUPPORTED_IN` | not supported in version ymir <> |
+| [E3044](E3044.md) | `NOT_SUPPORTED_IN` | <> is not supported in version ymir <> |
+| [E3045](E3045.md) | `UNEXPECTED_IN_TAG` | a declaration of a tag is a global, an apply or a self overload, not <> |
 
 ## E4xxx -- validation
 
@@ -275,6 +276,7 @@ deliberately carry no code, and have no page here.
 | [E4155](E4155.md) | `NOT_A_LVALUE_MAP_ACCESS` | <> is a map access, and cannot be used as a lvalue |
 | [E4156](E4156.md) | `NOT_A_LVALUE_PARAM` | <> is a value parameter, and cannot be used as a lvalue |
 | [E4157](E4157.md) | `NOT_A_LVALUE_TYPE` | value of type <> is not a lvalue |
+| [E4331](E4331.md) | `NOT_A_TAG` | <> is not a tag |
 | [E4162](E4162.md) | `NOT_A_TRAIT` | <> is not a trait |
 | [E4163](E4163.md) | `NOT_A_TUPLE` | <> is not a tuple type |
 | [E4315](E4315.md) | `NOT_A_UNION` | <> is not a union type |
