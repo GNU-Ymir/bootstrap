@@ -1,6 +1,7 @@
 in verif;
 
 use ymirc::errors;
+use ymirc::errors::snippet::suggestion;
 use ymirc::lexing::word;
 use ymirc::semantic::generator::{type, type::_, value, value::_};
 use ymirc::utils::format;
@@ -169,7 +170,14 @@ pub mod MemoryVerification {
         // Value to a value that needs ref, but without explicitely writing it
         // e.g. { let z = 12; let ref x = z; }
         if byReference && value !of ReferencerValue {
-            throw copy ErrorMsg::fatal(loc, end-> endLoc, format(ValidateErrorMessage::IMPLICIT_REFERENCE, value.type));
+            let err = copy ErrorMsg::fatal(loc, end-> endLoc, format(ValidateErrorMessage::IMPLICIT_REFERENCE, value.type));
+            if (value !of MapAccessValue && MemoryVerification::checkLeftOperandMove(value, allowSelf-> true)) {
+                if let Ok(start: &Word) = MemoryVerification::startOf(value) {
+                    throw err.withFix(Edit(start, replacement-> "ref ", msg-> format(ValidateErrorMessage::IMPLICIT_REFERENCE_FIX)));
+                }
+            }
+
+            throw err;
         }
 
         // Value to a value that needs mutable ref, but only simple ref was used
@@ -193,8 +201,13 @@ pub mod MemoryVerification {
         // Alias of borrowable data, but without explicitely writing it
         // e.g. { let z = [1, 2, 3]; let dmut a = z; }
         else if (!byReference && type.needsExplicitAlias && MemoryVerification::needsExplicitAlias(value)) {
-            throw copy ErrorMsg::fatal(loc, ValidateErrorMessage::DISCARD_CONST,
-                                        notes-> copy [copy ErrorMsg::note(endLoc, format(ValidateErrorMessage::IMPLICIT_ALIAS, value.type))]);
+            let note = copy ErrorMsg::note(endLoc, format(ValidateErrorMessage::IMPLICIT_ALIAS, value.type));
+            let fixed = match MemoryVerification::explicitAliasFix(type, value) {
+                Ok(fix: Edit) => { note.withFix(fix) }
+                _ => { note }
+            };
+
+            throw copy ErrorMsg::fatal(loc, ValidateErrorMessage::DISCARD_CONST, notes-> copy [fixed]);
         }
 
         // Alias but on non borrowable data, or on a const borrowable data, so when it is not needed
@@ -204,6 +217,73 @@ pub mod MemoryVerification {
                 throw copy ErrorMsg::fatal(loc, end-> endLoc, format(ValidateErrorMessage::UNECESSARY_ALIAS, type));
             }
         }
+    }
+
+    /**
+     * The edit writing explicitly the alias a movement implies.
+     * @params:
+     *  - type: the type that receives the value
+     *  - value: the value that is moved
+     * @returns: the edit, none when an alias of the value does not fit the type, or when the value
+     *           is not written as such in the source
+     */
+    fn explicitAliasFix(type: &Type, value: &Value)-> (Edit)? {
+        if (!value.type.isMutable || !value.type.mutabilityFit(type, borrowed-> false)) return none;
+        if let Ok(start: &Word) = MemoryVerification::startOf(value) {
+            return (Edit(start, replacement-> "alias ", msg-> format(ValidateErrorMessage::IMPLICIT_ALIAS_FIX)))?;
+        }
+
+        none
+    }
+
+    /**
+     * @params:
+     *  - value: the value of an expression
+     * @returns: the first word of the expression, that is the operand of an access rather than its
+     *           operator token, none when the value is not written as such in the source, or does not
+     *           access an lvalue
+     */
+    fn startOf(value: &Value)-> (&Word)? {
+        match value {
+            f: &FieldOperatorValue => return MemoryVerification::startOfAccess(f.loc, f.object);
+            a: &ArrayAccessValue => return MemoryVerification::startOfAccess(a.loc, a.array);
+            s: &SliceAccessValue => return MemoryVerification::startOfAccess(s.loc, s.slice);
+            m: &MapAccessValue => return MemoryVerification::startOfAccess(m.loc, m.map);
+            b: &BlockValue => {
+                // the runtime check of an access is a block located at its operator
+                if (b.values.len != 0us && b.values[$ - 1us].loc.isSameLoc(b.loc)) {
+                    return MemoryVerification::startOf(b.values[$ - 1us]);
+                }
+
+                return none;
+            }
+        }
+
+        if (!value.isLvalue || !MemoryVerification::isWritten(value.loc)) return none;
+        (value.loc)?
+    }
+
+    /**
+     * @params:
+     *  - loc: the operator token of an access
+     *  - operand: the value accessed
+     * @returns: the first word of the access, none when it is not written in the source
+     */
+    fn startOfAccess(loc: &Word, operand: &Value)-> (&Word)? {
+        if (!MemoryVerification::isWritten(loc)) return none;
+        if let Ok(start: &Word) = MemoryVerification::startOf(operand) {
+            if (start.isBefore(loc)) return (start)?;
+        }
+
+        none
+    }
+
+    /**
+     * @returns: true iif the word is the text its location holds, and not one made up by the validation
+     */
+    fn isWritten(loc: &Word)-> bool {
+        if (loc.isEof || loc.seek + loc.str.len > loc.fileContent.len) return false;
+        loc.fileContent[loc.seek .. loc.seek + loc.str.len] == loc.str
     }
 
     /**
