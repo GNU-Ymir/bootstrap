@@ -51,7 +51,8 @@ use ymirc::utils::format;
  * overloads: they are templates, validated once instantiated for a tag site.
  * A tag site is resolved for the symbol it tags: its arguments are bound to
  * the parameters of the tag, and the `apply` and `self` overloads applying to
- * the symbol are selected.
+ * the symbol are selected. The `apply` instances of the sites of a function are
+ * merged into it, the outermost one taking its name.
  */
 pub mod TagValidation {
 
@@ -198,6 +199,137 @@ pub mod TagValidation {
         }
 
         sym:.setResolvedTags(resolved);
+    }
+
+    /**
+     * Merge the tags of a function into it, from the innermost to the outermost:
+     * each site is resolved for the function the previous merge produced, and the
+     * instance of its `apply` overload, receiving that function, replaces it. The
+     * outermost instance takes the identity of the function, which moves to a
+     * hidden name. Only the prototypes are validated, the bodies being validated
+     * along with the one of the function, cf. `FunctionValidation::validate`.
+     *
+     * @params:
+     *   - context: validation context
+     *   - loc:     the location the function is used at
+     *   - sym:     the tagged function
+     *
+     * @throws:
+     *   - ErrorMsg if the function is used before its tags are merged into it,
+     *     or if a site does not resolve, the error of a failed merge being
+     *     thrown again at each later use
+     */
+    pub fn mergeFunction(dmut context: &ValidationContext, loc: &Word, dmut sym: &FunctionSymbol)
+        throws ErrorMsg
+    {
+        if (sym.isMerged) return;
+        if let Ok(err) = sym.mergeError {
+            throw err;
+        }
+
+        if (sym.isMerging) {
+            throw copy ErrorMsg::fatal(loc, format(ValidateErrorMessage::TAG_MERGE_CYCLE, sym.path.toStr()),
+                                       notes-> copy [copy ErrorMsg::note(sym.loc, ValidateErrorMessage::DEFINED_HERE)]);
+        }
+
+        sym:.setMerging();
+        let mut error: (&ErrorMsg)? = none;
+        let mut resolved: [TagResolution] = [];
+        let mut merges: [&FunctionSymbol] = [];
+
+        context:.pushReferent(alias context:.getSymbolFromRef(sym.referent));
+        context:.enterForeign(isFnBody-> false);
+        {
+            let mut current: &FunctionSymbol = sym;
+            for i in 0us .. sym.tags.len {
+                let site = sym.tags[$ - 1us - i];
+                let (tagged, kind) = TagValidation::validateTagged(alias context, alias context:.getFunctionFromRef(current));
+                let res = TagValidation::resolveSite(alias context, sym, tagged, kind, site);
+                resolved = [res] ~ resolved;
+                if let Ok(apply) = res.apply {
+                    current = TagValidation::instantiateApply(alias context, sym, res, apply);
+                    merges ~= [current];
+                }
+            }
+        } catch {
+            err => {
+                error = err?;
+            }
+        } exit {
+            context:.exitForeign();
+            context:.popReferent();
+        }
+
+        if let Ok(err) = error {
+            let fatal = copy ErrorMsg::fatal(sym.loc, format(ValidateErrorMessage::VALIDATING_SYMBOL, sym.path.toStr()),
+                                             notes-> copy [err]);
+            sym:.setMergeError(fatal);
+            throw fatal;
+        }
+
+        if (merges.len != 0us) {
+            context:.getFunctionFromRef(merges[$ - 1us]):.takeIdentity(sym);
+            sym:.hide();
+        }
+
+        sym:.setResolvedTags(resolved);
+        sym:.setMerges(merges);
+    }
+
+    /**
+     * @params:
+     *   - context: validation context
+     *   - loc:     the location the name is used at
+     *   - sym:     the function it names
+     *
+     * @returns: the function the name of `sym` means, the outermost instance its
+     * tags are merged into, `sym` itself if it has none
+     *
+     * @throws:
+     *   - ErrorMsg if the tags of `sym` cannot be merged into it, cf. `mergeFunction`
+     */
+    pub fn named(dmut context: &ValidationContext, loc: &Word, dmut sym: &FunctionSymbol)-> dmut &FunctionSymbol
+        throws ErrorMsg
+    {
+        if (sym.tags.len == 0us) return alias sym;
+
+        TagValidation::mergeFunction(alias context, loc, alias sym);
+        alias context:.getFunctionFromRef(sym.named)
+    }
+
+    /**
+     * Instantiate the `apply` overload a tag site selected for a function, under
+     * the name, the protection and the documentation of the function as written.
+     *
+     * @params:
+     *   - context: validation context
+     *   - sym:     the function as written
+     *   - res:     the tag site, resolved
+     *   - apply:   its `apply` overload, its first template parameter bound to the function it receives
+     *
+     * @returns: the instance, its prototype validated
+     *
+     * @throws:
+     *   - ErrorMsg if the overload cannot be instantiated, or its prototype does not validate
+     */
+    fn instantiateApply(dmut context: &ValidationContext, sym: &FunctionSymbol, res: TagResolution, apply: TagOverload)-> &FunctionSymbol
+        throws ErrorMsg
+    {
+        if let t: &TemplateDecl = apply.decl {
+            if let f: &FunctionDecl = t.decl {
+                let named = copy FunctionDecl(f.loc, sym.comm, sym.loc, f.proto, f.body, f.attrs, f.throwers, f.throwerLoc, f.isOver, isYield-> f.isYield);
+                let dmut tmpl = copy TemplateSymbol(sym.loc, sym.comm, copy TemplateDecl(t.loc, sym.comm, t.params, t.guard, named), sym.protection, inClass-> false);
+                tmpl:.setReferent(alias context:.getSymbolFromRef(res.tag));
+
+                let dmut inst = alias TemplateDeclaration::declareFunction(alias context, res.site.loc, copy TemplateRefValue(res.site.loc, tmpl), apply.mapper, named);
+                if let dmut instance: &FunctionSymbol = alias inst {
+                    FunctionValidation::validateProto(alias context, alias instance);
+                    return instance;
+                }
+            }
+        }
+
+        panic;
     }
 
     /**
