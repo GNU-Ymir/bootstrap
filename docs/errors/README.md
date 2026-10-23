@@ -26,7 +26,7 @@ check lives:
 | `E1xxx` | lexing | `LexingErrorMessage` -- `src/ymirc/lexing/errors.yr` | 24 |
 | `E2xxx` | parsing | `SyntaxErrorMessage` -- `src/ymirc/syntax/errors.yr` | 17 |
 | `E3xxx` | declaration | `DeclareErrorMessage` -- `src/ymirc/semantic/declarator/errors.yr` | 37 |
-| `E4xxx` | validation | `ValidateErrorMessage` -- `src/ymirc/semantic/validator/errors.yr` | 277 |
+| `E4xxx` | validation | `ValidateErrorMessage` -- `src/ymirc/semantic/validator/errors.yr` | 279 |
 | `E5xxx` | lowering (YIL) | `SerializeYILErrorMessage` -- `src/ymirc/lint/serialize/errors.yr`, `OptimizerErrorMessage` -- `src/ymirc/lint/optimizer/errors.yr` | 11 |
 
 Each page carries an example wherever a case in the suite raises the code: the
@@ -281,6 +281,7 @@ deliberately carry no code, and have no page here.
 | [E4163](E4163.md) | `NOT_A_TUPLE` | <> is not a tuple type |
 | [E4315](E4315.md) | `NOT_A_UNION` | <> is not a union type |
 | [E4165](E4165.md) | `NOT_MOVABLE` | type <> is not a movable type |
+| [E4337](E4337.md) | `NOT_TAGGED` | <> names no function whose tags are merged into it |
 | [E4166](E4166.md) | `NOT_UNSAFE` | an unsafe context is entered, but no unsafe operations are made |
 | [E4167](E4167.md) | `NO_COPY_EXIST` | no copy exists for type <> |
 | [E4168](E4168.md) | `NO_CTOR_FOUND` | no constructor found for class <> |
@@ -319,6 +320,7 @@ deliberately carry no code, and have no page here.
 | [E4334](E4334.md) | `TAG_APPLY_IDENTITY` | an apply overload cannot declare <>, the tagged symbol keeps its own |
 | [E4333](E4333.md) | `TAG_APPLY_KIND` | <> is <>, but the overload receiving it is declared as <> |
 | [E4335](E4335.md) | `TAG_APPLY_NOT_TEMPLATE` | an apply overload is a template, whose first parameter receives the tagged symbol |
+| [E4336](E4336.md) | `TAG_MERGE_CYCLE` | <> is used before its tags are merged into it |
 | [E4332](E4332.md) | `TAG_NOT_APPLICABLE` | tag <> does not apply to <> <> |
 | [E4202](E4202.md) | `TEMPLATE_SPECIALIZATION_FAILS` | template specialization for <> fails with <> |
 | [E4203](E4203.md) | `TEMPLATE_SPECIALIZATION_FAILS_SIMPLE` | template specialization fails with <> |
