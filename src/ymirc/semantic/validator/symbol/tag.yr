@@ -38,7 +38,7 @@ in tag;
 use ymirc::errors;
 use ymirc::lexing::word;
 use ymirc::semantic::{symbol, template_};
-use ymirc::semantic::generator::value::_;
+use ymirc::semantic::generator::{type, value::_};
 use ymirc::semantic::validator::symbol::function::proto;
 use ymirc::syntax::declaration::{block, custom, function, module};
 use ymirc::syntax::expression::empty;
@@ -53,7 +53,8 @@ use ymirc::utils::format;
  * the parameters of the tag, and the `apply` and `self` overloads applying to
  * the symbol are selected. The `apply` instances of the sites of a function are
  * merged into it, the outermost one taking its name; those of a class declare
- * their members into it.
+ * their members into it; those of an enum or a union append their fields or
+ * their member types to it.
  */
 pub mod TagValidation {
 
@@ -362,50 +363,241 @@ pub mod TagValidation {
         throws ErrorMsg
     {
         let dmut tag = alias context:.getSymbolFromRef(res.tag);
-        if let t: &TemplateDecl = apply.decl {
-            let dmut tmpl = copy TemplateSymbol(TagValidation::nameOf(t), t.comm, t, res.tag.protection, inClass-> false);
-            tmpl:.setReferent(alias tag);
+        if let c: &TypeDecl = TagValidation::rewriteApply(alias context, res, apply) {
+            let before = sym.getAllLocalSymbols(protection-> Protection::PRIVATE);
+            let dtor = sym.dtor;
+            let nbFields = sym.fields.len;
 
-            let decl = TemplateDeclaration::rewrite(alias context, res.site.loc, copy TemplateRefValue(res.site.loc, tmpl), apply.mapper);
-            if let c: &TypeDecl = decl {
-                let before = sym.getAllLocalSymbols(protection-> Protection::PRIVATE);
-                let dtor = sym.dtor;
-                let nbFields = sym.fields.len;
-
-                context:.pushReferent(alias sym, macroSym-> alias tag);
-                {
-                    ClassValidation::declareMembers(alias context, alias sym, c.decls);
-                } catch {
-                    err => {
-                        throw err.withNote(copy [copy ErrorMsg::note(res.site.loc, format(ValidateErrorMessage::TAG_MERGING, res.tag.path.toStr(), sym.path.toStr()))]);
-                    }
-                } exit {
-                    context:.popReferent();
+            context:.pushReferent(alias sym, macroSym-> alias tag);
+            {
+                ClassValidation::declareMembers(alias context, alias sym, c.decls);
+            } catch {
+                err => {
+                    throw TagValidation::noteMerging(err, res, sym);
                 }
-
-                let mut members: [&Word] = copy [f.name for f in sym.fields[nbFields .. $]];
-                for i in nbFields .. sym.fields.len {
-                    sym:.setFieldTagScope(i, tag);
-                }
-
-                let dmut after = sym:.getAllLocalSymbols(protection-> Protection::PRIVATE);
-                for i in 0us .. after.len if !TagValidation::holds(before, after[i]) {
-                    after[i]:.setTagScope(alias tag);
-                    members ~= TagValidation::locations(after[i]);
-                }
-
-                if (!(sym.dtor is dtor)) {
-                    let dmut added = alias sym.dtor;
-                    added:.setTagScope(alias tag);
-                    members ~= [added.loc];
-                }
-
-                sym:.addMergedMembers(res.site.loc, res.tag.path.toStr(), members);
-                return;
+            } exit {
+                context:.popReferent();
             }
+
+            let mut members: [&Word] = copy [f.name for f in sym.fields[nbFields .. $]];
+            for i in nbFields .. sym.fields.len {
+                sym:.setFieldTagScope(i, tag);
+            }
+
+            let dmut after = sym:.getAllLocalSymbols(protection-> Protection::PRIVATE);
+            for i in 0us .. after.len if !TagValidation::holds(before, after[i]) {
+                after[i]:.setTagScope(alias tag);
+                members ~= TagValidation::locations(after[i]);
+            }
+
+            if (!(sym.dtor is dtor)) {
+                let dmut added = alias sym.dtor;
+                added:.setTagScope(alias tag);
+                members ~= [added.loc];
+            }
+
+            sym:.addMergedMembers(res.site.loc, res.tag.path.toStr(), members);
+            return;
         }
 
         panic;
+    }
+
+    /**
+     * Merge the tags of an enum into it, from the innermost to the outermost:
+     * each site is resolved for the enum, and the fields of the instance of its
+     * `apply` overload are appended to it, after the written ones and the ones
+     * the previous tags appended, which are all the instance sees of the enum.
+     * Called once the written fields are validated.
+     *
+     * @params:
+     *   - context: validation context
+     *   - sym:     the tagged enum
+     *
+     * @throws:
+     *   - ErrorMsg if a site does not resolve, or if a field does not validate
+     */
+    pub fn mergeEnum(dmut context: &ValidationContext, dmut sym: &EnumSymbol)
+        throws ErrorMsg
+    {
+        if (sym.tags.len == 0us) return;
+
+        let mut resolved: [TagResolution] = [];
+        context:.pushReferent(alias context:.getSymbolFromRef(sym.referent));
+        context:.enterForeign(isFnBody-> false);
+        {
+            let (tagged, kind) = TagValidation::validateTagged(alias context, alias sym);
+            for i in 0us .. sym.tags.len {
+                let site = sym.tags[$ - 1us - i];
+                let res = TagValidation::resolveSite(alias context, sym, tagged, kind, site);
+                resolved = [res] ~ resolved;
+                if let Ok(apply) = res.apply {
+                    TagValidation::appendApply(alias context, alias sym, res, apply);
+                }
+            }
+        } exit {
+            context:.exitForeign();
+            context:.popReferent();
+        }
+
+        sym:.setResolvedTags(resolved);
+    }
+
+    /**
+     * Append the fields of the instance of the `apply` overload a tag site
+     * selected for an enum to that enum, their values reaching the scope of the
+     * tag besides the one of the enum.
+     *
+     * @params:
+     *   - context: validation context
+     *   - sym:     the tagged enum
+     *   - res:     the tag site, resolved
+     *   - apply:   its `apply` overload, its first template parameter bound to the enum
+     *
+     * @throws:
+     *   - ErrorMsg if the overload cannot be instantiated, or if a field does not validate
+     */
+    fn appendApply(dmut context: &ValidationContext, dmut sym: &EnumSymbol, res: TagResolution, apply: TagOverload)
+        throws ErrorMsg
+    {
+        let dmut tag = alias context:.getSymbolFromRef(res.tag);
+        if let e: &EnumDecl = TagValidation::rewriteApply(alias context, res, apply) {
+            context:.pushReferent(alias sym, macroSym-> alias tag);
+            {
+                let fields = EnumValidation::appendFields(alias context, alias sym, e.fields);
+                sym:.addMergedFields(res.site.loc, res.tag.path.toStr(), fields);
+            } catch {
+                err => {
+                    throw TagValidation::noteMerging(err, res, sym);
+                }
+            } exit {
+                context:.popReferent();
+            }
+
+            return;
+        }
+
+        panic;
+    }
+
+    /**
+     * Merge the tags of a union into it, from the innermost to the outermost:
+     * each site is resolved for the union, and the member types of the instance
+     * of its `apply` overload are appended to it, after the written ones and the
+     * ones the previous tags appended. Called once the written member types are
+     * validated, before the kinds of the members are verified.
+     *
+     * @params:
+     *   - context: validation context
+     *   - sym:     the tagged union
+     *   - members: the member types of the union, appended to
+     *   - locs:    the location of each member, appended to
+     *
+     * @throws:
+     *   - ErrorMsg if a site does not resolve, or if a member type does not validate
+     */
+    pub fn mergeUnion(dmut context: &ValidationContext, dmut sym: &UnionSymbol, ref mut members: [&Type], ref mut locs: [&Word])
+        throws ErrorMsg
+    {
+        if (sym.tags.len == 0us) return;
+
+        let mut resolved: [TagResolution] = [];
+        context:.pushReferent(alias context:.getSymbolFromRef(sym.referent));
+        context:.enterForeign(isFnBody-> false);
+        {
+            let (tagged, kind) = TagValidation::validateTagged(alias context, alias sym);
+            for i in 0us .. sym.tags.len {
+                let site = sym.tags[$ - 1us - i];
+                let res = TagValidation::resolveSite(alias context, sym, tagged, kind, site);
+                resolved = [res] ~ resolved;
+                if let Ok(apply) = res.apply {
+                    TagValidation::appendApply(alias context, alias sym, res, apply, ref members, ref locs);
+                }
+            }
+        } exit {
+            context:.exitForeign();
+            context:.popReferent();
+        }
+
+        sym:.setResolvedTags(resolved);
+    }
+
+    /**
+     * Append the member types of the instance of the `apply` overload a tag site
+     * selected for a union to that union, validated from the scope of the tag
+     * besides the one of the union.
+     *
+     * @params:
+     *   - context: validation context
+     *   - sym:     the tagged union
+     *   - res:     the tag site, resolved
+     *   - apply:   its `apply` overload, its first template parameter bound to the union
+     *   - members: the member types of the union, appended to
+     *   - locs:    the location of each member, appended to
+     *
+     * @throws:
+     *   - ErrorMsg if the overload cannot be instantiated, or if a member type does not validate
+     */
+    fn appendApply(dmut context: &ValidationContext, dmut sym: &UnionSymbol, res: TagResolution, apply: TagOverload, ref mut members: [&Type], ref mut locs: [&Word])
+        throws ErrorMsg
+    {
+        let dmut tag = alias context:.getSymbolFromRef(res.tag);
+        if let u: &UnionDecl = TagValidation::rewriteApply(alias context, res, apply) {
+            context:.pushReferent(alias sym, macroSym-> alias tag);
+            {
+                let appended = UnionValidation::appendMembers(alias context, alias sym, u.types, ref members, ref locs);
+                sym:.addMergedMembers(res.site.loc, res.tag.path.toStr(), appended);
+            } catch {
+                err => {
+                    throw TagValidation::noteMerging(err, res, sym);
+                }
+            } exit {
+                context:.popReferent();
+            }
+
+            return;
+        }
+
+        panic;
+    }
+
+    /**
+     * Instantiate the `apply` overload a tag site selected for a class, an enum
+     * or a union, without declaring it.
+     *
+     * @params:
+     *   - context: validation context
+     *   - res:     the tag site, resolved
+     *   - apply:   its `apply` overload, its first template parameter bound to the tagged symbol
+     *
+     * @returns: the declaration of the instance
+     *
+     * @throws:
+     *   - ErrorMsg if the overload cannot be instantiated
+     */
+    fn rewriteApply(dmut context: &ValidationContext, res: TagResolution, apply: TagOverload)-> &Declaration
+        throws ErrorMsg
+    {
+        if let t: &TemplateDecl = apply.decl {
+            let dmut tmpl = copy TemplateSymbol(TagValidation::nameOf(t), t.comm, t, res.tag.protection, inClass-> false);
+            tmpl:.setReferent(alias context:.getSymbolFromRef(res.tag));
+
+            return TemplateDeclaration::rewrite(alias context, res.site.loc, copy TemplateRefValue(res.site.loc, tmpl), apply.mapper);
+        }
+
+        panic;
+    }
+
+    /**
+     * @returns: an error raised when merging a tag site into a symbol, or each
+     * error of a list, noted with the site
+     */
+    fn noteMerging(err: &ErrorMsg, res: TagResolution, sym: &Symbol)-> &ErrorMsg {
+        if (err.isList) {
+            return copy ErrorMsg::list(copy [TagValidation::noteMerging(e, res, sym) for e in err.notes]);
+        }
+
+        err.withNote(copy [copy ErrorMsg::note(res.site.loc, format(ValidateErrorMessage::TAG_MERGING, res.tag.path.toStr(), sym.path.toStr()))])
     }
 
     /**
@@ -419,13 +611,39 @@ pub mod TagValidation {
      * @returns: the error, noted
      */
     pub fn noteMerges(sym: &ClassSymbol, err: &ErrorMsg)-> &ErrorMsg {
+        TagValidation::noteMerges(sym.path.toStr(), sym.mergedMembers, err)
+    }
+
+    /**
+     * Add to an error located at a member type a tag appended to a union, or to
+     * each such error of a list, a note at the site of the tag.
+     *
+     * @params:
+     *   - sym: the union
+     *   - err: the error
+     *
+     * @returns: the error, noted
+     */
+    pub fn noteMerges(sym: &UnionSymbol, err: &ErrorMsg)-> &ErrorMsg {
+        TagValidation::noteMerges(sym.path.toStr(), sym.mergedMembers, err)
+    }
+
+    /**
+     * @params:
+     *   - path:   the path of the tagged symbol
+     *   - merged: for each tag site merged into it, its location, the tag and the locations of the members it added
+     *   - err:    the error
+     *
+     * @returns: the error, noted at the site of the tag that added the member it is located at
+     */
+    fn noteMerges(path: [c8], merged: [(&Word, [c8], [&Word])], err: &ErrorMsg)-> &ErrorMsg {
         if (err.isList) {
-            return copy ErrorMsg::list(copy [TagValidation::noteMerges(sym, e) for e in err.notes]);
+            return copy ErrorMsg::list(copy [TagValidation::noteMerges(path, merged, e) for e in err.notes]);
         }
 
-        for merged in sym.mergedMembers {
-            for m in merged._2 if (m.filename == err.loc.filename && m.seek == err.loc.seek) {
-                return err.withNote(copy [copy ErrorMsg::note(merged._0, format(ValidateErrorMessage::TAG_MERGING, merged._1, sym.path.toStr()))]);
+        for m in merged {
+            for l in m._2 if (l.filename == err.loc.filename && l.seek == err.loc.seek) {
+                return err.withNote(copy [copy ErrorMsg::note(m._0, format(ValidateErrorMessage::TAG_MERGING, m._1, path))]);
             }
         }
 
