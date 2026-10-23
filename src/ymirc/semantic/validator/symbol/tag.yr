@@ -52,7 +52,8 @@ use ymirc::utils::format;
  * A tag site is resolved for the symbol it tags: its arguments are bound to
  * the parameters of the tag, and the `apply` and `self` overloads applying to
  * the symbol are selected. The `apply` instances of the sites of a function are
- * merged into it, the outermost one taking its name.
+ * merged into it, the outermost one taking its name; those of a class declare
+ * their members into it.
  */
 pub mod TagValidation {
 
@@ -298,6 +299,168 @@ pub mod TagValidation {
     }
 
     /**
+     * Merge the tags of a class into it, from the innermost to the outermost:
+     * each site is resolved for the class, and the members of the instance of
+     * its `apply` overload are declared into it, each tag seeing the members the
+     * previous ones declared. Called once the members written in the class are
+     * declared, before they are validated; a validation of the class nested in
+     * the merge sees the class as declared so far.
+     *
+     * @params:
+     *   - context: validation context
+     *   - sym:     the tagged class
+     *
+     * @throws:
+     *   - ErrorMsg if a site does not resolve, or if a member does not declare
+     */
+    pub fn mergeClass(dmut context: &ValidationContext, dmut sym: &ClassSymbol)
+        throws ErrorMsg
+    {
+        if (sym.tags.len == 0us || sym.isMerged || sym.isMerging) return;
+
+        sym:.setMerging();
+        let mut resolved: [TagResolution] = [];
+
+        context:.pushReferent(alias context:.getSymbolFromRef(sym.referent));
+        context:.enterForeign(isFnBody-> false);
+        {
+            let tagged = sym.classRefUnwrapped.createInstance(loc-> sym.loc, isMutable-> false, isInnerMutable-> false);
+            let kind = if (sym.isEntity) { "entity" } else if (sym.isRecord) { "record" } else { "class" };
+            for i in 0us .. sym.tags.len {
+                let site = sym.tags[$ - 1us - i];
+                let res = TagValidation::resolveSite(alias context, sym, tagged, kind, site);
+                resolved = [res] ~ resolved;
+                if let Ok(apply) = res.apply {
+                    TagValidation::declareApply(alias context, alias sym, res, apply);
+                }
+            }
+        } exit {
+            context:.exitForeign();
+            context:.popReferent();
+            sym:.setMerged();
+        }
+
+        sym:.setResolvedTags(resolved);
+    }
+
+    /**
+     * Declare the members of the instance of the `apply` overload a tag site
+     * selected for a class into that class, a lookup from inside them, or from
+     * the declaration of a field, reaching the scope of the tag besides the one
+     * of the class.
+     *
+     * @params:
+     *   - context: validation context
+     *   - sym:     the tagged class
+     *   - res:     the tag site, resolved
+     *   - apply:   its `apply` overload, its first template parameter bound to the class
+     *
+     * @throws:
+     *   - ErrorMsg if the overload cannot be instantiated, or if a member does not declare
+     */
+    fn declareApply(dmut context: &ValidationContext, dmut sym: &ClassSymbol, res: TagResolution, apply: TagOverload)
+        throws ErrorMsg
+    {
+        let dmut tag = alias context:.getSymbolFromRef(res.tag);
+        if let t: &TemplateDecl = apply.decl {
+            let dmut tmpl = copy TemplateSymbol(TagValidation::nameOf(t), t.comm, t, res.tag.protection, inClass-> false);
+            tmpl:.setReferent(alias tag);
+
+            let decl = TemplateDeclaration::rewrite(alias context, res.site.loc, copy TemplateRefValue(res.site.loc, tmpl), apply.mapper);
+            if let c: &TypeDecl = decl {
+                let before = sym.getAllLocalSymbols(protection-> Protection::PRIVATE);
+                let dtor = sym.dtor;
+                let nbFields = sym.fields.len;
+
+                context:.pushReferent(alias sym, macroSym-> alias tag);
+                {
+                    ClassValidation::declareMembers(alias context, alias sym, c.decls);
+                } catch {
+                    err => {
+                        throw err.withNote(copy [copy ErrorMsg::note(res.site.loc, format(ValidateErrorMessage::TAG_MERGING, res.tag.path.toStr(), sym.path.toStr()))]);
+                    }
+                } exit {
+                    context:.popReferent();
+                }
+
+                let mut members: [&Word] = copy [f.name for f in sym.fields[nbFields .. $]];
+                for i in nbFields .. sym.fields.len {
+                    sym:.setFieldTagScope(i, tag);
+                }
+
+                let dmut after = sym:.getAllLocalSymbols(protection-> Protection::PRIVATE);
+                for i in 0us .. after.len if !TagValidation::holds(before, after[i]) {
+                    after[i]:.setTagScope(alias tag);
+                    members ~= TagValidation::locations(after[i]);
+                }
+
+                if (!(sym.dtor is dtor)) {
+                    let dmut added = alias sym.dtor;
+                    added:.setTagScope(alias tag);
+                    members ~= [added.loc];
+                }
+
+                sym:.addMergedMembers(res.site.loc, res.tag.path.toStr(), members);
+                return;
+            }
+        }
+
+        panic;
+    }
+
+    /**
+     * Add to an error located at a member a tag declared into a class, or to each
+     * such error of a list, a note at the site of the tag.
+     *
+     * @params:
+     *   - sym: the class
+     *   - err: the error
+     *
+     * @returns: the error, noted
+     */
+    pub fn noteMerges(sym: &ClassSymbol, err: &ErrorMsg)-> &ErrorMsg {
+        if (err.isList) {
+            return copy ErrorMsg::list(copy [TagValidation::noteMerges(sym, e) for e in err.notes]);
+        }
+
+        for merged in sym.mergedMembers {
+            for m in merged._2 if (m.filename == err.loc.filename && m.seek == err.loc.seek) {
+                return err.withNote(copy [copy ErrorMsg::note(merged._0, format(ValidateErrorMessage::TAG_MERGING, merged._1, sym.path.toStr()))]);
+            }
+        }
+
+        err
+    }
+
+    /**
+     * @returns: the locations of a member declared into a class, those of the
+     * methods of an implementation
+     */
+    fn locations(sym: &Symbol)-> [&Word] {
+        if sym of ImplSymbol {
+            let mut res: [&Word] = [];
+            for s in sym.getAllLocalSymbols(protection-> Protection::PRIVATE) {
+                res ~= TagValidation::locations(s);
+            }
+
+            return res;
+        }
+
+        copy [sym.loc]
+    }
+
+    /**
+     * @returns: true iff `sym` is one of `lst`
+     */
+    fn holds(lst: [&Symbol], sym: &Symbol)-> bool {
+        for s in lst {
+            if (s is sym) return true;
+        }
+
+        false
+    }
+
+    /**
      * Instantiate the `apply` overload a tag site selected for a function, under
      * the name, the protection and the documentation of the function as written.
      *
@@ -393,7 +556,8 @@ pub mod TagValidation {
 
     /**
      * Validate the symbol a tag site is put on, as the first template parameter
-     * of an overload receives it: a function as a function pointer, a type as itself.
+     * of an overload receives it: a function as a function pointer, an enum or a
+     * union as itself.
      *
      * @params:
      *   - context: validation context
@@ -419,11 +583,6 @@ pub mod TagValidation {
                                                       proto.retType,
                                                       isCaught-> true);
                     return (fptr, "function");
-                }
-                dmut c: &ClassSymbol => {
-                    let type = ClassValidation::validate(alias context, alias c, inModule-> false);
-                    let kind = if (c.isEntity) { "entity" } else if (c.isRecord) { "record" } else { "class" };
-                    return (type.createInstance(loc-> c.loc, isMutable-> false, isInnerMutable-> false), kind);
                 }
                 dmut e: &EnumSymbol => {
                     return (EnumValidation::validate(alias context, alias e).clone(0u32), "enum");
