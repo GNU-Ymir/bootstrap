@@ -208,6 +208,83 @@ pub mod GeneratorExpander {
     }
 
     /**
+     * Finalize an `await` of an async value, resuming it with the waker of the current async until
+     * it completes, or an `await;` calling that waker before giving control back.
+     *
+     * @returns:
+     *   - &YILValue: the value the awaited async completed with, YIL_UNIT_VALUE when there is none
+     */
+    pub fn finalizeAwait(dmut context: &Expander, a: &AwaitValue, ref mut list: StmtList)-> &YILValue {
+        if a.handle of UnitValue {
+            return GeneratorExpander::finalizeYieldNow(alias context, a, ref list);
+        }
+
+        let value = ValueExpander::finalize(alias context, a.handle, ref list, asLeft-> false);
+        let (handle, _) = ValueExpander::createVarForBlock(alias context, a.loc, NONE_TYPE, value.type, ref list,
+                                                           withValue-> value);
+        let (out, outAddr) = if a.type of VoidType {
+            (YIL_UNIT_VALUE, YIL_NULL_VALUE)
+        } else {
+            ValueExpander::createVarForBlock(alias context, a.loc, NONE_TYPE, context:.finalizeType(a.type), ref list,
+                                             getAddr-> true)
+        };
+
+        let resume = copy YILLabel(a.loc, "resume", context:.generateLblId());
+        let pending = copy YILLabel(a.loc, "pending", context:.generateLblId());
+        let ready = copy YILLabel(a.loc, "ready", context:.generateLblId());
+
+        let dmut gen = context:.getGenerator();
+        gen.resumes ~= [resume];
+        list:.append(resume);
+
+        let func = copy YILFieldValue(a.loc, YIL_PTR_VOID, handle, DelegateKeys::FUNC);
+        let closure = copy YILFieldValue(a.loc, YIL_PTR_VOID, handle, DelegateKeys::CLOSURE);
+        let poll = copy YILPtrCallValue(a.loc, YIL_UINT_8, func, copy [closure, outAddr, gen.waker]);
+
+        list:.append(copy YILCondJmp(a.loc, poll, pending, ready));
+        list:.append(pending);
+        GeneratorExpander::finalizeSuspend(a.loc, gen, ref list);
+        list:.append(ready);
+
+        return out;
+    }
+
+    /**
+     * Finalize an `await;`: the waker of the current async is called, so that its driver
+     * resumes it, before it gives control back.
+     *
+     * @returns:
+     *   - &YILValue: always YIL_UNIT_VALUE
+     */
+    fn finalizeYieldNow(dmut context: &Expander, a: &AwaitValue, ref mut list: StmtList)-> &YILValue {
+        let resume = copy YILLabel(a.loc, "resume", context:.generateLblId());
+        let dmut gen = context:.getGenerator();
+        gen.resumes ~= [resume];
+
+        let func = copy YILFieldValue(a.loc, YIL_PTR_VOID, gen.waker, DelegateKeys::FUNC);
+        let closure = copy YILFieldValue(a.loc, YIL_PTR_VOID, gen.waker, DelegateKeys::CLOSURE);
+        list:.append(copy YILCall(a.loc, copy YILPtrCallValue(a.loc, YIL_VOID, func, copy [closure])));
+
+        GeneratorExpander::finalizeSuspend(a.loc, gen, ref list);
+        list:.append(resume);
+
+        return YIL_UNIT_VALUE;
+    }
+
+    /**
+     * Suspend the body at its last resume label: the state resuming there is recorded, and
+     * the resume function returns that it is pending.
+     *
+     * @params:
+     *   - gen: the generator frame, whose last resume label is the one of the suspension
+     */
+    fn finalizeSuspend(loc: &Word, gen: &GeneratorFrame, ref mut list: StmtList) {
+        let state = copy YILFieldValue(loc, YIL_UINT_32, gen.frame, GeneratorKeys::STATE);
+        list:.append(copy YILAffect(loc, state, copy YILIntValue(loc, YIL_UINT_32, cast!usize (GeneratorStates::DONE) + gen.resumes.len)));
+        list:.append(copy YILReturn(loc, copy YILIntValue(loc, YIL_UINT_8, 1us)));
+    }
+
+    /**
      * Finalize a return inside a generator or an async, that ends it, the value an async
      * completes with being written to `out`.
      *
@@ -292,16 +369,19 @@ pub mod GeneratorExpander {
 
         let mut params = copy [copy YILVarDecl(frame.loc, GeneratorKeys::FRAME, framePtr, frameId),
                                copy YILVarDecl(frame.loc, GeneratorKeys::OUT, outType, outId)];
+        let mut waker: &YILValue = YIL_UNIT_VALUE;
         if frame.isAsync {
-            params = params ~ [copy YILVarDecl(frame.loc, GeneratorKeys::WAKER, context.typeExpander:.finalizeDelegate(),
-                                               context:.generateVarId())];
+            let wakerType = context.typeExpander:.finalizeDelegate();
+            let wakerId = context:.generateVarId();
+            params = params ~ [copy YILVarDecl(frame.loc, GeneratorKeys::WAKER, wakerType, wakerId)];
+            waker = copy YILVar(frame.loc, GeneratorKeys::WAKER, wakerType, wakerId);
         }
 
         let frameRef = copy YILUnrefValue(frame.loc, tuple, copy YILVar(frame.loc, GeneratorKeys::FRAME, framePtr, frameId));
         let outRef = copy YILVar(frame.loc, GeneratorKeys::OUT, outType, outId);
         let done = copy YILLabel(frame.loc, "done", context:.generateLblId());
 
-        context:.enterGenerator(frameRef, alias tuple, outRef, done);
+        context:.enterGenerator(frameRef, alias tuple, outRef, done, waker-> waker);
 
         let state = context:.declareGeneratorField(frame.loc, GeneratorKeys::STATE, YIL_UINT_32);
         for p in frame.params {
