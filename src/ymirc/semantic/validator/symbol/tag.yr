@@ -38,11 +38,14 @@ in tag;
 use ymirc::errors;
 use ymirc::lexing::word;
 use ymirc::semantic::{symbol, template_};
-use ymirc::semantic::generator::{type, value::_};
+use ymirc::semantic::generator::{global, value::_};
+use ymirc::semantic::generator::type::native;
 use ymirc::semantic::validator::symbol::function::proto;
 use ymirc::syntax::declaration::{block, custom, function, module};
 use ymirc::syntax::expression::empty;
 use ymirc::utils::format;
+
+use std::fs::path;
 
 /**
  * TagValidation module
@@ -60,14 +63,14 @@ pub mod TagValidation {
 
     /**
      * Validate the globals of a tag, one per tag whatever the number of its sites,
-     * and the shape of its `apply` overloads.
+     * and the shape of its `apply` and `self` overloads.
      *
      * @params:
      *   - context: validation context
      *   - sym:     the tag symbol
      *
      * @throws:
-     *   - ErrorMsg::list of the errors of the globals and of the `apply` overloads
+     *   - ErrorMsg::list of the errors of the globals and of the overloads
      */
     pub fn validate(dmut context: &ValidationContext, dmut sym: &TagSymbol)
         throws ErrorMsg
@@ -76,6 +79,16 @@ pub mod TagValidation {
         for a in sym.applies {
             {
                 TagValidation::verifyApply(a._0);
+            } catch {
+                err => {
+                    errors ~= [err];
+                }
+            }
+        }
+
+        for c in sym.ctors {
+            {
+                TagValidation::verifyCtor(c._0);
             } catch {
                 err => {
                     errors ~= [err];
@@ -148,6 +161,31 @@ pub mod TagValidation {
     }
 
     /**
+     * Verify that a `self` overload takes no parameter and throws nothing, being
+     * called with no argument at program start.
+     *
+     * @params:
+     *   - decl: the `self` overload, a ctor or a template of one
+     *
+     * @throws:
+     *   - ErrorMsg at its first parameter or at its throwers
+     */
+    fn verifyCtor(decl: &Declaration)
+        throws ErrorMsg
+    {
+        let inner = if let t: &TemplateDecl = decl { t.decl } else { decl };
+        if let c: &CtorDecl = inner {
+            if (c.proto.params.len != 0us) {
+                throw copy ErrorMsg::fatal(c.proto.params[0].loc, format(ValidateErrorMessage::TAG_CTOR_SHAPE));
+            }
+
+            if (c.throwers.len != 0us) {
+                throw copy ErrorMsg::fatal(c.throwerLoc, format(ValidateErrorMessage::TAG_CTOR_SHAPE));
+            }
+        }
+    }
+
+    /**
      * Validate the tag sites written on top of the declaration of a template,
      * from the scope the declaration is written in. Their paths must name tags,
      * their arguments and overloads depending on the specialization, whose
@@ -192,8 +230,9 @@ pub mod TagValidation {
      * each site is resolved for the function the previous merge produced, and the
      * instance of its `apply` overload, receiving that function, replaces it. The
      * outermost instance takes the identity of the function, which moves to a
-     * hidden name. Only the prototypes are validated, the bodies being validated
-     * along with the one of the function, cf. `FunctionValidation::validate`.
+     * hidden name, the sites outside it receiving it under that identity. Only
+     * the prototypes are validated, the bodies being validated along with the
+     * one of the function, cf. `FunctionValidation::validate`.
      *
      * @params:
      *   - context: validation context
@@ -227,15 +266,24 @@ pub mod TagValidation {
         context:.enterForeign(isFnBody-> false);
         {
             let mut current: &FunctionSymbol = sym;
+            let mut sinceLast = 0us;
             for i in 0us .. sym.tags.len {
                 let site = sym.tags[$ - 1us - i];
                 let (tagged, kind) = TagValidation::validateTagged(alias context, alias context:.getFunctionFromRef(current));
                 let res = TagValidation::resolveSite(alias context, sym, tagged, kind, site);
                 resolved = [res] ~ resolved;
+                sinceLast += 1us;
                 if let Ok(apply) = res.apply {
                     current = TagValidation::instantiateApply(alias context, sym, res, apply);
                     merges ~= [current];
+                    sinceLast = 0us;
                 }
+            }
+
+            if (merges.len != 0us) {
+                context:.getFunctionFromRef(merges[$ - 1us]):.takeIdentity(sym);
+                sym:.hide();
+                resolved = TagValidation::resolveAgain(alias context, sym, alias context:.getFunctionFromRef(merges[$ - 1us]), resolved, sinceLast);
             }
         } catch {
             err => {
@@ -253,13 +301,42 @@ pub mod TagValidation {
             throw fatal;
         }
 
-        if (merges.len != 0us) {
-            context:.getFunctionFromRef(merges[$ - 1us]):.takeIdentity(sym);
-            sym:.hide();
+        sym:.setResolvedTags(resolved);
+        context:.insertTagged(sym);
+        sym:.setMerges(merges);
+    }
+
+    /**
+     * Resolve again the outermost sites of a function, those resolved for the
+     * outermost instance its tags merged before it took the identity of the
+     * function: they receive it under that identity.
+     *
+     * @params:
+     *   - context:  validation context
+     *   - sym:      the tagged function
+     *   - outer:    the outermost instance, its identity taken
+     *   - resolved: the sites of the function, resolved, the outermost first
+     *   - nb:       the number of outermost sites resolved for it
+     *
+     * @returns: the sites, resolved, the outermost first
+     *
+     * @throws:
+     *   - ErrorMsg if a site does not resolve
+     */
+    fn resolveAgain(dmut context: &ValidationContext, sym: &FunctionSymbol, dmut outer: &FunctionSymbol, resolved: [TagResolution], nb: usize)-> [TagResolution]
+        throws ErrorMsg
+    {
+        let (tagged, kind) = TagValidation::validateTagged(alias context, alias outer);
+        let mut res: [TagResolution] = [];
+        for i, r in resolved {
+            if (i < nb && r.ctor.hasValue) {
+                res ~= [TagValidation::resolveSite(alias context, sym, tagged, kind, r.site)];
+            } else {
+                res ~= [r];
+            }
         }
 
-        sym:.setResolvedTags(resolved);
-        sym:.setMerges(merges);
+        res
     }
 
     /**
@@ -281,6 +358,116 @@ pub mod TagValidation {
 
         TagValidation::mergeFunction(alias context, loc, alias sym);
         alias context:.getFunctionFromRef(sym.named)
+    }
+
+    /**
+     * Construct the tag sites of the symbols whose tags are resolved, until no
+     * more are: the instance of the `self` overload each site selected is
+     * validated, and its call is run at program start. Only the sites written
+     * in a module this compilation compiles are constructed, those of a
+     * specialization being written in the module of its template.
+     *
+     * @params:
+     *   - context: validation context
+     *
+     * @throws:
+     *   - ErrorMsg::list of the errors of the symbols whose sites do not construct
+     */
+    pub fn constructSites(dmut context: &ValidationContext)
+        throws ErrorMsg
+    {
+        let mut errors: [&ErrorMsg] = [];
+        loop {
+            let tagged = context:.takeTagged();
+            if (tagged.len == 0us) break;
+
+            for sym in tagged if context.declarator.checkPassFilter(Path(sym.loc.filename)) {
+                {
+                    TagValidation::constructSites(alias context, sym);
+                } catch {
+                    err => {
+                        errors ~= [err];
+                    }
+                }
+            }
+        }
+
+        if (errors.len != 0us) {
+            throw copy ErrorMsg::list(errors);
+        }
+    }
+
+    /**
+     * Construct the tag sites of a symbol whose tags are resolved, in the order
+     * they are written.
+     *
+     * @params:
+     *   - context: validation context
+     *   - sym:     the tagged symbol
+     *
+     * @throws:
+     *   - ErrorMsg if the instance of a `self` overload does not validate, noted with its site
+     */
+    fn constructSites(dmut context: &ValidationContext, sym: &Symbol)
+        throws ErrorMsg
+    {
+        let path = if let f: &FunctionSymbol = sym { f.named.path } else { sym.path };
+        let mut errors: [&ErrorMsg] = [];
+        for res in sym.resolvedTags if let Ok(ctor) = res.ctor {
+            {
+                let proto = TagValidation::instantiateCtor(alias context, res, ctor);
+                let call = copy PrototypeCallValue(res.site.loc, VOID_TYPE, proto, []);
+                context:.insertGenerator(alias context:.getSymbolFromRef(sym), copy TagCtorGenerator(res.site.loc, path, res.tag.path, call));
+            } catch {
+                err => {
+                    errors ~= [copy ErrorMsg::fatal(res.site.loc, format(ValidateErrorMessage::TAG_CONSTRUCTING, res.tag.path.toStr(), path.toStr()),
+                                                    notes-> copy [err])];
+                }
+            }
+        }
+
+        if (errors.len != 0us) {
+            throw copy ErrorMsg::fatal(sym.loc, format(ValidateErrorMessage::VALIDATING_SYMBOL, path.toStr()),
+                                       notes-> errors);
+        }
+    }
+
+    /**
+     * Instantiate the `self` overload a tag site selected, its template
+     * parameters and those of the tag bound, and validate the instance.
+     *
+     * @params:
+     *   - context: validation context
+     *   - res:     the tag site, resolved
+     *   - ctor:    its `self` overload
+     *
+     * @returns: the prototype of the instance, a function taking no parameter
+     *
+     * @throws:
+     *   - ErrorMsg if the overload cannot be instantiated, or the instance does not validate
+     */
+    fn instantiateCtor(dmut context: &ValidationContext, res: TagResolution, ctor: TagOverload)-> &PrototypeValue
+        throws ErrorMsg
+    {
+        if let tag: &TagSymbol = res.tag {
+            let tmpl = tag.ctorTemplate(ctor.decl);
+            context:.pushReferent(alias context:.getSymbolFromRef(tag));
+            context:.enterForeign(isFnBody-> false);
+            {
+                if let f: &FunctionDecl = tmpl.decl.decl {
+                    let dmut inst = alias TemplateDeclaration::declareFunction(alias context, res.site.loc, copy TemplateRefValue(res.site.loc, tmpl), ctor.mapper, f);
+                    if let dmut instance: &FunctionSymbol = alias inst {
+                        SymbolValidation::validate(alias context, alias instance);
+                        return FunctionValidation::validateProto(alias context, alias instance);
+                    }
+                }
+            } exit {
+                context:.exitForeign();
+                context:.popReferent();
+            }
+        }
+
+        panic;
     }
 
     /**
@@ -326,6 +513,7 @@ pub mod TagValidation {
         }
 
         sym:.setResolvedTags(resolved);
+        context:.insertTagged(sym);
     }
 
     /**
@@ -425,6 +613,7 @@ pub mod TagValidation {
         }
 
         sym:.setResolvedTags(resolved);
+        context:.insertTagged(sym);
     }
 
     /**
@@ -504,6 +693,7 @@ pub mod TagValidation {
         }
 
         sym:.setResolvedTags(resolved);
+        context:.insertTagged(sym);
     }
 
     /**
