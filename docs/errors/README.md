@@ -26,7 +26,7 @@ check lives:
 | `E1xxx` | lexing | `LexingErrorMessage` -- `src/ymirc/lexing/errors.yr` | 24 |
 | `E2xxx` | parsing | `SyntaxErrorMessage` -- `src/ymirc/syntax/errors.yr` | 17 |
 | `E3xxx` | declaration | `DeclareErrorMessage` -- `src/ymirc/semantic/declarator/errors.yr` | 37 |
-| `E4xxx` | validation | `ValidateErrorMessage` -- `src/ymirc/semantic/validator/errors.yr` | 282 |
+| `E4xxx` | validation | `ValidateErrorMessage` -- `src/ymirc/semantic/validator/errors.yr` | 285 |
 | `E5xxx` | lowering (YIL) | `SerializeYILErrorMessage` -- `src/ymirc/lint/serialize/errors.yr`, `OptimizerErrorMessage` -- `src/ymirc/lint/optimizer/errors.yr` | 11 |
 
 Each page carries an example wherever a case in the suite raises the code: the
@@ -409,8 +409,8 @@ deliberately carry no code, and have no page here.
 | [E4293](E4293.md) | `YIELD_PROTECTED_REGION` | cannot yield inside a try block, a catch or a scope guard |
 | [E4294](E4294.md) | `RETURN_VALUE_GENERATOR` | a generator cannot return a value, its values are yielded |
 | [E4295](E4295.md) | `GENERATOR_THROWS` | a generator cannot throw exceptions |
-| [E4296](E4296.md) | `GENERATOR_PARAM` | the parameter <> of a generator cannot be declared <> |
-| [E4297](E4297.md) | `GENERATOR_MOVABLE` | a generator cannot hold a value of type <>, which has a destructor |
+| [E4296](E4296.md) | `GENERATOR_PARAM` | the parameter <> of a generator or an async cannot be declared <> |
+| [E4297](E4297.md) | `GENERATOR_MOVABLE` | a generator or an async cannot hold a value of type <>, which has a destructor |
 | [E4298](E4298.md) | `FAKE_METHOD_CALL` | the method <> is not a value, it can only be called |
 | [E4299](E4299.md) | `YIELD_IN_NO_GENERATOR` | yield in expects a generator, not a value of type <> |
 | [E4300](E4300.md) | `UNECESSARY_GENERATOR_COPY` | copying a generator comprehension has no effect |
@@ -418,6 +418,9 @@ deliberately carry no code, and have no page here.
 | [E4302](E4302.md) | `LIST_COMPR_FILTER_SIZE` | the size of a list comprehension filtered by if is not determinable at compile time |
 | [E4303](E4303.md) | `LIST_COMPR_FILTER_CTE` | the filter of the list comprehension, constructed from type <>, must be determinable at compile time |
 | [E4304](E4304.md) | `TYPEOF_UNTYPED` | <> has no type of its own, it takes the type of what it is assigned to |
+| [E4341](E4341.md) | `ASYNC_THROWS` | an async cannot throw exceptions, it returns its errors in an option |
+| [E4342](E4342.md) | `YIELD_IN_ASYNC` | an async cannot yield, it completes with a single value |
+| [E4343](E4343.md) | `ASYNC_MAIN` | the main function cannot be async |
 
 ## E5xxx -- lowering (YIL)
 
