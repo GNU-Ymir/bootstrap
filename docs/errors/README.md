@@ -26,7 +26,7 @@ check lives:
 | `E1xxx` | lexing | `LexingErrorMessage` -- `src/ymirc/lexing/errors.yr` | 24 |
 | `E2xxx` | parsing | `SyntaxErrorMessage` -- `src/ymirc/syntax/errors.yr` | 17 |
 | `E3xxx` | declaration | `DeclareErrorMessage` -- `src/ymirc/semantic/declarator/errors.yr` | 37 |
-| `E4xxx` | validation | `ValidateErrorMessage` -- `src/ymirc/semantic/validator/errors.yr` | 280 |
+| `E4xxx` | validation | `ValidateErrorMessage` -- `src/ymirc/semantic/validator/errors.yr` | 281 |
 | `E5xxx` | lowering (YIL) | `SerializeYILErrorMessage` -- `src/ymirc/lint/serialize/errors.yr`, `OptimizerErrorMessage` -- `src/ymirc/lint/optimizer/errors.yr` | 11 |
 
 Each page carries an example wherever a case in the suite raises the code: the
@@ -281,6 +281,7 @@ deliberately carry no code, and have no page here.
 | [E4163](E4163.md) | `NOT_A_TUPLE` | <> is not a tuple type |
 | [E4315](E4315.md) | `NOT_A_UNION` | <> is not a union type |
 | [E4165](E4165.md) | `NOT_MOVABLE` | type <> is not a movable type |
+| [E4339](E4339.md) | `NOT_TAGGABLE` | <> names no single function, class, enum or union to carry tags |
 | [E4337](E4337.md) | `NOT_TAGGED` | <> names no function whose tags are merged into it |
 | [E4166](E4166.md) | `NOT_UNSAFE` | an unsafe context is entered, but no unsafe operations are made |
 | [E4167](E4167.md) | `NO_COPY_EXIST` | no copy exists for type <> |
