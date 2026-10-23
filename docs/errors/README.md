@@ -26,7 +26,7 @@ check lives:
 | `E1xxx` | lexing | `LexingErrorMessage` -- `src/ymirc/lexing/errors.yr` | 24 |
 | `E2xxx` | parsing | `SyntaxErrorMessage` -- `src/ymirc/syntax/errors.yr` | 17 |
 | `E3xxx` | declaration | `DeclareErrorMessage` -- `src/ymirc/semantic/declarator/errors.yr` | 37 |
-| `E4xxx` | validation | `ValidateErrorMessage` -- `src/ymirc/semantic/validator/errors.yr` | 279 |
+| `E4xxx` | validation | `ValidateErrorMessage` -- `src/ymirc/semantic/validator/errors.yr` | 280 |
 | `E5xxx` | lowering (YIL) | `SerializeYILErrorMessage` -- `src/ymirc/lint/serialize/errors.yr`, `OptimizerErrorMessage` -- `src/ymirc/lint/optimizer/errors.yr` | 11 |
 
 Each page carries an example wherever a case in the suite raises the code: the
@@ -320,6 +320,7 @@ deliberately carry no code, and have no page here.
 | [E4334](E4334.md) | `TAG_APPLY_IDENTITY` | an apply overload cannot declare <>, the tagged symbol keeps its own |
 | [E4333](E4333.md) | `TAG_APPLY_KIND` | <> is <>, but the overload receiving it is declared as <> |
 | [E4335](E4335.md) | `TAG_APPLY_NOT_TEMPLATE` | an apply overload is a template, whose first parameter receives the tagged symbol |
+| [E4338](E4338.md) | `TAG_CTOR_SHAPE` | a self overload of a tag is run at program start, it can neither take parameters nor throw |
 | [E4336](E4336.md) | `TAG_MERGE_CYCLE` | <> is used before its tags are merged into it |
 | [E4332](E4332.md) | `TAG_NOT_APPLICABLE` | tag <> does not apply to <> <> |
 | [E4202](E4202.md) | `TEMPLATE_SPECIALIZATION_FAILS` | template specialization for <> fails with <> |
