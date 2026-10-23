@@ -26,7 +26,7 @@ check lives:
 | `E1xxx` | lexing | `LexingErrorMessage` -- `src/ymirc/lexing/errors.yr` | 24 |
 | `E2xxx` | parsing | `SyntaxErrorMessage` -- `src/ymirc/syntax/errors.yr` | 17 |
 | `E3xxx` | declaration | `DeclareErrorMessage` -- `src/ymirc/semantic/declarator/errors.yr` | 37 |
-| `E4xxx` | validation | `ValidateErrorMessage` -- `src/ymirc/semantic/validator/errors.yr` | 285 |
+| `E4xxx` | validation | `ValidateErrorMessage` -- `src/ymirc/semantic/validator/errors.yr` | 287 |
 | `E5xxx` | lowering (YIL) | `SerializeYILErrorMessage` -- `src/ymirc/lint/serialize/errors.yr`, `OptimizerErrorMessage` -- `src/ymirc/lint/optimizer/errors.yr` | 11 |
 
 Each page carries an example wherever a case in the suite raises the code: the
@@ -395,7 +395,6 @@ deliberately carry no code, and have no page here.
 | [E4278](E4278.md) | `VOID_VALUE` | void expression cannot be used as a value |
 | [E4280](E4280.md) | `WORKS_WITH_BOTH` | <> called with <> works with multiple candidates |
 | [E4281](E4281.md) | `DECLARE_VARIABLE_NO_FUNCTION` | var declaration <> outside a function context |
-| [E4282](E4282.md) | `NOT_SUPPORTED_IN` | not supported in version ymir <> |
 | [E4283](E4283.md) | `DEFAULT_PARAM_BY_POSITION` | the parameter <> has a default value, it can only be passed by name |
 | [E4284](E4284.md) | `NAMED_PARAM_BY_POSITION` | the parameter <> can only be passed by name |
 | [E4285](E4285.md) | `NAMED_PARAM_WITH_DEFAULT` | parameter with a default value cannot be marked <>, it can already only be passed by name |
@@ -406,7 +405,7 @@ deliberately carry no code, and have no page here.
 | [E4290](E4290.md) | `UNUSABLE_SYMBOLS` | none of the symbols <> can be used as a value |
 | [E4291](E4291.md) | `YIELD_NO_GENERATOR` | yield statement is not within a generator |
 | [E4292](E4292.md) | `YIELD_NO_VALUE` | a yield statement must yield a value of type <> |
-| [E4293](E4293.md) | `YIELD_PROTECTED_REGION` | cannot yield inside a try block, a catch or a scope guard |
+| [E4293](E4293.md) | `SUSPEND_PROTECTED_REGION` | cannot <> inside a try block, a catch or a scope guard |
 | [E4294](E4294.md) | `RETURN_VALUE_GENERATOR` | a generator cannot return a value, its values are yielded |
 | [E4295](E4295.md) | `GENERATOR_THROWS` | a generator cannot throw exceptions |
 | [E4296](E4296.md) | `GENERATOR_PARAM` | the parameter <> of a generator or an async cannot be declared <> |
@@ -421,6 +420,9 @@ deliberately carry no code, and have no page here.
 | [E4341](E4341.md) | `ASYNC_THROWS` | an async cannot throw exceptions, it returns its errors in an option |
 | [E4342](E4342.md) | `YIELD_IN_ASYNC` | an async cannot yield, it completes with a single value |
 | [E4343](E4343.md) | `ASYNC_MAIN` | the main function cannot be async |
+| [E4344](E4344.md) | `AWAIT_NO_ASYNC` | await statement is not within an async |
+| [E4345](E4345.md) | `AWAIT_IN_GENERATOR` | a generator cannot await, it is resumed by its consumer, never woken |
+| [E4346](E4346.md) | `AWAIT_NOT_AWAITABLE` | cannot await a value of type <>, only an async value, a future value or a class with a poll method |
 
 ## E5xxx -- lowering (YIL)
 
@@ -514,3 +516,4 @@ ever reused.
 | [E4276](E4276.md) | `VAR_DECL_WITHOUT_VALUE` | var declared without value, when necessary |
 | [E4277](E4277.md) | `VAR_DECL_WITH_NOTHING` | var declaration must at least have a type or a value |
 | [E4279](E4279.md) | `VOID_VAR` | cannot create a variable of type void |
+| [E4282](E4282.md) | `NOT_SUPPORTED_IN` | not supported in version ymir <> |
