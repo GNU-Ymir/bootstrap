@@ -1,5 +1,5 @@
 /*
- * Lowers the frame of a generator into a state machine.
+ * Lowers the frame of a generator or of an async into a state machine.
  *
  * <hr>
  *
@@ -43,7 +43,7 @@ use ymirc::semantic::generator::type::native;
 use ymirc::utils::format;
 
 /**
- * The states of a generator frame, a state above DONE resumes the body after a yield.
+ * The states of a generator or async frame, a state above DONE resumes the body after a suspension.
  */
 enum GeneratorStates
 | START = 0us
@@ -58,6 +58,11 @@ enum GeneratorStates
  *     initializes it,
  *   - the function resuming the body up to its next yield: `resume (frame, out)-> bool`.
  *
+ * An async is expanded into the same three frames, its resume function taking the waker
+ * of its driver: `resume (frame, out, waker)-> u8`, 1 while pending, 0 once it completed,
+ * its value written to `out`. Resuming a completed async panics, where a completed
+ * generator yields no value.
+ *
  * A variable of the resume function whose value crosses a suspension is a field of the
  * frame, any other is a local of the resume function. Suspending the body is thus only
  * a return, whose resumption is a jump dispatched on the state of the frame.
@@ -70,12 +75,12 @@ enum GeneratorStates
 pub mod GeneratorExpander {
 
     /**
-     * Finalize the frame of a generator into its init, create and resume frames, unless
-     * a consumer already did.
+     * Finalize the frame of a generator or of an async into its init, create and resume frames,
+     * unless a consumer already did.
      *
      * @params:
      *   - context: the expansion context
-     *   - frame:   the frame generator node, a generator
+     *   - frame:   the frame generator node, a generator or an async
      */
     pub fn finalizeGenerator(dmut context: &Expander, frame: &FrameGenerator) {
         let name = Mangler::mangle(frame);
@@ -83,11 +88,16 @@ pub mod GeneratorExpander {
             return;
         }
 
-        let yieldType = if let y: &YieldType = frame.retType { y } else { panic; };
+        let outType = if let y: &YieldType = frame.retType {
+            y.retType
+        } else if let a: &AsyncType = frame.retType {
+            a.retType
+        } else { panic; };
+
         let dmut tuple = context.typeExpander:.createEmptyTuple();
         let framePtr = context.typeExpander:.finalizePointer(tuple);
 
-        GeneratorExpander::finalizeResumeFrame(alias context, frame, yieldType, alias tuple, framePtr);
+        GeneratorExpander::finalizeResumeFrame(alias context, frame, outType, alias tuple, framePtr);
         context:.endGenerator(name, tuple);
 
         GeneratorExpander::finalizeInitFrame(alias context, frame, framePtr);
@@ -198,14 +208,21 @@ pub mod GeneratorExpander {
     }
 
     /**
-     * Finalize a return inside a generator, that ends the generator.
+     * Finalize a return inside a generator or an async, that ends it, the value an async
+     * completes with being written to `out`.
      *
      * @returns:
      *   - &YILValue: always YIL_UNIT_VALUE
      */
     pub fn finalizeReturn(dmut context: &Expander, r: &ReturnValue, ref mut list: StmtList)-> &YILValue {
-        ValueExpander::finalize(alias context, r.value, ref list, asLeft-> false);
-        list:.append(copy YILGoto(r.loc, context:.getGenerator().done));
+        let value = ValueExpander::finalize(alias context, r.value, ref list, asLeft-> false);
+        let gen = context:.getGenerator();
+        if r.value.type !of VoidType {
+            let valueType = if let p: &YILPointer = gen.out.type { p.inner } else { panic; };
+            OperatorExpander::finalizeAffect(r.loc, copy YILUnrefValue(r.loc, valueType, gen.out), value, ref list);
+        }
+
+        list:.append(copy YILGoto(r.loc, gen.done));
 
         return YIL_UNIT_VALUE;
     }
@@ -228,11 +245,34 @@ pub mod GeneratorExpander {
     }
 
     /**
-     * Finalize the function resuming a generator.
+     * Finalize the run of an async: `_yrt_async_run (h, &out)`, driving it to completion.
+     *
+     * @returns:
+     *   - &YILValue: the value the async completed with, read from `out`, or the call itself
+     *                for an async-> void, which writes no value
+     */
+    pub fn finalizeRun(dmut context: &Expander, r: &AsyncRunValue, ref mut list: StmtList)-> &YILValue {
+        let handle = ValueExpander::finalize(alias context, r.handle, ref list, asLeft-> false);
+        if r.type of VoidType {
+            return copy YILNameCallValue(r.loc, YIL_VOID, YRuntimeFuncs::ASYNC_RUN, copy [handle, YIL_NULL_VALUE]);
+        }
+
+        let (out, outAddr) = ValueExpander::createVarForBlock(alias context, r.loc, NONE_TYPE, context:.finalizeType(r.type), ref list,
+                                                              getAddr-> true);
+        list:.append(copy YILCall(r.loc, copy YILNameCallValue(r.loc, YIL_VOID, YRuntimeFuncs::ASYNC_RUN, copy [handle, outAddr])));
+
+        return out;
+    }
+
+    /**
+     * Finalize the function resuming a generator or an async.
+     *
+     * @params:
+     *   - valueType: the type of the values the generator yields, or of the one the async completes with
      *
      * @info: the fields of `tuple` are complete once this function returns.
      */
-    fn finalizeResumeFrame(dmut context: &Expander, frame: &FrameGenerator, yieldType: &YieldType, dmut tuple: &YILTuple, framePtr: &YILPointer) {
+    fn finalizeResumeFrame(dmut context: &Expander, frame: &FrameGenerator, valueType: &Type, dmut tuple: &YILTuple, framePtr: &YILPointer) {
         let name = Mangler::mangleResumeFrame(frame);
         let enterCoverage = FrameExpander::isCoverageFrame(frame);
         let FRAME_INFO = Mangler::mangleCoverageFrameInfo(frame);
@@ -246,12 +286,16 @@ pub mod GeneratorExpander {
         context:.enterFrame(frame.name.toStr(), frameAddr-> frameAddr, frameCoverAddr-> frameCoverAddr);
         context:.enterBlock();
 
-        let outType = context.typeExpander:.finalizePointer(context:.finalizeType(yieldType.retType));
+        let outType = context.typeExpander:.finalizePointer(context:.finalizeType(valueType));
         let frameId = context:.generateVarId();
         let outId = context:.generateVarId();
 
-        let params = copy [copy YILVarDecl(frame.loc, GeneratorKeys::FRAME, framePtr, frameId),
-                           copy YILVarDecl(frame.loc, GeneratorKeys::OUT, outType, outId)];
+        let mut params = copy [copy YILVarDecl(frame.loc, GeneratorKeys::FRAME, framePtr, frameId),
+                               copy YILVarDecl(frame.loc, GeneratorKeys::OUT, outType, outId)];
+        if frame.isAsync {
+            params = params ~ [copy YILVarDecl(frame.loc, GeneratorKeys::WAKER, context.typeExpander:.finalizeDelegate(),
+                                               context:.generateVarId())];
+        }
 
         let frameRef = copy YILUnrefValue(frame.loc, tuple, copy YILVar(frame.loc, GeneratorKeys::FRAME, framePtr, frameId));
         let outRef = copy YILVar(frame.loc, GeneratorKeys::OUT, outType, outId);
@@ -271,9 +315,13 @@ pub mod GeneratorExpander {
         body:.append(copy YILAffect(frame.loc, state, copy YILIntValue(frame.loc, YIL_UINT_32, cast!usize (GeneratorStates::DONE))));
         body:.append(copy YILReturn(frame.loc, copy YILIntValue(frame.loc, YIL_UINT_8, 0us)));
 
+        let finished = if frame.isAsync {
+            GeneratorExpander::finalizeCompleted(alias context, frame, ref body)
+        } else { done };
+
         let gen = context:.exitGenerator();
         let mut list = StmtList();
-        GeneratorExpander::finalizeDispatch(alias context, frame.loc, state, gen, ref list);
+        GeneratorExpander::finalizeDispatch(alias context, frame.loc, state, gen, finished, ref list);
         list:.append(body);
 
         let resume = copy YILFrame(frame.loc, frame.implLoc, name, params, YIL_UINT_8,
@@ -307,6 +355,25 @@ pub mod GeneratorExpander {
         } else {
             context:.insertSymbol(name, final);
         }
+    }
+
+    /**
+     * Emit the panic of an async resumed after it completed.
+     *
+     * @params:
+     *   - frame: the frame of the async
+     *   - list:  the body of the resume function, the panic is appended to it
+     *
+     * @returns: the label of the panic, where the dispatch of a completed async jumps
+     */
+    fn finalizeCompleted(dmut context: &Expander, frame: &FrameGenerator, ref mut list: StmtList)-> &YILLabel {
+        let completed = copy YILLabel(frame.loc, "completed", context:.generateLblId());
+        list:.append(completed);
+
+        InstructionExpander::finalizePanic(alias context, copy PanicValue(frame.loc), ref list);
+        list:.append(copy YILReturn(frame.loc, copy YILIntValue(frame.loc, YIL_UINT_8, 0us)));
+
+        completed
     }
 
     /**
@@ -373,11 +440,12 @@ pub mod GeneratorExpander {
      * starts right after them in the START state.
      *
      * @params:
-     *   - state: the state field of the frame
-     *   - gen:   the generator frame, whose resume labels are all known
+     *   - state:    the state field of the frame
+     *   - gen:      the generator frame, whose resume labels are all known
+     *   - finished: the label a frame resumed in the DONE state jumps to
      */
-    fn finalizeDispatch(dmut context: &Expander, loc: &Word, state: &YILValue, gen: &GeneratorFrame, ref mut list: StmtList) {
-        let targets = copy [gen.done] ~ gen.resumes;
+    fn finalizeDispatch(dmut context: &Expander, loc: &Word, state: &YILValue, gen: &GeneratorFrame, finished: &YILLabel, ref mut list: StmtList) {
+        let targets = copy [finished] ~ gen.resumes;
         for i, target in targets {
             let next = copy YILLabel(loc, "next", context:.generateLblId());
             let test = copy YILBinaryValue(loc, YIL_UINT_8, BinaryOperators::DEQUAL, state,
