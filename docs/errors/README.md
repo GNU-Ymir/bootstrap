@@ -25,8 +25,8 @@ check lives:
 |---|---|---|---|
 | `E1xxx` | lexing | `LexingErrorMessage` -- `src/ymirc/lexing/errors.yr` | 24 |
 | `E2xxx` | parsing | `SyntaxErrorMessage` -- `src/ymirc/syntax/errors.yr` | 17 |
-| `E3xxx` | declaration | `DeclareErrorMessage` -- `src/ymirc/semantic/declarator/errors.yr` | 36 |
-| `E4xxx` | validation | `ValidateErrorMessage` -- `src/ymirc/semantic/validator/errors.yr` | 272 |
+| `E3xxx` | declaration | `DeclareErrorMessage` -- `src/ymirc/semantic/declarator/errors.yr` | 37 |
+| `E4xxx` | validation | `ValidateErrorMessage` -- `src/ymirc/semantic/validator/errors.yr` | 279 |
 | `E5xxx` | lowering (YIL) | `SerializeYILErrorMessage` -- `src/ymirc/lint/serialize/errors.yr`, `OptimizerErrorMessage` -- `src/ymirc/lint/optimizer/errors.yr` | 11 |
 
 Each page carries an example wherever a case in the suite raises the code: the
@@ -128,7 +128,8 @@ deliberately carry no code, and have no page here.
 | [E3041](E3041.md) | `UNDEFINED_ATTRIBUTE_FOR_MODULE` | custom attribute <> is not valid on modules |
 | [E3042](E3042.md) | `UNDEFINED_ATTRIBUTE_FOR_ENTITY` | custom attribute <> is not valid on entities |
 | [E3043](E3043.md) | `COMPANION_WITHOUT_TYPE` | the companion module <> is not named after a class, a record or an entity of module <> |
-| [E3044](E3044.md) | `NOT_SUPPORTED_IN` | not supported in version ymir <> |
+| [E3044](E3044.md) | `NOT_SUPPORTED_IN` | <> is not supported in version ymir <> |
+| [E3045](E3045.md) | `UNEXPECTED_IN_TAG` | a declaration of a tag is a global, an apply or a self overload, not <> |
 
 ## E4xxx -- validation
 
@@ -275,10 +276,12 @@ deliberately carry no code, and have no page here.
 | [E4155](E4155.md) | `NOT_A_LVALUE_MAP_ACCESS` | <> is a map access, and cannot be used as a lvalue |
 | [E4156](E4156.md) | `NOT_A_LVALUE_PARAM` | <> is a value parameter, and cannot be used as a lvalue |
 | [E4157](E4157.md) | `NOT_A_LVALUE_TYPE` | value of type <> is not a lvalue |
+| [E4331](E4331.md) | `NOT_A_TAG` | <> is not a tag |
 | [E4162](E4162.md) | `NOT_A_TRAIT` | <> is not a trait |
 | [E4163](E4163.md) | `NOT_A_TUPLE` | <> is not a tuple type |
 | [E4315](E4315.md) | `NOT_A_UNION` | <> is not a union type |
 | [E4165](E4165.md) | `NOT_MOVABLE` | type <> is not a movable type |
+| [E4337](E4337.md) | `NOT_TAGGED` | <> names no function whose tags are merged into it |
 | [E4166](E4166.md) | `NOT_UNSAFE` | an unsafe context is entered, but no unsafe operations are made |
 | [E4167](E4167.md) | `NO_COPY_EXIST` | no copy exists for type <> |
 | [E4168](E4168.md) | `NO_CTOR_FOUND` | no constructor found for class <> |
@@ -314,6 +317,11 @@ deliberately carry no code, and have no page here.
 | [E4197](E4197.md) | `RETURN_NO_FUNCTION` | return statement is not within a function |
 | [E4198](E4198.md) | `RETURN_SCOPE_GUARD` | cannot return inside a scope guard |
 | [E4199](E4199.md) | `SHADOWING_DECL` | declaration of <> shadows another declaration |
+| [E4334](E4334.md) | `TAG_APPLY_IDENTITY` | an apply overload cannot declare <>, the tagged symbol keeps its own |
+| [E4333](E4333.md) | `TAG_APPLY_KIND` | <> is <>, but the overload receiving it is declared as <> |
+| [E4335](E4335.md) | `TAG_APPLY_NOT_TEMPLATE` | an apply overload is a template, whose first parameter receives the tagged symbol |
+| [E4336](E4336.md) | `TAG_MERGE_CYCLE` | <> is used before its tags are merged into it |
+| [E4332](E4332.md) | `TAG_NOT_APPLICABLE` | tag <> does not apply to <> <> |
 | [E4202](E4202.md) | `TEMPLATE_SPECIALIZATION_FAILS` | template specialization for <> fails with <> |
 | [E4203](E4203.md) | `TEMPLATE_SPECIALIZATION_FAILS_SIMPLE` | template specialization fails with <> |
 | [E4206](E4206.md) | `THROWS_NOT_DECLARED` | the function <> might throw an exception of type <>, but that is not declared in its prototype |

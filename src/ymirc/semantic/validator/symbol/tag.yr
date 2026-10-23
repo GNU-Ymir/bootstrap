@@ -1,0 +1,864 @@
+/*
+ * Declares the TagValidation module.
+ *
+ * Validates the tag declarations, and the tag sites written on top of the
+ * tagged declarations.
+ *
+ * <hr>
+ *
+ * @Package: ymirc
+ * @Module: ymirc::semantic::validator::symbol::tag
+ * @File: ymirc/semantic/validator/symbol/tag.yr
+ * @Author(s):
+ *   - Emile Cadorel <ecadorel@gmail.com>
+ *
+ * @Created(YYYY-MM-DD): 2026-10-21
+ * @Copyright(C) 2021–2026 GNU-Ymir
+ * @License
+ *   ```text
+ *   This file is part of the Ymir language project.
+ *
+ *   Ymir is free software: you can redistribute it and/or modify it
+ *   under the terms of the GNU General Public License as published by
+ *   the Free Software Foundation, either version 3 of the License, or
+ *   (at your option) any later version.
+ *
+ *   Ymir is distributed in the hope that it will be useful,
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *   GNU General Public License for more details.
+ *
+ *   You should have received a copy of the GNU General Public License
+ *   along with Ymir.  If not, see <https://www.gnu.org/licenses/>.
+ *   ```
+ */
+
+in tag;
+
+use ymirc::errors;
+use ymirc::lexing::word;
+use ymirc::semantic::{symbol, template_};
+use ymirc::semantic::generator::value::_;
+use ymirc::semantic::validator::symbol::function::proto;
+use ymirc::syntax::declaration::{block, custom, function, module};
+use ymirc::syntax::expression::empty;
+use ymirc::utils::format;
+
+/**
+ * TagValidation module
+ *
+ * A tag is validated through its globals, and the shape of its `apply`
+ * overloads: they are templates, validated once instantiated for a tag site.
+ * A tag site is resolved for the symbol it tags: its arguments are bound to
+ * the parameters of the tag, and the `apply` and `self` overloads applying to
+ * the symbol are selected. The `apply` instances of the sites of a function are
+ * merged into it, the outermost one taking its name; those of a class declare
+ * their members into it.
+ */
+pub mod TagValidation {
+
+    /**
+     * Validate the globals of a tag, one per tag whatever the number of its sites,
+     * and the shape of its `apply` overloads.
+     *
+     * @params:
+     *   - context: validation context
+     *   - sym:     the tag symbol
+     *
+     * @throws:
+     *   - ErrorMsg::list of the errors of the globals and of the `apply` overloads
+     */
+    pub fn validate(dmut context: &ValidationContext, dmut sym: &TagSymbol)
+        throws ErrorMsg
+    {
+        let mut errors: [&ErrorMsg] = [];
+        for a in sym.applies {
+            {
+                TagValidation::verifyApply(a._0);
+            } catch {
+                err => {
+                    errors ~= [err];
+                }
+            }
+        }
+
+        context:.pushReferent(alias sym);
+        {
+            let dmut inner = sym:.getAllLocalSymbols(protection-> Protection::PRIVATE);
+            for i in 0us .. inner.len {
+                {
+                    SymbolValidation::validate(alias context, alias inner[i]);
+                } catch {
+                    err => {
+                        errors ~= [err];
+                    }
+                }
+            }
+        } exit {
+            context:.popReferent();
+        }
+
+        if (errors.len != 0us) {
+            throw copy ErrorMsg::list(errors);
+        }
+    }
+
+    /**
+     * Verify that an `apply` overload is a template, declaring nothing that is
+     * part of the identity of the symbol it is merged into: the ancestor and the
+     * attributes of a class, the type of an enum, the base of a union.
+     *
+     * @params:
+     *   - decl: the `apply` overload
+     *
+     * @throws:
+     *   - ErrorMsg if the overload is not a template, or declares an identity-level element
+     */
+    fn verifyApply(decl: &Declaration)
+        throws ErrorMsg
+    {
+        if let t: &TemplateDecl = decl {
+            match t.decl {
+                c: &TypeDecl => {
+                    if c.ancestor !of EmptyExpr {
+                        throw copy ErrorMsg::fatal(c.ancestor.loc, format(ValidateErrorMessage::TAG_APPLY_IDENTITY, format("over %", c.ancestor)));
+                    }
+
+                    if (c.attrs.len != 0us) {
+                        throw copy ErrorMsg::fatal(c.attrs[0].loc, format(ValidateErrorMessage::TAG_APPLY_IDENTITY, "@" ~ c.attrs[0].attr));
+                    }
+                }
+                e: &EnumDecl => {
+                    if e.type !of EmptyExpr {
+                        throw copy ErrorMsg::fatal(e.type.loc, format(ValidateErrorMessage::TAG_APPLY_IDENTITY, format(": %", e.type)));
+                    }
+                }
+                u: &UnionDecl => {
+                    if u.ancestor !of EmptyExpr {
+                        throw copy ErrorMsg::fatal(u.ancestor.loc, format(ValidateErrorMessage::TAG_APPLY_IDENTITY, format("over %", u.ancestor)));
+                    }
+                }
+            }
+
+            return;
+        }
+
+        throw copy ErrorMsg::fatal(TagValidation::nameOf(decl), format(ValidateErrorMessage::TAG_APPLY_NOT_TEMPLATE));
+    }
+
+    /**
+     * Validate the tag sites written on top of the declaration of a symbol, from
+     * the scope the declaration is written in. The path of a site on a template
+     * must name a tag, its arguments and its overloads depending on the
+     * specialization; the sites of any other symbol are resolved, and kept on it.
+     *
+     * @params:
+     *   - context: validation context
+     *   - sym:     the tagged symbol
+     *
+     * @throws:
+     *   - ErrorMsg when validating `sym`, a site that does not resolve
+     */
+    pub fn validateSites(dmut context: &ValidationContext, dmut sym: &Symbol)
+        throws ErrorMsg
+    {
+        let mut errors: [&ErrorMsg] = [];
+        let mut resolved: [TagResolution] = [];
+        context:.pushReferent(alias context:.getSymbolFromRef(sym.referent));
+        context:.enterForeign(isFnBody-> false);
+        {
+            if sym of TemplateSymbol {
+                for site in sym.tags {
+                    {
+                        TagValidation::validateSite(alias context, site);
+                    } catch {
+                        err => {
+                            errors ~= [err];
+                        }
+                    }
+                }
+            } else {
+                let (tagged, kind) = TagValidation::validateTagged(alias context, alias sym);
+                for site in sym.tags {
+                    {
+                        resolved ~= [TagValidation::resolveSite(alias context, sym, tagged, kind, site)];
+                    } catch {
+                        err => {
+                            errors ~= [err];
+                        }
+                    }
+                }
+            }
+        } exit {
+            context:.exitForeign();
+            context:.popReferent();
+        }
+
+        if (errors.len != 0us) {
+            throw copy ErrorMsg::fatal(sym.loc, format(ValidateErrorMessage::VALIDATING_SYMBOL, sym.path.toStr()),
+                                       notes-> errors);
+        }
+
+        sym:.setResolvedTags(resolved);
+    }
+
+    /**
+     * Merge the tags of a function into it, from the innermost to the outermost:
+     * each site is resolved for the function the previous merge produced, and the
+     * instance of its `apply` overload, receiving that function, replaces it. The
+     * outermost instance takes the identity of the function, which moves to a
+     * hidden name. Only the prototypes are validated, the bodies being validated
+     * along with the one of the function, cf. `FunctionValidation::validate`.
+     *
+     * @params:
+     *   - context: validation context
+     *   - loc:     the location the function is used at
+     *   - sym:     the tagged function
+     *
+     * @throws:
+     *   - ErrorMsg if the function is used before its tags are merged into it,
+     *     or if a site does not resolve, the error of a failed merge being
+     *     thrown again at each later use
+     */
+    pub fn mergeFunction(dmut context: &ValidationContext, loc: &Word, dmut sym: &FunctionSymbol)
+        throws ErrorMsg
+    {
+        if (sym.isMerged) return;
+        if let Ok(err) = sym.mergeError {
+            throw err;
+        }
+
+        if (sym.isMerging) {
+            throw copy ErrorMsg::fatal(loc, format(ValidateErrorMessage::TAG_MERGE_CYCLE, sym.path.toStr()),
+                                       notes-> copy [copy ErrorMsg::note(sym.loc, ValidateErrorMessage::DEFINED_HERE)]);
+        }
+
+        sym:.setMerging();
+        let mut error: (&ErrorMsg)? = none;
+        let mut resolved: [TagResolution] = [];
+        let mut merges: [&FunctionSymbol] = [];
+
+        context:.pushReferent(alias context:.getSymbolFromRef(sym.referent));
+        context:.enterForeign(isFnBody-> false);
+        {
+            let mut current: &FunctionSymbol = sym;
+            for i in 0us .. sym.tags.len {
+                let site = sym.tags[$ - 1us - i];
+                let (tagged, kind) = TagValidation::validateTagged(alias context, alias context:.getFunctionFromRef(current));
+                let res = TagValidation::resolveSite(alias context, sym, tagged, kind, site);
+                resolved = [res] ~ resolved;
+                if let Ok(apply) = res.apply {
+                    current = TagValidation::instantiateApply(alias context, sym, res, apply);
+                    merges ~= [current];
+                }
+            }
+        } catch {
+            err => {
+                error = err?;
+            }
+        } exit {
+            context:.exitForeign();
+            context:.popReferent();
+        }
+
+        if let Ok(err) = error {
+            let fatal = copy ErrorMsg::fatal(sym.loc, format(ValidateErrorMessage::VALIDATING_SYMBOL, sym.path.toStr()),
+                                             notes-> copy [err]);
+            sym:.setMergeError(fatal);
+            throw fatal;
+        }
+
+        if (merges.len != 0us) {
+            context:.getFunctionFromRef(merges[$ - 1us]):.takeIdentity(sym);
+            sym:.hide();
+        }
+
+        sym:.setResolvedTags(resolved);
+        sym:.setMerges(merges);
+    }
+
+    /**
+     * @params:
+     *   - context: validation context
+     *   - loc:     the location the name is used at
+     *   - sym:     the function it names
+     *
+     * @returns: the function the name of `sym` means, the outermost instance its
+     * tags are merged into, `sym` itself if it has none
+     *
+     * @throws:
+     *   - ErrorMsg if the tags of `sym` cannot be merged into it, cf. `mergeFunction`
+     */
+    pub fn named(dmut context: &ValidationContext, loc: &Word, dmut sym: &FunctionSymbol)-> dmut &FunctionSymbol
+        throws ErrorMsg
+    {
+        if (sym.tags.len == 0us) return alias sym;
+
+        TagValidation::mergeFunction(alias context, loc, alias sym);
+        alias context:.getFunctionFromRef(sym.named)
+    }
+
+    /**
+     * Merge the tags of a class into it, from the innermost to the outermost:
+     * each site is resolved for the class, and the members of the instance of
+     * its `apply` overload are declared into it, each tag seeing the members the
+     * previous ones declared. Called once the members written in the class are
+     * declared, before they are validated; a validation of the class nested in
+     * the merge sees the class as declared so far.
+     *
+     * @params:
+     *   - context: validation context
+     *   - sym:     the tagged class
+     *
+     * @throws:
+     *   - ErrorMsg if a site does not resolve, or if a member does not declare
+     */
+    pub fn mergeClass(dmut context: &ValidationContext, dmut sym: &ClassSymbol)
+        throws ErrorMsg
+    {
+        if (sym.tags.len == 0us || sym.isMerged || sym.isMerging) return;
+
+        sym:.setMerging();
+        let mut resolved: [TagResolution] = [];
+
+        context:.pushReferent(alias context:.getSymbolFromRef(sym.referent));
+        context:.enterForeign(isFnBody-> false);
+        {
+            let tagged = sym.classRefUnwrapped.createInstance(loc-> sym.loc, isMutable-> false, isInnerMutable-> false);
+            let kind = if (sym.isEntity) { "entity" } else if (sym.isRecord) { "record" } else { "class" };
+            for i in 0us .. sym.tags.len {
+                let site = sym.tags[$ - 1us - i];
+                let res = TagValidation::resolveSite(alias context, sym, tagged, kind, site);
+                resolved = [res] ~ resolved;
+                if let Ok(apply) = res.apply {
+                    TagValidation::declareApply(alias context, alias sym, res, apply);
+                }
+            }
+        } exit {
+            context:.exitForeign();
+            context:.popReferent();
+            sym:.setMerged();
+        }
+
+        sym:.setResolvedTags(resolved);
+    }
+
+    /**
+     * Declare the members of the instance of the `apply` overload a tag site
+     * selected for a class into that class, a lookup from inside them, or from
+     * the declaration of a field, reaching the scope of the tag besides the one
+     * of the class.
+     *
+     * @params:
+     *   - context: validation context
+     *   - sym:     the tagged class
+     *   - res:     the tag site, resolved
+     *   - apply:   its `apply` overload, its first template parameter bound to the class
+     *
+     * @throws:
+     *   - ErrorMsg if the overload cannot be instantiated, or if a member does not declare
+     */
+    fn declareApply(dmut context: &ValidationContext, dmut sym: &ClassSymbol, res: TagResolution, apply: TagOverload)
+        throws ErrorMsg
+    {
+        let dmut tag = alias context:.getSymbolFromRef(res.tag);
+        if let t: &TemplateDecl = apply.decl {
+            let dmut tmpl = copy TemplateSymbol(TagValidation::nameOf(t), t.comm, t, res.tag.protection, inClass-> false);
+            tmpl:.setReferent(alias tag);
+
+            let decl = TemplateDeclaration::rewrite(alias context, res.site.loc, copy TemplateRefValue(res.site.loc, tmpl), apply.mapper);
+            if let c: &TypeDecl = decl {
+                let before = sym.getAllLocalSymbols(protection-> Protection::PRIVATE);
+                let dtor = sym.dtor;
+                let nbFields = sym.fields.len;
+
+                context:.pushReferent(alias sym, macroSym-> alias tag);
+                {
+                    ClassValidation::declareMembers(alias context, alias sym, c.decls);
+                } catch {
+                    err => {
+                        throw err.withNote(copy [copy ErrorMsg::note(res.site.loc, format(ValidateErrorMessage::TAG_MERGING, res.tag.path.toStr(), sym.path.toStr()))]);
+                    }
+                } exit {
+                    context:.popReferent();
+                }
+
+                let mut members: [&Word] = copy [f.name for f in sym.fields[nbFields .. $]];
+                for i in nbFields .. sym.fields.len {
+                    sym:.setFieldTagScope(i, tag);
+                }
+
+                let dmut after = sym:.getAllLocalSymbols(protection-> Protection::PRIVATE);
+                for i in 0us .. after.len if !TagValidation::holds(before, after[i]) {
+                    after[i]:.setTagScope(alias tag);
+                    members ~= TagValidation::locations(after[i]);
+                }
+
+                if (!(sym.dtor is dtor)) {
+                    let dmut added = alias sym.dtor;
+                    added:.setTagScope(alias tag);
+                    members ~= [added.loc];
+                }
+
+                sym:.addMergedMembers(res.site.loc, res.tag.path.toStr(), members);
+                return;
+            }
+        }
+
+        panic;
+    }
+
+    /**
+     * Add to an error located at a member a tag declared into a class, or to each
+     * such error of a list, a note at the site of the tag.
+     *
+     * @params:
+     *   - sym: the class
+     *   - err: the error
+     *
+     * @returns: the error, noted
+     */
+    pub fn noteMerges(sym: &ClassSymbol, err: &ErrorMsg)-> &ErrorMsg {
+        if (err.isList) {
+            return copy ErrorMsg::list(copy [TagValidation::noteMerges(sym, e) for e in err.notes]);
+        }
+
+        for merged in sym.mergedMembers {
+            for m in merged._2 if (m.filename == err.loc.filename && m.seek == err.loc.seek) {
+                return err.withNote(copy [copy ErrorMsg::note(merged._0, format(ValidateErrorMessage::TAG_MERGING, merged._1, sym.path.toStr()))]);
+            }
+        }
+
+        err
+    }
+
+    /**
+     * @returns: the locations of a member declared into a class, those of the
+     * methods of an implementation
+     */
+    fn locations(sym: &Symbol)-> [&Word] {
+        if sym of ImplSymbol {
+            let mut res: [&Word] = [];
+            for s in sym.getAllLocalSymbols(protection-> Protection::PRIVATE) {
+                res ~= TagValidation::locations(s);
+            }
+
+            return res;
+        }
+
+        copy [sym.loc]
+    }
+
+    /**
+     * @returns: true iff `sym` is one of `lst`
+     */
+    fn holds(lst: [&Symbol], sym: &Symbol)-> bool {
+        for s in lst {
+            if (s is sym) return true;
+        }
+
+        false
+    }
+
+    /**
+     * Instantiate the `apply` overload a tag site selected for a function, under
+     * the name, the protection and the documentation of the function as written.
+     *
+     * @params:
+     *   - context: validation context
+     *   - sym:     the function as written
+     *   - res:     the tag site, resolved
+     *   - apply:   its `apply` overload, its first template parameter bound to the function it receives
+     *
+     * @returns: the instance, its prototype validated
+     *
+     * @throws:
+     *   - ErrorMsg if the overload cannot be instantiated, or its prototype does not validate
+     */
+    fn instantiateApply(dmut context: &ValidationContext, sym: &FunctionSymbol, res: TagResolution, apply: TagOverload)-> &FunctionSymbol
+        throws ErrorMsg
+    {
+        if let t: &TemplateDecl = apply.decl {
+            if let f: &FunctionDecl = t.decl {
+                let named = copy FunctionDecl(f.loc, sym.comm, sym.loc, f.proto, f.body, f.attrs, f.throwers, f.throwerLoc, f.isOver, isYield-> f.isYield);
+                let dmut tmpl = copy TemplateSymbol(sym.loc, sym.comm, copy TemplateDecl(t.loc, sym.comm, t.params, t.guard, named), sym.protection, inClass-> false);
+                tmpl:.setReferent(alias context:.getSymbolFromRef(res.tag));
+
+                let dmut inst = alias TemplateDeclaration::declareFunction(alias context, res.site.loc, copy TemplateRefValue(res.site.loc, tmpl), apply.mapper, named);
+                if let dmut instance: &FunctionSymbol = alias inst {
+                    FunctionValidation::validateProto(alias context, alias instance);
+                    return instance;
+                }
+            }
+        }
+
+        panic;
+    }
+
+    /**
+     * Validate a tag site, whose path must name a tag
+     *
+     * @params:
+     *   - context: validation context
+     *   - site:    the tag site
+     *
+     * @returns: the tag the site names
+     *
+     * @throws:
+     *   - ErrorMsg if the path names no tag
+     */
+    fn validateSite(dmut context: &ValidationContext, site: TagSite)-> &TagSymbol
+        throws ErrorMsg
+    {
+        let value = ValueValidation::validate(alias context, site.tag);
+        if let t: &TagRefValue = value {
+            return t.sym;
+        }
+
+        throw copy ErrorMsg::fatal(site.loc, format(ValidateErrorMessage::NOT_A_TAG, site.tag));
+    }
+
+    /**
+     * Resolve a tag site for the symbol it tags.
+     *
+     * @params:
+     *   - context: validation context
+     *   - sym:     the tagged symbol
+     *   - tagged:  the tagged symbol, as the first template parameter of an overload receives it
+     *   - kind:    the kind of the tagged symbol
+     *   - site:    the tag site
+     *
+     * @returns: the tag the site names, its parameters bound to the arguments of
+     * the site, and the `apply` and `self` overloads applying to the symbol
+     *
+     * @throws:
+     *   - ErrorMsg if the path names no tag, if the arguments do not match the
+     *     parameters of the tag, or if no overload applies to the symbol
+     */
+    fn resolveSite(dmut context: &ValidationContext, sym: &Symbol, tagged: &Generator, kind: [c8], site: TagSite)-> TagResolution
+        throws ErrorMsg
+    {
+        let tag = TagValidation::validateSite(alias context, site);
+        let params = TagValidation::validateArgs(alias context, tag, site);
+
+        context:.pushReferent(alias context:.getSymbolFromRef(tag));
+        context:.enterForeign(isFnBody-> false);
+        {
+            let apply = TagValidation::selectOverload(alias context, sym, tagged, kind, site, tag, params, tag.applies, isApply-> true);
+            let ctor = TagValidation::selectOverload(alias context, sym, tagged, kind, site, tag, params, tag.ctors, isApply-> false);
+
+            return TagResolution(site, tag, params, apply, ctor);
+        } exit {
+            context:.exitForeign();
+            context:.popReferent();
+        }
+    }
+
+    /**
+     * Validate the symbol a tag site is put on, as the first template parameter
+     * of an overload receives it: a function as a function pointer, an enum or a
+     * union as itself.
+     *
+     * @params:
+     *   - context: validation context
+     *   - sym:     the tagged symbol
+     *
+     * @returns: the tagged symbol as a value or a type, and its kind
+     *
+     * @throws:
+     *   - ErrorMsg if the symbol does not validate
+     */
+    fn validateTagged(dmut context: &ValidationContext, dmut sym: &Symbol)-> (&Generator, [c8])
+        throws ErrorMsg
+    {
+        context:.pushReferent(alias sym);
+        {
+            match alias sym {
+                dmut f: &FunctionSymbol => {
+                    let proto = FunctionValidation::validateProto(alias context, alias f);
+                    let fptr = copy ProtoFuncPtrValue(f.loc, proto,
+                                                      copy [p.isReference for p in proto.params],
+                                                      copy [p.isLazy for p in proto.params],
+                                                      copy [p.type for p in proto.params],
+                                                      proto.retType,
+                                                      isCaught-> true);
+                    return (fptr, "function");
+                }
+                dmut e: &EnumSymbol => {
+                    return (EnumValidation::validate(alias context, alias e).clone(0u32), "enum");
+                }
+                dmut u: &UnionSymbol => {
+                    let type = UnionValidation::validate(alias context, alias u);
+                    if (type.isRecord) {
+                        return (type.createInstance(loc-> u.loc, isMutable-> false, isInnerMutable-> false), "union");
+                    }
+
+                    return (type.clone(0u32), "union");
+                }
+            }
+        } exit {
+            context:.popReferent();
+        }
+
+        panic;
+    }
+
+    /**
+     * Validate the arguments of a tag site against the parameters of the tag
+     * they construct, named, defaulted or not, as for a call.
+     *
+     * @params:
+     *   - context: validation context
+     *   - tag:     the tag the site names
+     *   - site:    the tag site
+     *
+     * @returns: the parameters of the tag, bound to the compile-time values of the arguments
+     *
+     * @throws:
+     *   - ErrorMsg if the arguments do not match the parameters, or are unknown at compile time
+     */
+    fn validateArgs(dmut context: &ValidationContext, tag: &TagSymbol, site: TagSite)-> TemplateMapper
+        throws ErrorMsg
+    {
+        let (values, nbNamed) = CallValidation::validateRightOperands(alias context, site.args, []);
+        let params = TagValidation::validateParams(alias context, tag);
+        let (sorted, _) = CallParamListCreation::validateParamListSort(site.loc, params, values, nbNamed);
+        let (_, casted, _) = CallParamListCreation::validateTypeParamList(alias context, site.loc, params, sorted);
+
+        let mut mapper = TemplateMapper();
+        let mut errors: [&ErrorMsg] = [];
+        for i, v in casted {
+            let reduced = context.cteInterpret:.reduce(v);
+            if (context.cteInterpret.isCte(reduced)) {
+                mapper:.insert(tag.proto.params[i].name.str, copy ValueWrapperExpr(v.loc, reduced));
+            } else {
+                errors ~= [copy ErrorMsg::fatal(v.loc, format(ValidateErrorMessage::UNKNOWN_AT_COMPILE_TIME, v.type),
+                                                notes-> copy [copy ErrorMsg::note(site.loc, format(ValidateErrorMessage::PARAMETER_NAME, params[i]), oneLine-> true)])];
+            }
+        }
+
+        if (errors.len != 0us) {
+            throw copy ErrorMsg::list(errors);
+        }
+
+        mapper
+    }
+
+    /**
+     * Validate the parameters of a tag, from the scope of its declaration.
+     *
+     * @params:
+     *   - context: validation context
+     *   - tag:     the tag
+     *
+     * @returns: the parameters of the tag
+     *
+     * @throws:
+     *   - ErrorMsg if a parameter does not validate
+     */
+    fn validateParams(dmut context: &ValidationContext, tag: &TagSymbol)-> [&ProtoVarDeclValue]
+        throws ErrorMsg
+    {
+        context:.pushReferent(alias context:.getSymbolFromRef(tag));
+        context:.enterForeign(isFnBody-> false);
+        context:.enterBlock();
+        {
+            let (_, params) = FunctionPrototypeValidation::validateParamsAndRetType(alias context, tag.loc, tag, tag.proto);
+            return params;
+        } exit {
+            context:.safeQuitBlock();
+            context:.exitForeign();
+            context:.popReferent();
+        }
+    }
+
+    /**
+     * Select, among the `apply` or the `self` overloads of a tag, the one applying
+     * to the tagged symbol: the one whose first template parameter receives it
+     * with the best score, a `self` taking no template parameter applying to any.
+     *
+     * @params:
+     *   - context:   validation context
+     *   - sym:       the tagged symbol
+     *   - tagged:    the tagged symbol, as the first template parameter receives it
+     *   - kind:      the kind of the tagged symbol
+     *   - site:      the tag site
+     *   - tag:       the tag the site names
+     *   - params:    the parameters of the tag, bound
+     *   - overloads: the overloads, with their protection
+     *   - isApply:   true for the `apply` overloads, false for the `self` ones
+     *
+     * @returns: the overload selected, none if the tag declares none
+     *
+     * @throws:
+     *   - ErrorMsg if no overload applies to the symbol, or several do equally well
+     */
+    fn selectOverload(dmut context: &ValidationContext,
+                      sym:          &Symbol,
+                      tagged:       &Generator,
+                      kind:         [c8],
+                      site:         TagSite,
+                      tag:          &TagSymbol,
+                      params:       TemplateMapper,
+                      overloads:    [(&Declaration, Protection)],
+                      isApply:      bool)-> (TagOverload)?
+        throws ErrorMsg
+    {
+        if (overloads.len == 0us) return none;
+
+        let mut solved: [TagOverload] = [];
+        let mut notes: [&ErrorMsg] = [];
+        for o in overloads {
+            {
+                solved ~= [TagValidation::solveOverload(alias context, sym, tagged, kind, params, o._0, isApply-> isApply)];
+            } catch {
+                err => {
+                    notes ~= [copy ErrorMsg::note(TagValidation::nameOf(o._0),
+                                                  format(ValidateErrorMessage::CANDIDATE_ARE, TagValidation::prettyOverload(tag, o._0, isApply-> isApply)),
+                                                  notes-> copy [err],
+                                                  oneLine-> true,
+                                                  withLoc-> true)];
+                }
+            }
+        }
+
+        if (solved.len == 0us) {
+            throw copy ErrorMsg::fatal(site.loc, format(ValidateErrorMessage::TAG_NOT_APPLICABLE, tag.path.toStr(), kind, sym.path.toStr()),
+                                       notes-> notes);
+        }
+
+        let mut best = 0u32;
+        for o in solved if (o.mapper.score > best) {
+            best = o.mapper.score;
+        }
+
+        let bests = copy [o for o in solved if o.mapper.score == best];
+        if (bests.len != 1us) {
+            let name = format("%::%", tag.path.toStr(), if (isApply) { "apply" } else { "self" });
+            throw copy ErrorMsg::fatal(site.loc, format(ValidateErrorMessage::WORKS_WITH_BOTH, name, sym.path.toStr()),
+                                       notes-> copy [copy ErrorMsg::note(TagValidation::nameOf(o.decl),
+                                                                         format(ValidateErrorMessage::CANDIDATE_ARE, TagValidation::prettyOverload(tag, o.decl, isApply-> isApply)),
+                                                                         oneLine-> true,
+                                                                         withLoc-> true)
+                                                     for o in bests]);
+        }
+
+        bests[0]?
+    }
+
+    /**
+     * Solve the first template parameter of an overload against the tagged symbol.
+     *
+     * @params:
+     *   - context: validation context
+     *   - sym:     the tagged symbol
+     *   - tagged:  the tagged symbol, as the first template parameter receives it
+     *   - kind:    the kind of the tagged symbol
+     *   - params:  the parameters of the tag, bound
+     *   - decl:    the overload
+     *   - isApply: true for an `apply` overload, false for a `self` one
+     *
+     * @returns: the overload, with the parameters of the tag and its first template parameter bound
+     *
+     * @throws:
+     *   - ErrorMsg if the first template parameter does not receive the symbol, or
+     *     if an `apply` overload is not declared with the kind of the symbol
+     */
+    fn solveOverload(dmut context: &ValidationContext,
+                     sym:          &Symbol,
+                     tagged:       &Generator,
+                     kind:         [c8],
+                     params:       TemplateMapper,
+                     decl:         &Declaration,
+                     isApply:      bool)-> TagOverload
+        throws ErrorMsg
+    {
+        let mut mapper = TemplateMapper();
+        mapper:.merge(params);
+
+        if let t: &TemplateDecl = decl {
+            let templates = TemplateRewriting::rewriteTemplateParams(params, t.params);
+            mapper:.merge(TemplateSolving::solveChecker(alias context, t.loc, templates, copy [tagged]));
+
+            let declKind = TagValidation::kindOf(t.decl);
+            if (isApply && declKind != kind) {
+                throw copy ErrorMsg::fatal(TagValidation::nameOf(decl), format(ValidateErrorMessage::TAG_APPLY_KIND, sym.path.toStr(),
+                                                                                TagValidation::withArticle(kind),
+                                                                                TagValidation::withArticle(declKind)));
+            }
+
+            return TagOverload(decl, mapper);
+        }
+
+        if (isApply) {
+            throw copy ErrorMsg::fatal(TagValidation::nameOf(decl), format(ValidateErrorMessage::TAG_APPLY_NOT_TEMPLATE));
+        }
+
+        TagOverload(decl, mapper)
+    }
+
+    /**
+     * @returns: the name of an overload of a tag, an `apply` overload being a
+     * function, a class, an enum or a union, or a template of one of them, and
+     * a `self` overload the keyword declaring it
+     */
+    fn nameOf(decl: &Declaration)-> &Word {
+        match decl {
+            t: &TemplateDecl => return TagValidation::nameOf(t.decl);
+            c: &CtorDecl     => return c.loc;
+            f: &FunctionDecl => return f.name;
+            c: &TypeDecl     => return c.name;
+            e: &EnumDecl     => return e.name;
+            u: &UnionDecl    => return u.name;
+        }
+
+        decl.loc
+    }
+
+    /**
+     * @returns: the kind of symbol an `apply` overload declares
+     */
+    fn kindOf(decl: &Declaration)-> [c8] {
+        match decl {
+            FunctionDecl() => return "function";
+            c: &TypeDecl => {
+                if (c.isEntity) return "entity";
+                if (c.isRecord) return "record";
+                return "class";
+            }
+            EnumDecl()  => return "enum";
+            UnionDecl() => return "union";
+        }
+
+        "declaration"
+    }
+
+    /**
+     * @returns: `kind`, preceded by its indefinite article
+     */
+    fn withArticle(kind: [c8])-> [c8] {
+        if (kind == "enum" || kind == "entity") {
+            return "an " ~ kind;
+        }
+
+        "a " ~ kind
+    }
+
+    /**
+     * @returns: an overload of a tag, as a candidate of a diagnostic
+     */
+    fn prettyOverload(tag: &TagSymbol, decl: &Declaration, isApply: bool)-> [c8] {
+        let name = if (isApply) {
+            let inner = if let t: &TemplateDecl = decl { t.decl } else { decl };
+            format("% %::apply", TagValidation::kindOf(inner), tag.path.toStr())
+        } else {
+            format("%::self", tag.path.toStr())
+        };
+
+        if let t: &TemplateDecl = decl {
+            return format("% %", name, t.params);
+        }
+
+        name
+    }
+}
