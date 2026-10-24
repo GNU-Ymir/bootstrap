@@ -26,7 +26,7 @@ check lives:
 | `E1xxx` | lexing | `LexingErrorMessage` -- `src/ymirc/lexing/errors.yr` | 24 |
 | `E2xxx` | parsing | `SyntaxErrorMessage` -- `src/ymirc/syntax/errors.yr` | 17 |
 | `E3xxx` | declaration | `DeclareErrorMessage` -- `src/ymirc/semantic/declarator/errors.yr` | 37 |
-| `E4xxx` | validation | `ValidateErrorMessage` -- `src/ymirc/semantic/validator/errors.yr` | 290 |
+| `E4xxx` | validation | `ValidateErrorMessage` -- `src/ymirc/semantic/validator/errors.yr` | 294 |
 | `E5xxx` | lowering (YIL) | `SerializeYILErrorMessage` -- `src/ymirc/lint/serialize/errors.yr`, `OptimizerErrorMessage` -- `src/ymirc/lint/optimizer/errors.yr` | 11 |
 
 Each page carries an example wherever a case in the suite raises the code: the
@@ -428,6 +428,10 @@ deliberately carry no code, and have no page here.
 | [E4347](E4347.md) | `AWAIT_POLL` | cannot await a value of type <> through its method poll |
 | [E4348](E4348.md) | `AWAIT_POLL_NOT_OPTION` | the method poll of an awaited class must return an option, not a value of type <> |
 | [E4349](E4349.md) | `AWAIT_POLL_THROWS` | the method poll of an awaited class cannot throw, an async never throws |
+| [E4352](E4352.md) | `MOVE_HANDLE_RESET` | a value of type <> has no constructor to reset it, it is moved without arguments |
+| [E4353](E4353.md) | `MOVE_HANDLE_NOT_OWNED` | a value of type <> can only be moved out of the local variable or the parameter owning it |
+| [E4354](E4354.md) | `USE_AFTER_MOVE` | <> cannot be used, its value of type <> was moved out |
+| [E4355](E4355.md) | `MOVE_IN_LOOP` | <> is moved out inside a loop, but declared outside of it, so the next iteration would use it again |
 
 ## E5xxx -- lowering (YIL)
 
