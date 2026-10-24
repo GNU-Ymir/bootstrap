@@ -26,7 +26,7 @@ check lives:
 | `E1xxx` | lexing | `LexingErrorMessage` -- `src/ymirc/lexing/errors.yr` | 24 |
 | `E2xxx` | parsing | `SyntaxErrorMessage` -- `src/ymirc/syntax/errors.yr` | 17 |
 | `E3xxx` | declaration | `DeclareErrorMessage` -- `src/ymirc/semantic/declarator/errors.yr` | 37 |
-| `E4xxx` | validation | `ValidateErrorMessage` -- `src/ymirc/semantic/validator/errors.yr` | 287 |
+| `E4xxx` | validation | `ValidateErrorMessage` -- `src/ymirc/semantic/validator/errors.yr` | 290 |
 | `E5xxx` | lowering (YIL) | `SerializeYILErrorMessage` -- `src/ymirc/lint/serialize/errors.yr`, `OptimizerErrorMessage` -- `src/ymirc/lint/optimizer/errors.yr` | 11 |
 
 Each page carries an example wherever a case in the suite raises the code: the
@@ -423,6 +423,9 @@ deliberately carry no code, and have no page here.
 | [E4344](E4344.md) | `AWAIT_NO_ASYNC` | await statement is not within an async |
 | [E4345](E4345.md) | `AWAIT_IN_GENERATOR` | a generator cannot await, it is resumed by its consumer, never woken |
 | [E4346](E4346.md) | `AWAIT_NOT_AWAITABLE` | cannot await a value of type <>, only an async value, a future value or a class with a poll method |
+| [E4347](E4347.md) | `AWAIT_POLL` | cannot await a value of type <> through its method poll |
+| [E4348](E4348.md) | `AWAIT_POLL_NOT_OPTION` | the method poll of an awaited class must return an option, not a value of type <> |
+| [E4349](E4349.md) | `AWAIT_POLL_THROWS` | the method poll of an awaited class cannot throw, an async never throws |
 
 ## E5xxx -- lowering (YIL)
 
