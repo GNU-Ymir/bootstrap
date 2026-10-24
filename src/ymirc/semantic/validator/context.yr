@@ -253,6 +253,9 @@ pub class ValidationContext {
     /// Stack of used-symbol lists for each scope.
     let dmut _usedSyms                  : &List!{dmut &UsedList} = copy List!{dmut &UsedList} ();
 
+    /// Stack of the variables moved out, for each frame.
+    let dmut _moved                     : &MovedList = copy MovedList ();
+
     /// Stack of the statements collecting the unused warnings of their scopes, by the depth of their frame.
     let mut _unusedCollectors           : [usize] = [];
 
@@ -679,6 +682,7 @@ pub class ValidationContext {
         // frame local scopes
         self._symbols:.push(copy ScopeList());
         self._usedSyms:.push(copy UsedList());
+        self._moved:.push(copy MovedVars());
 
         // Loops of upper frame have no impact here
         self._loopBreakTypes:.push(copy TypeList());
@@ -721,6 +725,7 @@ pub class ValidationContext {
 
         self._symbols:.pop();
         self._usedSyms:.pop();
+        self._moved:.pop();
 
         self._loopBreakTypes:.pop();
         self._loopBreaks:.pop();
@@ -1634,6 +1639,7 @@ pub class ValidationContext {
     pub fn enterLoop(mut self, type: &Type = NONE_TYPE) {
         self._loopBreakTypes.back:.push(type);
         self._loopBreaks.back:.push(copy BreakList());
+        self._moved.back.loops ~= [self._symbols.back.len];
     }
 
     /**
@@ -1686,6 +1692,7 @@ pub class ValidationContext {
         let ret = self._loopBreakTypes.back.back;
         self._loopBreakTypes.back:.pop();
         self._loopBreaks.back:.pop();
+        self._moved.back.loops = self._moved.back.loops[0us .. $ - 1us];
         ret
     }
 
@@ -1948,6 +1955,126 @@ pub class ValidationContext {
             for name, _ in self._symbols.back[i].content {
                 self._usedSyms.back:[i].mutated[name] = MutabilityLevel::DEEP;
             }
+        }
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ==================================          MOVED LOCALS          ==================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Record that the value of the local variable or the parameter `value` refers to is moved out
+     * @params:
+     *   - value: the moved value, a variable of the current frame
+     * @throws:
+     *   - &ErrorMsg: if the variable is declared outside a loop enclosing the move, and is not
+     *                being assigned, the next iteration using it again
+     */
+    pub fn markMoved(mut self, value: &Value)
+        throws ErrorMsg
+    {
+        let var = if let v: &VarRefValue = value { v } else { return; };
+        if (self._symbols.len == 0us) return;
+
+        let moved = self._moved.back;
+        if moved.loops.len != 0us && var.refId !in moved.assigned {
+            let name = var.declLoc.str;
+            for i in 0 .. moved.loops[$ - 1us] {
+                if let Ok(g) = self._symbols.back[i].content[name] && g.uniqId == var.refId {
+                    throw copy ErrorMsg::fatal(value.loc, format(ValidateErrorMessage::MOVE_IN_LOOP, name),
+                                               notes-> copy [copy ErrorMsg::note(var.declLoc, ValidateErrorMessage::DECLARED_HERE)]);
+                }
+            }
+        }
+
+        self._moved.back.content[var.refId] = value.loc;
+    }
+
+    /**
+     * Record that the variable `value` refers to holds a value again, it is assigned
+     * @params:
+     *   - value: the assigned value, a variable of the current frame
+     */
+    pub fn unmarkMoved(mut self, value: &Value) {
+        if let v: &VarRefValue = value && (self._moved.len != 0us && v.refId in self._moved.back.content) {
+            self._moved.back.content:.remove(v.refId);
+        }
+    }
+
+    /**
+     * Enter the assignment of the variable `value` refers to, the value it is assigned can move it out
+     * @params:
+     *   - value: the assigned value
+     */
+    pub fn enterAssign(mut self, value: &Value) {
+        if let v: &VarRefValue = value && self._moved.len != 0us {
+            self._moved.back.assigned ~= [v.refId];
+        }
+    }
+
+    /**
+     * Exit the assignment entered by enterAssign
+     * @params:
+     *   - value: the assigned value
+     */
+    pub fn exitAssign(mut self, value: &Value) {
+        if let _: &VarRefValue = value && self._moved.len != 0us {
+            self._moved.back.assigned = self._moved.back.assigned[0us .. $ - 1us];
+        }
+    }
+
+    /**
+     * Verify that the value of the variable `uniqId` was not moved out before `loc`
+     * @params:
+     *   - loc: the location of the reference to the variable
+     *   - uniqId: the identifier of the variable
+     *   - type: the type of the variable
+     * @throws:
+     *   - &ErrorMsg: if the value was moved out
+     */
+    pub fn verifyNotMoved(self, loc: &Word, uniqId: usize, type: &Type)
+        throws ErrorMsg
+    {
+        if (self._moved.len == 0us) return;
+        if let Ok(moved) = self._moved.back.content[uniqId] && !loc.isBefore(moved) {
+            throw copy ErrorMsg::fatal(loc, format(ValidateErrorMessage::USE_AFTER_MOVE, loc.str, type),
+                                       notes-> copy [copy ErrorMsg::note(moved, ValidateErrorMessage::MOVED_HERE)]);
+        }
+    }
+
+    /**
+     * @returns: the variables of the current frame whose value is moved out, by their identifier
+     */
+    pub fn movedLocals(self)-> [usize => &Word] {
+        if (self._moved.len == 0us) return copy [];
+        copy self._moved.back.content
+    }
+
+    /**
+     * Restore the variables of the current frame whose value is moved out, e.g. before validating
+     * another branch of a conditional
+     * @params:
+     *   - moved: the state returned by movedLocals
+     */
+    pub fn restoreMoved(mut self, moved: [usize => &Word]) {
+        if (self._moved.len == 0us) return;
+        self._moved.back.content = copy moved;
+    }
+
+    /**
+     * Join the variables whose value is moved out by another branch to the ones of the current
+     * frame, the value of a variable being moved after the branches if one of them moved it
+     * @params:
+     *   - moved: the state returned by movedLocals at the end of the other branch
+     */
+    pub fn joinMoved(mut self, moved: [usize => &Word]) {
+        if (self._moved.len == 0us) return;
+        for id, loc in moved if id !in self._moved.back.content {
+            self._moved.back.content[id] = loc;
         }
     }
 
