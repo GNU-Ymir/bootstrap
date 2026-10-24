@@ -2,8 +2,9 @@
  * Implements validation for `await` expressions in Ymir.
  *
  * An `await` suspends the body of the async it appears in until the async value
- * it awaits completes, or the thread of the future value it awaits finishes, the
- * value it completes with being the one of the await.
+ * it awaits completes, the thread of the future value it awaits finishes, or the
+ * method poll of the class it awaits returns a value, the value it completes with
+ * being the one of the await.
  * Without a value, it gives control back to the driver of the async.
  *
  * <hr>
@@ -40,7 +41,7 @@ in await_;
 use ymirc::errors;
 use ymirc::lexing::keys;
 use ymirc::semantic::generator::value::_;
-use ymirc::semantic::generator::type::native;
+use ymirc::semantic::generator::type::{custom, native};
 use ymirc::syntax::expression::_;
 use ymirc::utils::format;
 
@@ -54,6 +55,9 @@ use ymirc::utils::format;
  *     would be resumed inside a region the resumption cannot re-enter,
  *   - `await e` awaits an async value `e: async-> U`, and is typed `U`,
  *   - `await f` awaits a future value `f: future-> U`, and is typed `U`,
+ *   - `await c` awaits a class `c` whose method `poll (waker: dg ()-> void)-> U?` is
+ *     called at each resumption until it returns a value, and is typed `U`, the method
+ *     being found by name, called on `alias c` when it is mutable, and never throwing,
  *   - `await;` gives control back to the driver, and is typed `void`.
  */
 pub mod AwaitValidation {
@@ -103,7 +107,69 @@ pub mod AwaitValidation {
             return copy AwaitValue(aw.loc, f.retType, handle);
         }
 
+        let (object, byAlias) = if let a: &AliaserValue = handle { (a.value, true) } else { (handle, false) };
+        if let c: &ClassPtrType = object.type {
+            return AwaitValidation::validatePoll(alias context, aw, object, c, byAlias-> byAlias);
+        }
+
         throw copy ErrorMsg::fatal(aw.loc, format(ValidateErrorMessage::AWAIT_NOT_AWAITABLE, handle.type));
+    }
+
+    /**
+     * Validate the `await` of a class: the class is stored once, crossing the suspensions,
+     * and its method poll is called with the waker of the current async at each resumption.
+     *
+     * @params:
+     *   - context: validation context
+     *   - aw:      await expression
+     *   - object:  the class awaited
+     *   - cptr:    the type of the class awaited
+     *   - byAlias: true iff the class is awaited by `await alias c`
+     *
+     * @returns:
+     *   - the block `{ let #_awaited = c; await #_awaited.poll (#_waker) }`, typed as the content
+     *     of the option poll returns
+     *
+     * @throws:
+     *   - ErrorMsg if the class has no method poll taking the waker, or it does not return an
+     *     option, or it throws
+     */
+    fn validatePoll(dmut context: &ValidationContext, aw: &AwaitExpr, object: &Value, cptr: &ClassPtrType, byAlias: bool)-> &Value
+        throws ErrorMsg
+    {
+        let decl = copy VarDeclValue(object.loc.locate(GeneratorKeys::AWAITED), object.type, object,
+                                     isMutable-> false);
+        let awaited = VariableCreation::createVarFromDecl(decl, canCte-> false);
+        let inst = if byAlias { copy ClassAliaserValue(awaited.loc, cptr, awaited) } else { awaited };
+
+        let meth = ValueCreation::createObjectMethodAcc(alias context, aw.loc, cptr, inst, AsyncKeys::POLL);
+        let poll = CallValidation::validate(alias context, aw.loc, meth, copy [copy AsyncWakerValue(aw.loc)]);
+        let (protoLoc, retLoc, protoMsg) = if let c: &MethodCallValue = poll {
+            (c.delegate.proto.loc, c.delegate.proto.retType.loc, format("%", c.delegate.proto, tags-> FormatTags(withParams-> true)))
+        } else {
+            (aw.loc, aw.loc, format("%", poll))
+        };
+
+        {
+            if let o: &OptionType = poll.type {
+                if poll.throwers.len != 0us {
+                    let list = copy [copy ErrorMsg::note(it.loc, format("%", it.type)) for it in poll.throwers];
+                    throw copy ErrorMsg::fatal(protoLoc, format(ValidateErrorMessage::AWAIT_POLL_THROWS), notes-> list);
+                }
+
+                return copy BlockValue(aw.loc, o.inners[0], copy [decl, copy AwaitValue(aw.loc, o.inners[0], poll)]);
+            }
+
+            throw copy ErrorMsg::fatal(retLoc, format(ValidateErrorMessage::AWAIT_POLL_NOT_OPTION, poll.type));
+        } catch {
+            err: &ErrorMsg => {
+                throw err.withNote(copy [copy ErrorMsg::note(protoLoc, format(ValidateErrorMessage::CALL_PROTO, protoMsg))]);
+            }
+        }
+    } catch {
+        err: &ErrorMsg => {
+            throw copy ErrorMsg::fatal(aw.loc, format(ValidateErrorMessage::AWAIT_POLL, cptr), notes-> copy [err]);
+        }
     }
 
 }
