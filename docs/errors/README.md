@@ -296,6 +296,7 @@ deliberately carry no code, and have no page here.
 | [E4178](E4178.md) | `OVERFLOW_CAPACITY` | overflow capacity for type <> = <>, maximum value is <> |
 | [E4179](E4179.md) | `OVERFLOW_CAPACITY_ARRAY` | static array size <> exceeds limits <> |
 | [E4180](E4180.md) | `OVERFLOW_CAPACITY_MIN` | overflow capacity for type <> = <>, minimum value is <> |
+| [E4350](E4350.md) | `OVERRIDE_ASYNC_NO_ASYNC` | method <> must be an async to override the async <> |
 | [E4181](E4181.md) | `OVERRIDE_EMPTY` | method <> must have a body to override <> |
 | [E4182](E4182.md) | `OVERRIDE_FIELD_NO_FIELD` | method <> must be a field method to override <> |
 | [E4183](E4183.md) | `OVERRIDE_FINAL` | cannot override final method <> |
@@ -306,6 +307,7 @@ deliberately carry no code, and have no page here.
 | [E4187](E4187.md) | `OVERRIDE_MULTIPLE_TIMES_TRAIT` | trait method <> was already overridden |
 | [E4188](E4188.md) | `OVERRIDE_NON_TRAIT_INSIDE` | cannot override a non trait method <> with <> inside impl |
 | [E4189](E4189.md) | `OVERRIDE_NOTHING` | method <> overrides nothing |
+| [E4351](E4351.md) | `OVERRIDE_NO_ASYNC_BY_ASYNC` | async <> cannot override the non async method <> |
 | [E4190](E4190.md) | `OVERRIDE_NO_FIELD_BY_FIELD` | field method <> cannot override the non field method <> |
 | [E4320](E4320.md) | `OVERRIDE_NO_GENERATOR_BY_GENERATOR` | generator <> cannot override the non generator method <> |
 | [E4192](E4192.md) | `OVERRIDE_TRAIT_OUTSIDE` | cannot override trait method <> with <> outside impl |
