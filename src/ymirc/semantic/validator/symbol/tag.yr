@@ -41,6 +41,7 @@ use ymirc::semantic::{symbol, template_};
 use ymirc::semantic::generator::{global, mangler, value::_};
 use ymirc::semantic::generator::type::native;
 use ymirc::semantic::validator::symbol::function::proto;
+use ymirc::semantic::validator::value::operator::call::template_;
 use ymirc::syntax::declaration::{block, custom, function, module};
 use ymirc::syntax::expression::empty;
 use ymirc::utils::format;
@@ -53,7 +54,8 @@ use std::fs::path;
  * A tag is validated through its globals, and the shape of its `apply`
  * overloads: they are templates, validated once instantiated for a tag site.
  * A tag site is resolved for the symbol it tags: its arguments are bound to
- * the parameters of the tag, and the `apply` and `self` overloads applying to
+ * the parameters of the tag, its template parameters solved against them as
+ * for a call, and the `apply` and `self` overloads applying to
  * the symbol are selected. The `apply` instances of the sites of a function are
  * merged into it, the outermost one taking its name; those of a class declare
  * their members into it; those of an enum or a union append their fields or
@@ -95,6 +97,8 @@ pub mod TagValidation {
                 }
             }
         }
+
+        errors ~= TagValidation::verifyShadowing(sym);
 
         context:.pushReferent(alias sym);
         {
@@ -183,6 +187,35 @@ pub mod TagValidation {
                 throw copy ErrorMsg::fatal(c.throwerLoc, format(ValidateErrorMessage::TAG_CTOR_SHAPE));
             }
         }
+    }
+
+    /**
+     * Verify that neither the parameters of a tag nor the template parameters of
+     * its overloads are named after one of its template parameters, all of them
+     * being bound in the overloads instantiated for a site.
+     *
+     * @params:
+     *   - sym: the tag symbol
+     *
+     * @returns: an error at each parameter named after a template parameter of the tag
+     */
+    fn verifyShadowing(sym: &TagSymbol)-> [&ErrorMsg] {
+        let templates = declaredTemplateNames(sym.decl.templates);
+        if (templates.len == 0us) return [];
+
+        let mut params: [&Expression] = copy [p for p in sym.proto.params];
+        for o in sym.applies ~ sym.ctors if let t: &TemplateDecl = o._0 {
+            params ~= t.params;
+        }
+
+        let mut errors: [&ErrorMsg] = [];
+        for p in params {
+            for n in declaredTemplateNames(copy [p]) if n in templates {
+                errors ~= [copy ErrorMsg::fatal(p.loc, format(ValidateErrorMessage::TAG_TEMPLATE_SHADOWED, n, sym.path.toStr()))];
+            }
+        }
+
+        errors
     }
 
     /**
@@ -1026,26 +1059,137 @@ pub mod TagValidation {
 
     /**
      * Validate the arguments of a tag site against the parameters of the tag
-     * they construct, named, defaulted or not, as for a call.
+     * they construct, named, defaulted or not, as for a call: its template
+     * parameters, given explicitly or not, are solved against them.
      *
      * @params:
      *   - context: validation context
      *   - tag:     the tag the site names
      *   - site:    the tag site
      *
-     * @returns: the parameters of the tag, bound to the compile-time values of the arguments
+     * @returns: the parameters and the template parameters of the tag, bound to
+     * the compile-time values of the arguments
      *
      * @throws:
-     *   - ErrorMsg if the arguments do not match the parameters, are unknown at compile time, or have no mangling
+     *   - ErrorMsg if the arguments do not match the parameters, are unknown at compile time, or have no mangling,
+     *     or if the site gives template arguments to a tag declaring no template parameter
      */
     fn validateArgs(dmut context: &ValidationContext, tag: &TagSymbol, site: TagSite)-> TemplateMapper
         throws ErrorMsg
     {
+        if let Ok(tmpl) = tag.protoTemplate {
+            return TagValidation::validateTemplateArgs(alias context, tag, tmpl, site);
+        }
+
+        if (site.templates.len != 0us) {
+            let list = TemplateValidation::validateArgumentList(alias context, site.templates);
+            throw copy ErrorMsg::fatal(site.loc, format(ValidateErrorMessage::UNDEFINED_TEMPLATE_CALL, tag.path.toStr(), list,
+                                                        tags-> FormatTags(withParams-> true)));
+        }
+
         let (values, nbNamed) = CallValidation::validateRightOperands(alias context, site.args, []);
         let params = TagValidation::validateParams(alias context, tag);
         let (sorted, _) = CallParamListCreation::validateParamListSort(site.loc, params, values, nbNamed);
         let (_, casted, _) = CallParamListCreation::validateTypeParamList(alias context, site.loc, params, sorted);
 
+        TagValidation::bindArgs(alias context, tag, site, params, casted)
+    }
+
+    /**
+     * Validate the arguments of a site of a tag declaring template parameters,
+     * as those of a call of the template of a function taking its parameters.
+     *
+     * @params:
+     *   - context: validation context
+     *   - tag:     the tag the site names
+     *   - tmpl:    the template of a function taking the parameters of the tag
+     *   - site:    the tag site
+     *
+     * @returns: the parameters and the template parameters of the tag, bound
+     *
+     * @throws:
+     *   - ErrorMsg if the template parameters cannot be solved, or the arguments
+     *     do not match the parameters or are unknown at compile time
+     */
+    fn validateTemplateArgs(dmut context: &ValidationContext, tag: &TagSymbol, tmpl: &TemplateSymbol, site: TagSite)-> TemplateMapper
+        throws ErrorMsg
+    {
+        let (values, nbNamed) = CallValidation::validateRightOperands(alias context, site.args, []);
+        let explicit = if (site.templates.len != 0us) {
+            let list = TemplateValidation::validateArgumentList(alias context, site.templates);
+            TemplateSolving::solveCall(alias context, site.loc, copy TemplateRefValue(site.loc, tmpl), list)
+        } else {
+            TemplateMapper()
+        };
+
+        let left = if (site.templates.len != 0us) {
+            copy TemplateRefValue(site.loc, TagValidation::specialize(alias context, tag, tmpl, explicit))
+        } else {
+            copy TemplateRefValue(site.loc, tmpl)
+        };
+
+        if let f: &FunctionDecl = left.sym.decl.decl {
+            let (call, implicit, _) = {
+                TemplatePrototypeCallValidation::validateFunction(alias context, site.loc, left, f, values, nbNamed)
+            } catch {
+                err => {
+                    throw copy ErrorMsg::fatal(site.loc, format(ValidateErrorMessage::TEMPLATE_SPECIALIZATION_FAILS, tag.path.toStr(), values),
+                                               notes-> copy [err]);
+                }
+            };
+
+            if let c: &PrototypeCallValue = call {
+                let mut mapper = TemplateMapper();
+                mapper:.merge(TagValidation::bindArgs(alias context, tag, site, c.proto.params, c.params));
+                mapper:.merge(explicit);
+                mapper:.merge(implicit);
+
+                return mapper;
+            }
+        }
+
+        panic;
+    }
+
+    /**
+     * @params:
+     *   - context: validation context
+     *   - tag:     a tag declaring template parameters
+     *   - tmpl:    the template of a function taking its parameters
+     *   - mapper:  some of its template parameters, given explicitly
+     *
+     * @returns: the template of the function, those template parameters replaced
+     */
+    fn specialize(dmut context: &ValidationContext, tag: &TagSymbol, tmpl: &TemplateSymbol, mapper: TemplateMapper)-> &TemplateSymbol {
+        let decl = copy TemplateDecl(tmpl.decl.loc, tmpl.decl.comm,
+                                     TemplateRewriting::rewriteTemplateParams(mapper, tmpl.decl.params),
+                                     TemplateRewriting::rewrite(mapper, tmpl.decl.guard),
+                                     TemplateRewriting::rewrite(mapper, tmpl.decl.decl));
+
+        let dmut spe = copy TemplateSymbol(tmpl.loc, tmpl.comm, decl, tag.protection, inClass-> false);
+        spe:.setReferent(alias context:.getSymbolFromRef(tag));
+
+        spe
+    }
+
+    /**
+     * Bind the parameters of a tag to the compile-time values of the arguments of a site.
+     *
+     * @params:
+     *   - context: validation context
+     *   - tag:     the tag the site names
+     *   - site:    the tag site
+     *   - params:  the parameters of the tag, validated
+     *   - casted:  the arguments, sorted and cast to the type of the parameters
+     *
+     * @returns: the parameters of the tag, bound
+     *
+     * @throws:
+     *   - ErrorMsg::list of the arguments unknown at compile time, or that have no mangling
+     */
+    fn bindArgs(dmut context: &ValidationContext, tag: &TagSymbol, site: TagSite, params: [&ProtoVarDeclValue], casted: [&Value])-> TemplateMapper
+        throws ErrorMsg
+    {
         let mut mapper = TemplateMapper();
         let mut errors: [&ErrorMsg] = [];
         for i, v in casted {
