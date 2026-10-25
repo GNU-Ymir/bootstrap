@@ -26,7 +26,7 @@ check lives:
 | `E1xxx` | lexing | `LexingErrorMessage` -- `src/ymirc/lexing/errors.yr` | 24 |
 | `E2xxx` | parsing | `SyntaxErrorMessage` -- `src/ymirc/syntax/errors.yr` | 17 |
 | `E3xxx` | declaration | `DeclareErrorMessage` -- `src/ymirc/semantic/declarator/errors.yr` | 37 |
-| `E4xxx` | validation | `ValidateErrorMessage` -- `src/ymirc/semantic/validator/errors.yr` | 292 |
+| `E4xxx` | validation | `ValidateErrorMessage` -- `src/ymirc/semantic/validator/errors.yr` | 293 |
 | `E5xxx` | lowering (YIL) | `SerializeYILErrorMessage` -- `src/ymirc/lint/serialize/errors.yr`, `OptimizerErrorMessage` -- `src/ymirc/lint/optimizer/errors.yr` | 11 |
 
 Each page carries an example wherever a case in the suite raises the code: the
@@ -329,6 +329,7 @@ deliberately carry no code, and have no page here.
 | [E4332](E4332.md) | `TAG_NOT_APPLICABLE` | tag <> does not apply to <> <> |
 | [E4202](E4202.md) | `TEMPLATE_SPECIALIZATION_FAILS` | template specialization for <> fails with <> |
 | [E4203](E4203.md) | `TEMPLATE_SPECIALIZATION_FAILS_SIMPLE` | template specialization fails with <> |
+| [E4354](E4354.md) | `TEMPLATE_VALUE_NOT_MANGLEABLE` | the value <> of type <> cannot be the value of a template parameter |
 | [E4206](E4206.md) | `THROWS_NOT_DECLARED` | the function <> might throw an exception of type <>, but that is not declared in its prototype |
 | [E4207](E4207.md) | `THROWS_NOT_DECLARED_OVER` | the method might throw an exception of type <>, but that is not covered by the method of the ancestor class |
 | [E4208](E4208.md) | `THROWS_NOT_USED` | the prototype of the function <> declares a possible throw of an exception of type <>, but the function never throws it |
