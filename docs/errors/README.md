@@ -26,7 +26,7 @@ check lives:
 | `E1xxx` | lexing | `LexingErrorMessage` -- `src/ymirc/lexing/errors.yr` | 24 |
 | `E2xxx` | parsing | `SyntaxErrorMessage` -- `src/ymirc/syntax/errors.yr` | 17 |
 | `E3xxx` | declaration | `DeclareErrorMessage` -- `src/ymirc/semantic/declarator/errors.yr` | 37 |
-| `E4xxx` | validation | `ValidateErrorMessage` -- `src/ymirc/semantic/validator/errors.yr` | 290 |
+| `E4xxx` | validation | `ValidateErrorMessage` -- `src/ymirc/semantic/validator/errors.yr` | 292 |
 | `E5xxx` | lowering (YIL) | `SerializeYILErrorMessage` -- `src/ymirc/lint/serialize/errors.yr`, `OptimizerErrorMessage` -- `src/ymirc/lint/optimizer/errors.yr` | 11 |
 
 Each page carries an example wherever a case in the suite raises the code: the
@@ -395,6 +395,8 @@ deliberately carry no code, and have no page here.
 | [E4273](E4273.md) | `USE_AS_VALUE` | expression produces a type, but is used as a value |
 | [E4275](E4275.md) | `USE_AS_VALUE_TYPE` | expression produces the type <>, but is used as a value |
 | [E4278](E4278.md) | `VOID_VALUE` | void expression cannot be used as a value |
+| [E4352](E4352.md) | `VTABLE_ABSTRACT_CLASS` | class <> is abstract, it has no vtable |
+| [E4353](E4353.md) | `VTABLE_STRUCT` | <> is a structure, it has no vtable |
 | [E4280](E4280.md) | `WORKS_WITH_BOTH` | <> called with <> works with multiple candidates |
 | [E4281](E4281.md) | `DECLARE_VARIABLE_NO_FUNCTION` | var declaration <> outside a function context |
 | [E4283](E4283.md) | `DEFAULT_PARAM_BY_POSITION` | the parameter <> has a default value, it can only be passed by name |
