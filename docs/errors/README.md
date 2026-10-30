@@ -26,8 +26,8 @@ check lives:
 | `E1xxx` | lexing | `LexingErrorMessage` -- `src/ymirc/lexing/errors.yr` | 24 |
 | `E2xxx` | parsing | `SyntaxErrorMessage` -- `src/ymirc/syntax/errors.yr` | 17 |
 | `E3xxx` | declaration | `DeclareErrorMessage` -- `src/ymirc/semantic/declarator/errors.yr` | 37 |
-| `E4xxx` | validation | `ValidateErrorMessage` -- `src/ymirc/semantic/validator/errors.yr` | 294 |
-| `E5xxx` | lowering (YIL) | `SerializeYILErrorMessage` -- `src/ymirc/lint/serialize/errors.yr`, `OptimizerErrorMessage` -- `src/ymirc/lint/optimizer/errors.yr` | 11 |
+| `E4xxx` | validation | `ValidateErrorMessage` -- `src/ymirc/semantic/validator/errors.yr` | 295 |
+| `E5xxx` | lowering (YIL) | `SerializeYILErrorMessage` -- `src/ymirc/lint/serialize/errors.yr`, `OptimizerErrorMessage` -- `src/ymirc/lint/optimizer/errors.yr`, `LoweringErrorMessage` -- `src/ymirc/lint/lowering/errors.yr` | 12 |
 
 Each page carries an example wherever a case in the suite raises the code: the
 snippet is quoted from `test_resources/`, so it is one the suite keeps compiling.
@@ -264,6 +264,7 @@ deliberately carry no code, and have no page here.
 | [E4142](E4142.md) | `NEGATIVE_INT_INDEX` | index cannot be negative for type <>, but is <> |
 | [E4143](E4143.md) | `NEVER_ENTERED_LOOP` | loop test is always false, loop is never entered |
 | [E4144](E4144.md) | `NON_ABSTRACT_NOT_COMPLETE` | class <> is not abstract but has empty methods |
+| [E4356](E4356.md) | `NOGC_CALL` | <> is not nogc, a nogc function cannot call it |
 | [E4145](E4145.md) | `NOTHING_TO_CATCH` | nothing to catch |
 | [E4305](E4305.md) | `NO_ENCLOSING_PRAGMA` | __pragma <> is not enclosed in a <> |
 | [E4146](E4146.md) | `NOT_ALIASABLE` | <> is not an aliasable type |
@@ -448,6 +449,7 @@ deliberately carry no code, and have no page here.
 | [E5009](E5009.md) | `MALFORMED_BYTECODE_LOCATION_TABLE` | malformed bytecode, location table invalid |
 | [E5010](E5010.md) | `MISMATCH_ARCH_POINTER_SIZE` | YIL byte file was created for a <> bits target, mismatch current target arch <> bits |
 | [E5011](E5011.md) | `ALWAYS_OVERFLOW` | slice access always overflows, <> (len) <> <> (index) |
+| [E5012](E5012.md) | `NOGC_ALLOCATION` | a nogc function cannot allocate on the GC heap, the runtime call <> does |
 
 ## Retired
 
