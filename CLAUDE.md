@@ -159,6 +159,9 @@ Either way, each case:
    - `testN.yil.opt` — the same dump after the optimizer ran. A case carrying this file is
      compiled at `-O1` instead of `-O0`; absent, no pass runs. This is where a pass is
      regression tested, one case per pass under `test_resources/optimizer/`.
+   - `testN.yil.low` — the same dump once lowered (`getFinalYILNodes`): what the backend is
+     handed, the write barriers of the garbage collector inserted. `test_resources/barriers/`
+     is the directory dedicated to it.
    - `testN.warn` — expected formatted dump of the warnings reported without aborting the
      compilation. A case carrying this file is compiled in **debug mode**, the only mode in
      which a warning is reported instead of thrown; absent, a warning is fatal as any other
@@ -300,7 +303,11 @@ The whole frontend is orchestrated by `Parser` (`src/ymirc/parser.yr`), in three
 3. **Expansion / lowering** (`src/ymirc/lint`): lowers semantic generators into `YILNode`s
    (`lint/node`) — desugaring operators, normalizing control flow, scheduling destructors,
    finalizing types (`lint/expander`, `lint/optimizer`), and optionally serializing YIL
-   (`lint/serialize`).
+   (`lint/serialize`). After the optimizer, at every `-O`, `lint/lowering` checks that the
+   frames of the `@nogc` functions never allocate on the GC heap (on the expander output) and
+   inserts the write barriers of the concurrent collector (`_yrt_nh_wb`, guarded by
+   `_yrt_nh_marking`) before every store of a pointer out of the frame; that lowered YIL is
+   what is exported and compiled.
 
    
 Cross-cutting: `src/ymirc/errors` (the `ErrorMsg` type and its pretty-printing/formatting —
