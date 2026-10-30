@@ -1,0 +1,299 @@
+/*
+ * Declares WriteBarriers, the lowering inserting the write barriers of the concurrent
+ * garbage collector before the stores that may hide a pointer from it.
+ *
+ * <hr>
+ *
+ * @Package: ymirc
+ * @Module: ymirc::lint::lowering::barrier
+ * @File: ymirc/lint/lowering/barrier.yr
+ * @Author(s):
+ *   - Emile Cadorel <ecadorel@gmail.com>
+ *
+ * @Created(YYYY-MM-DD): 2026-10-30
+ * @Copyright(C) 2021–2026 GNU-Ymir
+ * @License
+ *   ```text
+ *   This file is part of the Ymir language project.
+ *
+ *   Ymir is free software: you can redistribute it and/or modify it
+ *   under the terms of the GNU General Public License as published by
+ *   the Free Software Foundation, either version 3 of the License, or
+ *   (at your option) any later version.
+ *
+ *   Ymir is distributed in the hope that it will be useful,
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *   GNU General Public License for more details.
+ *
+ *   You should have received a copy of the GNU General Public License
+ *   along with Ymir.  If not, see <https://www.gnu.org/licenses/>.
+ *   ```
+ */
+
+in barrier;
+
+use ymirc::global::core_;
+use ymirc::lint::optimizer;
+use ymirc::lint::node::{_, global::_, instr::_, type::_, value::_};
+
+/**
+ * The name of the temporaries holding the value of a store while its barrier runs.
+ * */
+def TEMP_NAME = "#_wb";
+
+/**
+ * Inserts the write barriers of the garbage collector. While the collector marks, concurrently
+ * with the program, a store of a value holding pointers into memory that is not a local of the
+ * frame (a heap object, a global, what a pointer points at) first hands the overwritten value and
+ * the stored one to the runtime, so that the collector loses track of neither:
+ *
+ * ```text
+ * t = R;
+ * if (_yrt_nh_marking) _yrt_nh_wb(&L, t);   // _yrt_nh_wb_range(&L, &t, size) for an aggregate
+ * L = t;
+ * ```
+ *
+ * A destination whose address calls a function is stored by `_yrt_nh_store(&L, &t, size)`,
+ * which makes the call once. The frames of the `@nogc` functions get no barrier.
+ * */
+pub mod WriteBarriers {
+
+    /**
+     * @params:
+     *    - nodes: the symbols of the module, optimized
+     * @returns: the symbols of the module, their frames with the barriers inserted
+     * */
+    pub fn insert(nodes: [&YILSymbol])-> [&YILSymbol] {
+        let mut res: [&YILSymbol] = [];
+        for n in nodes {
+            if let f: &YILFrame = n && !f.isNoGC {
+                let dmut inserter = copy BarrierInserter(f);
+                let body = inserter:.rewriteInstr(f.body);
+                if (body is f.body) {
+                    res ~= [f];
+                } else {
+                    res ~= [f.withBody(body)];
+                }
+            } else {
+                res ~= [n];
+            }
+        }
+
+        res
+    }
+}
+
+/**
+ * Rewrites the stores of a frame that need a write barrier.
+ * */
+class BarrierInserter over YILRewriter {
+
+    // the identifier of the next temporary
+    let mut _nextVar: usize;
+
+    // the identifier of the next label
+    let mut _nextLabel: usize;
+
+    /**
+     * @params:
+     *    - frame: the frame to rewrite
+     * */
+    pub self (frame: &YILFrame)
+        with super ()
+        , _nextVar = maxVarId(frame) + 1us
+        , _nextLabel = maxLabelId(frame.body) + 1us
+    {}
+
+    prot over rewriteList(mut self, instrs: [&YILInstr])-> [&YILInstr] {
+        let mut res: [&YILInstr] = [];
+        for i in instrs {
+            if let a: &YILAffect = i && needsBarrier(a) {
+                res ~= self:.lowerStore(a);
+            } else {
+                res ~= [self:.rewriteInstr(i)];
+            }
+        }
+
+        res
+    }
+
+    /**
+     * @params:
+     *    - a: a store that needs a barrier
+     * @returns: the instructions making the store, its barrier included
+     * */
+    fn lowerStore(mut self, a: &YILAffect)-> [&YILInstr] {
+        let loc = a.loc;
+        let type = a.left.type;
+        let mut res: [&YILInstr] = [];
+
+        let src: &YILValue = if let v: &YILVar = a.right {
+            v
+        } else {
+            let id = self:.nextVar();
+            let t = copy YILVar(loc, TEMP_NAME, type, id, isTemp-> true);
+            res ~= [copy YILVarDecl(loc, TEMP_NAME, type, id, isTemp-> true), copy YILAffect(loc, t, a.right)];
+            t
+        };
+
+        let size = copy YILIntValue(loc, YIL_UINT_64, type.size);
+        if (hasCall(a.left)) {
+            let store = copy YILNameCallValue(loc, YIL_VOID, YRuntimeFuncs::NH_STORE, copy [addressOf(a.left), addressOf(src), size]);
+            res ~= [copy YILCall(loc, store)];
+            return res;
+        }
+
+        let barrier = if (type of YILPointer && src.type of YILPointer) {
+            copy YILNameCallValue(loc, YIL_VOID, YRuntimeFuncs::NH_WRITE_BARRIER,
+                                  copy [addressOf(a.left), copy YILCastValue(loc, YIL_PTR_VOID, src)])
+        } else {
+            copy YILNameCallValue(loc, YIL_VOID, YRuntimeFuncs::NH_WRITE_RANGE, copy [addressOf(a.left), addressOf(src), size])
+        };
+
+        let then = copy YILLabel(loc, "wb", self:.nextLabel());
+        let end = copy YILLabel(loc, "store", self:.nextLabel());
+        let marking = copy YILVar(loc, YRuntimeGlobals::NH_MARKING, YIL_UINT_8, 0us);
+
+        res ~= [copy YILCondJmp(loc, marking, then, end), then, copy YILCall(loc, barrier), end,
+                copy YILAffect(loc, a.left, src)];
+
+        res
+    }
+
+    /**
+     * @returns: a fresh variable identifier
+     * */
+    fn nextVar(mut self)-> usize {
+        self._nextVar += 1us;
+        self._nextVar - 1us
+    }
+
+    /**
+     * @returns: a fresh label identifier
+     * */
+    fn nextLabel(mut self)-> usize {
+        self._nextLabel += 1us;
+        self._nextLabel - 1us
+    }
+}
+
+/**
+ * @params:
+ *    - a: a store
+ * @returns: true iif the store may hide a pointer from a concurrent collector
+ * */
+fn needsBarrier(a: &YILAffect)-> bool {
+    isOutOfFrame(a.left) && hasPointers(a.left.type)
+}
+
+/**
+ * @params:
+ *    - dest: the destination of a store
+ * @returns: true iif the destination may not be a local of the frame
+ *
+ * A thread local global is not one either, but it is scanned with the stack of its thread, and
+ * as the stack, needs no barrier.
+ * */
+fn isOutOfFrame(dest: &YILValue)-> bool {
+    match dest {
+        v: &YILVar              => { return v.id == 0us && !v.isThreadLocal; }
+        f: &YILFieldValue       => { return isOutOfFrame(f.tuple); }
+        c: &YILCastValue        => { return isOutOfFrame(c.value); }
+        a: &YILArrayAccessValue => { return (a.value.type of YILPointer) || isOutOfFrame(a.value); }
+    }
+
+    true
+}
+
+/**
+ * @params:
+ *    - type: a type
+ * @returns: true iif a value of the type can hold a pointer
+ * */
+fn hasPointers(type: &YILType)-> bool {
+    match type {
+        YILPointer() => { return true; }
+        a: &YILArray => { return a.len != 0us && hasPointers(a.inner); }
+        t: &YILTuple => {
+            for i in t.inners if hasPointers(i) {
+                return true;
+            }
+        }
+    }
+
+    false
+}
+
+/**
+ * @params:
+ *    - value: the destination of a store
+ * @returns: true iif computing the address of the destination calls a function
+ * */
+fn hasCall(value: &YILValue)-> bool {
+    match value {
+        YILNameCallValue()      => { return true; }
+        YILPtrCallValue()       => { return true; }
+        f: &YILFieldValue       => { return hasCall(f.tuple); }
+        c: &YILCastValue        => { return hasCall(c.value); }
+        u: &YILUnrefValue       => { return hasCall(u.value); }
+        a: &YILAddrValue        => { return hasCall(a.value); }
+        a: &YILArrayAccessValue => { return hasCall(a.value) || hasCall(a.index); }
+        b: &YILBinaryValue      => { return hasCall(b.left) || hasCall(b.right); }
+        u: &YILUnaryValue       => { return hasCall(u.left); }
+    }
+
+    false
+}
+
+/**
+ * @returns: the address of a place, as an untyped pointer
+ * */
+fn addressOf(value: &YILValue)-> &YILValue {
+    copy YILAddrValue(value.loc, YIL_PTR_VOID, value)
+}
+
+/**
+ * @returns: the largest variable identifier the frame declares
+ * */
+fn maxVarId(frame: &YILFrame)-> usize {
+    let mut res = 0us;
+    for p in frame.params if p.id > res {
+        res = p.id;
+    }
+
+    let inner = maxInstrId(frame.body, labels-> false);
+    if (inner > res) { inner } else { res }
+}
+
+/**
+ * @returns: the largest label identifier the instruction defines
+ * */
+fn maxLabelId(instr: &YILInstr)-> usize {
+    maxInstrId(instr, labels-> true)
+}
+
+/**
+ * @params:
+ *    - instr: an instruction
+ *    - labels: true to search the labels, false the variable declarations
+ * @returns: the largest identifier of a label or a declaration under the instruction
+ * */
+fn maxInstrId(instr: &YILInstr, labels: bool)-> usize {
+    let mut res = 0us;
+    let children: [&YILInstr] = match instr {
+        b: &YILBlock      => { b.instrs }
+        t: &YILTryCatch   => { t.tryPart ~ t.catchPart }
+        t: &YILTryFinally => { t.tryPart ~ t.finPart }
+        l: &YILLabel      => { if (labels) { res = l.id; } [] }
+        v: &YILVarDecl    => { if (!labels) { res = v.id; } [] }
+        _ => { [] }
+    };
+
+    for c in children {
+        let inner = maxInstrId(c, labels-> labels);
+        if (inner > res) { res = inner; }
+    }
+
+    res
+}
