@@ -26,7 +26,7 @@ check lives:
 | `E1xxx` | lexing | `LexingErrorMessage` -- `src/ymirc/lexing/errors.yr` | 24 |
 | `E2xxx` | parsing | `SyntaxErrorMessage` -- `src/ymirc/syntax/errors.yr` | 17 |
 | `E3xxx` | declaration | `DeclareErrorMessage` -- `src/ymirc/semantic/declarator/errors.yr` | 37 |
-| `E4xxx` | validation | `ValidateErrorMessage` -- `src/ymirc/semantic/validator/errors.yr` | 300 |
+| `E4xxx` | validation | `ValidateErrorMessage` -- `src/ymirc/semantic/validator/errors.yr` | 301 |
 | `E5xxx` | lowering (YIL) | `SerializeYILErrorMessage` -- `src/ymirc/lint/serialize/errors.yr`, `OptimizerErrorMessage` -- `src/ymirc/lint/optimizer/errors.yr`, `LoweringErrorMessage` -- `src/ymirc/lint/lowering/errors.yr` | 12 |
 
 Each page carries an example wherever a case in the suite raises the code: the
@@ -398,6 +398,7 @@ deliberately carry no code, and have no page here.
 | [E4268](E4268.md) | `USELESS_COND_TRUE` | conditional test is always evaluated to true, branch is always entered |
 | [E4269](E4269.md) | `USELESS_RUNTIME_ASSERT` | useless runtime assertion for a test that is always true |
 | [E4270](E4270.md) | `USE_AS_TYPE` | expression produces a value, but is used as a type |
+| [E4362](E4362.md) | `USE_AS_FUNCTION_TEMPLATE` | template specialization expected a function not <> |
 | [E4271](E4271.md) | `USE_AS_TYPE_TEMPLATE` | template specialization expected a type not the value <> |
 | [E4272](E4272.md) | `USE_AS_TYPE_VAL` | expression produces a value of type <>, but is used as a type |
 | [E4273](E4273.md) | `USE_AS_VALUE` | expression produces a type, but is used as a value |
