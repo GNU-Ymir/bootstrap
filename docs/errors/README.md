@@ -26,7 +26,7 @@ check lives:
 | `E1xxx` | lexing | `LexingErrorMessage` -- `src/ymirc/lexing/errors.yr` | 24 |
 | `E2xxx` | parsing | `SyntaxErrorMessage` -- `src/ymirc/syntax/errors.yr` | 17 |
 | `E3xxx` | declaration | `DeclareErrorMessage` -- `src/ymirc/semantic/declarator/errors.yr` | 37 |
-| `E4xxx` | validation | `ValidateErrorMessage` -- `src/ymirc/semantic/validator/errors.yr` | 295 |
+| `E4xxx` | validation | `ValidateErrorMessage` -- `src/ymirc/semantic/validator/errors.yr` | 300 |
 | `E5xxx` | lowering (YIL) | `SerializeYILErrorMessage` -- `src/ymirc/lint/serialize/errors.yr`, `OptimizerErrorMessage` -- `src/ymirc/lint/optimizer/errors.yr`, `LoweringErrorMessage` -- `src/ymirc/lint/lowering/errors.yr` | 12 |
 
 Each page carries an example wherever a case in the suite raises the code: the
@@ -271,6 +271,7 @@ deliberately carry no code, and have no page here.
 | [E4147](E4147.md) | `NOT_ANCESTOR` | <> is not an ancestor type of <> |
 | [E4149](E4149.md) | `NOT_AN_EXCEPTION_CLASS` | class type <> does not inherit from exception type <> |
 | [E4150](E4150.md) | `NOT_A_CLASS` | <> is not a class type |
+| [E4359](E4359.md) | `NOT_A_FUNCTION` | <> is neither a function nor a callable type |
 | [E4151](E4151.md) | `NOT_A_LVALUE` | not a lvalue |
 | [E4153](E4153.md) | `NOT_A_LVALUE_ITERATOR` | <> is a value iterator, and cannot be used as a lvalue |
 | [E4154](E4154.md) | `NOT_A_LVALUE_LAZY` | <> is a lazy variable, and cannot be used as a lvalue |
@@ -312,10 +313,14 @@ deliberately carry no code, and have no page here.
 | [E4190](E4190.md) | `OVERRIDE_NO_FIELD_BY_FIELD` | field method <> cannot override the non field method <> |
 | [E4320](E4320.md) | `OVERRIDE_NO_GENERATOR_BY_GENERATOR` | generator <> cannot override the non generator method <> |
 | [E4192](E4192.md) | `OVERRIDE_TRAIT_OUTSIDE` | cannot override trait method <> with <> outside impl |
+| [E4360](E4360.md) | `PARAMETER_ARITY_OVERFLOW` | parameter access out of bound(<>), the arity of the function is <> |
+| [E4361](E4361.md) | `PARAMETER_UNKNOWN` | the function has no parameter named <> |
 | [E4324](E4324.md) | `PART_AFFECT_LENGTH` | a part of <> elements cannot be affected from <> elements |
 | [E4322](E4322.md) | `PART_AFFECT_OPERATOR` | the affectation of a part of <> is only defined for the operator <> |
 | [E4323](E4323.md) | `PART_AFFECT_TYPE` | a part of <> cannot be affected from a value of type <>, an array or a slice was expected |
 | [E4193](E4193.md) | `PATTERN_IS_REFUTABLE` | the pattern <> with value <> is refutable |
+| [E4357](E4357.md) | `PRAGMA_OVERLOAD_SET` | <> is an overload set, __pragma <> reflects over a single function |
+| [E4358](E4358.md) | `PRAGMA_UNINSTANTIATED` | the parameters of <> are not known, __pragma <> reflects over an instantiated function |
 | [E4340](E4340.md) | `PROTO_CYCLE` | <> is used before its prototype is validated |
 | [E4195](E4195.md) | `RANGE_ON_ARRAY_NO_COPY` | the index operator on <> with a dynamic operand of type <> is allowed only in the context of a copy statement |
 | [E4196](E4196.md) | `RECURSIVE_ANCESTOR` | ancestor cycle found when validating <> |
