@@ -1,0 +1,317 @@
+/*
+ * Implements the resolution of the function a reflection pragma is given.
+ *
+ * `__pragma!parameter_infos`, `__pragma!parameter_type`, `__pragma!return_type`
+ * and `__pragma!function_infos` all reflect over one function, given as a
+ * function symbol or as a callable type, and reject the same parameters: this
+ * module resolves it into a FunctionSignature they read.
+ *
+ * <hr>
+ *
+ * @Package: ymirc
+ * @Module: ymirc::semantic::validator::pragma::signature
+ * @File: ymirc/semantic/validator/pragma/signature.yr
+ * @Author(s):
+ *   - Emile Cadorel <ecadorel@gmail.com>
+ *
+ * @Created(YYYY-MM-DD): 2026-10-31
+ * @Copyright(C) 2021–2026 GNU-Ymir
+ * @License
+ *   ```text
+ *   This file is part of the Ymir language project.
+ *
+ *   Ymir is free software: you can redistribute it and/or modify it
+ *   under the terms of the GNU General Public License as published by
+ *   the Free Software Foundation, either version 3 of the License, or
+ *   (at your option) any later version.
+ *
+ *   Ymir is distributed in the hope that it will be useful,
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *   GNU General Public License for more details.
+ *
+ *   You should have received a copy of the GNU General Public License
+ *   along with Ymir.  If not, see <https://www.gnu.org/licenses/>.
+ *   ```
+ */
+
+in signature;
+
+use ymirc::errors;
+use ymirc::lexing::{keys, word};
+use ymirc::semantic::symbol;
+use ymirc::semantic::generator::{type::_, value::_};
+use ymirc::syntax::declaration::function;
+use ymirc::syntax::expression::operator;
+use ymirc::utils::format;
+
+/**
+ * A parameter of a reflected function.
+ */
+pub record ParamSignature {
+
+    // The name of the parameter, empty for the parameter of a callable type
+    pub let name: [c8];
+
+    // The type of the parameter
+    pub let type: &Type;
+
+    pub let isMutable: bool;
+
+    pub let isRef: bool;
+
+    pub let isLazy: bool;
+
+    // True iff the parameter cannot be passed by position
+    pub let isNamed: bool;
+
+    pub let hasDefault: bool;
+
+    pub self (name: [c8], type: &Type, isMutable: bool, isRef: bool, isLazy: bool, isNamed: bool, hasDefault: bool)
+        with name = name
+        , type = type
+        , isMutable = isMutable
+        , isRef = isRef
+        , isLazy = isLazy
+        , isNamed = isNamed
+        , hasDefault = hasDefault
+    {}
+}
+
+/**
+ * A reflected function: a function symbol, or a callable type whose
+ * parameters have no name and which has no attribute.
+ */
+pub record FunctionSignature {
+
+    // The path of the function, empty for a callable type
+    pub let name: [c8];
+
+    // fn, yield or async
+    pub let kind: [c8];
+
+    // The parameters, without the self of a method
+    pub let params: [ParamSignature];
+
+    // The declared return type, what is yielded by a generator, or completed with by an async
+    pub let retType: &Type;
+
+    pub let isUnsafe: bool;
+
+    pub let isInline: bool;
+
+    pub let isCVariadic: bool;
+
+    // True iff the prototype declares a thrown type
+    pub let isThrowing: bool;
+
+    pub let isMethod: bool;
+
+    pub self (name: [c8], kind: [c8], params: [ParamSignature], retType: &Type,
+              isUnsafe: bool = false,
+              isInline: bool = false,
+              isCVariadic: bool = false,
+              isThrowing: bool = false,
+              isMethod: bool = false)
+        with name = name
+        , kind = kind
+        , params = params
+        , retType = retType
+        , isUnsafe = isUnsafe
+        , isInline = isInline
+        , isCVariadic = isCVariadic
+        , isThrowing = isThrowing
+        , isMethod = isMethod
+    {}
+}
+
+/**
+ * PragmaSignatureValidation module
+ *
+ * Resolves the parameter of a function reflection pragma, validated as a type
+ * and failing that as a value, into a FunctionSignature.
+ *
+ * A function symbol, a pointer to it, or a method reached through a delegate
+ * gives its own signature: the names and the modifiers of its parameters, its
+ * kind and its attributes. Any other value or type is reflected by its type, a
+ * function pointer or a delegate, an enum being unwrapped to its proxy.
+ */
+pub mod PragmaSignatureValidation {
+
+    /**
+     * Resolve the function a reflection pragma reflects over.
+     *
+     * @params:
+     *   - context: validation context
+     *   - p:       the pragma expression
+     *   - param:   the parameter of the pragma naming the function
+     *
+     * @returns: the signature of the function
+     *
+     * @throws:
+     *   - ErrorMsg if the parameter is an overload set, a template whose parameters are not known, or
+     *     neither a function nor a callable type
+     */
+    pub fn resolve(dmut context: &ValidationContext, p: &PragmaExpr, param: &Expression)-> FunctionSignature
+        throws ErrorMsg
+    {
+        let type = (TypeValidation::validate(alias context, param))?;
+        if let Ok(t) = type {
+            return PragmaSignatureValidation::fromType(p, param.loc, t);
+        }
+
+        PragmaSignatureValidation::fromValue(p, param.loc, ValueValidation::validate(alias context, param))
+    }
+
+    /**
+     * @params:
+     *   - p:     the pragma expression
+     *   - loc:   the location of the parameter of the pragma
+     *   - value: the validated parameter
+     *
+     * @returns: the signature of the function the value is, or is a pointer to, or the one of its type
+     *
+     * @throws:
+     *   - ErrorMsg if the value is an overload set, an uninstantiated template, or not callable
+     */
+    fn fromValue(p: &PragmaExpr, loc: &Word, value: &Value)-> FunctionSignature
+        throws ErrorMsg
+    {
+        match value {
+            proto: &PrototypeValue => return PragmaSignatureValidation::fromProto(proto);
+            f: &ProtoFuncPtrValue => return PragmaSignatureValidation::fromProto(f.proto);
+            m: &MethodDelegateValue => return PragmaSignatureValidation::fromProto(m.proto);
+            m: &MultSymValue => {
+                if (m.values.len == 1us) return PragmaSignatureValidation::fromValue(p, loc, m.values[0]);
+                throw copy ErrorMsg::fatal(loc, format(ValidateErrorMessage::PRAGMA_OVERLOAD_SET, m, p.name.str),
+                                           notes-> copy [copy ErrorMsg::note(v.loc,
+                                                                             format(ValidateErrorMessage::CANDIDATE_ARE, CallParamListCreation::formatPrettyName(v)),
+                                                                             oneLine-> true,
+                                                                             withLoc-> true)
+                                                         for v in m.values]);
+            }
+            t: &TemplateRefValue => {
+                throw copy ErrorMsg::fatal(loc, format(ValidateErrorMessage::PRAGMA_UNINSTANTIATED, t, p.name.str));
+            }
+            l: &LambdaValue => {
+                throw copy ErrorMsg::fatal(loc, format(ValidateErrorMessage::PRAGMA_UNINSTANTIATED, l.type, p.name.str));
+            }
+        }
+
+        PragmaSignatureValidation::fromType(p, loc, value.type)
+    }
+
+    /**
+     * @params:
+     *   - p:    the pragma expression
+     *   - loc:  the location of the parameter of the pragma
+     *   - type: the validated parameter
+     *
+     * @returns: the signature of a function pointer or delegate type, through enum proxies
+     *
+     * @throws:
+     *   - ErrorMsg if the type is a lambda or a function template, whose parameters are not known, or is not
+     *     callable
+     */
+    fn fromType(p: &PragmaExpr, loc: &Word, type: &Type)-> FunctionSignature
+        throws ErrorMsg
+    {
+        let inner = if let e: &EnumType = type { e.getLastLevelProxy() } else { type };
+        match inner {
+            f: &FuncPtrType => return PragmaSignatureValidation::fromCallable(f.params, f.references, f.lazys, f.retType);
+            d: &DelegateType => return PragmaSignatureValidation::fromCallable(d.params, d.references, d.lazys, d.retType);
+            l: &LambdaType => {
+                throw copy ErrorMsg::fatal(loc, format(ValidateErrorMessage::PRAGMA_UNINSTANTIATED, l, p.name.str));
+            }
+            t: &TemplateRefType if t.sym.decl.decl of FunctionDecl => {
+                throw copy ErrorMsg::fatal(loc, format(ValidateErrorMessage::PRAGMA_UNINSTANTIATED, t, p.name.str));
+            }
+        }
+
+        throw copy ErrorMsg::fatal(loc, format(ValidateErrorMessage::NOT_A_FUNCTION, inner));
+    }
+
+    /**
+     * @params:
+     *   - params:  the types of the parameters of a callable type
+     *   - refs:    which of them are passed by reference
+     *   - lazys:   which of them are lazy
+     *   - retType: its return type
+     *
+     * @returns: the signature of the callable type, whose parameters have no name
+     */
+    fn fromCallable(params: [&Type], refs: [bool], lazys: [bool], retType: &Type)-> FunctionSignature {
+        let mut result: [ParamSignature] = [];
+        for i, t in params {
+            result ~= [ParamSignature("", t,
+                                      isMutable-> false,
+                                      isRef-> (i < refs.len && refs[i]),
+                                      isLazy-> (i < lazys.len && lazys[i]),
+                                      isNamed-> false,
+                                      hasDefault-> false)];
+        }
+
+        FunctionSignature("", Keys::FUNCTION, result, retType)
+    }
+
+    /**
+     * @params:
+     *   - proto: the prototype of a function, a method or a lambda
+     *
+     * @returns: the signature of the prototype, the self of a method left out
+     */
+    fn fromProto(proto: &PrototypeValue)-> FunctionSignature {
+        let mut params: [ParamSignature] = [];
+        for v in proto.params if (!v.isSelf) {
+            params ~= [ParamSignature(v.name, v.type,
+                                      isMutable-> v.isMutable,
+                                      isRef-> v.isReference,
+                                      isLazy-> v.isLazy,
+                                      isNamed-> v.isForcedNamed,
+                                      hasDefault-> (v.value !of UnitValue))];
+        }
+
+        let kind = PragmaSignatureValidation::kindOf(proto);
+        let retType = match proto.retType {
+            y: &YieldType if kind == Keys::YIELD => { y.retType }
+            a: &AsyncType if kind == Keys::ASYNC => { a.retType }
+            r: _ => { r }
+        };
+
+        let (name, isMethod) = match proto {
+            n: &NamePrototypeValue if n.isLambda => { ("", false) }
+            m: &MethodPrototypeValue => { (format("%", m), true) }
+            _ => { (format("%", proto), false) }
+        };
+
+        FunctionSignature(name, kind, params, retType,
+                          isUnsafe-> proto.isUnsafe,
+                          isInline-> proto.isInline,
+                          isCVariadic-> proto.isCVariadic,
+                          isThrowing-> proto.throwers.len != 0us,
+                          isMethod-> isMethod)
+    }
+
+    /**
+     * @params:
+     *   - proto: the prototype of a function, a method or a lambda
+     *
+     * @returns: the keyword declaring the function, a lambda being a `fn` returning what its call returns
+     */
+    fn kindOf(proto: &PrototypeValue)-> [c8] {
+        let (isYield, isAsync) = match proto {
+            m: &MethodPrototypeValue => { (m.isYield, m.isAsync) }
+            _ => {
+                match proto.sym {
+                    f: &FunctionSymbol => { (f.decl.isYield, f.decl.isAsync) }
+                    _ => { (false, false) }
+                }
+            }
+        };
+
+        if (isYield) return Keys::YIELD;
+        if (isAsync) return Keys::ASYNC;
+        Keys::FUNCTION
+    }
+
+}
