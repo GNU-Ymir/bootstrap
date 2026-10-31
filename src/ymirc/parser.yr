@@ -65,7 +65,7 @@ in parser;
 use ymirc::{errors, session, utils::_};
 use ymirc::doc::visitor;
 use ymirc::lexing::word;
-use ymirc::lint::{expander, node::_, optimizer, serialize};
+use ymirc::lint::{expander, lowering::_, node::_, optimizer, serialize};
 use ymirc::semantic::{declarator, generator, index, symbol, validator};
 use ymirc::syntax::{declaration::_, visitor};
 
@@ -109,6 +109,9 @@ pub class Parser {
 
     // The list of generator created after optimization (identical to _expNodes at -O0)
     let mut _optNodes: [&YILNode] = [];
+
+    // The list of generator handed to the backend, the optimized ones once lowered
+    let mut _finalNodes: [&YILNode] = [];
 
     // The list of complex types created during expansion
     let mut _expTypes: [&YILType] = [];
@@ -216,11 +219,21 @@ pub class Parser {
      *   - the list of YIL nodes produced by optimizationStep() after the
      *     optimization passes ran.
      *
-     * This is what is dumped, exported and handed to the backend. At `-O0` no
-     * pass runs, so it is exactly getExpYILNodes().
+     * At `-O0` no pass runs, so it is exactly getExpYILNodes().
      */
     pub fn getOptYILNodes(self)-> [&YILNode] {
         self._optNodes
+    }
+
+    /**
+     * @returns:
+     *   - the list of YIL nodes handed to the backend: the ones of getOptYILNodes(),
+     *     lowered, the write barriers of the garbage collector inserted.
+     *
+     * This is what is exported, and what a backend compiles.
+     */
+    pub fn getFinalYILNodes(self)-> [&YILNode] {
+        self._finalNodes
     }
 
     /**
@@ -681,6 +694,8 @@ pub class Parser {
     {
         if (global::state::noYIL()) return [];
 
+        NoGCVerifier::verify(expanded);
+
         let dmut opt = copy Optimizer(level-> global::state::optLevel(), types-> types);
         // first: a landing pad pins what it protects and cuts the region it
         // protects into pieces no other pass reasons across, so the passes
@@ -735,20 +750,47 @@ pub class Parser {
         }
 
         let finals = opt:.optimize(expanded, dumpPath-> file);
-
         self._optTypes = opt.getTypes();
+
+        let lowered = self.loweringStep(finals);
+        self._finalNodes = lowered;
+
         if (global::state::isExportYIL()) {
             let mut yilExp = YILExporter(packageDir-> file.parent());
             yilExp:.registerTypes(self._optTypes);
-            yilExp:.registerSymbols(finals);
+            yilExp:.registerSymbols(lowered);
             yilExp:.writeFiles(compiled);
         }
 
         if (global::state::isDumpDependenciesActive()) {
-            self.writeModuleDependencies(file, compiled, finals);
+            self.writeModuleDependencies(file, compiled, lowered);
         }
 
         finals
+    }
+
+    /**
+     * Lower the optimized YIL nodes, at every optimization level: insert the write barriers of
+     * the garbage collector.
+     *
+     * Returns:
+     *   - list of YIL symbols handed to the backend
+     *
+     * Throws:
+     *   - ErrorMsg: iif `--fverify-yil` is set and a lowered frame is malformed
+     */
+    fn loweringStep(self, optimized: [&YILSymbol])-> [&YILSymbol]
+        throws ErrorMsg
+    {
+        let lowered = WriteBarriers::insert(optimized);
+        if (global::state::isYilVerifyActive()) {
+            let dmut ver = copy Verifier(pass-> "write barriers");
+            for n in lowered match n {
+                frame: &YILFrame => { ver:.verify(frame); }
+            }
+        }
+
+        lowered
     }
 
     /**
