@@ -43,19 +43,18 @@ use ymirc::lint::node::{_, global::_, instr::_, type::_, value::_};
 def TEMP_NAME = "#_wb";
 
 /**
- * Inserts the write barriers of the garbage collector. While the collector marks, concurrently
- * with the program, a store of a value holding pointers into memory that is not a local of the
- * frame (a heap object, a global, what a pointer points at) first hands the overwritten value and
- * the stored one to the runtime, so that the collector loses track of neither:
+ * Inserts the write barriers of the garbage collector. A store of a value holding pointers into
+ * memory that is not a local of the frame (a heap object, a global, what a pointer points at) is
+ * made by the runtime, which hands the overwritten value and the stored one to the collector while
+ * it marks, concurrently with the program, so that it loses track of neither:
  *
  * ```text
  * t = R;
- * if (_yrt_nh_marking) _yrt_nh_wb(&L, t);   // _yrt_nh_wb_range(&L, &t, size) for an aggregate
- * L = t;
+ * _yrt_nh_store_ptr(&L, t);   // _yrt_nh_store(&L, &t, size) for an aggregate
  * ```
  *
- * A destination whose address calls a function is stored by `_yrt_nh_store(&L, &t, size)`,
- * which makes the call once. The frames of the `@nogc` functions get no barrier.
+ * The runtime tests whether the collector marks and stores in one go, no handshake of the
+ * collector parking the thread in between. The frames of the `@nogc` functions get no barrier.
  * */
 pub mod WriteBarriers {
 
@@ -92,9 +91,6 @@ class BarrierInserter over YILRewriter {
     // the identifier of the next temporary
     let mut _nextVar: usize;
 
-    // the identifier of the next label
-    let mut _nextLabel: usize;
-
     /**
      * @params:
      *    - frame: the frame to rewrite
@@ -102,7 +98,6 @@ class BarrierInserter over YILRewriter {
     pub self (frame: &YILFrame)
         with super ()
         , _nextVar = maxVarId(frame) + 1us
-        , _nextLabel = maxLabelId(frame.body) + 1us
     {}
 
     prot over rewriteList(mut self, instrs: [&YILInstr])-> [&YILInstr] {
@@ -137,27 +132,15 @@ class BarrierInserter over YILRewriter {
             t
         };
 
-        let size = copy YILIntValue(loc, YIL_UINT_64, type.size);
-        if (hasCall(a.left)) {
-            let store = copy YILNameCallValue(loc, YIL_VOID, YRuntimeFuncs::NH_STORE, copy [addressOf(a.left), addressOf(src), size]);
-            res ~= [copy YILCall(loc, store)];
-            return res;
-        }
-
-        let barrier = if (type of YILPointer && src.type of YILPointer) {
-            copy YILNameCallValue(loc, YIL_VOID, YRuntimeFuncs::NH_WRITE_BARRIER,
+        let store = if (type of YILPointer && src.type of YILPointer) {
+            copy YILNameCallValue(loc, YIL_VOID, YRuntimeFuncs::NH_STORE_PTR,
                                   copy [addressOf(a.left), copy YILCastValue(loc, YIL_PTR_VOID, src)])
         } else {
-            copy YILNameCallValue(loc, YIL_VOID, YRuntimeFuncs::NH_WRITE_RANGE, copy [addressOf(a.left), addressOf(src), size])
+            let size = copy YILIntValue(loc, YIL_UINT_64, type.size);
+            copy YILNameCallValue(loc, YIL_VOID, YRuntimeFuncs::NH_STORE, copy [addressOf(a.left), addressOf(src), size])
         };
 
-        let then = copy YILLabel(loc, "wb", self:.nextLabel());
-        let end = copy YILLabel(loc, "store", self:.nextLabel());
-        let marking = copy YILVar(loc, YRuntimeGlobals::NH_MARKING, YIL_UINT_8, 0us);
-
-        res ~= [copy YILCondJmp(loc, marking, then, end), then, copy YILCall(loc, barrier), end,
-                copy YILAffect(loc, a.left, src)];
-
+        res ~= [copy YILCall(loc, store)];
         res
     }
 
@@ -167,14 +150,6 @@ class BarrierInserter over YILRewriter {
     fn nextVar(mut self)-> usize {
         self._nextVar += 1us;
         self._nextVar - 1us
-    }
-
-    /**
-     * @returns: a fresh label identifier
-     * */
-    fn nextLabel(mut self)-> usize {
-        self._nextLabel += 1us;
-        self._nextLabel - 1us
     }
 }
 
@@ -226,27 +201,6 @@ fn hasPointers(type: &YILType)-> bool {
 }
 
 /**
- * @params:
- *    - value: the destination of a store
- * @returns: true iif computing the address of the destination calls a function
- * */
-fn hasCall(value: &YILValue)-> bool {
-    match value {
-        YILNameCallValue()      => { return true; }
-        YILPtrCallValue()       => { return true; }
-        f: &YILFieldValue       => { return hasCall(f.tuple); }
-        c: &YILCastValue        => { return hasCall(c.value); }
-        u: &YILUnrefValue       => { return hasCall(u.value); }
-        a: &YILAddrValue        => { return hasCall(a.value); }
-        a: &YILArrayAccessValue => { return hasCall(a.value) || hasCall(a.index); }
-        b: &YILBinaryValue      => { return hasCall(b.left) || hasCall(b.right); }
-        u: &YILUnaryValue       => { return hasCall(u.left); }
-    }
-
-    false
-}
-
-/**
  * @returns: the address of a place, as an untyped pointer
  * */
 fn addressOf(value: &YILValue)-> &YILValue {
@@ -262,36 +216,27 @@ fn maxVarId(frame: &YILFrame)-> usize {
         res = p.id;
     }
 
-    let inner = maxInstrId(frame.body, labels-> false);
+    let inner = maxDeclId(frame.body);
     if (inner > res) { inner } else { res }
-}
-
-/**
- * @returns: the largest label identifier the instruction defines
- * */
-fn maxLabelId(instr: &YILInstr)-> usize {
-    maxInstrId(instr, labels-> true)
 }
 
 /**
  * @params:
  *    - instr: an instruction
- *    - labels: true to search the labels, false the variable declarations
- * @returns: the largest identifier of a label or a declaration under the instruction
+ * @returns: the largest identifier of a declaration under the instruction
  * */
-fn maxInstrId(instr: &YILInstr, labels: bool)-> usize {
+fn maxDeclId(instr: &YILInstr)-> usize {
     let mut res = 0us;
     let children: [&YILInstr] = match instr {
         b: &YILBlock      => { b.instrs }
         t: &YILTryCatch   => { t.tryPart ~ t.catchPart }
         t: &YILTryFinally => { t.tryPart ~ t.finPart }
-        l: &YILLabel      => { if (labels) { res = l.id; } [] }
-        v: &YILVarDecl    => { if (!labels) { res = v.id; } [] }
+        v: &YILVarDecl    => { res = v.id; [] }
         _ => { [] }
     };
 
     for c in children {
-        let inner = maxInstrId(c, labels-> labels);
+        let inner = maxDeclId(c);
         if (inner > res) { res = inner; }
     }
 
