@@ -305,8 +305,9 @@ The whole frontend is orchestrated by `Parser` (`src/ymirc/parser.yr`), in three
    finalizing types (`lint/expander`, `lint/optimizer`), and optionally serializing YIL
    (`lint/serialize`). After the optimizer, at every `-O`, `lint/lowering` checks that the
    frames of the `@nogc` functions never allocate on the GC heap (on the expander output) and
-   inserts the write barriers of the concurrent collector (`_yrt_nh_wb`, guarded by
-   `_yrt_nh_marking`) before every store of a pointer out of the frame; that lowered YIL is
+   makes every store of a pointer out of the frame a call to the write barrier of the concurrent
+   collector (`_yrt_nh_store_ptr`, `_yrt_nh_store` for an aggregate), which tests whether it marks
+   and stores with no handshake in between; that lowered YIL is
    what is exported and compiled.
 
    
