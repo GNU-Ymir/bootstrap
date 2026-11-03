@@ -26,7 +26,7 @@ check lives:
 | `E1xxx` | lexing | `LexingErrorMessage` -- `src/ymirc/lexing/errors.yr` | 24 |
 | `E2xxx` | parsing | `SyntaxErrorMessage` -- `src/ymirc/syntax/errors.yr` | 17 |
 | `E3xxx` | declaration | `DeclareErrorMessage` -- `src/ymirc/semantic/declarator/errors.yr` | 37 |
-| `E4xxx` | validation | `ValidateErrorMessage` -- `src/ymirc/semantic/validator/errors.yr` | 305 |
+| `E4xxx` | validation | `ValidateErrorMessage` -- `src/ymirc/semantic/validator/errors.yr` | 308 |
 | `E5xxx` | lowering (YIL) | `SerializeYILErrorMessage` -- `src/ymirc/lint/serialize/errors.yr`, `OptimizerErrorMessage` -- `src/ymirc/lint/optimizer/errors.yr`, `LoweringErrorMessage` -- `src/ymirc/lint/lowering/errors.yr` | 12 |
 
 Each page carries an example wherever a case in the suite raises the code: the
@@ -335,8 +335,11 @@ deliberately carry no code, and have no page here.
 | [E4333](E4333.md) | `TAG_APPLY_KIND` | <> is <>, but the overload receiving it is declared as <> |
 | [E4335](E4335.md) | `TAG_APPLY_NOT_TEMPLATE` | an apply overload is a template, whose first parameter receives the tagged symbol |
 | [E4338](E4338.md) | `TAG_CTOR_SHAPE` | a self overload of a tag is run at program start, it can neither take parameters nor throw |
+| [E4367](E4367.md) | `TAG_FIELD_APPLY` | tag <> declares apply overloads, a field cannot carry it |
 | [E4336](E4336.md) | `TAG_MERGE_CYCLE` | <> is used before its tags are merged into it |
 | [E4332](E4332.md) | `TAG_NOT_APPLICABLE` | tag <> does not apply to <> <> |
+| [E4368](E4368.md) | `TAG_SITE_NOT_SINGLE` | <> carries <> sites of tag <>, where a single one was expected |
+| [E4369](E4369.md) | `TAG_SITES_RECORDS` | the sites of tag <> on <> hold their arguments in different records, <> and <> |
 | [E4355](E4355.md) | `TAG_TEMPLATE_SHADOWED` | <> is already a template parameter of tag <> |
 | [E4202](E4202.md) | `TEMPLATE_SPECIALIZATION_FAILS` | template specialization for <> fails with <> |
 | [E4203](E4203.md) | `TEMPLATE_SPECIALIZATION_FAILS_SIMPLE` | template specialization fails with <> |
