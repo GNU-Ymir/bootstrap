@@ -1,0 +1,797 @@
+/*
+ * Declares the CompileTimeExecutor class.
+ *
+ * The CompileTimeExecutor runs the body of functions at compile time, with
+ * mutable locals, loops, calls with parameters, throws and catches, where the
+ * CompileTimeInterpret only folds what reduces structurally. It is only used
+ * where a value is required at compile time (see CompileTimeExecution).
+ *
+ * <hr>
+ *
+ * @Package: ymirc
+ * @Module: ymirc::semantic::interpret::exec
+ * @File: ymirc/semantic/interpret/exec.yr
+ * @Author(s):
+ *   - Emile Cadorel <ecadorel@gmail.com>
+ *
+ * @Created(YYYY-MM-DD): 2026-11-03
+ * @Copyright(C) 2021–2026 GNU-Ymir
+ * @License
+ *   ```text
+ *   This file is part of the Ymir language project.
+ *
+ *   Ymir is free software: you can redistribute it and/or modify it
+ *   under the terms of the GNU General Public License as published by
+ *   the Free Software Foundation, either version 3 of the License, or
+ *   (at your option) any later version.
+ *
+ *   Ymir is distributed in the hope that it will be useful,
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *   GNU General Public License for more details.
+ *
+ *   You should have received a copy of the GNU General Public License
+ *   along with Ymir.  If not, see <https://www.gnu.org/licenses/>.
+ *   ```
+ */
+
+in exec;
+
+use ymirc::errors;
+use ymirc::lexing::{keys, word};
+use ymirc::semantic::{symbol, validator};
+use ymirc::semantic::generator::{type::_, value::_};
+use ymirc::utils::{bigint, format};
+
+use std::{conv, stream};
+
+/**
+ * The maximal number of values a compile-time execution evaluates, against code that does not terminate.
+ */
+def MAX_STEPS = 100000us;
+
+/**
+ * The maximal number of calls nested in a compile-time execution.
+ */
+def MAX_DEPTH = 256us;
+
+/**
+ * A non-local exit of the executed code.
+ */
+pub class ExecSignal over Exception {
+    pub self () {}
+    impl Streamable;
+}
+
+/**
+ * A `return`, leaving the executed function with `value`.
+ */
+class ExecReturn over ExecSignal {
+    pub let value: &Value;
+    pub self (value: &Value) with value = value {}
+}
+
+/**
+ * A `break`, leaving the executed loop with `value`.
+ */
+class ExecBreak over ExecSignal {
+    pub let value: &Value;
+    pub self (value: &Value) with value = value {}
+}
+
+/**
+ * A `continue` of the executed loop.
+ */
+class ExecContinue over ExecSignal {
+    pub self () {}
+}
+
+/**
+ * An exception thrown by the executed code at `loc`, `object` being the construction of the thrown object.
+ */
+pub class ExecThrow over ExecSignal {
+    pub let loc: &Word;
+    pub let object: &CtorCallValue;
+    pub self (loc: &Word, object: &CtorCallValue) with loc = loc, object = object {}
+}
+
+/**
+ * The executed code leaves what can be executed at compile time, `notes` saying why.
+ */
+pub class ExecBail over ExecSignal {
+    pub let notes: [&ErrorMsg];
+    pub self (notes: [&ErrorMsg]) with notes = notes {}
+}
+
+/**
+ * Executor of generator values at compile time.
+ *
+ * A value is executed against the environment of the current frame, mapping the
+ * declarations (by uniqId) to their current literal value. An operator is executed
+ * by executing its operands, and handing the operator rebuilt over their literals
+ * to the CompileTimeInterpret, so that the folding rules stay in one place.
+ *
+ * An exception thrown by the executed code is a class and the location of its
+ * throw, a catch dispatching on the class only.
+ */
+@final
+pub class CompileTimeExecutor {
+
+    prv {
+        let dmut _context: &ValidationContext;
+
+        // The location of the value whose execution is required
+        let _loc: &Word;
+
+        // The values of the declarations of the current frame
+        let mut _env: [usize => mut &Value] = copy [];
+
+        let mut _steps: usize = 0us;
+        let mut _depth: usize = 0us;
+    }
+
+    /**
+     * @params:
+     *   - context: the validation context, forcing the validation of the bodies of the called functions
+     *   - loc: the location of the value whose execution is required
+     */
+    pub self (dmut context: &ValidationContext, loc: &Word)
+        with _context = alias context
+        , _loc = loc
+    {}
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          DISPATCH          ====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Executes a value.
+     *
+     * @returns: the literal the value evaluates to
+     * @throws:
+     *   - ExecSignal: a non-local exit, or the value cannot be executed
+     *   - ErrorMsg: the execution fails (panic, limit exceeded, folding error)
+     */
+    pub fn execute(mut self, value: &Value)-> &Value
+        throws ErrorMsg, ExecSignal
+    {
+        self:.step(value.loc);
+        if (value.isReduced && value of LiteralValue && value !of SliceCtorValue) {
+            return value;
+        }
+
+        match value {
+            b: &BlockValue => { return self:.executeBlock(b.values); }
+            i: &InlineBlockValue => { return self:.executeInline(i); }
+            c: &ConditionalValue => { return self:.executeConditional(c); }
+            l: &LoopValue => { return self:.executeLoop(l); }
+            t: &TryCatchValue => { return self:.executeTryCatch(t); }
+            d: &VarDeclValue => { return self:.executeVarDecl(d); }
+            r: &VarRefValue => { return self:.executeVarRef(r); }
+            a: &AffectValue => { return self:.executeAffect(a); }
+            r: &ReturnValue => { throw copy ExecReturn(self:.execute(r.value)); }
+            b: &BreakValue => { throw copy ExecBreak(self:.execute(b.value)); }
+            ContinueValue() => { throw copy ExecContinue(); }
+            t: &ThrowValue => { return self:.executeThrow(t); }
+            p: &PanicValue => {
+                throw copy ErrorMsg::fatal(self._loc, ValidateErrorMessage::CTE_EXEC_PANIC,
+                                           notes-> copy [copy ErrorMsg::note(p.loc, ValidateErrorMessage::HERE)]);
+            }
+            c: &PrototypeCallValue => { return self:.executeCall(c); }
+            b: &BinaryOperatorValue => { return self:.executeBinary(b); }
+            c: &CastValue => {
+                if c of UnionWidenValue || c of UnionNarrowValue || c of UnionBaseValue || c of SuperProxyValue {
+                    throw self.bail(c);
+                }
+
+                let inner = self:.execute(c.value);
+                if (inner of CtorCallValue && c.type of ClassPtrType) { // the downcast of a caught object
+                    return inner;
+                }
+
+                return self:.foldOperator(copy CastValue(c.loc, c.type, inner, isLvalue-> c.isLvalue));
+            }
+            u: &UnaryOperatorValue => {
+                return self:.foldOperator(copy UnaryOperatorValue(u.loc, u.type, u.op, self:.execute(u.value)));
+            }
+            f: &StructFieldAccessValue => {
+                return self:.foldOperator(copy StructFieldAccessValue(f.loc, f.type, self:.execute(f.object), f.name));
+            }
+            a: &ArrayAccessValue => {
+                return self:.foldOperator(copy ArrayAccessValue(a.loc, a.type, self:.execute(a.array), self:.execute(a.index)));
+            }
+            s: &SliceAccessValue => {
+                return self:.foldOperator(copy SliceAccessValue(s.loc, s.type, self:.execute(s.slice), self:.execute(s.index)));
+            }
+            s: &SliceCtorValue => { return self:.executeSubSlice(s); }
+            a: &AliaserValue => { return self:.execute(a.value); }
+            UnitValue() => { return value; }
+            _ => {
+                return self:.fold(value);
+            }
+        }
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * =====================================          SCOPES          =====================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Executes the values of a block in order.
+     * @returns: the value of the last one
+     */
+    fn executeBlock(mut self, values: [&Value])-> &Value
+        throws ErrorMsg, ExecSignal
+    {
+        let mut res: &Value = UNIT_VALUE;
+        for v in values {
+            res = self:.execute(v);
+        }
+
+        res
+    }
+
+    /**
+     * Executes the body of an inlined function, a `return` leaving the block.
+     */
+    fn executeInline(mut self, i: &InlineBlockValue)-> &Value
+        throws ErrorMsg, ExecSignal
+    {
+        {
+            return self:.executeBlock(i.values);
+        } catch {
+            r: &ExecReturn => { return r.value; }
+            s: &ExecSignal => { throw s; }
+            err: &ErrorMsg => { throw err; }
+        }
+    }
+
+    /**
+     * Executes the branch of a conditional selected by its test.
+     */
+    fn executeConditional(mut self, c: &ConditionalValue)-> &Value
+        throws ErrorMsg, ExecSignal
+    {
+        if (self:.executeBool(c.test)) {
+            return self:.execute(c.thenv);
+        }
+
+        self:.execute(c.elsev)
+    }
+
+    /**
+     * Executes a loop until its test fails, or a `break` leaves it.
+     * @returns: the value of the `break`, unit when the test fails
+     */
+    fn executeLoop(mut self, l: &LoopValue)-> &Value
+        throws ErrorMsg, ExecSignal
+    {
+        while (l.test of UnitValue || self:.executeBool(l.test)) {
+            let mut broken: (&Value)? = none;
+            {
+                self:.execute(l.value);
+            } catch {
+                b: &ExecBreak => { broken = (b.value)?; }
+                _: &ExecContinue => {}
+                s: &ExecSignal => { throw s; }
+                err: &ErrorMsg => { throw err; }
+            }
+
+            if let Ok(v) = broken {
+                return v;
+            }
+
+            self:.execute(l.step);
+        }
+
+        UNIT_VALUE
+    }
+
+    /**
+     * Executes a block with a catch, binding the thrown object to the catch variable.
+     */
+    fn executeTryCatch(mut self, t: &TryCatchValue)-> &Value
+        throws ErrorMsg, ExecSignal
+    {
+        let mut thrown: (&ExecThrow)? = none;
+        {
+            return self:.execute(t.tryBlock);
+        } catch {
+            e: &ExecThrow => { thrown = (e)?; }
+            s: &ExecSignal => { throw s; }
+            err: &ErrorMsg => { throw err; }
+        }
+
+        if let (Ok(e), d: &VarDeclValue) = (thrown, t.catchVar) {
+            self._env[d.uniqId] = e.object;
+            return self:.execute(t.catchBlock);
+        }
+
+        throw self.bail(t);
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          VARIABLES          ===================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Declares a variable of the current frame, with the value of its initializer.
+     */
+    fn executeVarDecl(mut self, d: &VarDeclValue)-> &Value
+        throws ErrorMsg, ExecSignal
+    {
+        if (d.isLazy || d.isReference) {
+            throw self.bail(d);
+        }
+
+        self._env[d.uniqId] = self:.execute(d.value);
+        UNIT_VALUE
+    }
+
+    /**
+     * @returns: the current value of a variable of the frame, or its compile-time value for
+     *           a variable declared outside the execution
+     */
+    fn executeVarRef(mut self, r: &VarRefValue)-> &Value
+        throws ErrorMsg, ExecSignal
+    {
+        if let Ok(v) = self._env[r.refId] {
+            return v;
+        }
+
+        self:.fold(r)
+    }
+
+    /**
+     * Assigns a variable of the current frame.
+     * @returns: the assigned value
+     */
+    fn executeAffect(mut self, a: &AffectValue)-> &Value
+        throws ErrorMsg, ExecSignal
+    {
+        if let r: &VarRefValue = a.left && (r.refId in self._env) {
+            let v = self:.execute(a.right);
+            self._env[r.refId] = v;
+            return v;
+        }
+
+        throw self.bail(a.left);
+    }
+
+    /**
+     * Throws the object constructed by a throw statement, or a caught one rethrown.
+     */
+    fn executeThrow(mut self, t: &ThrowValue)-> &Value
+        throws ErrorMsg, ExecSignal
+    {
+        if let c: &CtorCallValue = t.value {
+            throw copy ExecThrow(t.loc, c);
+        }
+
+        if let c: &CtorCallValue = self:.execute(t.value) {
+            throw copy ExecThrow(t.loc, c);
+        }
+
+        throw self.bail(t);
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * =====================================          CALLS          ======================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Executes the call of a function, in a frame of its own binding its parameters.
+     *
+     * An argument passed by reference to a variable of the current frame receives the
+     * value the parameter has when the call returns.
+     */
+    fn executeCall(mut self, call: &PrototypeCallValue)-> &Value
+        throws ErrorMsg, ExecSignal
+    {
+        let func = self:.calleeOf(call);
+        if (call.addParams.len != 0us || call.proto.retType of AsyncType || call.proto.retType of YieldType) {
+            throw self.bail(call);
+        }
+
+        let mut args: [&Value] = [];
+        let mut refs: [(usize)?] = [];
+        for p in call.params {
+            if let r: &ReferencerValue = p {
+                if let v: &VarRefValue = r.value && (v.refId in self._env) {
+                    args ~= [self:.execute(v)];
+                    refs ~= [(v.refId)?];
+                    continue;
+                }
+
+                throw self.bail(p);
+            }
+
+            args ~= [self:.execute(p)];
+            refs ~= [none];
+        }
+
+        if (func.externLang != "") {
+            if let Ok((res, outs)) = CompileTimeIntrinsics::execute(alias self._context.cteInterpret, call.loc, func, call.type, args) {
+                self:.writeBack(refs, outs);
+                return res;
+            }
+
+            throw copy ExecBail(copy [copy ErrorMsg::note(call.loc, format(ValidateErrorMessage::CTE_EXEC_EXTERN, func.path.toStr()))]);
+        }
+
+        let (proto, body) = self:.frameOf(call, func);
+        if (proto.params.len != args.len) {
+            throw self.bail(call);
+        }
+
+        for p in proto.params {
+            if (p.isLazy || p.isSelf) {
+                throw self.bail(call);
+            }
+        }
+
+        if (self._depth >= MAX_DEPTH) {
+            throw copy ErrorMsg::fatal(self._loc, format(ValidateErrorMessage::CTE_EXEC_LIMIT, conv::to!{[c8]} (MAX_DEPTH) ~ " nested calls"),
+                                       notes-> copy [copy ErrorMsg::note(call.loc, ValidateErrorMessage::HERE)]);
+        }
+
+        let mut saved: [usize => mut &Value] = alias self._env;
+        self._env = copy [];
+        self._depth += 1us;
+        {
+            for i, p in proto.params {
+                self._env[p.uniqId] = args[i];
+            }
+
+            let res = {
+                self:.execute(body)
+            } catch {
+                r: &ExecReturn => { r.value }
+                s: &ExecSignal => { throw s; }
+                err: &ErrorMsg => { throw err; }
+            };
+
+            let mut outs: [&Value] = [];
+            for i, p in proto.params {
+                if let Ok(v) = self._env[p.uniqId] {
+                    outs ~= [v];
+                } else {
+                    outs ~= [args[i]];
+                }
+            }
+
+            self._env = alias saved;
+            self:.writeBack(refs, outs);
+
+            return self:.retype(res, call.type, call.loc);
+        } exit {
+            self._env = alias saved;
+            self._depth -= 1us;
+        }
+    }
+
+    /**
+     * @returns: the function a call calls, the specialization of the template it names for a template
+     */
+    fn calleeOf(mut self, call: &PrototypeCallValue)-> &FunctionSymbol
+        throws ExecSignal
+    {
+        match call.proto.sym {
+            f: &FunctionSymbol => { return f; }
+            t: &TemplateSymbol => {
+                if let Ok(mapper) = call.proto.templateMapper {
+                    if let Ok(f: &FunctionSymbol) = self._context.templateContext:.findOf(t, mapper) {
+                        return f;
+                    }
+                }
+            }
+        }
+
+        throw self.bail(call);
+    }
+
+    /**
+     * @returns: the validated prototype and body of the called function, its body being
+     *           validated first if it is not yet
+     */
+    fn frameOf(mut self, call: &PrototypeCallValue, func: &FunctionSymbol)-> (&PrototypeValue, &Value)
+        throws ExecSignal
+    {
+        if (func.frameProto !of PrototypeValue) {
+            if (self._context.cteInterpret.isInlining(func)) {
+                throw self.bail(call);
+            }
+
+            self._context.cteInterpret:.insertInlining(func);
+            {
+                if let dmut f: &FunctionSymbol = alias self._context:.getSymbolFromRef(func) {
+                    FunctionValidation::validate(alias self._context, alias f);
+                }
+            } catch {
+                _ => { throw self.bail(call); }
+            } exit {
+                self._context.cteInterpret:.removeInlining(func);
+            }
+        }
+
+        if let (proto: &PrototypeValue, body: &Value) = (func.frameProto, func.frameBody) && body !of UnitValue {
+            return (proto, body);
+        }
+
+        throw self.bail(call);
+    }
+
+    /**
+     * Writes the values the parameters passed by reference have when a call returns into the variables passed.
+     */
+    fn writeBack(mut self, refs: [(usize)?], outs: [&Value]) {
+        for i, r in refs {
+            if let Ok(id) = r {
+                self._env[id] = outs[i];
+            }
+        }
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * ====================================          OPERATORS          ===================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * Executes a binary operator, the logical ones short-circuiting their right operand.
+     */
+    fn executeBinary(mut self, b: &BinaryOperatorValue)-> &Value
+        throws ErrorMsg, ExecSignal
+    {
+        match b {
+            l: &LogicalBoolOperatorValue => {
+                let left = self:.executeBool(l.left);
+                if (l.op == BinaryOperators::DAND && !left) return copy BoolValue(l.loc, false);
+                if (l.op == BinaryOperators::DPIPE && left) return copy BoolValue(l.loc, true);
+
+                return copy BoolValue(l.loc, self:.executeBool(l.right));
+            }
+            c: &CmpClassTypeOperatorValue => {
+                if let o: &CtorCallValue = self:.execute(c.left) {
+                    let inner = if let p: &ClassPtrType = o.type { p.inner } else { throw self.bail(c); };
+                    let isOf = c.classRef.isCompatible(inner) || TypeVerification::isAncestor(c.classRef, inner);
+                    return copy BoolValue(c.loc, isOf == (c.op == BinaryOperators::OF));
+                }
+
+                throw self.bail(c);
+            }
+            CmpPointerOperatorValue() => { throw self.bail(b); }
+            MathPointerOperatorValue() => { throw self.bail(b); }
+            _ => {}
+        }
+
+        let left = self:.execute(b.left);
+        let right = self:.execute(b.right);
+        let rebuilt: &OperatorValue = match b {
+            c: &CmpIntOperatorValue => { copy CmpIntOperatorValue(c.loc, c.op, left, right) }
+            m: &MathIntOperatorValue => { copy MathIntOperatorValue(m.loc, m.type, m.op, left, right) }
+            t: &BitwiseIntOperatorValue => { copy BitwiseIntOperatorValue(t.loc, t.type, t.op, left, right) }
+            s: &SpecialMathIntOperatorValue => { copy SpecialMathIntOperatorValue(s.loc, s.type, s.op, left, right, s.call) }
+            c: &CmpCharOperatorValue => { copy CmpCharOperatorValue(c.loc, c.op, left, right) }
+            m: &MathCharOperatorValue => { copy MathCharOperatorValue(m.loc, m.type, m.op, left, right) }
+            c: &CmpBoolOperatorValue => { copy CmpBoolOperatorValue(c.loc, c.op, left, right) }
+            c: &CmpFloatOperatorValue => { copy CmpFloatOperatorValue(c.loc, c.op, left, right) }
+            m: &MathFloatOperatorValue => { copy MathFloatOperatorValue(m.loc, m.type, m.op, left, right) }
+            s: &SpecialMathFloatOperatorValue => { copy SpecialMathFloatOperatorValue(s.loc, s.type, s.op, left, right, s.call) }
+            r: &RangeContainsValue => { copy RangeContainsValue(r.loc, r.type, r.op, left, right, r.call) }
+            s: &SpecialArrayOperatorValue => { copy SpecialArrayOperatorValue(s.loc, s.type, s.op, left, right, s.call) }
+            _ => { throw self.bail(b); }
+        };
+
+        self:.foldOperator(rebuilt)
+    }
+
+    /**
+     * Executes the part of a string `str[a .. b]`, built as a slice whose pointer is the
+     * one of the string moved by the offset of its first element.
+     */
+    fn executeSubSlice(mut self, s: &SliceCtorValue)-> &Value
+        throws ErrorMsg, ExecSignal
+    {
+        if let (m: &MathPointerOperatorValue, t: &SliceType) = (s.ptr, s.type) && m.op == BinaryOperators::PLUS {
+            if let f: &StructFieldAccessValue = m.left && f.name == SliceKeys::PTR {
+                let str = self:.execute(f.object);
+                let offset = self:.execute(m.right);
+                let len = self:.execute(s.len);
+                if let (st: &StringValue, o: &IntValue, l: &IntValue) = (str, offset, len) {
+                    let fst = { o.value / copy BigInt(cast!i64 (st.encodingSize / 8u16)) } catch { _ => { throw self.bail(s); } };
+                    let fstV = copy IntValue(s.loc, USIZE_TYPE, fst);
+                    let scdV = copy IntValue(s.loc, USIZE_TYPE, fst + l.value);
+                    if let Ok(res) = SliceOrArrayInterpret::reduceStringRange(s.loc, t, st, fstV, scdV) {
+                        return res;
+                    }
+                }
+            }
+        }
+
+        self:.fold(s)
+    }
+
+    /*!
+     * ====================================================================================================
+     * ====================================================================================================
+     * =====================================          UTILS          ======================================
+     * ====================================================================================================
+     * ====================================================================================================
+     */
+
+    /**
+     * @returns: the boolean the value executes to
+     */
+    fn executeBool(mut self, value: &Value)-> bool
+        throws ErrorMsg, ExecSignal
+    {
+        if let b: &BoolValue = self:.execute(value) {
+            return b.isTrue;
+        }
+
+        throw self.bail(value);
+    }
+
+    /**
+     * Folds a value whose operands are executed with the CompileTimeInterpret.
+     * @throws: ExecBail if it does not fold to a compile-time value
+     */
+    fn fold(mut self, value: &Value)-> &Value
+        throws ErrorMsg, ExecSignal
+    {
+        let res = self._context.cteInterpret:.reduceInOperator(value, checkCte-> false);
+        if (self._context.cteInterpret.isCte(res)) {
+            return res;
+        }
+
+        throw self.bail(value);
+    }
+
+    /**
+     * Folds an operator rebuilt over executed operands, transient so not cached by the CompileTimeInterpret.
+     * @throws: ExecBail if it does not fold to a compile-time value
+     */
+    fn foldOperator(mut self, op: &OperatorValue)-> &Value
+        throws ErrorMsg, ExecSignal
+    {
+        let res = self._context.cteInterpret:.reduceTransient(op);
+        if (self._context.cteInterpret.isCte(res)) {
+            return res;
+        }
+
+        throw self.bail(op);
+    }
+
+    /**
+     * @returns: the literal `value` typed as `type`, a literal returned by a function being of the type of its call
+     */
+    fn retype(mut self, value: &Value, type: &Type, loc: &Word)-> &Value
+        throws ErrorMsg, ExecSignal
+    {
+        match type {
+            IntType() => { return self:.foldOperator(copy CastValue(loc, type, value)); }
+            CharType() => { return self:.foldOperator(copy CastValue(loc, type, value)); }
+            FloatType() => { return self:.foldOperator(copy CastValue(loc, type, value)); }
+            _ => { return value; }
+        }
+    }
+
+    /**
+     * Counts one step of the execution.
+     * @throws: ErrorMsg when the execution exceeds its limit of steps
+     */
+    fn step(mut self, loc: &Word)
+        throws ErrorMsg
+    {
+        self._steps += 1us;
+        if (self._steps > MAX_STEPS) {
+            throw copy ErrorMsg::fatal(self._loc, format(ValidateErrorMessage::CTE_EXEC_LIMIT, conv::to!{[c8]} (MAX_STEPS) ~ " steps"),
+                                       notes-> copy [copy ErrorMsg::note(loc, ValidateErrorMessage::HERE)]);
+        }
+    }
+
+    /**
+     * @returns: the bail out of an execution that reaches a value it cannot execute, saying
+     *           why only when it is in a called function
+     */
+    fn bail(self, value: &Value)-> &ExecBail {
+        if (self._depth == 0us) {
+            return copy ExecBail([]);
+        }
+
+        copy ExecBail(copy [copy ErrorMsg::note(value.loc, ValidateErrorMessage::CTE_EXEC_UNSUPPORTED)])
+    }
+
+}
+
+/**
+ * Entry point of the compile-time execution.
+ */
+pub mod CompileTimeExecution {
+
+    /**
+     * Computes a value required at compile time: reduced, then executed when the reduction is not enough.
+     *
+     * @params:
+     *   - context: the validation context
+     *   - value: the validated value
+     *   - end: the end of the location of the error
+     *   - notes: the notes of the error
+     *
+     * @returns: the compile-time value
+     * @throws:
+     *   - ErrorMsg E4256 when the value is not known at compile time, the reason of
+     *     the failure of its execution as a note
+     *   - ErrorMsg when its execution fails
+     */
+    pub fn require(dmut context: &ValidationContext, value: &Value, end: &Word = EOF_WORD, notes: [&ErrorMsg] = [])-> &Value
+        throws ErrorMsg
+    {
+        let reduced = context.cteInterpret:.reduce(value);
+        if (context.cteInterpret.isCte(reduced)) {
+            return reduced;
+        }
+
+        let mut allNotes = notes;
+        if let Ok(executed) = CompileTimeExecution::execute(alias context, value, ref allNotes) {
+            return executed;
+        }
+
+        throw copy ErrorMsg::fatal(value.loc, end-> end, format(ValidateErrorMessage::UNKNOWN_AT_COMPILE_TIME, reduced.type), notes-> allNotes);
+    }
+
+    /**
+     * Executes a value at compile time.
+     *
+     * @params:
+     *   - context: the validation context
+     *   - value: the value to execute
+     *   - notes: receives why the value cannot be executed, if it executed a call
+     *
+     * @returns: the literal the value evaluates to, none when it cannot be executed
+     * @throws: ErrorMsg when the execution fails, an uncaught exception being reported at the value
+     */
+    pub fn execute(dmut context: &ValidationContext, value: &Value, ref mut notes: [&ErrorMsg])-> (&Value)?
+        throws ErrorMsg
+    {
+        let dmut exec = copy CompileTimeExecutor(alias context, value.loc);
+        {
+            let res = exec:.execute(value);
+            if (context.cteInterpret.isCte(res)) {
+                return (res)?;
+            }
+        } catch {
+            e: &ExecThrow => {
+                let cls = if let p: &ClassPtrType = e.object.type { p.inner } else { e.object.type };
+                throw copy ErrorMsg::fatal(value.loc, format(ValidateErrorMessage::CTE_EXEC_EXCEPTION, cls),
+                                           notes-> copy [copy ErrorMsg::note(e.loc, ValidateErrorMessage::HERE)]);
+            }
+            b: &ExecBail => { notes ~= b.notes; }
+            _: &ExecSignal => {}
+            err: &ErrorMsg => { throw err; }
+        }
+
+        none
+    }
+
+}
