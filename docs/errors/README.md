@@ -26,7 +26,7 @@ check lives:
 | `E1xxx` | lexing | `LexingErrorMessage` -- `src/ymirc/lexing/errors.yr` | 24 |
 | `E2xxx` | parsing | `SyntaxErrorMessage` -- `src/ymirc/syntax/errors.yr` | 17 |
 | `E3xxx` | declaration | `DeclareErrorMessage` -- `src/ymirc/semantic/declarator/errors.yr` | 37 |
-| `E4xxx` | validation | `ValidateErrorMessage` -- `src/ymirc/semantic/validator/errors.yr` | 302 |
+| `E4xxx` | validation | `ValidateErrorMessage` -- `src/ymirc/semantic/validator/errors.yr` | 305 |
 | `E5xxx` | lowering (YIL) | `SerializeYILErrorMessage` -- `src/ymirc/lint/serialize/errors.yr`, `OptimizerErrorMessage` -- `src/ymirc/lint/optimizer/errors.yr`, `LoweringErrorMessage` -- `src/ymirc/lint/lowering/errors.yr` | 12 |
 
 Each page carries an example wherever a case in the suite raises the code: the
@@ -164,6 +164,9 @@ deliberately carry no code, and have no page here.
 | [E4029](E4029.md) | `CONTAIN_MOVABLE_TYPE` | movable type <> cannot be embedded within another type |
 | [E4030](E4030.md) | `CTE_ASSERT_NO_MSG` | cte assertion failed |
 | [E4031](E4031.md) | `CTE_ASSERT_WITH_MSG` | cte assertion failed <> |
+| [E4364](E4364.md) | `CTE_EXEC_EXCEPTION` | the compile-time execution throws an exception of type <> |
+| [E4365](E4365.md) | `CTE_EXEC_LIMIT` | the compile-time execution exceeds its limit of <> |
+| [E4366](E4366.md) | `CTE_EXEC_PANIC` | the compile-time execution panics |
 | [E4035](E4035.md) | `CTOR_INFINITE_REDIRECTION` | infinite constructor redirection calls when calling <> |
 | [E4036](E4036.md) | `CTOR_MAP_DCOPY` | using a deep copy instead of a one level copy is prohibited when constructing a map <> |
 | [E4037](E4037.md) | `CTOR_MAP_STACK` | creating an instance of map <> on the stack is prohibited |
