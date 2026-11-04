@@ -26,7 +26,7 @@ check lives:
 | `E1xxx` | lexing | `LexingErrorMessage` -- `src/ymirc/lexing/errors.yr` | 24 |
 | `E2xxx` | parsing | `SyntaxErrorMessage` -- `src/ymirc/syntax/errors.yr` | 17 |
 | `E3xxx` | declaration | `DeclareErrorMessage` -- `src/ymirc/semantic/declarator/errors.yr` | 37 |
-| `E4xxx` | validation | `ValidateErrorMessage` -- `src/ymirc/semantic/validator/errors.yr` | 309 |
+| `E4xxx` | validation | `ValidateErrorMessage` -- `src/ymirc/semantic/validator/errors.yr` | 310 |
 | `E5xxx` | lowering (YIL) | `SerializeYILErrorMessage` -- `src/ymirc/lint/serialize/errors.yr`, `OptimizerErrorMessage` -- `src/ymirc/lint/optimizer/errors.yr`, `LoweringErrorMessage` -- `src/ymirc/lint/lowering/errors.yr` | 12 |
 
 Each page carries an example wherever a case in the suite raises the code: the
@@ -366,6 +366,7 @@ deliberately carry no code, and have no page here.
 | [E4226](E4226.md) | `UNDEFINED_CALL_OP` | the call operator is not defined for <> and <> |
 | [E4227](E4227.md) | `UNDEFINED_CAST_OP` | cannot cast value of type <> into a value of type <> |
 | [E4229](E4229.md) | `UNDEFINED_DOLLAR_OP` | operator $ is not defined for type <> |
+| [E4371](E4371.md) | `UNDEFINED_ENUM_NAME` | enum <> has no field named <> |
 | [E4230](E4230.md) | `UNDEFINED_ESCAPE` | undefined escape sequence |
 | [E4231](E4231.md) | `UNDEFINED_INDEX_OP` | the index operator is not defined for type <> and <> |
 | [E4233](E4233.md) | `UNDEFINED_REDIRECT_CALL_CTOR` | no constructor is callable with the parameters <> |
