@@ -34,11 +34,12 @@
 
 in lexer;
 
+pub mod ::condition;
 pub mod ::scope;
 
 use ymirc::errors;
 use ymirc::lexing::_;
-use ymirc::lexing::lexer::scope;
+use ymirc::lexing::lexer::{condition, scope};
 use ymirc::utils::format;
 
 use std::{io, stream};
@@ -1517,7 +1518,7 @@ pub class SrcLexer {
 
             let hasIf = tzer.next(self._content[testCursor.seek .. $]);
             if hasIf.tok != Keys::IF { // no if, a fallback scope
-                scope:.enter(loc, EOF_WORD, pastPass);
+                scope:.enter(loc, ALWAYS_COND, pastPass);
                 return;
             }
 
@@ -1530,10 +1531,187 @@ pub class SrcLexer {
         let ifLoc = cursor.instantiateLoc(Keys::IF); // keeping location before the reading of spaces
         cursor:.forward(Keys::IF.len);
 
-        self.skipSpaces(ref cursor); // there can spaces between 'if' and 'version'
+        let cond = self.readVersionCond(tzer, ifLoc, ref cursor);
+        scope:.enter(ifLoc, cond, pastPass);
+    }
 
-        // Reading the version, it can be either an identifier or a backquote string
+    /**
+     * Read the condition of a '#if' or '#else if' directive, up to the end of its line
+     *
+     * @info: Cond := Any, Any := All ('|' All)*, All := Not ('&' Not)*, Not := '!' Not | Atom,
+     * Atom := identifier | `backquoted` | '(' Any ')'
+     *
+     * @params:
+     *   - tzer:   the tokenizer to read the words of the condition
+     *   - ifLoc:  the 'if' of the directive
+     *   - cursor: the cursor pointing right after the 'if'
+     *
+     * @returns: the condition of the directive
+     *
+     * @throws:
+     *   - MISSING_VERSION_CONDITION: an operand is missing
+     *   - UNCLOSED_VERSION_PAREN: a parenthesis is not closed on the line of the directive
+     *   - UNMATCHED_VERSION_PAREN: a closing parenthesis follows the condition
+     *   - UNEXPECTED_VERSION_TOKEN: a token that continues no condition is met before the end of the line
+     * */
+    fn readVersionCond(self, tzer: SrcTokenizer, ifLoc: &Word, ref mut cursor: SrcCursor)-> &VersionCond
+        throws ErrorMsg
+    {
+        let cond = self.readVersionAny(tzer, ifLoc, EOF_WORD, ref cursor);
+
+        let mut testCursor = cursor;
+        let next = self.peekVersionToken(tzer, ref testCursor);
+        if next == Tokens::RPAR {
+            throw copy ErrorMsg::fatal(testCursor.instantiateLoc(Tokens::RPAR), format(LexingErrorMessage::UNMATCHED_VERSION_PAREN));
+        }
+
+        if !self.isLineEnd(next) {
+            throw copy ErrorMsg::fatal(testCursor.instantiateLoc(next), format(LexingErrorMessage::UNEXPECTED_VERSION_TOKEN, next));
+        }
+
+        cond
+    }
+
+    /**
+     * Read a disjunction of a version condition, All ('|' All)*
+     *
+     * @params:
+     *   - tzer:   the tokenizer to read the words of the condition
+     *   - ifLoc:  the 'if' of the directive
+     *   - prev:   the token the disjunction is the operand of, EOF if none
+     *   - cursor: the cursor pointing to the disjunction
+     *
+     * @returns: the disjunction, or its single operand
+     *
+     * @throws: cf. readVersionCond
+     * */
+    fn readVersionAny(self, tzer: SrcTokenizer, ifLoc: &Word, prev: &Word, ref mut cursor: SrcCursor)-> &VersionCond
+        throws ErrorMsg
+    {
+        let mut operands: [&VersionCond] = copy [self.readVersionAll(tzer, ifLoc, prev, ref cursor)];
+        loop {
+            let mut testCursor = cursor;
+            if self.peekVersionToken(tzer, ref testCursor) != Tokens::PIPE
+                break;
+
+            let op = testCursor.instantiateLoc(Tokens::PIPE);
+            testCursor:.forward(Tokens::PIPE.len);
+            cursor = testCursor;
+
+            operands ~= [self.readVersionAll(tzer, ifLoc, op, ref cursor)];
+        }
+
+        if operands.len == 1 {
+            return operands[0];
+        }
+
+        copy VersionAny(operands)
+    }
+
+    /**
+     * Read a conjunction of a version condition, Not ('&' Not)*
+     *
+     * @params:
+     *   - tzer:   the tokenizer to read the words of the condition
+     *   - ifLoc:  the 'if' of the directive
+     *   - prev:   the token the conjunction is the operand of, EOF if none
+     *   - cursor: the cursor pointing to the conjunction
+     *
+     * @returns: the conjunction, or its single operand
+     *
+     * @throws: cf. readVersionCond
+     * */
+    fn readVersionAll(self, tzer: SrcTokenizer, ifLoc: &Word, prev: &Word, ref mut cursor: SrcCursor)-> &VersionCond
+        throws ErrorMsg
+    {
+        let mut operands: [&VersionCond] = copy [self.readVersionNot(tzer, ifLoc, prev, ref cursor)];
+        loop {
+            let mut testCursor = cursor;
+            if self.peekVersionToken(tzer, ref testCursor) != Tokens::AND
+                break;
+
+            let op = testCursor.instantiateLoc(Tokens::AND);
+            testCursor:.forward(Tokens::AND.len);
+            cursor = testCursor;
+
+            operands ~= [self.readVersionNot(tzer, ifLoc, op, ref cursor)];
+        }
+
+        if operands.len == 1 {
+            return operands[0];
+        }
+
+        copy VersionAll(operands)
+    }
+
+    /**
+     * Read a negation of a version condition, '!' Not | Atom
+     *
+     * @params:
+     *   - tzer:   the tokenizer to read the words of the condition
+     *   - ifLoc:  the 'if' of the directive
+     *   - prev:   the token the negation is the operand of, EOF if none
+     *   - cursor: the cursor pointing to the negation
+     *
+     * @returns: the negation, or the atom when there is no '!'
+     *
+     * @throws: cf. readVersionCond
+     * */
+    fn readVersionNot(self, tzer: SrcTokenizer, ifLoc: &Word, prev: &Word, ref mut cursor: SrcCursor)-> &VersionCond
+        throws ErrorMsg
+    {
+        let mut testCursor = cursor;
+        if self.peekVersionToken(tzer, ref testCursor) != Tokens::NOT {
+            return self.readVersionAtom(tzer, ifLoc, prev, ref cursor);
+        }
+
+        let op = testCursor.instantiateLoc(Tokens::NOT);
+        testCursor:.forward(Tokens::NOT.len);
+        cursor = testCursor;
+
+        copy VersionNot(self.readVersionNot(tzer, ifLoc, op, ref cursor))
+    }
+
+    /**
+     * Read an atom of a version condition, a version name or a parenthesized condition
+     *
+     * @params:
+     *   - tzer:   the tokenizer to read the words of the condition
+     *   - ifLoc:  the 'if' of the directive
+     *   - prev:   the token the atom is the operand of, EOF if none
+     *   - cursor: the cursor pointing to the atom
+     *
+     * @returns: the version name, or the condition between the parentheses
+     *
+     * @throws: cf. readVersionCond
+     * */
+    fn readVersionAtom(self, tzer: SrcTokenizer, ifLoc: &Word, prev: &Word, ref mut cursor: SrcCursor)-> &VersionCond
+        throws ErrorMsg
+    {
+        self.skipSpaces(ref cursor);
+
         let next = tzer.next(self._content[cursor.seek .. $]);
+        if next.tok == Tokens::LPAR {
+            let open = cursor.instantiateLoc(Tokens::LPAR);
+            cursor:.forward(Tokens::LPAR.len);
+
+            let cond = self.readVersionAny(tzer, ifLoc, open, ref cursor);
+
+            let mut testCursor = cursor;
+            let close = self.peekVersionToken(tzer, ref testCursor);
+            if self.isLineEnd(close) {
+                throw copy ErrorMsg::fatal(open, format(LexingErrorMessage::UNCLOSED_VERSION_PAREN));
+            }
+
+            if close != Tokens::RPAR {
+                throw copy ErrorMsg::fatal(testCursor.instantiateLoc(close), format(LexingErrorMessage::UNEXPECTED_VERSION_TOKEN, close));
+            }
+
+            testCursor:.forward(Tokens::RPAR.len);
+            cursor = testCursor;
+            return cond;
+        }
+
         let v = if next.isString && next.tok == Tokens::BACK_QUOTE {
             self.tokenizeString(tzer, next.tok, Tokens::BACK_QUOTE, copy [], [], false, true, ref cursor)
         } else if next.isWord {
@@ -1543,11 +1721,36 @@ pub class SrcLexer {
         };
 
         if !v.isName { // backquote string are identifiers, but not EOF, or numbers
-            throw copy ErrorMsg::fatal(ifLoc, format(LexingErrorMessage::MISSING_VERSION_CONDITION));
+            let mut notes: [&ErrorMsg] = [];
+            if !prev.isEof {
+                notes = copy [copy ErrorMsg::note(prev, "")];
+            }
+
+            throw copy ErrorMsg::fatal(ifLoc, format(LexingErrorMessage::MISSING_VERSION_CONDITION), notes-> notes);
         }
 
-        // Enter the new scope
-        scope:.enter(ifLoc, v, pastPass);
+        copy VersionName(v)
+    }
+
+    /**
+     * Read the next token of a version condition, without consuming it
+     *
+     * @params:
+     *   - tzer:   the tokenizer to read the token
+     *   - cursor: the cursor to move past the spaces preceding the token
+     *
+     * @returns: the token, a line return or an empty one at the end of the content
+     * */
+    fn peekVersionToken(self, tzer: SrcTokenizer, ref mut cursor: SrcCursor)-> [c8] {
+        self.skipSpaces(ref cursor);
+        tzer.next(self._content[cursor.seek .. $]).tok
+    }
+
+    /**
+     * @returns: true iif the token read by peekVersionToken ends the line of a directive (a line return or the end of the content)
+     * */
+    fn isLineEnd(self, tok: [c8])-> bool {
+        tok.len == 0 || tok == Tokens::RETURN || tok == Tokens::RRETURN || tok == Tokens::RRETURN_CMP
     }
 
     /**
@@ -1558,7 +1761,7 @@ pub class SrcLexer {
      *
      * */
     fn skipSpaces(self, ref mut cursor: SrcCursor) {
-        while self._content[cursor.seek] == ' ' || self._content[cursor.seek] == '\t' {
+        while cursor.seek < self._content.len && (self._content[cursor.seek] == ' ' || self._content[cursor.seek] == '\t') {
             cursor:.forward(1);
         }
     }
