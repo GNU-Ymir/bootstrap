@@ -26,7 +26,7 @@ check lives:
 | `E1xxx` | lexing | `LexingErrorMessage` -- `src/ymirc/lexing/errors.yr` | 24 |
 | `E2xxx` | parsing | `SyntaxErrorMessage` -- `src/ymirc/syntax/errors.yr` | 17 |
 | `E3xxx` | declaration | `DeclareErrorMessage` -- `src/ymirc/semantic/declarator/errors.yr` | 37 |
-| `E4xxx` | validation | `ValidateErrorMessage` -- `src/ymirc/semantic/validator/errors.yr` | 308 |
+| `E4xxx` | validation | `ValidateErrorMessage` -- `src/ymirc/semantic/validator/errors.yr` | 309 |
 | `E5xxx` | lowering (YIL) | `SerializeYILErrorMessage` -- `src/ymirc/lint/serialize/errors.yr`, `OptimizerErrorMessage` -- `src/ymirc/lint/optimizer/errors.yr`, `LoweringErrorMessage` -- `src/ymirc/lint/lowering/errors.yr` | 12 |
 
 Each page carries an example wherever a case in the suite raises the code: the
@@ -410,6 +410,7 @@ deliberately carry no code, and have no page here.
 | [E4272](E4272.md) | `USE_AS_TYPE_VAL` | expression produces a value of type <>, but is used as a type |
 | [E4273](E4273.md) | `USE_AS_VALUE` | expression produces a type, but is used as a value |
 | [E4275](E4275.md) | `USE_AS_VALUE_TYPE` | expression produces the type <>, but is used as a value |
+| [E4370](E4370.md) | `VERSION_NO_VALUE` | version <> has no value |
 | [E4278](E4278.md) | `VOID_VALUE` | void expression cannot be used as a value |
 | [E4352](E4352.md) | `VTABLE_ABSTRACT_CLASS` | class <> is abstract, it has no vtable |
 | [E4353](E4353.md) | `VTABLE_STRUCT` | <> is a structure, it has no vtable |
