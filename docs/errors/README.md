@@ -66,6 +66,9 @@ deliberately carry no code, and have no page here.
 | [E1023](E1023.md) | `UNMATCHED_VERSION_END` | #<> without matching #if |
 | [E1024](E1024.md) | `MISSING_VERSION_CONDITION` | missing version condition: expected identifier or backquoted identifier |
 | [E1025](E1025.md) | `UNDEFINED_VERSION_DIRECTIVE` | undefined version directive; expecting if, else or end |
+| [E1026](E1026.md) | `UNCLOSED_VERSION_PAREN` | unclosed parenthesis in version condition |
+| [E1027](E1027.md) | `UNMATCHED_VERSION_PAREN` | unmatched closing parenthesis in version condition |
+| [E1028](E1028.md) | `UNEXPECTED_VERSION_TOKEN` | unexpected <> in version condition; a directive ends at the end of its line |
 
 ## E2xxx -- parsing
 
