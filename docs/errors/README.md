@@ -26,7 +26,7 @@ check lives:
 | `E1xxx` | lexing | `LexingErrorMessage` -- `src/ymirc/lexing/errors.yr` | 24 |
 | `E2xxx` | parsing | `SyntaxErrorMessage` -- `src/ymirc/syntax/errors.yr` | 17 |
 | `E3xxx` | declaration | `DeclareErrorMessage` -- `src/ymirc/semantic/declarator/errors.yr` | 37 |
-| `E4xxx` | validation | `ValidateErrorMessage` -- `src/ymirc/semantic/validator/errors.yr` | 312 |
+| `E4xxx` | validation | `ValidateErrorMessage` -- `src/ymirc/semantic/validator/errors.yr` | 313 |
 | `E5xxx` | lowering (YIL) | `SerializeYILErrorMessage` -- `src/ymirc/lint/serialize/errors.yr`, `OptimizerErrorMessage` -- `src/ymirc/lint/optimizer/errors.yr`, `LoweringErrorMessage` -- `src/ymirc/lint/lowering/errors.yr` | 12 |
 
 Each page carries an example wherever a case in the suite raises the code: the
@@ -271,6 +271,7 @@ deliberately carry no code, and have no page here.
 | [E4143](E4143.md) | `NEVER_ENTERED_LOOP` | loop test is always false, loop is never entered |
 | [E4144](E4144.md) | `NON_ABSTRACT_NOT_COMPLETE` | class <> is not abstract but has empty methods |
 | [E4356](E4356.md) | `NOGC_CALL` | <> is not nogc, a nogc function cannot call it |
+| [E4374](E4374.md) | `NOGC_DTOR` | the destructor of <> is not nogc, a nogc function cannot run it |
 | [E4145](E4145.md) | `NOTHING_TO_CATCH` | nothing to catch |
 | [E4305](E4305.md) | `NO_ENCLOSING_PRAGMA` | __pragma <> is not enclosed in a <> |
 | [E4146](E4146.md) | `NOT_ALIASABLE` | <> is not an aliasable type |
