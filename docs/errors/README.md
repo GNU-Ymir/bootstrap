@@ -26,7 +26,7 @@ check lives:
 | `E1xxx` | lexing | `LexingErrorMessage` -- `src/ymirc/lexing/errors.yr` | 24 |
 | `E2xxx` | parsing | `SyntaxErrorMessage` -- `src/ymirc/syntax/errors.yr` | 17 |
 | `E3xxx` | declaration | `DeclareErrorMessage` -- `src/ymirc/semantic/declarator/errors.yr` | 37 |
-| `E4xxx` | validation | `ValidateErrorMessage` -- `src/ymirc/semantic/validator/errors.yr` | 310 |
+| `E4xxx` | validation | `ValidateErrorMessage` -- `src/ymirc/semantic/validator/errors.yr` | 312 |
 | `E5xxx` | lowering (YIL) | `SerializeYILErrorMessage` -- `src/ymirc/lint/serialize/errors.yr`, `OptimizerErrorMessage` -- `src/ymirc/lint/optimizer/errors.yr`, `LoweringErrorMessage` -- `src/ymirc/lint/lowering/errors.yr` | 12 |
 
 Each page carries an example wherever a case in the suite raises the code: the
@@ -340,6 +340,7 @@ deliberately carry no code, and have no page here.
 | [E4338](E4338.md) | `TAG_CTOR_SHAPE` | a self overload of a tag is run at program start, it can neither take parameters nor throw |
 | [E4367](E4367.md) | `TAG_FIELD_APPLY` | tag <> declares apply overloads, a field cannot carry it |
 | [E4336](E4336.md) | `TAG_MERGE_CYCLE` | <> is used before its tags are merged into it |
+| [E4372](E4372.md) | `TAG_METHOD_APPLY` | tag <> declares apply overloads, a method cannot carry it |
 | [E4332](E4332.md) | `TAG_NOT_APPLICABLE` | tag <> does not apply to <> <> |
 | [E4368](E4368.md) | `TAG_SITE_NOT_SINGLE` | <> carries <> sites of tag <>, where a single one was expected |
 | [E4369](E4369.md) | `TAG_SITES_RECORDS` | the sites of tag <> on <> hold their arguments in different records, <> and <> |
@@ -358,6 +359,7 @@ deliberately carry no code, and have no page here.
 | [E4214](E4214.md) | `TUPLE_ARITY_OVERFLOW` | tuple access out of bound(<>), tuple arity is <> |
 | [E4216](E4216.md) | `TUPLE_PATTERN` | pattern <> only matches tuple values, not <> |
 | [E4217](E4217.md) | `TYPE_HAS_NO_FIELDINFO` | type <> has no fields |
+| [E4373](E4373.md) | `TYPE_HAS_NO_METHOD` | type <> has no methods |
 | [E4218](E4218.md) | `TYPE_HAS_NO_SIZE` | temporary type <> has no size |
 | [E4220](E4220.md) | `TYPE_NO_FIELD` | type <> has no field named <> |
 | [E4222](E4222.md) | `UNDEFINED_BIN_ACC_OP` | undefined operator <> for type <> and field <> |
